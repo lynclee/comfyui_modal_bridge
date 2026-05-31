@@ -1,0 +1,22 @@
+[project]
+name = "comfyui_modal_bridge"
+description = "把当前 ComfyUI workflow 一键推到 Modal Serverless GPU 上跑,自动同步模型/自定义节点、按显存自动选 GPU,结果回填本地。"
+version = "0.1.0"
+license = { text = "MIT" }
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "aiohttp",
+    "pyyaml",
+]
+
+[project.urls]
+Repository = "https://github.com/lynclee/comfyui_modal_bridge"
+
+# ComfyUI Registry 元数据
+# 发布命令:comfy node publish(需 comfy-cli + Registry API key)
+# 文档:https://docs.comfy.org/registry/publishing
+[tool.comfy]
+PublisherId = "lynclee"
+DisplayName = "Modal Bridge — 云端 GPU 跑图"
+Icon = ""

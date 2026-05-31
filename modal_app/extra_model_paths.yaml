@@ -1,0 +1,35 @@
+# ComfyUI 模型搜索路径 — Modal worker 用
+# base_path 指向挂载的 Volume:/comfy-volume
+# Volume 内顶层是 /models/<子目录>,所以 ComfyUI 看到的完整路径是 /comfy-volume/models/<子目录>
+
+comfyui-bridge:
+    base_path: /comfy-volume/
+    is_default: true
+
+    checkpoints: models/checkpoints/
+    diffusion_models: models/diffusion_models/
+    unet: models/unet/
+    vae: models/vae/
+    clip: models/clip/
+    text_encoders: models/text_encoders/
+    clip_vision: models/clip_vision/
+    style_models: models/style_models/
+    loras: models/loras/
+    controlnet: models/controlnet/
+    upscale_models: models/upscale_models/
+    embeddings: models/embeddings/
+    hypernetworks: models/hypernetworks/
+    photomaker: models/photomaker/
+    gligen: models/gligen/
+    diffusers: models/diffusers/
+    vae_approx: models/vae_approx/
+    pulid: models/pulid/
+    inpaint: models/inpaint/
+    insightface: models/insightface/
+    onnx: models/onnx/
+    sams: models/sams/
+    ultralytics: models/ultralytics/
+    ultralytics_bbox: models/ultralytics/bbox/
+    ultralytics_segm: models/ultralytics/segm/
+    # 注:不要映射 custom_nodes 到 Volume —— custom_nodes 装在镜像 /comfyui/custom_nodes,
+    #     Volume 没有这目录,映射过去会让 ComfyUI 启动时 os.listdir 崩溃(prestartup crash)

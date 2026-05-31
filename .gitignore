@@ -1,0 +1,11 @@
+# 敏感配置(绝不提交)
+secrets.toml
+config.json
+
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+
+# 系统
+.DS_Store
