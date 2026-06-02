@@ -68,13 +68,16 @@ def _sweep_job_state():
             continue
         if s.get("status") in terminal:
             finished.append((jid, s.get("completed_at") or 0))
+    def _drop(jid):
+        for k in (jid, f"{jid}:call"):  # 连带删独立的 call_id key,不留孤儿
+            try:
+                del job_state[k]
+            except Exception:
+                pass
     # 1) 过期删
     for jid, done_at in finished:
         if done_at and now - done_at > JOB_TTL_S:
-            try:
-                del job_state[jid]
-            except Exception:
-                pass
+            _drop(jid)
     # 2) 数量兜底:仍超上限就删最旧的终态条目
     try:
         remaining = [(j, s.get("completed_at") or 0) for j, s in job_state.items()
@@ -82,10 +85,7 @@ def _sweep_job_state():
         if len(remaining) > JOB_MAX:
             remaining.sort(key=lambda x: x[1])
             for jid, _ in remaining[: len(remaining) - JOB_MAX]:
-                try:
-                    del job_state[jid]
-                except Exception:
-                    pass
+                _drop(jid)
     except Exception:
         pass
 
@@ -125,13 +125,12 @@ def _worker_shutdown(self):
 
 
 def _worker_run(workflow: dict, job_id: str, input_images: list | None = None) -> dict:
-    cur: dict = {}
-    for _ in range(100):
-        cur = job_state.get(job_id, {})
-        if cur.get("call_id"):
+    # call_id 现在存独立 key(见 run_endpoint);等它出现仅为让 cancel 可用,等不到也继续。
+    for _ in range(50):  # 最多 ~5s
+        if job_state.get(f"{job_id}:call"):
             break
         time.sleep(0.1)
-    job_state[job_id] = {**cur, "status": "running", "started_at": time.time()}
+    job_state[job_id] = {**job_state.get(job_id, {}), "status": "running", "started_at": time.time()}
     try:
         # Volume 已在 boot() reload;这里不能再 reload(ComfyUI 已打开文件会冲突)
         from _comfy_ws import run_workflow
@@ -218,7 +217,11 @@ def run_endpoint(payload: dict):
     _sweep_job_state()  # 顺手清理过期/超量的旧 job(防 Dict 无限膨胀)
     job_state[job_id] = {"status": "queued", "queued_at": time.time(), "gpu": gpu_display, "tier": tier}
     call = worker().run.spawn(workflow, job_id, input_images)
-    job_state[job_id] = {**job_state.get(job_id, {}), "call_id": call.object_id}
+    # ⚠ call_id 存到独立 key,run_endpoint 不再回写 job_state[job_id]。
+    # 原因:job_state[job_id] 同时被 worker 容器写(running/failed/completed)。Modal Dict 跨容器
+    # 最终一致、无序,run_endpoint spawn 后 merge 回写可能读到 stale 的 queued、把 worker 刚写的
+    # 终态冲掉 → 前端永远 poll 到 queued、卡片一直转。分离 key 后两边各写各的,彻底无竞态。
+    job_state[f"{job_id}:call"] = call.object_id
     return {"id": job_id, "status": "queued", "gpu": gpu_display}
 
 
@@ -245,7 +248,7 @@ def cancel_endpoint(payload: dict):
         return {"error": "Missing 'job_id'"}
     s = job_state.get(job_id) or {}
     was_running = s.get("status") == "running"
-    call_id = s.get("call_id")
+    call_id = job_state.get(f"{job_id}:call") or s.get("call_id")  # 新独立 key,兼容旧字段
     if call_id:
         try:
             modal.FunctionCall.from_id(call_id).cancel(terminate_containers=was_running)

@@ -535,17 +535,21 @@ async function runOnceOnModal(workflowPrompt, outputNodeIds, ctx, submitGuard, b
 
   const jobId = sub.job_id;
   const gpu = sub.gpu;
+  let cancelled = false;  // 点取消后置位:poll 循环据此立即退出,卡片不等后续 poll
   addActiveJob({ jobId, gpu, wfName: ctx.wfName, startedAt: Date.now() });
   // 这张卡的取消只取消这个 job(各 job 互不影响)
   ctx.setCancel(jobId, async () => {
     if (!confirm(`Cancel Modal job ${jobId.slice(0, 8)}?`)) return;
-    try {
-      await api.fetchApi("/modal_bridge/cancel", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ job_id: jobId }),
-      });
-    } catch (e) { err("cancel failed", e); }
+    cancelled = true;
+    // 立即结束卡片(不依赖后续 poll 拿到 cancelled —— 那可能慢或因竞态拿不到)
+    removeActiveJob(jobId);
+    ctx.finish(false, "✕ Cancelled");
+    // 后台告诉 Modal 取消(不阻塞 UI,失败也无所谓)
+    api.fetchApi("/modal_bridge/cancel", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ job_id: jobId }),
+    }).catch((e) => err("cancel failed", e));
   });
   log("submitted", jobId, "gpu=" + gpu);
 
@@ -559,7 +563,9 @@ async function runOnceOnModal(workflowPrompt, outputNodeIds, ctx, submitGuard, b
   let lastStatus = "queued";
   try {
     while (Date.now() < deadline) {
+      if (cancelled) return { jobId, gpu, cancelled: true };  // 用户已取消,卡片已结束,静默退出
       await sleep(interval);
+      if (cancelled) return { jobId, gpu, cancelled: true };
       let pData;
       try {
         const pRes = await api.fetchApi(`/modal_bridge/poll?job_id=${encodeURIComponent(jobId)}`);
@@ -742,6 +748,7 @@ async function queueOnModal() {
         promptWithSeed, outputNodeIds, ctx, submitGuard,
         batchCount > 1 ? { current: i + 1, total: batchCount } : null,
       );
+      if (result?.cancelled) return;  // 用户取消:卡片已 finish,别再 finish(true) 覆盖
       allOutputs.push(result);
     }
 
@@ -844,9 +851,10 @@ const SETTINGS = [
     id: "ModalBridge.timeoutSec",
     name: "Modal Bridge: Timeout (sec)",
     type: "number",
-    defaultValue: 1200,
+    defaultValue: 60,
     attrs: { min: 60, max: 7200, step: 60 },
-    tooltip: "单 job 最长等待",
+    tooltip: "单 job 最长等待(秒)。注意:冷启动 30-40s + 大模型加载/推理常 >60s," +
+      "60s 下冷启动的首张图易超时;想兼顾冷启动建议设 180-300s。",
   },
   {
     id: "ModalBridge.incognito",

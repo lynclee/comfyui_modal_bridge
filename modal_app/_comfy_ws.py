@@ -87,7 +87,42 @@ def upload_images(images: list[dict]) -> dict:
     return {"status": "success"}
 
 
-def queue_workflow(workflow: dict, client_id: str) -> dict:
+def refresh_model_list() -> None:
+    """让 ComfyUI 重扫模型目录(reload Volume 之后调)。
+    warm 容器复用时,ComfyUI 在 boot 那刻缓存了模型列表,运行时新上传到 Volume 的模型
+    它看不到 → 报 value_not_in_list。ComfyUI 有 /api/refresh-models / /refresh 接口可刷缓存,
+    版本不一逐个试,失败也不致命(caller 会判定重试结果)。"""
+    for path in ("/api/refresh-models", "/refresh", "/api/refresh"):
+        try:
+            r = requests.post(f"http://{COMFY_HOST}{path}", timeout=30)
+            if r.ok:
+                print(f"[bridge] refreshed model list via {path}")
+                return
+        except Exception:
+            pass
+    print("[bridge] WARN: 没有可用的 model refresh 接口(将依赖 reload 后的目录扫描)")
+
+
+def _parse_validation_error(err: dict):
+    """从 ComfyUI 400 响应提取 (details文案, 是否为'模型不在列表'类错误)。"""
+    details, is_missing_value = [], False
+    node_errors = err.get("node_errors") or {}
+    for nid, nerr in node_errors.items():
+        if isinstance(nerr, dict):
+            for sub in nerr.get("errors", []) or []:
+                if isinstance(sub, dict):
+                    if sub.get("type") == "value_not_in_list":
+                        is_missing_value = True
+                    details.append(f"Node {nid}: {sub.get('details', sub)}")
+            for et, em in nerr.items():
+                if et != "errors":
+                    details.append(f"Node {nid} ({et}): {em}")
+        else:
+            details.append(f"Node {nid}: {nerr}")
+    return details, is_missing_value
+
+
+def queue_workflow(workflow: dict, client_id: str, _retried: bool = False) -> dict:
     payload = {"prompt": workflow, "client_id": client_id}
     r = requests.post(
         f"http://{COMFY_HOST}/prompt",
@@ -98,19 +133,24 @@ def queue_workflow(workflow: dict, client_id: str) -> dict:
     if r.status_code == 400:
         try:
             err = r.json()
-            details = []
-            if "node_errors" in err:
-                for nid, nerr in err["node_errors"].items():
-                    if isinstance(nerr, dict):
-                        for et, em in nerr.items():
-                            details.append(f"Node {nid} ({et}): {em}")
-                    else:
-                        details.append(f"Node {nid}: {nerr}")
-            if details:
-                raise ValueError("Workflow validation: " + "; ".join(details))
+        except json.JSONDecodeError:
             raise ValueError(f"ComfyUI 400: {r.text}")
-        except (json.JSONDecodeError, KeyError):
-            raise ValueError(f"ComfyUI 400: {r.text}")
+        details, is_missing_value = _parse_validation_error(err)
+        # warm 容器没看到运行时新上传的模型 → reload Volume + 刷新 ComfyUI 模型列表,重试一次
+        if is_missing_value and not _retried:
+            print("[bridge] 模型不在列表(warm 容器缓存旧),reload Volume + 刷新后重试...")
+            try:
+                import modal
+                modal.Volume.from_name(
+                    os.environ.get("MODAL_BRIDGE_VOLUME", "comfyui-bridge-models")
+                ).reload()
+            except Exception as e:
+                print(f"[bridge] volume reload 失败: {e}")
+            refresh_model_list()
+            return queue_workflow(workflow, client_id, _retried=True)
+        if details:
+            raise ValueError("Workflow validation: " + "; ".join(details))
+        raise ValueError(f"ComfyUI 400: {r.text}")
     r.raise_for_status()
     return r.json()
 
