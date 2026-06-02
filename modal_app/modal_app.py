@@ -155,10 +155,11 @@ def _worker_run(workflow: dict, job_id: str, input_images: list | None = None) -
     return result
 
 
-# 80G 档(flux2 dev 等大模型):H100 优先,排不到降 A100-80GB
+# 统一所有工作流都跑 H100,排不到自动降级 A100-80GB(用户要求:别把小模型丢到 L40S 反而慢)。
+# 单 worker class —— 不再按显存分档(那会让 klein 等小模型落到 L40S/弱卡)。
 @app.cls(gpu=["H100", "A100-80GB"], **_WORKER_KW)
 @modal.concurrent(max_inputs=1)
-class ComfyWorker80G:
+class ComfyWorker:
     @modal.enter()
     def boot(self):
         _worker_boot(self)
@@ -172,25 +173,9 @@ class ComfyWorker80G:
         return _worker_run(workflow, job_id, input_images)
 
 
-# 40G 档(z-image / flux2-klein 等):L40S 优先(便宜易分配),排不到升 H100
-@app.cls(gpu=["L40S", "H100"], **_WORKER_KW)
-@modal.concurrent(max_inputs=1)
-class ComfyWorker40G:
-    @modal.enter()
-    def boot(self):
-        _worker_boot(self)
-
-    @modal.exit()
-    def shutdown(self):
-        _worker_shutdown(self)
-
-    @modal.method()
-    def run(self, workflow: dict, job_id: str, input_images: list | None = None) -> dict:
-        return _worker_run(workflow, job_id, input_images)
-
-
-_TIER_WORKERS = {"80g": ComfyWorker80G, "40g": ComfyWorker40G}
-_TIER_GPU_DISPLAY = {"80g": "H100→A100-80G", "40g": "L40S→H100"}
+# tier 入参保留兼容(前端仍可能传 80g/40g),但都指向同一个 H100 worker。
+_TIER_WORKERS = {"80g": ComfyWorker, "40g": ComfyWorker}
+_TIER_GPU_DISPLAY = {"80g": "H100→A100-80G", "40g": "H100→A100-80G"}
 
 
 # ============================================================================
@@ -280,12 +265,11 @@ def health_endpoint(key: str = ""):
     info: dict = {"healthy": True, "app": APP_NAME, "volume": VOLUME_NAME}
     try:
         warm = 0
-        for cls_name in ("ComfyWorker80G", "ComfyWorker40G"):
-            try:
-                stats = modal.Cls.from_name(APP_NAME, cls_name)().run.get_current_stats()
-                warm += getattr(stats, "num_total_runners", 0) or 0
-            except Exception:
-                pass
+        try:
+            stats = modal.Cls.from_name(APP_NAME, "ComfyWorker")().run.get_current_stats()
+            warm += getattr(stats, "num_total_runners", 0) or 0
+        except Exception:
+            pass
         info["warm_containers"] = warm
     except Exception as e:
         info["stats_error"] = str(e)

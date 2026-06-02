@@ -494,55 +494,14 @@ function newProgress(initialStage = "preparing", wfName = null) {
 // =====================================================================
 // 单次跑(submit + poll + fetch_result)
 // =====================================================================
-// 显存档 → GPU 优先级(后端各档 worker 用 @app.cls(gpu=[...]) 原生 fallback)
-//   80g: H100 → A100-80GB     40g: L40S → H100
-// 判断:估算工作流里所有模型权重总大小,>~26GB 走 80g 档,否则 40g。
-// 估算来自文件名特征(前端拿不到字节数);命中大模型/大权重特征 = 高显存。
+// GPU:统一全部走 H100 → A100-80GB(原生 fallback)。
+// 不再按显存分档 —— 之前把小模型(klein 等)丢到 L40S 反而比大模型在 H100 上慢。
+// tier 入参保留(后端兼容),但恒为 "80g" 都指向同一个 H100 worker。
+// =====================================================================
 
-// 单个模型≈"重"(需要大显存)的文件名特征(主要是 diffusion/checkpoint/大 text encoder)
-const HEAVY_MODEL_PATTERNS = [
-  { re: /flux[-_ ]?2[-_ ]?dev/i,        gb: 32 },  // flux2 dev fp8mixed ~32G
-  { re: /flux[-_ ]?1[-_ ]?dev/i,        gb: 24 },  // flux1 dev
-  { re: /flux[-_ ]?1[-_ ]?krea/i,       gb: 24 },
-  { re: /flux\b/i,                      gb: 24 },   // 其它 flux 全尺寸
-  { re: /qwen[-_ ]?image/i,             gb: 20 },   // qwen-image 全家
-  { re: /mistral.*flux2/i,              gb: 24 },   // flux2 的大 text encoder(bf16 ~34G)
-  { re: /t5xxl.*fp16/i,                 gb: 10 },
-  { re: /wan/i,                         gb: 28 },   // WAN 视频
-  { re: /hunyuan/i,                     gb: 24 },
-];
-const TIER_80G_THRESHOLD_GB = 26;  // 总权重超这个 → 80G 档
-
-const MODEL_FIELDS = ["unet_name", "ckpt_name", "model_name", "clip_name",
-  "clip_name1", "clip_name2", "clip_name3", "vae_name", "lora_name", "style_model_name"];
-
-function estimateWorkflowVramGb(prompt) {
-  let total = 0;
-  const seen = new Set();
-  for (const n of Object.values(prompt || {})) {
-    const ins = n?.inputs || {};
-    for (const f of MODEL_FIELDS) {
-      const v = ins[f];
-      if (typeof v !== "string" || !v || seen.has(v)) continue;
-      seen.add(v);
-      const hit = HEAVY_MODEL_PATTERNS.find((p) => p.re.test(v));
-      if (hit) total += hit.gb;
-    }
-  }
-  return total;
-}
-
-// 返回 "80g" / "40g":① 设置强制档优先;② 否则按估算总显存
-function getVramTier(prompt) {
-  const forced = getSetting("ModalBridge.vramTier", "auto");
-  if (forced === "80g" || forced === "40g") {
-    log(`vram tier=${forced} (forced by setting)`);
-    return forced;
-  }
-  const gb = estimateWorkflowVramGb(prompt);
-  const tier = gb >= TIER_80G_THRESHOLD_GB ? "80g" : "40g";
-  log(`vram estimate ~${gb}GB → tier=${tier} (${tier === "80g" ? "H100→A100-80G" : "L40S→H100"})`);
-  return tier;
+// 所有工作流统一 H100;tier 恒为 "80g"(后端两档都指向同一个 H100 worker)。
+function getVramTier(_prompt) {
+  return "80g";
 }
 
 // 未完成 job 持久化(支持多个并发):LS 存数组,刷新后逐个尝试恢复
@@ -864,16 +823,7 @@ async function recoverOne(pending) {
 // 注册 ComfyUI Settings
 // =====================================================================
 const SETTINGS = [
-  {
-    id: "ModalBridge.vramTier",
-    name: "Modal Bridge: 显存档 / GPU",
-    type: "combo",
-    options: ["auto", "80g", "40g"],
-    defaultValue: "auto",
-    tooltip: "auto=按工作流模型自动估算显存档(推荐)。" +
-      "80g=H100→A100-80GB(大模型如 flux2 dev);40g=L40S→H100(z-image/klein 等)。" +
-      "每档自带 Modal 原生 GPU fallback,主卡排不到自动降级,不干等。",
-  },
+  // 注:GPU 已统一为 H100→A100-80GB(原生 fallback),不再有显存档选项。
   {
     id: "ModalBridge.batchCount",
     name: "Modal Bridge: Batch count",
@@ -952,10 +902,6 @@ async function openDeployDialog() {
     alignItems: "center", justifyContent: "center",
   });
 
-  const gpuOpts = ["H100", "A100-80GB", "A100", "L40S", "A10G"]
-    .map((g) => `<option value="${g}"${(cfg.default_gpu || "H100") === g ? " selected" : ""}>${g}</option>`)
-    .join("");
-
   const panel = document.createElement("div");
   Object.assign(panel.style, {
     background: "#1e1e1e", color: "#eee", width: "560px", maxWidth: "92vw",
@@ -977,8 +923,7 @@ async function openDeployDialog() {
     <input id="mb-dep-id" type="text" style="${inputCss}" value="${cfg.modal_token_id || ""}" placeholder="ak-xxxxxxxx">
     <label>Token Secret <span style="color:#9aa;">(as-...${cfg.has_token_secret ? ";已保存,留空=沿用" : ""})</span></label>
     <input id="mb-dep-secret" type="password" style="${inputCss}" value="" placeholder="${cfg.has_token_secret ? "已保存(留空沿用,或粘贴新的覆盖)" : "as-xxxxxxxx"}">
-    <label>默认 GPU</label>
-    <select id="mb-dep-gpu" style="${inputCss}">${gpuOpts}</select>
+    <div style="margin:4px 0 10px;color:#9aa;">GPU:H100 →(排不到)A100-80GB,所有工作流统一,无需选择。</div>
     <div style="margin:10px 0;">
       <button id="mb-dep-go" style="padding:8px 18px;background:#2563eb;color:#fff;border:none;border-radius:6px;cursor:pointer;font-weight:600;">部署</button>
       <button id="mb-dep-test" style="padding:8px 14px;margin-left:8px;background:#374151;color:#ddd;border:none;border-radius:6px;cursor:pointer;">测试连接</button>
@@ -1127,7 +1072,6 @@ async function openDeployDialog() {
       workspace: panel.querySelector("#mb-dep-ws").value.trim(),
       token_id: panel.querySelector("#mb-dep-id").value.trim(),
       token_secret: panel.querySelector("#mb-dep-secret").value.trim(),
-      default_gpu: panel.querySelector("#mb-dep-gpu").value,
     };
     // token_secret 留空 = 沿用已存的(/config 不再回显它);只有填了才校验格式
     const secretOk = payload.token_secret === "" ? cfg.has_token_secret : payload.token_secret.startsWith("as-");

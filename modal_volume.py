@@ -70,8 +70,14 @@ def get_volume(cfg: dict):
 
 
 def volume_files_by_type(cfg, types) -> dict:
-    """返回 {type: set(filename)},一个 type 一次 listdir(只查需要的 type,省往返)。"""
+    """返回 {type: set(filename)},一个 type 一次 listdir(只查需要的 type,省往返)。
+    查询前 reload() 刷新元数据:否则刚 batch_upload 提交的文件在最终一致性窗口内可能
+    listdir 看不到 → 误判"缺失"→ 又触发上传(用户遇到的"传过了还触发")。"""
     vol = get_volume(cfg)
+    try:
+        vol.reload()
+    except Exception:
+        pass
     out = {}
     for t in sorted(set(types)):
         try:
