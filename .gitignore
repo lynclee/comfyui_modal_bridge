@@ -9,3 +9,6 @@ __pycache__/
 
 # 系统
 .DS_Store
+
+# comfy-cli publish 临时产物
+node.zip

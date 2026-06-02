@@ -922,7 +922,7 @@ async function openDeployDialog() {
     <label>Token ID <span style="color:#9aa;">(ak-...)</span></label>
     <input id="mb-dep-id" type="text" style="${inputCss}" value="${cfg.modal_token_id || ""}" placeholder="ak-xxxxxxxx">
     <label>Token Secret <span style="color:#9aa;">(as-...${cfg.has_token_secret ? ";已保存,留空=沿用" : ""})</span></label>
-    <input id="mb-dep-secret" type="password" style="${inputCss}" value="" placeholder="${cfg.has_token_secret ? "已保存(留空沿用,或粘贴新的覆盖)" : "as-xxxxxxxx"}">
+    <input id="mb-dep-secret" type="password" style="${inputCss}" value="" placeholder="${cfg.has_token_secret ? "••••••••(已保存,留空沿用)" : "as-xxxxxxxx"}">
     <div style="margin:4px 0 10px;color:#9aa;">GPU:H100 →(排不到)A100-80GB,所有工作流统一,无需选择。</div>
     <div style="margin:10px 0;">
       <button id="mb-dep-go" style="padding:8px 18px;background:#2563eb;color:#fff;border:none;border-radius:6px;cursor:pointer;font-weight:600;">部署</button>
