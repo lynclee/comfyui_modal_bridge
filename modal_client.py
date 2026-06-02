@@ -127,65 +127,11 @@ async def cancel(session, cfg, job_id) -> dict:
 
 
 # ============================================================================
-# 模型管理
+# custom_nodes(权威源:并入 /health 返回,供本地双向同步对比真实部署的镜像)
 # ============================================================================
 
-async def list_models(session, cfg, type_: Optional[str] = None) -> dict:
-    url = _endpoint(cfg["modal_endpoint_base"], "list-models")
-    params = {"key": _key(cfg)}
-    if type_:
-        params["type"] = type_
-    async with session.get(url, params=params,
-                           timeout=aiohttp.ClientTimeout(total=30)) as r:
-        return await r.json(content_type=None)
-
-
-async def check_models(session, cfg, required: list) -> dict:
-    """批量检查模型存在性。带重试(check 类 endpoint 易遇瞬时连接抖动/代理波动)。"""
-    url = _endpoint(cfg["modal_endpoint_base"], "check-models")
-    body = {"required": required, "auth_key": _key(cfg)}
-    last = None
-    for attempt in range(3):
-        try:
-            async with session.post(
-                url, json=body, headers={"Content-Type": "application/json"},
-                timeout=aiohttp.ClientTimeout(total=30),
-            ) as r:
-                return await r.json(content_type=None)
-        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-            last = e
-            print(f"[modal_bridge] check_models attempt {attempt+1} 连接失败: {e},重试...")
-            await asyncio.sleep(1.5)
-    raise last or RuntimeError("check_models failed after retries")
-
-
-async def seed_model(session, cfg, item: dict) -> dict:
-    """
-    触发 Modal 端下载一个模型。同步等待(可能很久)。
-    item: {type, filename, source, repo?, hf_filename?, url?, requires_token?}
-    """
-    url = _endpoint(cfg["modal_endpoint_base"], "seed-model")
-    timeout = aiohttp.ClientTimeout(total=cfg.get("seed_timeout_sec", 1800))
-    async with session.post(
-        url, json={**item, "auth_key": _key(cfg)},
-        headers={"Content-Type": "application/json"},
-        timeout=timeout,
-    ) as r:
-        return await r.json(content_type=None)
-
-
 async def list_nodes(session, cfg) -> dict:
-    """镜像已装的 custom_nodes(权威源)。并入 /health 返回(Starter plan 限 8 endpoint)。"""
+    """镜像已装的 custom_nodes。模型相关全部走本地 SDK(modal_volume.py),这里只剩节点。"""
     h = await health(session, cfg)
     nodes = h.get("custom_nodes", []) if isinstance(h, dict) else []
     return {"custom_nodes": nodes}
-
-
-async def seed_status(session, cfg, type_: str, filename: str) -> dict:
-    """查模型下载状态(用于前端 polling 显示进度)"""
-    url = _endpoint(cfg["modal_endpoint_base"], "seed-status")
-    async with session.get(
-        url, params={"type": type_, "filename": filename, "key": _key(cfg)},
-        timeout=aiohttp.ClientTimeout(total=15),
-    ) as r:
-        return await r.json(content_type=None)

@@ -72,27 +72,6 @@ def write_baked_nodes(nodes: list[dict]) -> None:
     DATA_FILE.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def add_baked_nodes(new_entries: list[dict]) -> dict:
-    """把 new_entries 合并进 baked 清单(按 name 去重),返回 {added, skipped}。"""
-    current = read_baked_nodes()
-    have = {n.get("name") for n in current}
-    added, skipped = [], []
-    for e in new_entries:
-        name = e.get("name")
-        if not name or not e.get("url"):
-            skipped.append({"name": name, "reason": "missing name/url"})
-            continue
-        if name in have:
-            skipped.append({"name": name, "reason": "already baked"})
-            continue
-        current.append({"name": name, "url": e["url"], "commit": e.get("commit", "")})
-        have.add(name)
-        added.append(name)
-    if added:
-        write_baked_nodes(current)
-    return {"added": added, "skipped": skipped}
-
-
 # ============================================================================
 # class_type → 本地 custom_node 文件夹 解析
 # ============================================================================
@@ -190,40 +169,93 @@ def analyze_workflow(prompt: dict) -> dict:
     return {"builtin": builtin, "by_folder": by_folder, "unresolved": unresolved}
 
 
-def find_missing_nodes(prompt: dict, baked_names: set[str] | None = None) -> dict:
+def folder_exists_locally(folder: str) -> bool:
+    return (_comfyui_root() / "custom_nodes" / folder).is_dir()
+
+
+def plan_node_sync(prompt: dict, baked: list[dict] | None = None) -> dict:
     """
-    对比工作流用到的 custom_node 文件夹 vs Modal 已 baked 的清单,找出缺的。
-    baked_names 不传则用本地 _custom_nodes_data.py(传 Modal /list-nodes 结果更权威)。
+    双向同步规划:让 Modal 镜像的 custom_node 清单跟本地保持一致(本地是真源)。
+      - add:   工作流用到、本地有 git、baked 还没有的 → 加
+      - update: baked 有、但本地 commit 跟 baked 不一致的 → 按本地 commit 更新(和本地不一致就同步)
+      - prune: baked 有、但本地 custom_nodes 已经删了的 → 从镜像清单移除(本地删了也同步)
+    任一非空即 needs_deploy=True;new_baked 是写回 _custom_nodes_data.py 的完整新清单。
+
+    baked 不传则读本地 _custom_nodes_data.py。
     返回:
       {
-        "missing": [{folder, class_types, has_git, url, commit}],  # 缺、且能自动补(has_git=True)
-        "missing_no_git": [{folder, class_types, ...}],            # 缺、但本地没 git 信息,补不了
-        "unresolved": [class_type...],
+        "add": [{folder, class_types, url, commit}],
+        "update": [{folder, url, old_commit, commit}],
+        "prune": [{name}],
+        "missing_no_git": [{folder, class_types}],  # 工作流要、baked 没、本地也没 git → 补不了
+        "unresolved": [class_type...],              # 本地都没装(打字错/没装)
         "ok_builtin": int, "ok_baked": int,
+        "new_baked": [{name, url, commit}],
+        "needs_deploy": bool,
       }
     """
-    if baked_names is None:
-        baked_names = baked_node_names()
+    if baked is None:
+        baked = read_baked_nodes()
+    baked_by_name = {n.get("name"): dict(n) for n in baked if n.get("name")}
     info = analyze_workflow(prompt)
-    missing, missing_no_git = [], []
+
+    add, update, missing_no_git = [], [], []
     ok_baked = 0
+    # 1) 工作流用到的 custom_node:加 / 更新
     for folder, class_types in info["by_folder"].items():
-        if folder in baked_names:
-            ok_baked += 1
-            continue
         git = folder_git_info(folder)
-        entry = {"folder": folder, "class_types": sorted(class_types), **git}
+        if folder in baked_by_name:
+            ok_baked += 1
+            local_commit = (git.get("commit") or "").strip()
+            baked_commit = (baked_by_name[folder].get("commit") or "").strip()
+            if git["has_git"] and local_commit and local_commit != baked_commit:
+                update.append({"folder": folder, "url": git["url"],
+                               "old_commit": baked_commit, "commit": local_commit})
+                baked_by_name[folder] = {"name": folder, "url": git["url"], "commit": local_commit}
+            continue
         if git["has_git"]:
-            missing.append(entry)
+            add.append({"folder": folder, "class_types": sorted(class_types),
+                        "url": git["url"], "commit": git.get("commit") or ""})
+            baked_by_name[folder] = {"name": folder, "url": git["url"],
+                                     "commit": git.get("commit") or ""}
         else:
-            missing_no_git.append(entry)
+            missing_no_git.append({"folder": folder, "class_types": sorted(class_types)})
+
+    # 2) baked 里、本地已卸载的 → prune
+    prune = []
+    for name in list(baked_by_name.keys()):
+        if not folder_exists_locally(name):
+            prune.append({"name": name})
+            del baked_by_name[name]
+
+    # new_baked 保持原顺序(已存在的)+ 新增的追加在后,排除被 prune 的
+    new_baked = []
+    seen = set()
+    for n in baked:
+        nm = n.get("name")
+        if nm in baked_by_name and nm not in seen:
+            new_baked.append(baked_by_name[nm]); seen.add(nm)
+    for nm, entry in baked_by_name.items():
+        if nm not in seen:
+            new_baked.append(entry); seen.add(nm)
+
+    needs_deploy = bool(add or update or prune)
     return {
-        "missing": missing,
+        "add": add,
+        "update": update,
+        "prune": prune,
         "missing_no_git": missing_no_git,
         "unresolved": info["unresolved"],
         "ok_builtin": len(info["builtin"]),
         "ok_baked": ok_baked,
+        "new_baked": new_baked,
+        "needs_deploy": needs_deploy,
     }
+
+
+def apply_node_plan(plan: dict) -> None:
+    """把 plan 的 new_baked 写回 _custom_nodes_data.py(随后 modal deploy 生效)。"""
+    write_baked_nodes(plan.get("new_baked", []))
 
 
 # ============================================================================
@@ -289,7 +321,7 @@ def deploy_env(cfg: dict) -> dict:
     env["MODAL_BRIDGE_VOLUME"] = cfg.get("modal_volume_name", "comfyui-bridge-models")
     env["MODAL_BRIDGE_SECRET"] = f"{app_name}-secrets"
     env["MODAL_BRIDGE_DEFAULT_GPU"] = cfg.get("default_gpu", "H100")
-    env["MODAL_BRIDGE_SCALEDOWN"] = str(cfg.get("scaledown_window", 120))
+    env["MODAL_BRIDGE_SCALEDOWN"] = str(cfg.get("scaledown_window", 40))
     if cfg.get("modal_token_id"):
         env["MODAL_TOKEN_ID"] = cfg["modal_token_id"]
     if cfg.get("modal_token_secret"):

@@ -5,16 +5,17 @@ routes.py — 本地 ComfyUI 服务器上的 HTTP 路由
 import asyncio
 import base64
 import os
+import subprocess
 import time
 import uuid
 from pathlib import Path
 
 import aiohttp
-import yaml
 from aiohttp import web
 
 from . import config as cfg_mod
 from . import modal_client
+from . import modal_volume
 from . import node_sync
 
 
@@ -25,26 +26,43 @@ except Exception:
     folder_paths = None
 
 
-# ── model_registry.yaml 缓存 ──
-_REGISTRY_CACHE = None
+# ComfyUI 里互为别名(同一池子)的模型目录:同一个文件可能放在任一目录。
+# 历史命名:UNET 旧叫 unet、新叫 diffusion_models;CLIP 旧叫 clip、新叫 text_encoders。
+# 不同机器(Mac/Win)、不同下载器默认目录不同,所以两个都得搜,否则会误报"本地没有"。
+_TYPE_ALIASES = {
+    "diffusion_models": ["unet"],
+    "unet": ["diffusion_models"],
+    "text_encoders": ["clip"],
+    "clip": ["text_encoders"],
+}
 
-def _load_registry() -> dict:
-    """读 model_registry.yaml,返回 {filename: registry_entry}"""
-    global _REGISTRY_CACHE
-    if _REGISTRY_CACHE is not None:
-        return _REGISTRY_CACHE
-    p = Path(__file__).resolve().parent / "model_registry.yaml"
-    if not p.exists():
-        _REGISTRY_CACHE = {}
-        return _REGISTRY_CACHE
-    try:
-        data = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
-        _REGISTRY_CACHE = data
-        print(f"[modal_bridge] loaded {len(data)} models from registry")
-    except Exception as e:
-        print(f"[modal_bridge] load registry failed: {e}")
-        _REGISTRY_CACHE = {}
-    return _REGISTRY_CACHE
+
+def _local_model_resolver():
+    """返回 (type_, filename) -> Path|None,用 ComfyUI folder_paths 在本地定位模型文件。
+    模型都在本地 ComfyUI Desktop 下好,这里把工作流里的文件名映射到磁盘路径,供上传 Volume。"""
+    def resolve(type_: str, filename: str):
+        search_types = [type_, *_TYPE_ALIASES.get(type_, [])]
+        roots = []
+        if folder_paths is not None:
+            # 1) ComfyUI 官方解析(认 extra_model_paths.yaml 的所有根,最权威);别名类型逐个试
+            for t in search_types:
+                try:
+                    full = folder_paths.get_full_path(t, filename)
+                    if full:
+                        return Path(full)
+                except Exception:
+                    pass
+            for t in search_types:
+                try:
+                    roots += folder_paths.get_folder_paths(t) or []
+                except Exception:
+                    pass
+        # 2) 兜底:默认 models/<type>(含别名目录)里找
+        if not roots:
+            base = Path(__file__).resolve().parents[2] / "models"
+            roots = [str(base / t) for t in search_types]
+        return modal_volume.find_local_model(type_, filename, roots)
+    return resolve
 
 
 # ── 从 workflow prompt 解析需要的模型 ──
@@ -145,21 +163,58 @@ async def _emit(resp: web.StreamResponse, text: str) -> None:
 
 
 async def _run_streamed(resp: web.StreamResponse, cmd: list[str], cwd: str, env: dict) -> int:
-    """跑一个命令,stdout/stderr 实时写进 resp(流式回前端),返回 returncode。
-    找不到可执行文件返回 127。"""
+    """跑一个命令,stdout/stderr 实时流式回前端,返回 returncode(找不到可执行文件返回 127)。
+    用线程 + subprocess.Popen(不走 asyncio 子进程)——避免 Windows 上事件循环不支持
+    子进程(SelectorEventLoop → NotImplementedError)的坑,Mac/Linux/Win 一致。"""
     await _emit(resp, f"$ {' '.join(cmd)}\n")
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            *cmd, cwd=cwd, env=env,
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
-        )
-    except FileNotFoundError:
-        await _emit(resp, f"  ✗ 找不到可执行文件: {cmd[0]}\n")
-        return 127
-    assert proc.stdout is not None
-    async for raw in proc.stdout:
-        await _emit(resp, raw.decode("utf-8", errors="replace"))
-    return await proc.wait()
+
+    def work(emit):
+        try:
+            proc = subprocess.Popen(
+                cmd, cwd=cwd, env=env,
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, bufsize=1, encoding="utf-8", errors="replace",
+            )
+        except FileNotFoundError:
+            emit(f"  ✗ 找不到可执行文件: {cmd[0]}\n")
+            return 127
+        for line in proc.stdout:
+            emit(line)
+        proc.wait()
+        return proc.returncode
+
+    return await _run_blocking_streamed(resp, work)
+
+
+_STREAM_SENTINEL = object()
+
+# 模型上传串行化:同一时刻只允许一个 /sync_models 真正上传,避免并发工作流同时往
+# Volume 写同一个大模型撞车(用户实测 35GB flux2 dev 并发上传会失败)。
+_UPLOAD_LOCK = asyncio.Lock()
+
+
+async def _run_blocking_streamed(resp: web.StreamResponse, fn):
+    """在线程里跑一个阻塞函数 fn(emit),emit(line) 线程安全地把日志流式写回 resp。
+    返回 fn 的返回值。用于 Volume 上传这种阻塞 + 想要实时进度的场景。"""
+    loop = asyncio.get_event_loop()
+    q: asyncio.Queue = asyncio.Queue()
+
+    def emit(line: str):
+        loop.call_soon_threadsafe(q.put_nowait, line)
+
+    def runner():
+        try:
+            return fn(emit)
+        finally:
+            loop.call_soon_threadsafe(q.put_nowait, _STREAM_SENTINEL)
+
+    task = loop.run_in_executor(None, runner)
+    while True:
+        line = await q.get()
+        if line is _STREAM_SENTINEL:
+            break
+        await _emit(resp, line)
+    return await task
 
 
 async def _ensure_modal(resp: web.StreamResponse) -> int:
@@ -209,7 +264,7 @@ def _setup_routes():
             return web.json_response({"error": "prompt (object) required"}, status=400)
 
         cfg = cfg_mod.load_config()
-        gpu = body.get("gpu") or cfg.get("default_gpu", "H100")
+        tier = (body.get("tier") or "40g").lower()
 
         try:
             image_names = _extract_input_image_names(prompt)
@@ -227,17 +282,18 @@ def _setup_routes():
             async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=60)) as session:
                 submit_result = await modal_client.submit_job(
                     session, cfg, workflow=prompt,
-                    input_images=input_images or None, gpu=gpu,
+                    input_images=input_images or None, tier=tier,
                 )
         except Exception as e:
             return web.json_response({"error": str(e)}, status=502)
 
         job_id = submit_result.get("id")
-        print(f"[modal_bridge] submitted job {job_id} (gpu={gpu}, refs={len(input_images)})")
+        gpu = submit_result.get("gpu") or tier
+        print(f"[modal_bridge] submitted job {job_id} (tier={tier}, gpu={gpu}, refs={len(input_images)})")
         return web.json_response({
             "ok": True,
             "job_id": job_id,
-            "gpu": submit_result.get("gpu") or gpu,
+            "gpu": gpu,
             "input_image_count": len(input_images),
         })
 
@@ -312,18 +368,14 @@ def _setup_routes():
         print(f"[modal_bridge] ✓ job {job_id} fetched → {outputs[0]['subfolder']}/{outputs[0]['filename']}")
         return web.json_response({"ok": True, "job_id": job_id, "outputs": outputs})
 
-    # -------- 模型相关 --------
+    # -------- 模型同步(本地 → Volume,全程本地 modal SDK,不经 endpoint)--------
 
     @routes.post("/modal_bridge/check_models")
     async def _check_models(request: web.Request):
         """
-        body: {prompt: {...}}
-        返回: {
-          required: [{type, filename}],
-          missing:  [{type, filename, registry_entry?}],
-          present:  [{type, filename, size_mb}],
-          unknown:  [{type, filename}],   # 缺失 && 不在 registry,无法自动下
-        }
+        查工作流要的模型 Volume 有没有 / 本地能不能补(本地 SDK 直查 Volume)。
+        body: {prompt}
+        返回: {required, present, missing_local[], missing_no_source[]}
         """
         body = await request.json()
         prompt = body.get("prompt")
@@ -332,115 +384,85 @@ def _setup_routes():
 
         required = extract_required_models(prompt)
         if not required:
-            return web.json_response({"required": [], "missing": [], "present": [], "unknown": []})
+            return web.json_response(
+                {"required": [], "present": [], "missing_local": [],
+                 "downloading": [], "missing_no_source": []})
+
+        if not modal_volume.modal_importable():
+            return web.json_response(
+                {"error": "本地没装 modal(先点 [Modal Setup] 部署一次,会自动装 modal)"}, status=400)
 
         cfg = cfg_mod.load_config()
-        async with aiohttp.ClientSession() as session:
-            try:
-                check_result = await modal_client.check_models(session, cfg, required)
-            except Exception as e:
-                return web.json_response({"error": f"check_models failed: {e}"}, status=502)
-
-        registry = _load_registry()
-        missing = check_result.get("missing", [])
-        present = check_result.get("present", [])
-
-        # 给 missing 配上 registry entry
-        annotated_missing = []
-        unknown = []
-        for m in missing:
-            entry = registry.get(m["filename"])
-            if entry:
-                annotated_missing.append({**m, "registry_entry": entry})
-            else:
-                unknown.append(m)
-
-        return web.json_response({
-            "required": required,
-            "missing": annotated_missing,
-            "present": present,
-            "unknown": unknown,
-        })
-
-    @routes.post("/modal_bridge/seed_model")
-    async def _seed_model(request: web.Request):
-        """
-        触发 Modal 下载某个模型。
-        body: {type, filename, registry_entry}
-        返回: Modal 的 {ok, downloaded?, cached?, path, size_mb, elapsed_sec?, error?}
-        """
-        body = await request.json()
-        type_ = body.get("type")
-        filename = body.get("filename")
-        entry = body.get("registry_entry")
-        if not type_ or not filename:
-            return web.json_response({"error": "type + filename required"}, status=400)
-
-        # 没传 registry_entry 时,自己查 registry
-        if not entry:
-            registry = _load_registry()
-            entry = registry.get(filename)
-            if not entry:
-                return web.json_response(
-                    {"error": f"{filename} 不在 model_registry.yaml 内,无法自动下"},
-                    status=404,
-                )
-
-        item = {
-            "type": type_,
-            "filename": filename,
-            "source": entry.get("source", "huggingface"),
-            "repo": entry.get("repo"),
-            "hf_filename": entry.get("hf_filename"),
-            "hf_subfolder": entry.get("hf_subfolder"),
-            "url": entry.get("url"),
-            "civitai_id": entry.get("civitai_id"),
-            "requires_token": entry.get("requires_token", False),
-        }
-
-        cfg = cfg_mod.load_config()
-        print(f"[modal_bridge] seed_model: {type_}/{filename} (source={entry.get('source')})")
-        async with aiohttp.ClientSession() as session:
-            try:
-                result = await modal_client.seed_model(session, cfg, item)
-            except asyncio.TimeoutError:
-                return web.json_response({"error": "seed_model timed out"}, status=504)
-            except Exception as e:
-                return web.json_response({"error": str(e)}, status=502)
+        resolver = _local_model_resolver()
+        try:
+            result = await asyncio.to_thread(modal_volume.check_models, cfg, required, resolver)
+        except Exception as e:
+            return web.json_response({"error": f"check_models(SDK) failed: {e}"}, status=502)
         return web.json_response(result)
 
-    @routes.get("/modal_bridge/seed_status")
-    async def _seed_status(request: web.Request):
-        type_ = request.query.get("type")
-        filename = request.query.get("filename")
-        if not type_ or not filename:
-            return web.json_response({"error": "type + filename required"}, status=400)
-        cfg = cfg_mod.load_config()
-        async with aiohttp.ClientSession() as session:
-            try:
-                return web.json_response(await modal_client.seed_status(session, cfg, type_, filename))
-            except Exception as e:
-                return web.json_response({"error": str(e)}, status=502)
+    @routes.post("/modal_bridge/sync_models")
+    async def _sync_models(request: web.Request):
+        """
+        把本地有、Volume 没有的模型上传到 Volume(batch_upload,CAS 去重)。stream 回传进度。
+        body: {items: [{type, filename, local_path}]}  (前端从 check_models 的 missing_local 拿)
+        最后一行: __DEPLOY_DONE__ rc=<code>
+        """
+        body = await request.json()
+        items = body.get("items")
+        if not isinstance(items, list) or not items:
+            return web.json_response({"error": "items (non-empty list) required"}, status=400)
 
-    @routes.get("/modal_bridge/list_models")
-    async def _list_models(request: web.Request):
-        type_ = request.query.get("type")
         cfg = cfg_mod.load_config()
-        async with aiohttp.ClientSession() as session:
-            try:
-                return web.json_response(await modal_client.list_models(session, cfg, type_))
-            except Exception as e:
-                return web.json_response({"error": str(e)}, status=502)
+        resp = web.StreamResponse(
+            status=200,
+            headers={"Content-Type": "text/plain; charset=utf-8", "Cache-Control": "no-cache"},
+        )
+        await resp.prepare(request)
 
-    # -------- custom_node 同步 --------
+        if not modal_volume.modal_importable():
+            await _emit(resp, "✗ 本地没装 modal,无法上传\n\n__DEPLOY_DONE__ rc=1\n")
+            await resp.write_eof()
+            return resp
+
+        total_mb = sum(int(it.get("size_mb") or 0) for it in items)
+        await _emit(resp, f"== 上传 {len(items)} 个模型到 Volume(共 ~{total_mb} MB)==\n")
+        await _emit(resp, "== Modal Volume 块级去重:网上通用大模型秒过,只有新内容真正占上行带宽 ==\n\n")
+
+        def do_upload(emit):
+            def on_progress(i, n, it):
+                emit(f"  ↑ [{i+1}/{n}] {it['type']}/{it['filename']} ({it.get('size_mb', '?')} MB)\n")
+            return modal_volume.upload_models(cfg, items, on_progress=on_progress)
+
+        # 串行化:有别的上传在跑就排队等(上传前会复查 Volume,等到时多半已有、直接跳过)
+        if _UPLOAD_LOCK.locked():
+            await _emit(resp, "== 另有模型上传进行中,排队等待(同一时刻只传一个,避免并发撞车)…\n\n")
+        try:
+            async with _UPLOAD_LOCK:
+                result = await _run_blocking_streamed(resp, do_upload)
+        except Exception as e:
+            import traceback
+            tb = traceback.format_exc()
+            print(f"[modal_bridge] sync_models 上传失败: {e}\n{tb}")  # 进 ComfyUI 控制台日志
+            await _emit(resp, f"\n✗ 上传失败: {e}\n{tb[-800:]}\n\n__DEPLOY_DONE__ rc=1\n")
+            await resp.write_eof()
+            return resp
+
+        await _emit(resp, f"\n== ✓ 上传完成:{len(result['uploaded'])} 个,共 ~{result['total_mb']} MB ==\n")
+        if result["skipped"]:
+            await _emit(resp, f"== ⚠ 跳过 {len(result['skipped'])} 个(本地文件丢失)==\n")
+        await _emit(resp, "\n__DEPLOY_DONE__ rc=0\n")
+        await resp.write_eof()
+        return resp
+
+    # -------- custom_node 双向同步 --------
 
     @routes.post("/modal_bridge/check_nodes")
     async def _check_nodes(request: web.Request):
         """
-        检查工作流用到的 custom_node 是否都在 Modal 镜像里。全部本地解析,瞬时。
-        baked 清单优先用 Modal /list-nodes(权威,反映真实已部署镜像),不可达时回退本地数据文件。
+        双向同步规划:对比工作流用到的 custom_node 与 Modal 镜像,算出加/改/删。全本地解析,瞬时。
+        baked 清单优先用 Modal /health 的 custom_nodes(权威,反映真实已部署镜像),不可达回退本地数据文件。
         body: {prompt}
-        返回: {ok, source, missing[], missing_no_git[], unresolved[], ok_builtin, ok_baked}
+        返回: node_sync.plan_node_sync(...) + {ok, source}
         """
         body = await request.json()
         prompt = body.get("prompt")
@@ -448,46 +470,49 @@ def _setup_routes():
             return web.json_response({"error": "prompt required"}, status=400)
 
         cfg = cfg_mod.load_config()
-        baked_names = None
+        baked = None
         source = "local"
         try:
             async with aiohttp.ClientSession() as session:
                 nodes_info = await modal_client.list_nodes(session, cfg)
             if isinstance(nodes_info, dict) and isinstance(nodes_info.get("custom_nodes"), list):
-                baked_names = set(nodes_info["custom_nodes"])
+                # Modal 只给名字;url/commit 用本地清单补全(prune 只看名字,add/update 用本地 git)
+                local_baked = {n["name"]: n for n in node_sync.read_baked_nodes()}
+                baked = [local_baked.get(name, {"name": name, "url": "", "commit": ""})
+                         for name in nodes_info["custom_nodes"]]
                 source = "modal"
         except Exception as e:
-            print(f"[modal_bridge] check_nodes: /list-nodes 不可达,回退本地清单 ({e})")
+            print(f"[modal_bridge] check_nodes: /health 不可达,回退本地清单 ({e})")
 
-        result = node_sync.find_missing_nodes(prompt, baked_names=baked_names)
+        result = node_sync.plan_node_sync(prompt, baked=baked)
         result["ok"] = True
         result["source"] = source
         return web.json_response(result)
 
-    @routes.post("/modal_bridge/add_nodes")
-    async def _add_nodes(request: web.Request):
+    @routes.post("/modal_bridge/sync_nodes")
+    async def _sync_nodes(request: web.Request):
         """
-        把缺失 custom_node 加进 Modal 镜像清单并重部署。stream 回传 modal deploy 日志。
-        body: {nodes: [{folder, url, commit}]}
+        按 plan 的 new_baked 重写镜像清单(增/改/删)并重部署。stream 回传 modal deploy 日志。
+        body: {new_baked: [{name,url,commit}], summary?: {add,update,prune}}
         最后一行: __DEPLOY_DONE__ rc=<code>
         """
         body = await request.json()
-        entries = body.get("nodes")
-        if not isinstance(entries, list) or not entries:
-            return web.json_response({"error": "nodes (non-empty list) required"}, status=400)
+        new_baked = body.get("new_baked")
+        if not isinstance(new_baked, list):
+            return web.json_response({"error": "new_baked (list) required"}, status=400)
 
-        # folder → name(clone 出来的目录名必须和本地一致,ComfyUI 才认)
-        new_entries = []
-        for e in entries:
-            folder = e.get("folder") or e.get("name")
-            if not folder or not e.get("url"):
+        # 校验并规整每条
+        clean = []
+        for e in new_baked:
+            name = e.get("name")
+            if not name:
                 continue
-            new_entries.append({"name": folder, "url": e["url"], "commit": e.get("commit", "")})
-        if not new_entries:
-            return web.json_response({"error": "no valid {folder,url} entries"}, status=400)
+            clean.append({"name": name, "url": e.get("url", ""), "commit": e.get("commit", "")})
 
-        merge = node_sync.add_baked_nodes(new_entries)
-        print(f"[modal_bridge] add_nodes: baked +{merge['added']} (skipped {merge['skipped']})")
+        node_sync.write_baked_nodes(clean)
+        summary = body.get("summary") or {}
+        print(f"[modal_bridge] sync_nodes: baked → {len(clean)} 条 (add={summary.get('add')} "
+              f"update={summary.get('update')} prune={summary.get('prune')})")
 
         cfg = cfg_mod.load_config()
         cwd = str(node_sync.MODAL_APP_DIR)
@@ -498,9 +523,9 @@ def _setup_routes():
         )
         await resp.prepare(request)
 
-        await _emit(resp, f"== adding nodes: {[n['name'] for n in new_entries]} ==\n")
-        await _emit(resp, f"== merged into image list: added={merge['added']} skipped={merge['skipped']} ==\n")
-        await _emit(resp, "== 首次 clone 新节点 + 装依赖,约 1-3 分钟,别关窗口 ==\n\n")
+        await _emit(resp, f"== 同步 custom_nodes:加 {summary.get('add', '?')} / 改 "
+                          f"{summary.get('update', '?')} / 删 {summary.get('prune', '?')} ==\n")
+        await _emit(resp, f"== 镜像清单现 {len(clean)} 条,重新部署(clone + 装依赖约 1-3 分钟,别关窗口)==\n\n")
 
         rc = await _ensure_modal(resp)
         if rc != 0:
@@ -552,7 +577,7 @@ def _setup_routes():
         app_name = (body.get("app_name") or cfg.get("modal_app_name") or "comfyui-bridge").strip()
         volume_name = (body.get("volume_name") or cfg.get("modal_volume_name") or "comfyui-bridge-models").strip()
         default_gpu = (body.get("default_gpu") or cfg.get("default_gpu") or "H100").strip()
-        scaledown = int(body.get("scaledown_window") or cfg.get("scaledown_window") or 120)
+        scaledown = int(body.get("scaledown_window") or cfg.get("scaledown_window") or 40)
         hf_token = (body.get("hf_token") or "").strip()
         civitai_token = (body.get("civitai_token") or "").strip()
         endpoint_base = f"https://{workspace}--{app_name}"
@@ -575,9 +600,8 @@ def _setup_routes():
         cwd = str(node_sync.MODAL_APP_DIR)
 
         await _emit(resp, "== Modal 一键部署 ==\n")
-        await _emit(resp, f"   workspace={workspace}  app={app_name}  gpu={default_gpu}\n")
-        await _emit(resp, f"   endpoint={endpoint_base}\n")
-        await _emit(resp, f"   HF token={'已填' if hf_token else '空(只能下公开模型)'}\n\n")
+        await _emit(resp, f"   workspace={workspace}  app={app_name}\n")
+        await _emit(resp, f"   endpoint={endpoint_base}\n\n")
 
         # 1) modal 包
         rc = await _ensure_modal(resp)
@@ -657,9 +681,8 @@ def _setup_routes():
         if not isinstance(prompt, dict):
             return web.json_response({"error": "prompt (object) required"}, status=400)
 
-        gpu_override = body.get("gpu")
         cfg = cfg_mod.load_config()
-        gpu = gpu_override or cfg.get("default_gpu", "H100")
+        tier = (body.get("tier") or "40g").lower()
 
         # 1) 解析 prompt 找 LoadImage,准备 base64
         try:
@@ -682,10 +705,11 @@ def _setup_routes():
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 submit_result = await modal_client.submit_job(
                     session, cfg, workflow=prompt,
-                    input_images=input_images or None, gpu=gpu,
+                    input_images=input_images or None, tier=tier,
                 )
                 job_id = submit_result.get("id")
-                print(f"[modal_bridge] submitted job {job_id} (gpu={gpu})")
+                gpu = submit_result.get("gpu") or tier
+                print(f"[modal_bridge] submitted job {job_id} (tier={tier}, gpu={gpu})")
 
                 def _on_progress(status, data):
                     print(f"[modal_bridge] job {job_id} status={status}")

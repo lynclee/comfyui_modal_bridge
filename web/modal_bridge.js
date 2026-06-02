@@ -75,37 +75,82 @@ function findOutputNodes(prompt) {
   return ids;
 }
 
+// 当前活动工作流的标识(切 tab 会变)。用于判断结果该不该回填到当前画板。
+function activeWorkflowKey() {
+  try {
+    const w = app.extensionManager?.workflow?.activeWorkflow
+           ?? app.workflowManager?.activeWorkflow;
+    if (!w) return null;
+    return w.path ?? w.key ?? w.filename ?? w.id ?? (typeof w === "string" ? w : null);
+  } catch (e) { return null; }
+}
+
+// 当前工作流的可读短名(用于进度卡片标题)。取文件名去掉 .json,拿不到则 null。
+function activeWorkflowName() {
+  try {
+    const w = app.extensionManager?.workflow?.activeWorkflow
+           ?? app.workflowManager?.activeWorkflow;
+    if (!w) return null;
+    let n = w.filename ?? w.name ?? (typeof w.path === "string" ? w.path : null)
+         ?? w.key ?? (typeof w === "string" ? w : null);
+    if (!n) return null;
+    n = String(n).split(/[\\/]/).pop().replace(/\.json$/i, "");
+    return n || null;
+  } catch (e) { return null; }
+}
+
+// 结果回填:仅当仍停在提交时那个工作流(tab)才按 id 回填,切了就不填(避免填到别的工作流)。
+// guard = {graph, wfKey}(提交时抓)。返回回填节点数(0 = 没填,调用方提示存盘路径)。
+// 回填到「当前前台」工作流的节点。ComfyUI 单 graph,只能渲染当前前台;调用方负责
+// 确保这是该结果对应的工作流。走原生 executed 事件(ComfyUI 自己写 nodeOutputStore/
+// nodeOutputs + 调 onExecuted,跨版本可靠)。返回成功回填的节点数。
 function displayInGraph(outputNodeIds, modalOutputs) {
-  if (!outputNodeIds.length || !modalOutputs?.length) return;
+  if (!outputNodeIds?.length || !modalOutputs?.length) return 0;
   const imagesMeta = modalOutputs.map((o) => ({
     filename: o.filename,
     subfolder: o.subfolder,
     type: o.type || "output",
   }));
-  app.nodeOutputs = app.nodeOutputs || {};
+  let placed = 0;
   for (const nid of outputNodeIds) {
     const node = app.graph.getNodeById(parseInt(nid, 10)) || app.graph.getNodeById(nid);
     if (!node) continue;
-    app.nodeOutputs[node.id] = { images: imagesMeta };
-    try { node.onExecuted?.({ images: imagesMeta }); } catch (e) {}
     try {
       api.dispatchEvent(new CustomEvent("executed", {
-        detail: {
-          node: String(nid), display_node: String(nid),
-          output: { images: imagesMeta },
-          prompt_id: "modal-bridge-" + Date.now(),
-        },
+        detail: { node: String(nid), display_node: String(nid), output: { images: imagesMeta } },
       }));
     } catch (e) {}
+    try { node.onExecuted?.({ images: imagesMeta }); } catch (e) {}
+    placed++;
   }
   try { app.graph.setDirtyCanvas(true, true); } catch (e) {}
+  log(`displayInGraph: ids=[${outputNodeIds.join(",")}] placed=${placed}`);
+  return placed;
+}
+
+// 后台工作流的出图结果暂存,等用户切回那个 tab 再渲染(ComfyUI 单 graph,后台渲染不了)。
+const _pendingResults = new Map();  // wfKey -> {outputNodeIds, outputs}
+let _pendingWatcher = null;
+function storePendingResult(wfKey, outputNodeIds, outputs) {
+  _pendingResults.set(wfKey, { outputNodeIds, outputs });
+  if (_pendingWatcher) return;
+  _pendingWatcher = setInterval(() => {
+    if (!_pendingResults.size) { clearInterval(_pendingWatcher); _pendingWatcher = null; return; }
+    const k = activeWorkflowKey();
+    if (k != null && _pendingResults.has(k)) {
+      const r = _pendingResults.get(k);
+      _pendingResults.delete(k);
+      log("切到该工作流,回填暂存结果:", k);
+      displayInGraph(r.outputNodeIds, r.outputs);
+    }
+  }, 700);
 }
 
 // =====================================================================
-// custom_node 同步
-// 后端 /check_nodes 精确解析(本地 NODE_CLASS_MAPPINGS → custom_nodes 文件夹,
-// 再和 Modal /list-nodes 权威比对),缺的就走 /add_nodes 一键加进镜像 + 重部署。
-// 全程在 ComfyUI 里完成,不用开终端。
+// custom_node 双向同步
+// 后端 /check_nodes 精确解析(本地 NODE_CLASS_MAPPINGS → custom_nodes 文件夹),
+// 和 Modal /health 的 custom_nodes 权威比对,算出 加/改/删 plan;确认后走 /sync_nodes
+// 写回清单 + 重部署。本地始终是真源。全程在 ComfyUI 里完成,不用开终端。
 // =====================================================================
 async function checkNodesOnModal(prompt) {
   const res = await api.fetchApi("/modal_bridge/check_nodes", {
@@ -114,7 +159,7 @@ async function checkNodesOnModal(prompt) {
     body: JSON.stringify({ prompt }),
   });
   if (!res.ok) throw new Error(`check_nodes HTTP ${res.status}`);
-  return res.json(); // {missing, missing_no_git, unresolved, ok_builtin, ok_baked, source}
+  return res.json(); // {add, update, prune, missing_no_git, unresolved, new_baked, needs_deploy, ok_*, source}
 }
 
 // 流式 POST(/deploy、/add_nodes 共用):逐行回调 onLine,返回 __DEPLOY_DONE__ 的 rc(无则 null)
@@ -146,71 +191,83 @@ async function streamPost(path, body, onLine) {
   return rc;
 }
 
-// 调 /add_nodes,流式推进 deploying 进度条,返回 deploy 是否成功
-async function addMissingNodes(missing) {
+// 调 /sync_nodes,把新清单写回并重部署,流式推进 deploying 进度条,返回是否成功
+async function syncNodes(plan, ctx) {
   const [a, b] = STATUS_PROGRESS.deploying;
   let tick = 0;
   const rc = await streamPost(
-    "/modal_bridge/add_nodes",
-    { nodes: missing.map((m) => ({ folder: m.folder, url: m.url, commit: m.commit })) },
+    "/modal_bridge/sync_nodes",
+    {
+      new_baked: plan.new_baked,
+      summary: { add: plan.add.length, update: plan.update.length, prune: plan.prune.length },
+    },
     (line) => {
       log("deploy:", line);
       tick++;
-      setProgressBar(a + Math.min(b - a - 1, tick * 0.4)); // 缓慢逼近 band 末端
-      updateStage("deploying", line.length > 72 ? line.slice(0, 72) + "…" : line);
+      ctx.bar(a + Math.min(b - a - 1, tick * 0.4));
+      ctx.stage("deploying", line.length > 72 ? line.slice(0, 72) + "…" : line);
     },
   );
   return rc === 0;
 }
 
-// submit 前调:缺 custom_node 就问用户要不要一键补。返回 true=可继续 / false=用户取消
-async function ensureNodesAvailable(prompt) {
-  updateStage("nodes", "Scanning workflow custom nodes...");
-  let info;
+// submit 前调:custom_node 与本地双向同步(加/改/删)。返回 true=可继续 / false=用户取消
+async function ensureNodesAvailable(prompt, ctx) {
+  ctx.stage("nodes", "Scanning workflow custom nodes...");
+  let plan;
   try {
-    info = await checkNodesOnModal(prompt);
+    plan = await checkNodesOnModal(prompt);
   } catch (e) {
     log("check_nodes failed, skip:", e);
     return true; // 检查本身失败不阻塞提交
   }
 
-  const { missing = [], missing_no_git = [], unresolved = [], source } = info;
+  const { add = [], update = [], prune = [], missing_no_git = [], unresolved = [], source } = plan;
   if (unresolved.length) log("unresolved class_types (本地也没装):", unresolved);
 
-  if (!missing.length && !missing_no_git.length) {
-    updateStage("nodes", `nodes ok (${info.ok_baked} custom + ${info.ok_builtin} builtin)`);
-    return true;
-  }
-
   if (missing_no_git.length) {
-    const list = missing_no_git
-      .map((m) => `  ${m.folder} (${m.class_types.join(", ")})`).join("\n");
+    const list = missing_no_git.map((m) => `  ${m.folder} (${m.class_types.join(", ")})`).join("\n");
     notify(`这些 custom_node 没有 git 信息,无法自动补:\n${list}`, "warn");
   }
 
-  if (!missing.length) {
-    return confirm(`部分 custom_node 不在 Modal 且无法自动补,仍然提交?(很可能失败)`);
+  if (!plan.needs_deploy) {
+    ctx.stage("nodes", `nodes ok (${plan.ok_baked} custom + ${plan.ok_builtin} builtin)`);
+    if (missing_no_git.length) {
+      return confirm(`部分 custom_node 无法自动补,仍然提交?(很可能失败)`);
+    }
+    return true;
   }
 
-  const lines = missing.map((m) =>
-    `  • ${m.folder}  (${m.class_types.length} 个节点)\n     ${m.url}` +
-    (m.commit ? ` @ ${m.commit.slice(0, 8)}` : "")
-  ).join("\n");
+  // 组装确认文案(加 / 改 / 删)
+  const parts = [];
+  if (add.length) {
+    parts.push("➕ 新增(Modal 还没有):\n" + add.map((m) =>
+      `   • ${m.folder} (${m.class_types.length} 节点)` + (m.commit ? ` @ ${m.commit.slice(0, 8)}` : "")
+    ).join("\n"));
+  }
+  if (update.length) {
+    parts.push("🔄 更新(本地 commit 变了):\n" + update.map((m) =>
+      `   • ${m.folder}  ${(m.old_commit || "—").slice(0, 8)} → ${m.commit.slice(0, 8)}`
+    ).join("\n"));
+  }
+  if (prune.length) {
+    parts.push("➖ 移除(本地已卸载):\n" + prune.map((m) => `   • ${m.name}`).join("\n"));
+  }
   const msg =
-    `工作流用到以下 custom_node,Modal 镜像(${source})里还没有:\n\n${lines}\n\n` +
-    `点「确定」一键加进 Modal 镜像并重新部署(约 1-3 分钟,只这一次,之后秒进)。\n` +
-    `点「取消」则不补,直接提交。`;
+    `custom_node 需要和本地同步(镜像来源:${source}):\n\n${parts.join("\n\n")}\n\n` +
+    `点「确定」更新 Modal 镜像并重新部署(约 1-3 分钟,只这一次,之后秒进)。\n` +
+    `点「取消」则跳过同步,直接提交。`;
   if (!confirm(msg)) {
-    return confirm("不补节点,直接提交?(大概率失败)");
+    return confirm("不同步节点,直接提交?(可能失败)");
   }
 
-  updateStage("deploying", "Redeploying Modal image with new nodes...", true);
-  setProgressBar(STATUS_PROGRESS.deploying[0]);
-  const ok = await addMissingNodes(missing);
+  ctx.stage("deploying", "Redeploying Modal image...", false);
+  ctx.bar(STATUS_PROGRESS.deploying[0]);
+  const ok = await syncNodes(plan, ctx);
   if (!ok) {
     throw new Error("Modal 重部署失败(看进度窗 deploy 日志 / ComfyUI 控制台)");
   }
-  updateStage("deploying", "✓ image updated", false);
+  ctx.stage("deploying", "✓ image updated", false);
   return true;
 }
 
@@ -236,21 +293,21 @@ function reseedPrompt(prompt, newSeed) {
 }
 
 // =====================================================================
-// 进度浮窗
+// 进度浮窗 — 每个 job 一张独立卡片(多 workflow 并发互不覆盖)
 // =====================================================================
-let progressEl = null;
-let progressTimer = null;
-let progressStartMs = 0;
-let currentJobId = null;
-let currentCancelable = false;
-let seedController = null;   // seeding 阶段的下载 AbortController(供取消按钮中断)
+const STAGE_LABELS = {
+  preparing: "Preparing", nodes: "Checking nodes", deploying: "Deploying image",
+  checking: "Checking models", uploading: "Uploading models", submitting: "Submitting",
+  queued: "Queued", running: "Running",
+  downloading: "Downloading result", done: "Done", failed: "Failed",
+};
 
 const STATUS_PROGRESS = {
   preparing:   [0,  2],    // 序列化 workflow(纯前端,几百 ms)
   nodes:       [2,  5],    // 检查 custom_node Modal 是否齐全
   deploying:   [5, 35],    // (仅需补节点时)重 build 镜像并部署,1-3 分钟
   checking:    [35, 40],   // 检查 Modal Volume 已有哪些模型
-  seeding:     [40, 78],   // 下载缺失模型到 Volume
+  uploading:   [40, 78],   // 上传本地缺失模型到 Volume
   submitting:  [78, 82],
   queued:      [82, 85],
   running:     [85, 96],
@@ -259,212 +316,182 @@ const STATUS_PROGRESS = {
   failed:      [100, 100],
 };
 
-function ensureProgressEl() {
-  if (progressEl) return progressEl;
-  progressEl = document.createElement("div");
-  progressEl.id = "modal-bridge-progress";
+// 卡片容器:右上角纵向堆叠,每个并发 job 一张卡。拖任意卡的标题 = 移动整个堆。
+let progressStack = null;
+let _stackDrag = null;
 
-  // 应用上次保存的位置
-  const savedPos = loadLS(LS_KEYS.progressPos);
-  const top = savedPos?.top ?? 60;
-  const right = savedPos?.right ?? 20;
+function _initStackDragListeners() {
+  if (_initStackDragListeners._done) return;
+  _initStackDragListeners._done = true;
+  document.addEventListener("mousemove", (e) => {
+    if (!_stackDrag || !progressStack) return;
+    const dx = e.clientX - _stackDrag.x, dy = e.clientY - _stackDrag.y;
+    const top = Math.max(0, _stackDrag.top + dy);
+    const right = Math.max(0, _stackDrag.right - dx);
+    progressStack.style.top = `${top}px`;
+    progressStack.style.right = `${right}px`;
+    progressStack.style.left = "auto";
+  });
+  document.addEventListener("mouseup", () => {
+    if (!_stackDrag || !progressStack) { _stackDrag = null; return; }
+    const top = parseInt(progressStack.style.top, 10);
+    const right = parseInt(progressStack.style.right, 10);
+    saveLS(LS_KEYS.progressPos, { top, right });
+    _stackDrag = null;
+  });
+}
 
-  progressEl.style.cssText = `
-    position: fixed; top: ${top}px; right: ${right}px;
-    z-index: 99999; min-width: 280px; max-width: 360px;
-    padding: 10px 14px;
-    background: rgba(28, 28, 36, 0.96);
-    color: #fff;
-    border-radius: 10px;
-    font-size: 12px;
-    font-family: -apple-system, system-ui, sans-serif;
-    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
-    backdrop-filter: blur(10px);
-    border: 1px solid rgba(255, 255, 255, 0.08);
-    display: none;
-  `;
-  progressEl.innerHTML = `
-    <div id="mb-drag-handle" style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px;cursor:move;user-select:none;">
-      <div id="mb-progress-label" style="font-weight:600;display:flex;align-items:center;gap:4px;">☁️ Modal</div>
+function startStackDrag(e) {
+  if (e.target.closest(".mb-cancel")) return; // 别和取消按钮抢点击
+  const rect = progressStack.getBoundingClientRect();
+  _stackDrag = {
+    x: e.clientX, y: e.clientY,
+    top: rect.top,
+    right: window.innerWidth - rect.right,
+  };
+  e.preventDefault();
+}
+
+function ensureStack() {
+  if (progressStack) return progressStack;
+  progressStack = document.createElement("div");
+  progressStack.id = "modal-bridge-progress-stack";
+  const pos = loadLS(LS_KEYS.progressPos) || {};
+  const top = pos.top ?? 60;
+  const right = pos.right ?? 20;
+  progressStack.style.cssText =
+    `position:fixed;top:${top}px;right:${right}px;z-index:99999;display:flex;flex-direction:column;gap:8px;align-items:flex-end;pointer-events:none;`;
+  document.body.appendChild(progressStack);
+  _initStackDragListeners();
+  return progressStack;
+}
+
+let progressSeq = 0;
+
+// 创建一个 job 的进度卡片,返回带方法的 ctx(stage / bar / setCancel / finish)。
+// 每张卡自带计时器和状态,互不干扰 —— 这是多 workflow 并发不互相覆盖的关键。
+function newProgress(initialStage = "preparing", wfName = null) {
+  ensureStack();
+  const card = document.createElement("div");
+  card.style.cssText =
+    "pointer-events:auto;min-width:280px;max-width:360px;padding:10px 14px;" +
+    "background:rgba(28,28,36,0.96);color:#fff;border-radius:10px;font-size:12px;" +
+    "font-family:-apple-system,system-ui,sans-serif;box-shadow:0 8px 24px rgba(0,0,0,0.5);" +
+    "backdrop-filter:blur(10px);border:1px solid rgba(255,255,255,0.08);";
+  card.innerHTML = `
+    <div class="mb-drag" style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px;cursor:move;user-select:none;">
+      <div class="mb-label" style="font-weight:600;flex:1;min-width:0;margin-right:8px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">☁️ Modal</div>
       <div style="display:flex;align-items:center;gap:8px;">
-        <div id="mb-progress-time" style="opacity:0.7;font-variant-numeric:tabular-nums;font-size:11px;">0s</div>
-        <button id="mb-cancel-btn" title="Cancel" style="
-          all:unset;cursor:pointer;color:#ef4444;font-size:14px;font-weight:bold;
-          padding:0 4px;border-radius:3px;display:none;
-        ">✕</button>
+        <div class="mb-time" style="opacity:0.7;font-variant-numeric:tabular-nums;font-size:11px;">0s</div>
+        <button class="mb-cancel" title="Cancel" style="all:unset;cursor:pointer;color:#ef4444;font-size:14px;font-weight:bold;padding:0 4px;border-radius:3px;display:none;">✕</button>
       </div>
     </div>
     <div style="height:4px;background:rgba(255,255,255,0.1);border-radius:2px;overflow:hidden;">
-      <div id="mb-progress-bar" style="
-        height:100%;width:0%;
-        background:linear-gradient(90deg,#6366f1,#8b5cf6);
-        border-radius:2px;
-        transition:width 0.4s cubic-bezier(0.4, 0, 0.2, 1);
-      "></div>
+      <div class="mb-bar" style="height:100%;width:0%;background:linear-gradient(90deg,#6366f1,#8b5cf6);border-radius:2px;transition:width 0.4s cubic-bezier(0.4,0,0.2,1);"></div>
     </div>
-    <div id="mb-progress-detail" style="margin-top:6px;opacity:0.6;font-size:11px;word-break:break-all;"></div>
-    <div id="mb-error-toggle" style="display:none;margin-top:4px;font-size:10px;color:#fca5a5;cursor:pointer;text-decoration:underline;">
-      ▶ Show error details
-    </div>
-    <pre id="mb-error-detail" style="display:none;margin:4px 0 0;padding:6px;background:rgba(0,0,0,0.3);border-radius:4px;
-      font-size:10px;max-height:160px;overflow:auto;white-space:pre-wrap;"></pre>
+    <div class="mb-detail" style="margin-top:6px;opacity:0.6;font-size:11px;word-break:break-all;"></div>
+    <div class="mb-errtoggle" style="display:none;margin-top:4px;font-size:10px;color:#fca5a5;cursor:pointer;text-decoration:underline;">▶ Show error details</div>
+    <pre class="mb-errdetail" style="display:none;margin:4px 0 0;padding:6px;background:rgba(0,0,0,0.3);border-radius:4px;font-size:10px;max-height:160px;overflow:auto;white-space:pre-wrap;"></pre>
   `;
-  document.body.appendChild(progressEl);
+  progressStack.appendChild(card);
+  card.querySelector(".mb-drag").addEventListener("mousedown", startStackDrag);
 
-  // 绑定拖动
-  setupDrag(progressEl, progressEl.querySelector("#mb-drag-handle"));
+  const els = {
+    card,
+    label: card.querySelector(".mb-label"),
+    time: card.querySelector(".mb-time"),
+    bar: card.querySelector(".mb-bar"),
+    detail: card.querySelector(".mb-detail"),
+    cancel: card.querySelector(".mb-cancel"),
+    errToggle: card.querySelector(".mb-errtoggle"),
+    errDetail: card.querySelector(".mb-errdetail"),
+  };
 
-  // 绑定取消
-  progressEl.querySelector("#mb-cancel-btn").onclick = async (ev) => {
+  const ctx = {
+    id: ++progressSeq,
+    jobId: null,
+    wfName: wfName,
+    cancelable: false,
+    finished: false,
+    onCancel: null,
+    startMs: Date.now(),
+    timer: null,
+    runTimer: null,
+    els,
+  };
+
+  ctx.timer = setInterval(() => {
+    els.time.textContent = `${((Date.now() - ctx.startMs) / 1000).toFixed(1)}s`;
+  }, 100);
+
+  els.cancel.onclick = async (ev) => {
     ev.stopPropagation();
-    // seeding 阶段:中断模型下载
-    if (seedController) {
-      if (!confirm("取消正在进行的模型下载?(已下好的会保留;正在下的那个 Modal 端可能继续下完,下次直接缓存)")) return;
-      seedController.abort();
-      return;
+    if (ctx.finished) { ctx.closeCard(); return; }  // 结束后:✕ = 关闭卡片
+    if (!ctx.cancelable || typeof ctx.onCancel !== "function") return;
+    await ctx.onCancel();
+  };
+  els.errToggle.onclick = () => {
+    const open = els.errDetail.style.display === "block";
+    els.errDetail.style.display = open ? "none" : "block";
+    els.errToggle.textContent = open ? "▶ Show error details" : "▼ Hide error details";
+  };
+
+  ctx.bar = (pct) => { els.bar.style.width = `${pct}%`; };
+
+  ctx.closeCard = () => {
+    if (ctx.timer) { clearInterval(ctx.timer); ctx.timer = null; }
+    if (ctx.runTimer) { clearInterval(ctx.runTimer); ctx.runTimer = null; }
+    els.card.remove();
+  };
+
+  ctx.stage = (stageKey, detail = null, cancelable = null) => {
+    els.label.textContent = `☁️ ${ctx.wfName || "Modal"} · ${STAGE_LABELS[stageKey] || stageKey}`;
+    if (detail !== null) els.detail.textContent = detail;
+    if (cancelable !== null) {
+      ctx.cancelable = cancelable;
+      els.cancel.style.display = cancelable ? "inline-block" : "none";
     }
-    // run 阶段:取消 Modal job
-    if (!currentJobId || !currentCancelable) return;
-    if (!confirm(`Cancel Modal job ${currentJobId.slice(0, 8)}?`)) return;
-    try {
-      await api.fetchApi("/modal_bridge/cancel", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ job_id: currentJobId }),
-      });
-      finishProgress(false, "✕ Cancelled");
-      clearLS(LS_KEYS.activeJob);
-    } catch (e) {
-      err("cancel failed", e);
+    const range = STATUS_PROGRESS[stageKey];
+    if (range) ctx.bar((range[0] + range[1]) / 2);
+    if (ctx.runTimer) { clearInterval(ctx.runTimer); ctx.runTimer = null; }
+    if (stageKey === "running" && range) {
+      const [a, b] = range;
+      const stageStart = Date.now();
+      ctx.runTimer = setInterval(() => {
+        const s = (Date.now() - stageStart) / 1000;
+        ctx.bar(a + Math.min(b - a, (s / 60) * (b - a)));  // 60s 占满 running 区间
+      }, 200);
     }
   };
 
-  // 错误展开
-  const errToggle = progressEl.querySelector("#mb-error-toggle");
-  errToggle.onclick = () => {
-    const detail = progressEl.querySelector("#mb-error-detail");
-    const isOpen = detail.style.display === "block";
-    detail.style.display = isOpen ? "none" : "block";
-    errToggle.textContent = isOpen ? "▶ Show error details" : "▼ Hide error details";
+  ctx.setCancel = (jobId, fn) => { ctx.jobId = jobId; ctx.onCancel = fn; };
+
+  ctx.finish = (success, finalLabel = "✓ Done", errDetail = null) => {
+    ctx.finished = true;
+    if (ctx.timer) { clearInterval(ctx.timer); ctx.timer = null; }
+    if (ctx.runTimer) { clearInterval(ctx.runTimer); ctx.runTimer = null; }
+    ctx.bar(100);
+    els.bar.style.background = success
+      ? "linear-gradient(90deg,#10b981,#22c55e)"
+      : "linear-gradient(90deg,#ef4444,#f97316)";
+    els.label.textContent = `☁️ ${ctx.wfName || "Modal"} · ${finalLabel}`;
+    els.time.textContent = `${((Date.now() - ctx.startMs) / 1000).toFixed(1)}s`;
+    // 结束后 ✕ 变成「关闭」按钮(失败/取消的卡留着不自动消失,得能手动关)
+    ctx.cancelable = false;
+    els.cancel.textContent = "×";
+    els.cancel.title = "关闭";
+    els.cancel.style.color = "#9aa";
+    els.cancel.style.display = "inline-block";
+    if (errDetail) {
+      els.errToggle.style.display = "block";
+      els.errDetail.textContent = errDetail;
+    }
+    // 成功 4s 后自动移除;失败/取消留着让用户看,点 × 关
+    if (success) setTimeout(() => els.card.remove(), 4000);
   };
 
-  return progressEl;
-}
-
-function setupDrag(el, handle) {
-  let startX, startY, startTop, startRight;
-  let dragging = false;
-  handle.addEventListener("mousedown", (e) => {
-    if (e.target.id === "mb-cancel-btn") return;
-    dragging = true;
-    startX = e.clientX; startY = e.clientY;
-    const rect = el.getBoundingClientRect();
-    startTop = rect.top;
-    startRight = window.innerWidth - rect.right;
-    e.preventDefault();
-  });
-  document.addEventListener("mousemove", (e) => {
-    if (!dragging) return;
-    const dx = e.clientX - startX, dy = e.clientY - startY;
-    const top = Math.max(0, startTop + dy);
-    const right = Math.max(0, startRight - dx);
-    el.style.top = `${top}px`;
-    el.style.right = `${right}px`;
-    el.style.left = "auto";
-  });
-  document.addEventListener("mouseup", () => {
-    if (!dragging) return;
-    dragging = false;
-    const top = parseInt(el.style.top, 10);
-    const right = parseInt(el.style.right, 10);
-    saveLS(LS_KEYS.progressPos, { top, right });
-  });
-}
-
-function setProgressBar(pct) {
-  const bar = document.getElementById("mb-progress-bar");
-  if (bar) bar.style.width = `${pct}%`;
-}
-
-function showProgress(stage, detail = "", cancelable = false) {
-  ensureProgressEl();
-  progressEl.style.display = "block";
-  document.getElementById("mb-progress-label").innerHTML = `☁️ Modal · ${stage}`;
-  document.getElementById("mb-progress-detail").textContent = detail;
-  document.getElementById("mb-error-toggle").style.display = "none";
-  document.getElementById("mb-error-detail").style.display = "none";
-  currentCancelable = cancelable;
-  document.getElementById("mb-cancel-btn").style.display = cancelable ? "inline-block" : "none";
-
-  if (!progressTimer) {
-    progressStartMs = Date.now();
-    progressTimer = setInterval(() => {
-      const sec = (Date.now() - progressStartMs) / 1000;
-      document.getElementById("mb-progress-time").textContent = `${sec.toFixed(1)}s`;
-    }, 100);
-  }
-}
-
-function updateStage(stageKey, detail = null, cancelable = null) {
-  if (!progressEl) ensureProgressEl();
-  const labels = {
-    preparing: "Preparing", nodes: "Checking nodes", deploying: "Deploying image",
-    checking: "Checking models", seeding: "Downloading models", submitting: "Submitting",
-    queued: "Queued", running: "Running",
-    downloading: "Downloading result", done: "Done", failed: "Failed",
-  };
-  document.getElementById("mb-progress-label").innerHTML = `☁️ Modal · ${labels[stageKey] || stageKey}`;
-  if (detail !== null) document.getElementById("mb-progress-detail").textContent = detail;
-  if (cancelable !== null) {
-    currentCancelable = cancelable;
-    document.getElementById("mb-cancel-btn").style.display = cancelable ? "inline-block" : "none";
-  }
-
-  // 把进度条平滑滑到该阶段区间的中点
-  const range = STATUS_PROGRESS[stageKey];
-  if (range) setProgressBar((range[0] + range[1]) / 2);
-
-  // running 阶段:在区间内随时间渐进
-  if (stageKey === "running") {
-    const [a, b] = range;
-    const stageStartMs = Date.now();
-    if (progressTimer) clearInterval(progressTimer);
-    progressTimer = setInterval(() => {
-      const totalSec = (Date.now() - progressStartMs) / 1000;
-      document.getElementById("mb-progress-time").textContent = `${totalSec.toFixed(1)}s`;
-      const stageSec = (Date.now() - stageStartMs) / 1000;
-      const pct = a + Math.min(b - a, (stageSec / 60) * (b - a));  // 60s 占满 running 区间
-      setProgressBar(pct);
-    }, 200);
-  }
-}
-
-function finishProgress(success, finalLabel = "✓ Done", errDetail = null) {
-  if (progressTimer) { clearInterval(progressTimer); progressTimer = null; }
-  if (!progressEl) ensureProgressEl();
-  setProgressBar(100);
-  const bar = document.getElementById("mb-progress-bar");
-  bar.style.background = success
-    ? "linear-gradient(90deg,#10b981,#22c55e)"
-    : "linear-gradient(90deg,#ef4444,#f97316)";
-  document.getElementById("mb-progress-label").innerHTML = `☁️ Modal · ${finalLabel}`;
-  const sec = (Date.now() - progressStartMs) / 1000;
-  document.getElementById("mb-progress-time").textContent = `${sec.toFixed(1)}s`;
-  document.getElementById("mb-cancel-btn").style.display = "none";
-
-  if (errDetail) {
-    document.getElementById("mb-error-toggle").style.display = "block";
-    document.getElementById("mb-error-detail").textContent = errDetail;
-  }
-
-  currentJobId = null;
-  currentCancelable = false;
-  clearLS(LS_KEYS.activeJob);
-
-  // 4 秒后淡出(成功才自动隐藏;失败留着让用户看)
-  if (success) {
-    setTimeout(() => { if (progressEl) progressEl.style.display = "none"; }, 4000);
-  }
+  ctx.stage(initialStage);
+  return ctx;
 }
 
 // =====================================================================
@@ -521,12 +548,24 @@ function getVramTier(prompt) {
   return tier;
 }
 
-async function runOnceOnModal(workflowPrompt, outputNodeIds, batchInfo = null) {
+// 未完成 job 持久化(支持多个并发):LS 存数组,刷新后逐个尝试恢复
+function addActiveJob(j) {
+  let a = loadLS(LS_KEYS.activeJob);
+  a = Array.isArray(a) ? a : (a ? [a] : []);
+  a.push(j);
+  saveLS(LS_KEYS.activeJob, a);
+}
+function removeActiveJob(jobId) {
+  let a = loadLS(LS_KEYS.activeJob);
+  a = Array.isArray(a) ? a : (a ? [a] : []);
+  saveLS(LS_KEYS.activeJob, a.filter((x) => x.jobId !== jobId));
+}
+
+async function runOnceOnModal(workflowPrompt, outputNodeIds, ctx, submitGuard, batchInfo = null) {
   // batchInfo: {current, total}
   const batchSuffix = batchInfo ? `[${batchInfo.current}/${batchInfo.total}] ` : "";
 
-  showProgress("Submitting", batchSuffix + "POST /submit", false);
-  updateStage("submitting", batchSuffix + "POST /submit", false);
+  ctx.stage("submitting", batchSuffix + "POST /submit", false);
 
   const subRes = await api.fetchApi("/modal_bridge/submit", {
     method: "POST",
@@ -540,11 +579,21 @@ async function runOnceOnModal(workflowPrompt, outputNodeIds, batchInfo = null) {
 
   const jobId = sub.job_id;
   const gpu = sub.gpu;
-  currentJobId = jobId;
-  saveLS(LS_KEYS.activeJob, { jobId, gpu, startedAt: Date.now() });
+  addActiveJob({ jobId, gpu, wfName: ctx.wfName, startedAt: Date.now() });
+  // 这张卡的取消只取消这个 job(各 job 互不影响)
+  ctx.setCancel(jobId, async () => {
+    if (!confirm(`Cancel Modal job ${jobId.slice(0, 8)}?`)) return;
+    try {
+      await api.fetchApi("/modal_bridge/cancel", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ job_id: jobId }),
+      });
+    } catch (e) { err("cancel failed", e); }
+  });
   log("submitted", jobId, "gpu=" + gpu);
 
-  updateStage("queued", `${batchSuffix}job=${jobId.slice(0, 8)} gpu=${gpu}`, true);
+  ctx.stage("queued", `${batchSuffix}job=${jobId.slice(0, 8)} gpu=${gpu}`, true);
 
   const interval = getSetting("ModalBridge.pollIntervalSec", 1.2) * 1000;
   const timeoutMs = getSetting("ModalBridge.timeoutSec", 1200) * 1000;
@@ -552,33 +601,37 @@ async function runOnceOnModal(workflowPrompt, outputNodeIds, batchInfo = null) {
 
   let final = null;
   let lastStatus = "queued";
-  while (Date.now() < deadline) {
-    await sleep(interval);
-    let pData;
-    try {
-      const pRes = await api.fetchApi(`/modal_bridge/poll?job_id=${encodeURIComponent(jobId)}`);
-      pData = await pRes.json();
-    } catch (e) {
-      log("poll error (will retry)", e);
-      continue;
-    }
-    if (pData.error) {
-      log("poll resp error:", pData);
-      continue;
-    }
-    if (pData.status !== lastStatus) {
-      lastStatus = pData.status;
-      log("status →", pData.status);
-      if (pData.status === "running") {
-        updateStage("running", `${batchSuffix}H100 inference (gpu=${gpu})`, true);
-      } else if (pData.status === "queued") {
-        updateStage("queued", `${batchSuffix}Waiting for worker...`, true);
+  try {
+    while (Date.now() < deadline) {
+      await sleep(interval);
+      let pData;
+      try {
+        const pRes = await api.fetchApi(`/modal_bridge/poll?job_id=${encodeURIComponent(jobId)}`);
+        pData = await pRes.json();
+      } catch (e) {
+        log("poll error (will retry)", e);
+        continue;
+      }
+      if (pData.error) {
+        log("poll resp error:", pData);
+        continue;
+      }
+      if (pData.status !== lastStatus) {
+        lastStatus = pData.status;
+        log("status →", pData.status);
+        if (pData.status === "running") {
+          ctx.stage("running", `${batchSuffix}inference (gpu=${gpu})`, true);
+        } else if (pData.status === "queued") {
+          ctx.stage("queued", `${batchSuffix}Waiting for worker...`, true);
+        }
+      }
+      if (pData.status === "completed" || pData.status === "failed" || pData.status === "cancelled") {
+        final = pData;
+        break;
       }
     }
-    if (pData.status === "completed" || pData.status === "failed" || pData.status === "cancelled") {
-      final = pData;
-      break;
-    }
+  } finally {
+    removeActiveJob(jobId);
   }
   if (!final) throw new Error("Polling timed out");
   if (final.status === "cancelled") throw new Error("Job cancelled");
@@ -586,7 +639,7 @@ async function runOnceOnModal(workflowPrompt, outputNodeIds, batchInfo = null) {
     throw new Error(final.error || "Modal worker failed");
   }
 
-  updateStage("downloading", `${batchSuffix}Decoding base64...`, false);
+  ctx.stage("downloading", `${batchSuffix}Decoding base64...`, false);
   const fetchRes = await api.fetchApi("/modal_bridge/fetch_result", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -596,51 +649,30 @@ async function runOnceOnModal(workflowPrompt, outputNodeIds, batchInfo = null) {
   if (!fetchRes.ok || !fetched.ok) {
     throw new Error(fetched.error || `fetch HTTP ${fetchRes.status}`);
   }
-  displayInGraph(outputNodeIds, fetched.outputs);
+  // ComfyUI 单 graph:提交时的工作流当前在前台才能直接回填;在后台 tab 的先暂存,
+  // 等用户切回该 tab 再渲染(图始终也在 output 里,一张不丢)。
+  const sf = fetched.outputs?.[0]?.subfolder || "modal_results";
+  const wfKey = submitGuard?.wfKey;
+  const onFront = wfKey == null || activeWorkflowKey() === wfKey;
+  if (onFront) {
+    const placed = displayInGraph(outputNodeIds, fetched.outputs);
+    if (!placed && fetched.outputs?.length) {
+      notify(`图已存到 output/${sf}/(没找到对应输出节点)`, "warn");
+    }
+  } else if (fetched.outputs?.length) {
+    storePendingResult(wfKey, outputNodeIds, fetched.outputs);
+    notify(`✓ 后台工作流出图完成,切到该 tab 即显示(也已存 output/${sf}/)`, "info");
+  }
   return { jobId, gpu, outputs: fetched.outputs };
 }
 
 // =====================================================================
-// 从工作流 MarkdownNote 的 "Model links" 自动提取模型来源
-// ComfyUI 官方模板约定:note 里写 [文件名](https://huggingface.co/REPO/resolve/REV/PATH)
-// 解析出来 → 动态来源,不依赖手维护的 registry
-// 返回 {filename: {source, repo?, hf_filename?, url?, requires_token}}
+// 模型自动同步(在 submit 前):本地 → Modal Volume
+// 模型都在本地 ComfyUI Desktop 下好。提交前查 Volume 缺哪些:本地有的直接上传(块级
+// 去重,通用大模型秒过);Volume 和本地都没有的 → 提示先在本地下好,允许强行提交。
 // =====================================================================
-function parseModelLinks(workflow) {
-  const out = {};
-  const nodes = (workflow && workflow.nodes) || [];
-  // [name.ext](url) — 文件名带常见模型扩展名
-  const reLink = /\[([^\]\/]+\.(?:safetensors|sft|gguf|pth|ckpt|bin|pt))\]\((https?:\/\/[^)]+)\)/gi;
-  for (const n of nodes) {
-    if (n.type !== "MarkdownNote") continue;
-    const wv = n.widgets_values;
-    const text = Array.isArray(wv) ? wv.join("\n") : (typeof wv === "string" ? wv : "");
-    if (!text) continue;
-    let m;
-    while ((m = reLink.exec(text)) !== null) {
-      const fname = m[1].trim();
-      const url = m[2].trim();
-      // https://huggingface.co/OWNER/REPO/resolve/REV/PATH → repo + 路径(走 hf_hub_download,自动处理 token)
-      const hf = url.match(/huggingface\.co\/([^\/]+\/[^\/]+)\/resolve\/[^\/]+\/(.+)$/);
-      if (hf) {
-        out[fname] = { source: "huggingface", repo: hf[1], hf_filename: decodeURIComponent(hf[2]), requires_token: true };
-      } else {
-        out[fname] = { source: "url", url, requires_token: false };
-      }
-    }
-  }
-  return out;
-}
-
-// =====================================================================
-// 模型自动同步(在 submit 前)
-// 来源三级:① 工作流 note 自带 link  ② model_registry.yaml  ③ 都没有→报 unknown
-// =====================================================================
-async function ensureModelsAvailable(prompt, workflow) {
-  updateStage("checking", "Scanning workflow + Modal Volume...");
-  const links = parseModelLinks(workflow);
-  const nLinks = Object.keys(links).length;
-  if (nLinks) log(`workflow note 自带 ${nLinks} 个模型来源`);
+async function ensureModelsAvailable(prompt, ctx) {
+  ctx.stage("checking", "Scanning workflow + Modal Volume...");
 
   const checkRes = await api.fetchApi("/modal_bridge/check_models", {
     method: "POST",
@@ -650,107 +682,97 @@ async function ensureModelsAvailable(prompt, workflow) {
   const check = await checkRes.json();
   if (check.error) throw new Error(check.error);
 
-  const { required, missing, present, unknown } = check;
-  updateStage("checking", `${present.length}/${required.length} cached on Modal`);
+  const { required = [], present = [], missing_local = [], downloading = [], missing_no_source = [] } = check;
+  ctx.stage("checking", `${present.length}/${required.length} 已在 Volume`);
+  log(`models: required=${required.length} present=${present.length} missing_local=${missing_local.length} ` +
+      `downloading=${downloading.length} missing_no_source=${missing_no_source.length}`);
 
-  // 组装待下载:missing(note 优先于 registry) + unknown 里 note 能补来源的
-  const toSeed = [];
-  for (const m of missing) {
-    const entry = links[m.filename] || m.registry_entry; // note 优先
-    toSeed.push({ type: m.type, filename: m.filename, registry_entry: entry, src: links[m.filename] ? "note" : "registry" });
-  }
-  const stillUnknown = [];
-  for (const u of unknown) {
-    if (links[u.filename]) {
-      toSeed.push({ type: u.type, filename: u.filename, registry_entry: links[u.filename], src: "note" });
-    } else {
-      stillUnknown.push(u);
-    }
-  }
-  log(`models: required=${required.length} present=${present.length} toSeed=${toSeed.length} unknown=${stillUnknown.length}`);
-
-  // 真正没来源的(note + registry 都没写):必须手动
-  if (stillUnknown.length) {
-    const list = stillUnknown.map(u => `  ${u.type}/${u.filename}`).join("\n");
-    const msg = `下面这些模型 Modal 没有,工作流 note 和 registry 也都没写来源,无法自动下:\n\n${list}\n\n` +
-                `解决:\n` +
-                `  1. 用带「## Model links」note 的官方模板(会自动识别来源)\n` +
-                `  2. 或在 model_registry.yaml 补来源\n\n` +
-                `仍然继续提交?(会失败)`;
-    if (!confirm(msg)) throw new Error("Cancelled due to unknown models");
+  // 本地还在下载中的模型 → 不能传(会传成残缺),提示等下完
+  if (downloading.length) {
+    const list = downloading.map((u) => `  ${u.type}/${u.filename}`).join("\n");
+    const msg = `这些模型本地还在下载中,现在传会传成残缺文件:\n\n${list}\n\n` +
+                `建议:等本地下完再点 [☁️ Modal]。\n\n` +
+                `仍然继续提交?(会缺这些模型,大概率失败)`;
+    if (!confirm(msg)) throw new Error("Cancelled — 本地模型还在下载中");
   }
 
-  if (!toSeed.length) {
-    updateStage("checking", `All ${required.length} models present ✓`);
+  // Volume 和本地都没有 → 没法自动补
+  if (missing_no_source.length) {
+    const list = missing_no_source.map((u) => `  ${u.type}/${u.filename}`).join("\n");
+    const msg = `下面这些模型 Modal Volume 没有,本地也找不到,无法自动同步:\n\n${list}\n\n` +
+                `解决:先在本地 ComfyUI 里把这些模型下到对应 models/<类型>/ 目录,再跑。\n\n` +
+                `仍然继续提交?(大概率失败)`;
+    if (!confirm(msg)) throw new Error("Cancelled — 缺本地模型");
+  }
+
+  if (!missing_local.length) {
+    ctx.stage("checking", `模型齐全(${present.length}/${required.length})✓`);
     return;
   }
 
-  // 串行下载(避免单 endpoint 并发争抢),每个在 seeding 区间内分一段
-  const seedRange = STATUS_PROGRESS.seeding;
-  const perModelPct = (seedRange[1] - seedRange[0]) / toSeed.length;
-  for (let i = 0; i < toSeed.length; i++) {
-    const m = toSeed[i];
-    // cancelable=true → 显示取消按钮(seeding 阶段可中断)
-    updateStage("seeding", `[${i+1}/${toSeed.length}] ${m.filename} — downloading on Modal... (源:${m.src})`, true);
-    setProgressBar(seedRange[0] + i * perModelPct);
-
-    seedController = new AbortController();
-    let seedRes;
-    try {
-      seedRes = await api.fetchApi("/modal_bridge/seed_model", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ type: m.type, filename: m.filename, registry_entry: m.registry_entry }),
-        signal: seedController.signal,
-      });
-    } catch (e) {
-      if (e.name === "AbortError") throw new Error(`已取消(下载到第 ${i+1}/${toSeed.length} 个 ${m.filename})`);
-      throw e;
-    } finally {
-      seedController = null;
-    }
-    const seedData = await seedRes.json();
-    if (!seedRes.ok || !seedData.ok) {
-      const errMsg = seedData.error || `HTTP ${seedRes.status}`;
-      throw new Error(`Seed ${m.filename} failed: ${errMsg}`);
-    }
-    const note = seedData.cached
-      ? `cached (${seedData.size_mb}MB)`
-      : `done (${seedData.size_mb}MB in ${seedData.elapsed_sec}s)`;
-    log(`seed ${m.filename}: ${note}`);
-    setProgressBar(seedRange[0] + (i + 1) * perModelPct);
+  // 本地有、Volume 没 → 上传
+  const totalMb = missing_local.reduce((s, m) => s + (m.size_mb || 0), 0);
+  const list = missing_local.map((m) => `  • ${m.type}/${m.filename} (${m.size_mb} MB)`).join("\n");
+  const msg = `这些模型本地有、Modal Volume 还没有,需要上传一次(共 ~${totalMb} MB):\n\n${list}\n\n` +
+              `点「确定」上传到 Volume(块级去重:网上通用大模型秒过,只有新内容真正占上行带宽;只这一次,之后秒进)。\n` +
+              `点「取消」则不传,直接提交。`;
+  if (!confirm(msg)) {
+    return; // 用户选择不传,直接提交(可能失败,交给 Modal 报错)
   }
 
-  seedController = null;
-  updateStage("seeding", `${toSeed.length} model(s) seeded ✓`, false);
+  ctx.stage("uploading", `上传 ${missing_local.length} 个模型到 Volume...`, false);
+  ctx.bar(STATUS_PROGRESS.uploading[0]);
+  const [a, b] = STATUS_PROGRESS.uploading;
+  let tick = 0;
+  const rc = await streamPost(
+    "/modal_bridge/sync_models",
+    { items: missing_local.map((m) => ({ type: m.type, filename: m.filename, local_path: m.local_path, size_mb: m.size_mb })) },
+    (line) => {
+      log("upload:", line);
+      tick++;
+      ctx.bar(a + Math.min(b - a - 1, tick * 0.6));
+      ctx.stage("uploading", line.length > 72 ? line.slice(0, 72) + "…" : line);
+    },
+  );
+  if (rc !== 0) throw new Error("模型上传失败(看进度窗日志 / ComfyUI 控制台)");
+  ctx.stage("uploading", `${missing_local.length} 个模型已同步 ✓`, false);
 }
 
 // =====================================================================
 // 主入口:批量包装
 // =====================================================================
 async function queueOnModal() {
+  // 没部署/没配置就直接引导去 Setup,别走后面链路再失败
+  const cfg0 = await fetchConfig();
+  if (!isConfigured(cfg0)) {
+    notify("还没部署到 Modal。先点右上角 [⚙️ Modal Setup] 填 token 一键部署(不用开终端)", "warn");
+    try { openDeployDialog(); } catch (e) {}
+    return;
+  }
+  // 每次点击 = 一个独立的 job 卡片(多 workflow 并发互不覆盖),标题带工作流名
+  const ctx = newProgress("preparing", activeWorkflowName());
+  ctx.stage("preparing", "Serializing graph...");
   try {
-    showProgress("Preparing", "Serializing graph...");
-    updateStage("preparing", "Serializing graph...");
-
     const p = await app.graphToPrompt();
     const outputNodeIds = findOutputNodes(p.output);
-    log("output nodes:", outputNodeIds);
+    // 提交时记下当前工作流(tab)身份;结果回来时据此判断该直接回填还是暂存(等切回该 tab)
+    const submitGuard = { wfKey: activeWorkflowKey() };
+    log("output nodes:", outputNodeIds, "wfKey:", submitGuard.wfKey);
 
     // ⭐ custom_node 自动同步(默认开启,Settings 可关)
     const autoCheckNodes = getSetting("ModalBridge.autoCheckNodes", true);
     if (autoCheckNodes) {
-      const proceed = await ensureNodesAvailable(p.output);
+      const proceed = await ensureNodesAvailable(p.output, ctx);
       if (!proceed) {
-        finishProgress(false, "✕ Cancelled");
+        ctx.finish(false, "✕ Cancelled");
         return;
       }
     }
 
-    // ⭐ 模型自动同步(默认开启,Settings 可关)
-    const autoSeed = getSetting("ModalBridge.autoSeedModels", true);
-    if (autoSeed) {
-      await ensureModelsAvailable(p.output, p.workflow);
+    // ⭐ 模型自动同步:本地 → Volume(默认开启,Settings 可关)
+    const autoSync = getSetting("ModalBridge.autoSyncModels", true);
+    if (autoSync) {
+      await ensureModelsAvailable(p.output, ctx);
     }
 
     const batchCount = Math.max(1, parseInt(getSetting("ModalBridge.batchCount", 1), 10));
@@ -761,13 +783,13 @@ async function queueOnModal() {
       const seed = Date.now() % 2147483647 + i * 7919;
       const promptWithSeed = batchCount > 1 ? reseedPrompt(p.output, seed) : p.output;
       const result = await runOnceOnModal(
-        promptWithSeed, outputNodeIds,
+        promptWithSeed, outputNodeIds, ctx, submitGuard,
         batchCount > 1 ? { current: i + 1, total: batchCount } : null,
       );
       allOutputs.push(result);
     }
 
-    finishProgress(true, batchCount > 1 ? `✓ ${batchCount} done` : "✓ Done");
+    ctx.finish(true, batchCount > 1 ? `✓ ${batchCount} done` : "✓ Done");
     notify(
       batchCount > 1
         ? `✓ ${batchCount} Modal jobs done`
@@ -776,7 +798,7 @@ async function queueOnModal() {
     );
   } catch (e) {
     err(e);
-    finishProgress(false, "✗ " + (e.message || "Error").slice(0, 40), e.stack || e.toString());
+    ctx.finish(false, "✗ " + (e.message || "Error").slice(0, 40), e.stack || e.toString());
     notify(`Failed: ${e.message}`, "error");
   }
 }
@@ -795,46 +817,49 @@ async function doHealthCheck() {
 }
 
 async function recoverPendingJob() {
-  const pending = loadLS(LS_KEYS.activeJob);
-  if (!pending?.jobId) return;
-  const age = (Date.now() - pending.startedAt) / 1000;
-  if (age > 1200) {
-    log("dropping stale pending job:", pending.jobId);
-    clearLS(LS_KEYS.activeJob);
-    return;
-  }
+  let pending = loadLS(LS_KEYS.activeJob);
+  pending = Array.isArray(pending) ? pending : (pending ? [pending] : []);
+  // 丢弃过期的(>20min),其余各自恢复(并行,每个一张卡)
+  const fresh = pending.filter((j) => j?.jobId && (Date.now() - j.startedAt) / 1000 <= 1200);
+  saveLS(LS_KEYS.activeJob, fresh);
+  for (const j of fresh) recoverOne(j);
+}
+
+async function recoverOne(pending) {
   log("recovering pending job:", pending.jobId);
-  showProgress("Recovering", `job=${pending.jobId.slice(0, 8)}`);
-  currentJobId = pending.jobId;
+  const ctx = newProgress("queued", pending.wfName || null);
+  ctx.stage("queued", `recover job=${pending.jobId.slice(0, 8)}`);
   try {
     const pRes = await api.fetchApi(`/modal_bridge/poll?job_id=${encodeURIComponent(pending.jobId)}`);
     const pData = await pRes.json();
     if (pData.status === "completed") {
-      updateStage("downloading", "Fetching result of recovered job...");
+      ctx.stage("downloading", "Fetching result of recovered job...");
       const fr = await api.fetchApi("/modal_bridge/fetch_result", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ job_id: pending.jobId, modal_state: pData }),
       });
       const fd = await fr.json();
+      // 恢复时画板多半已不是当时的工作流 → 不强行回填,提示存盘路径
       if (fd.ok) {
-        finishProgress(true, "✓ Recovered");
-        notify(`✓ Recovered job ${pending.jobId.slice(0, 8)}`, "success");
+        const sf = fd.outputs?.[0]?.subfolder || "modal_results";
+        ctx.finish(true, "✓ Recovered");
+        notify(`✓ Recovered job ${pending.jobId.slice(0, 8)} → output/${sf}/`, "success");
       } else {
-        finishProgress(false, "✗ Recover fetch failed", JSON.stringify(fd));
+        ctx.finish(false, "✗ Recover fetch failed", JSON.stringify(fd));
       }
     } else if (pData.status === "running" || pData.status === "queued") {
-      updateStage(pData.status, "Resuming poll...");
-      // 简化:不重新进入完整 poll loop,告诉用户去手动检查
-      notify(`Job ${pending.jobId.slice(0, 8)} still ${pData.status}; please re-click Modal to monitor`, "warn");
-      progressEl.style.display = "none";
-      clearLS(LS_KEYS.activeJob);
+      ctx.stage(pData.status, `still ${pData.status};重新点 [☁️ Modal] 监控`);
+      notify(`Job ${pending.jobId.slice(0, 8)} 仍在 ${pData.status};重新点 [☁️ Modal] 监控`, "warn");
+      ctx.finish(true, `· ${pData.status}`);
     } else {
-      finishProgress(false, `✗ ${pData.status}`);
+      ctx.finish(false, `✗ ${pData.status}`);
     }
   } catch (e) {
     err("recover failed", e);
-    clearLS(LS_KEYS.activeJob);
+    ctx.finish(false, "✗ recover error");
+  } finally {
+    removeActiveJob(pending.jobId);
   }
 }
 
@@ -884,18 +909,18 @@ const SETTINGS = [
     tooltip: "关闭后图会上传到 R2(需要 modal_app R2 凭据)",
   },
   {
-    id: "ModalBridge.autoSeedModels",
-    name: "Modal Bridge: Auto-seed missing models",
+    id: "ModalBridge.autoSyncModels",
+    name: "Modal Bridge: Auto-sync models (本地 → Volume)",
     type: "boolean",
     defaultValue: true,
-    tooltip: "提交前检查 Modal Volume,缺的模型自动从 HF/URL 下载(走 registry 白名单)",
+    tooltip: "提交前检查 Modal Volume,工作流要、Volume 没、但本地有的模型自动上传上去(块级去重,通用大模型秒过)",
   },
   {
     id: "ModalBridge.autoCheckNodes",
-    name: "Modal Bridge: Auto-check custom nodes",
+    name: "Modal Bridge: Auto-sync custom nodes",
     type: "boolean",
     defaultValue: true,
-    tooltip: "提交前检查工作流用到的 custom_node,Modal 镜像没有的可一键加进去并重部署",
+    tooltip: "提交前把工作流用到的 custom_node 与本地双向同步到 Modal:缺的加、本地 commit 变的更新、本地已卸载的移除,再重部署",
   },
 ];
 
@@ -955,8 +980,6 @@ async function openDeployDialog() {
     <input id="mb-dep-id" type="text" style="${inputCss}" value="${cfg.modal_token_id || ""}" placeholder="ak-xxxxxxxx">
     <label>Token Secret <span style="color:#9aa;">(as-...)</span></label>
     <input id="mb-dep-secret" type="password" style="${inputCss}" value="${cfg.modal_token_secret || ""}" placeholder="as-xxxxxxxx">
-    <label>HuggingFace Token <span style="color:#9aa;">(可选,下 FLUX 等私有模型才需要)</span></label>
-    <input id="mb-dep-hf" type="password" style="${inputCss}" placeholder="hf_xxxxxxxx(留空=只能下公开模型)">
     <label>默认 GPU</label>
     <select id="mb-dep-gpu" style="${inputCss}">${gpuOpts}</select>
     <div style="margin:10px 0;">
@@ -982,7 +1005,6 @@ async function openDeployDialog() {
       workspace: panel.querySelector("#mb-dep-ws").value.trim(),
       token_id: panel.querySelector("#mb-dep-id").value.trim(),
       token_secret: panel.querySelector("#mb-dep-secret").value.trim(),
-      hf_token: panel.querySelector("#mb-dep-hf").value.trim(),
       default_gpu: panel.querySelector("#mb-dep-gpu").value,
     };
     if (!payload.token_id.startsWith("ak-") || !payload.token_secret.startsWith("as-") || !payload.workspace) {

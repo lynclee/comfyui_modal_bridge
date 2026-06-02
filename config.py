@@ -12,7 +12,7 @@ DEFAULT_CONFIG = {
     "modal_app_name": "comfyui-bridge",
     "modal_workspace": "",                       # 用于拼 endpoint
     "modal_volume_name": "comfyui-bridge-models",  # 重部署(加 custom_node)时要
-    "scaledown_window": 120,                     # 重部署时要
+    "scaledown_window": 40,                      # 空闲多久回收容器(s);重部署时要
 
     # ── 鉴权(私有 endpoint,deploy.py / GUI 部署自动写)──
     "modal_token_id": "",      # ak-xxx(account token,仅本机 deploy 用)
@@ -27,12 +27,16 @@ DEFAULT_CONFIG = {
     "timeout_sec": 1200,
     "output_subfolder": "modal_results",
 
-    # ── 模型自动同步 ──
-    "auto_seed_models": True,  # 提交 workflow 前检查并下载缺失模型
-    "seed_timeout_sec": 1800,  # 单模型下载超时(30 分钟)
+    # ── 模型自动同步(本地 → Modal Volume,SDK batch_upload,CAS 去重)──
+    # 提交前检查 Volume,工作流要、Volume 没、但本地有的模型自动上传上去。
+    # 不再从 HF/civitai 下载——模型都在本地 ComfyUI Desktop 下好。
+    "auto_sync_models": True,
+    "model_sync_timeout_sec": 3600,  # 上传整批模型的超时(大模型走上行带宽)
 
-    # ── custom_node 自动同步 ──
-    "auto_check_nodes": True,  # 提交前检查工作流用到的 custom_node Modal 是否都有
+    # ── custom_node 双向同步 ──
+    # 提交前对比工作流用到的 custom_node 与 Modal 镜像:缺的加、本地 commit 变了的更新、
+    # 本地已卸载的从镜像清单里删掉,再重部署。本地始终是真源。
+    "auto_check_nodes": True,
 }
 
 

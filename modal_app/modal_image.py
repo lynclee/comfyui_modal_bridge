@@ -43,7 +43,7 @@ cuda_image = (
         "nvidia/cuda:13.0.0-cudnn-runtime-ubuntu24.04",
         add_python="3.13",
     )
-    .apt_install("git", "wget", "libgl1", "libglib2.0-0", "libsm6", "libxext6", "libxrender1", "ffmpeg", "aria2")
+    .apt_install("git", "wget", "libgl1", "libglib2.0-0", "libsm6", "libxext6", "libxrender1", "ffmpeg")
     .run_commands(
         "git clone --depth=1 --branch v0.22.0 https://github.com/comfyanonymous/ComfyUI /comfyui"
     )
@@ -54,15 +54,14 @@ cuda_image = (
     .run_commands("cd /comfyui && pip install -r requirements.txt")
     .run_commands(_CLONE_CMD)
     .run_commands(_INSTALL_REQS_CMD)
+    # worker 自身需要的小包。模型不在容器里下载(本地 SDK 传 Volume),所以不再装
+    # huggingface_hub / hf_xet。这层经常改,放最后让 cache 命中率最高。
     .pip_install(
         "websocket-client",
         "requests",
         "fastapi[standard]",
-        "huggingface_hub[hf_xet]",   # Xet 高速传输(新版 hub 已弃 hf_transfer,必须用 hf_xet)
-        "hf_xet",
         "pyyaml",
     )
-    .env({"HF_XET_HIGH_PERFORMANCE": "1"})  # 启用 Xet 高性能下载(替代失效的 HF_HUB_ENABLE_HF_TRANSFER)
     .run_commands("mkdir -p /comfy-volume")
     .add_local_file(str(_EXTRA_MODEL_PATHS_YAML), "/comfyui/extra_model_paths.yaml")
     .add_local_python_source("modal_image", "_comfy_ws", "_custom_nodes_data")
