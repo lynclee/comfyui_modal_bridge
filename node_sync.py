@@ -173,12 +173,17 @@ def folder_exists_locally(folder: str) -> bool:
     return (_comfyui_root() / "custom_nodes" / folder).is_dir()
 
 
-def plan_node_sync(prompt: dict, baked: list[dict] | None = None) -> dict:
+def plan_node_sync(prompt: dict, baked: list[dict] | None = None,
+                   allow_prune: bool = False) -> dict:
     """
-    双向同步规划:让 Modal 镜像的 custom_node 清单跟本地保持一致(本地是真源)。
+    节点同步规划:让 Modal 镜像装上工作流需要的 custom_node。
       - add:   工作流用到、本地有 git、baked 还没有的 → 加
-      - update: baked 有、但本地 commit 跟 baked 不一致的 → 按本地 commit 更新(和本地不一致就同步)
-      - prune: baked 有、但本地 custom_nodes 已经删了的 → 从镜像清单移除(本地删了也同步)
+      - update: baked 有、但本地 commit 跟 baked 不一致的 → 按本地 commit 更新
+      - prune: baked 有、但本地 custom_nodes 没有的 → 候选移除
+
+    ⚠ 多机场景:不同电脑各装一部分节点,"本地没有"≠"全局不需要"。所以默认
+    allow_prune=False —— 自动同步(出图时)只增不删,镜像 = 各机贡献的并集,永不互删。
+    prune 只在「管理云端节点」面板里手动勾选执行(allow_prune=True 时才会从 new_baked 移除)。
     任一非空即 needs_deploy=True;new_baked 是写回 _custom_nodes_data.py 的完整新清单。
 
     baked 不传则读本地 _custom_nodes_data.py。
@@ -221,12 +226,14 @@ def plan_node_sync(prompt: dict, baked: list[dict] | None = None) -> dict:
         else:
             missing_no_git.append({"folder": folder, "class_types": sorted(class_types)})
 
-    # 2) baked 里、本地已卸载的 → prune
+    # 2) baked 里、本地没有的 → prune 候选。默认不真删(多机并集,见 docstring),
+    #    只在 allow_prune 时才从 new_baked 移除(手动清理面板用)。
     prune = []
     for name in list(baked_by_name.keys()):
         if not folder_exists_locally(name):
             prune.append({"name": name})
-            del baked_by_name[name]
+            if allow_prune:
+                del baked_by_name[name]
 
     # new_baked 保持原顺序(已存在的)+ 新增的追加在后,排除被 prune 的
     new_baked = []
@@ -239,7 +246,8 @@ def plan_node_sync(prompt: dict, baked: list[dict] | None = None) -> dict:
         if nm not in seen:
             new_baked.append(entry); seen.add(nm)
 
-    needs_deploy = bool(add or update or prune)
+    # 自动同步只看 add/update(prune 默认不执行 → 不该触发部署);allow_prune 时 prune 也算
+    needs_deploy = bool(add or update or (prune and allow_prune))
     return {
         "add": add,
         "update": update,

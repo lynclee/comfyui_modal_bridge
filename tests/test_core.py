@@ -73,12 +73,26 @@ def test_plan_update_on_commit_change():
         _restore()
 
 
-def test_plan_prune_uninstalled():
-    """baked 有、本地已卸载(且工作流没用到)→ prune,从 new_baked 移除。"""
+def test_plan_prune_default_keeps():
+    """默认 allow_prune=False(多机并集):本地没有的列为 prune 候选,但不真删、不触发部署。"""
     _stub_analyze({})  # 工作流没用任何 custom node
     _stub_env({}, exists_set=set())  # gone-node 本地不存在了
     try:
         p = node_sync.plan_node_sync({}, baked=[{"name": "gone-node", "url": "u", "commit": "c"}])
+        assert [x["name"] for x in p["prune"]] == ["gone-node"]  # 列为候选
+        assert [n["name"] for n in p["new_baked"]] == ["gone-node"]  # 但仍保留
+        assert p["needs_deploy"] is False  # 不因 prune 触发部署
+    finally:
+        _restore()
+
+
+def test_plan_prune_when_allowed():
+    """allow_prune=True(手动清理面板):本地没有的真从 new_baked 移除并触发部署。"""
+    _stub_analyze({})
+    _stub_env({}, exists_set=set())
+    try:
+        p = node_sync.plan_node_sync({}, baked=[{"name": "gone-node", "url": "u", "commit": "c"}],
+                                     allow_prune=True)
         assert [x["name"] for x in p["prune"]] == ["gone-node"]
         assert p["new_baked"] == []
         assert p["needs_deploy"] is True

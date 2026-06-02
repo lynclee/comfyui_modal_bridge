@@ -48,6 +48,47 @@ except Exception:
 
 job_state = modal.Dict.from_name(f"{APP_NAME}-jobs", create_if_missing=True)
 
+# job_state 清理:每条 completed 含整张图 base64,不清会让 Dict 无限膨胀。
+# 策略:终态(completed/failed/cancelled)条目超过 JOB_TTL_S 就删;再按数量上限兜底。
+JOB_TTL_S = int(os.environ.get("MODAL_BRIDGE_JOB_TTL", "3600"))   # 终态保留 1 小时(够客户端取回)
+JOB_MAX = int(os.environ.get("MODAL_BRIDGE_JOB_MAX", "200"))       # 最多保留多少条
+
+
+def _sweep_job_state():
+    """best-effort 清理过期/超量的终态 job。任何异常都不影响主流程。"""
+    try:
+        now = time.time()
+        items = list(job_state.items())
+    except Exception:
+        return
+    terminal = {"completed", "failed", "cancelled"}
+    finished = []
+    for jid, s in items:
+        if not isinstance(s, dict):
+            continue
+        if s.get("status") in terminal:
+            finished.append((jid, s.get("completed_at") or 0))
+    # 1) 过期删
+    for jid, done_at in finished:
+        if done_at and now - done_at > JOB_TTL_S:
+            try:
+                del job_state[jid]
+            except Exception:
+                pass
+    # 2) 数量兜底:仍超上限就删最旧的终态条目
+    try:
+        remaining = [(j, s.get("completed_at") or 0) for j, s in job_state.items()
+                     if isinstance(s, dict) and s.get("status") in terminal]
+        if len(remaining) > JOB_MAX:
+            remaining.sort(key=lambda x: x[1])
+            for jid, _ in remaining[: len(remaining) - JOB_MAX]:
+                try:
+                    del job_state[jid]
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
 
 # ============================================================================
 # ComfyUI worker — 两档(按显存),每档 gpu=list 走 Modal 原生 fallback
@@ -101,9 +142,16 @@ def _worker_run(workflow: dict, job_id: str, input_images: list | None = None) -
         job_state[job_id] = {**job_state.get(job_id, {}), "status": "failed",
                              "error": str(e), "trace": tb[-2000:], "completed_at": time.time()}
         raise
-    job_state[job_id] = {**job_state.get(job_id, {}), "status": "completed",
-                         "data_base64": result.get("data_base64"), "image_url": result.get("image_url"),
-                         "filename": result.get("filename"), "completed_at": time.time()}
+    # 有 images(多图)就只存 images,不再冗余存 data_base64/filename(那是 images[0] 的重复,
+    # 白白让 job_state 体积翻倍);只有极老回退路径(没 images)才退回单图字段。
+    done = {**job_state.get(job_id, {}), "status": "completed",
+            "image_url": result.get("image_url"), "completed_at": time.time()}
+    if result.get("images"):
+        done["images"] = result["images"]
+    else:
+        done["data_base64"] = result.get("data_base64")
+        done["filename"] = result.get("filename")
+    job_state[job_id] = done
     return result
 
 
@@ -182,6 +230,7 @@ def run_endpoint(payload: dict):
     worker = _TIER_WORKERS[tier]
     gpu_display = _TIER_GPU_DISPLAY[tier]
 
+    _sweep_job_state()  # 顺手清理过期/超量的旧 job(防 Dict 无限膨胀)
     job_state[job_id] = {"status": "queued", "queued_at": time.time(), "gpu": gpu_display, "tier": tier}
     call = worker().run.spawn(workflow, job_id, input_images)
     job_state[job_id] = {**job_state.get(job_id, {}), "call_id": call.object_id}

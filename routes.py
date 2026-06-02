@@ -121,6 +121,55 @@ def _output_dir() -> Path:
     return Path(__file__).resolve().parents[2] / "output"
 
 
+async def _write_results(final: dict, job_id: str, subfolder: str) -> list:
+    """把 Modal 返回的图写到 output/<subfolder>/<job_id>/,返回 outputs 列表。
+    多图(final.images=[{filename,data_base64}])优先;否则回退单图 data_base64 / image_url。
+    写失败 raise(由调用方转 502)。"""
+    out_dir = _output_dir() / subfolder / job_id
+    out_dir.mkdir(parents=True, exist_ok=True)
+    outputs, seen = [], set()
+
+    def _dedup(fn: str) -> str:
+        if fn not in seen:
+            seen.add(fn); return fn
+        stem, _, ext = fn.rpartition(".")
+        fn2 = f"{stem}_{len(seen)}.{ext}" if ext else f"{fn}_{len(seen)}"
+        seen.add(fn2); return fn2
+
+    images = final.get("images")
+    if isinstance(images, list) and images:
+        for img in images:
+            b64 = img.get("data_base64")
+            if not b64:
+                continue
+            fn = _dedup(img.get("filename") or "output.png")
+            data = base64.b64decode(b64)
+            (out_dir / fn).write_bytes(data)
+            outputs.append({"filename": fn, "subfolder": f"{subfolder}/{job_id}",
+                            "type": "output", "size_bytes": len(data)})
+        return outputs
+
+    # 单图回退
+    fn = final.get("filename") or "output.png"
+    b64 = final.get("data_base64")
+    image_url = final.get("image_url")
+    if b64:
+        data = base64.b64decode(b64)
+        (out_dir / fn).write_bytes(data)
+        outputs.append({"filename": fn, "subfolder": f"{subfolder}/{job_id}",
+                        "type": "output", "size_bytes": len(data)})
+    elif image_url:
+        async with aiohttp.ClientSession() as s:
+            async with s.get(image_url) as r:
+                if r.status >= 400:
+                    raise RuntimeError(f"download {image_url} failed: {r.status}")
+                data = await r.read()
+        (out_dir / fn).write_bytes(data)
+        outputs.append({"filename": fn, "subfolder": f"{subfolder}/{job_id}",
+                        "type": "output", "size_bytes": len(data), "source_url": image_url})
+    return outputs
+
+
 def _extract_input_image_names(prompt: dict) -> list[str]:
     """遍历 prompt 找所有 LoadImage 类节点引用的本地文件名(去重)。"""
     names: list[str] = []
@@ -248,7 +297,13 @@ def _setup_routes():
     # -------- 配置读写 --------
     @routes.get("/modal_bridge/config")
     async def _get_config(request: web.Request):
-        return web.json_response(cfg_mod.load_config())
+        # 不把密钥送到浏览器:抹掉 token_secret 和 bridge_api_key,只给前端要的非敏感字段
+        # + 一个 has_token_secret 标志(部署框据此显示"已保存,留空=沿用")。
+        cfg = dict(cfg_mod.load_config())
+        cfg["has_token_secret"] = bool(cfg.get("modal_token_secret"))
+        cfg.pop("modal_token_secret", None)
+        cfg.pop("bridge_api_key", None)
+        return web.json_response(cfg)
 
     @routes.post("/modal_bridge/config")
     async def _set_config(request: web.Request):
@@ -330,47 +385,14 @@ def _setup_routes():
 
         cfg = cfg_mod.load_config()
         subfolder = cfg.get("output_subfolder", "modal_results")
-        out_dir = _output_dir() / subfolder / job_id
-        out_dir.mkdir(parents=True, exist_ok=True)
-
-        b64 = final.get("data_base64")
-        image_url = final.get("image_url")
-        filename = final.get("filename") or "output.png"
-        outputs = []
-
-        if b64:
-            try:
-                data = base64.b64decode(b64)
-            except Exception as e:
-                return web.json_response({"error": f"decode base64 failed: {e}"}, status=502)
-            (out_dir / filename).write_bytes(data)
-            outputs.append({
-                "filename": filename,
-                "subfolder": f"{subfolder}/{job_id}",
-                "type": "output",
-                "size_bytes": len(data),
-            })
-        elif image_url:
-            try:
-                async with aiohttp.ClientSession() as s:
-                    async with s.get(image_url) as r:
-                        if r.status >= 400:
-                            return web.json_response({"error": f"download {image_url} failed: {r.status}"}, status=502)
-                        data = await r.read()
-            except Exception as e:
-                return web.json_response({"error": f"download failed: {e}"}, status=502)
-            (out_dir / filename).write_bytes(data)
-            outputs.append({
-                "filename": filename,
-                "subfolder": f"{subfolder}/{job_id}",
-                "type": "output",
-                "size_bytes": len(data),
-                "source_url": image_url,
-            })
-        else:
+        try:
+            outputs = await _write_results(final, job_id, subfolder)
+        except Exception as e:
+            return web.json_response({"error": f"write result failed: {e}"}, status=502)
+        if not outputs:
             return web.json_response({"error": "no image in modal_state"}, status=502)
 
-        print(f"[modal_bridge] ✓ job {job_id} fetched → {outputs[0]['subfolder']}/{outputs[0]['filename']}")
+        print(f"[modal_bridge] ✓ job {job_id} fetched {len(outputs)} img → {subfolder}/{job_id}/")
         return web.json_response({"ok": True, "job_id": job_id, "outputs": outputs})
 
     # -------- 模型同步(本地 → Volume,全程本地 modal SDK,不经 endpoint)--------
@@ -468,6 +490,34 @@ def _setup_routes():
 
     # -------- custom_node 双向同步 --------
 
+    @routes.get("/modal_bridge/list_nodes")
+    async def _list_nodes(request: web.Request):
+        """
+        列出镜像实装的 custom_nodes 全集(供「管理云端节点」面板手动清理)。
+        权威来自 Modal /health 的 custom_nodes(真实部署),url/commit 用本地 baked 补全;
+        /health 不可达则回退本地 baked 清单。
+        返回: {ok, source, nodes: [{name, url, commit, in_local_baked}]}
+        """
+        cfg = cfg_mod.load_config()
+        local_baked = {n["name"]: n for n in node_sync.read_baked_nodes()}
+        names, source = None, "local"
+        try:
+            async with aiohttp.ClientSession() as session:
+                info = await modal_client.list_nodes(session, cfg)
+            if isinstance(info, dict) and isinstance(info.get("custom_nodes"), list):
+                names = info["custom_nodes"]
+                source = "modal"
+        except Exception as e:
+            print(f"[modal_bridge] list_nodes: /health 不可达,回退本地 ({e})")
+        if names is None:
+            names = list(local_baked.keys())
+        nodes = []
+        for name in sorted(names):
+            b = local_baked.get(name, {})
+            nodes.append({"name": name, "url": b.get("url", ""), "commit": b.get("commit", ""),
+                          "in_local_baked": name in local_baked})
+        return web.json_response({"ok": True, "source": source, "nodes": nodes})
+
     @routes.post("/modal_bridge/check_nodes")
     async def _check_nodes(request: web.Request):
         """
@@ -563,8 +613,10 @@ def _setup_routes():
                app_name?, volume_name?, default_gpu?, scaledown_window?}
         """
         body = await request.json()
-        token_id = (body.get("token_id") or "").strip()
-        token_secret = (body.get("token_secret") or "").strip()
+        # token_secret 现在不回显到前端(/config 已抹掉),留空 = 沿用已存的;token_id 同理
+        _stored = cfg_mod.load_config()
+        token_id = (body.get("token_id") or "").strip() or (_stored.get("modal_token_id") or "")
+        token_secret = (body.get("token_secret") or "").strip() or (_stored.get("modal_token_secret") or "")
         workspace = (body.get("workspace") or "").strip()
 
         resp = web.StreamResponse(
@@ -578,7 +630,7 @@ def _setup_routes():
         if not token_id.startswith("ak-"):
             errs.append("token_id 应以 ak- 开头(modal.com/settings/tokens 创建)")
         if not token_secret.startswith("as-"):
-            errs.append("token_secret 应以 as- 开头")
+            errs.append("token_secret 应以 as- 开头(首次部署必填;之后留空=沿用已存的)")
         if not workspace:
             errs.append("workspace 不能空(modal.com 个人主页 URL 那一段)")
         if errs:
@@ -756,52 +808,16 @@ def _setup_routes():
                 status=502,
             )
 
-        # 4) 写出 base64 → output/modal_results/<job_id>/output.png
+        # 4) 写出图(多图/单图共用 helper)→ output/<subfolder>/<job_id>/
         subfolder = cfg.get("output_subfolder", "modal_results")
-        out_dir = _output_dir() / subfolder / job_id
-        out_dir.mkdir(parents=True, exist_ok=True)
-        outputs = []
-
-        b64 = final.get("data_base64")
-        image_url = final.get("image_url")
-        filename = final.get("filename") or "output.png"
-
-        if b64:
-            try:
-                data = base64.b64decode(b64)
-            except Exception as e:
-                return web.json_response({"error": f"decode base64 failed: {e}", "modal_state": final}, status=502)
-            out_path = out_dir / filename
-            out_path.write_bytes(data)
-            outputs.append({
-                "filename": filename,
-                "subfolder": f"{subfolder}/{job_id}",
-                "type": "output",
-                "size_bytes": len(data),
-            })
-        elif image_url:
-            # 非 incognito 情况下,Modal 会返回 R2 URL — 下载下来
-            try:
-                async with aiohttp.ClientSession() as s:
-                    async with s.get(image_url) as r:
-                        if r.status >= 400:
-                            return web.json_response({"error": f"download {image_url} failed: {r.status}"}, status=502)
-                        data = await r.read()
-            except Exception as e:
-                return web.json_response({"error": f"download failed: {e}"}, status=502)
-            out_path = out_dir / filename
-            out_path.write_bytes(data)
-            outputs.append({
-                "filename": filename,
-                "subfolder": f"{subfolder}/{job_id}",
-                "type": "output",
-                "size_bytes": len(data),
-                "source_url": image_url,
-            })
-        else:
+        try:
+            outputs = await _write_results(final, job_id, subfolder)
+        except Exception as e:
+            return web.json_response({"error": f"write result failed: {e}", "modal_state": final}, status=502)
+        if not outputs:
             return web.json_response({"error": "no image returned", "modal_state": final}, status=502)
 
-        print(f"[modal_bridge] ✓ job {job_id} done in {elapsed}s → {outputs[0]['subfolder']}/{outputs[0]['filename']}")
+        print(f"[modal_bridge] ✓ job {job_id} done in {elapsed}s → {subfolder}/{job_id}/ ({len(outputs)} img)")
 
         return web.json_response({
             "ok": True,

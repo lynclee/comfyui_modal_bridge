@@ -136,12 +136,13 @@ def get_image_data(filename: str, subfolder: str, image_type: str) -> bytes | No
 
 def run_workflow(workflow: dict, job_id: str, input_images: list[dict] | None = None) -> dict:
     """
-    跑一个 workflow,返回第一张产出图 base64。
-    Returns: {data_base64, filename, errors}
+    跑一个 workflow,返回所有产出图 base64。
+    Returns: {images: [{filename, data_base64}], filename, data_base64, errors}
+      - images: 所有非 temp 输出图(支持多 SaveImage / batch 出多图)
+      - filename/data_base64: 第一张(向后兼容老回流路径)
     失败时 raise — 由 caller 转 status="failed"
     """
-    wait_comfy_ready()
-
+    # 注:boot() 已 wait_comfy_ready 过;这里不再重复等(ComfyUI 若中途崩,下面 ws 连接会快速报错)
     if input_images:
         up = upload_images(input_images)
         if up["status"] == "error":
@@ -198,6 +199,7 @@ def run_workflow(workflow: dict, job_id: str, input_images: list[dict] | None = 
             raise ValueError(f"Prompt {prompt_id} not in history")
 
         outputs = history[prompt_id].get("outputs", {})
+        images = []  # 收集所有非 temp 图(多 SaveImage / batch)
         for _, node_output in outputs.items():
             for image_info in node_output.get("images", []):
                 filename = image_info.get("filename")
@@ -209,14 +211,20 @@ def run_workflow(workflow: dict, job_id: str, input_images: list[dict] | None = 
                 if not image_bytes:
                     errors.append(f"failed to fetch {filename}")
                     continue
-                return {
-                    "image_url": None,
+                images.append({
                     "filename": filename,
                     "data_base64": base64.b64encode(image_bytes).decode("utf-8"),
-                    "errors": errors,
-                }
+                })
 
-        raise ValueError(f"No usable images in output. errors={errors}")
+        if not images:
+            raise ValueError(f"No usable images in output. errors={errors}")
+        return {
+            "image_url": None,
+            "images": images,
+            "filename": images[0]["filename"],        # 向后兼容
+            "data_base64": images[0]["data_base64"],   # 向后兼容
+            "errors": errors,
+        }
     finally:
         if ws and ws.connected:
             try:

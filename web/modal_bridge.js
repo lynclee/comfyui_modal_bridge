@@ -238,7 +238,7 @@ async function ensureNodesAvailable(prompt, ctx) {
     return true;
   }
 
-  // 组装确认文案(加 / 改 / 删)
+  // 组装确认文案(只加 / 改,不删 —— 多机并集,删走 Setup 的「管理云端节点」手动做)
   const parts = [];
   if (add.length) {
     parts.push("➕ 新增(Modal 还没有):\n" + add.map((m) =>
@@ -250,11 +250,8 @@ async function ensureNodesAvailable(prompt, ctx) {
       `   • ${m.folder}  ${(m.old_commit || "—").slice(0, 8)} → ${m.commit.slice(0, 8)}`
     ).join("\n"));
   }
-  if (prune.length) {
-    parts.push("➖ 移除(本地已卸载):\n" + prune.map((m) => `   • ${m.name}`).join("\n"));
-  }
   const msg =
-    `custom_node 需要和本地同步(镜像来源:${source}):\n\n${parts.join("\n\n")}\n\n` +
+    `工作流需要的 custom_node 要同步到 Modal(镜像来源:${source}):\n\n${parts.join("\n\n")}\n\n` +
     `点「确定」更新 Modal 镜像并重新部署(约 1-3 分钟,只这一次,之后秒进)。\n` +
     `点「取消」则跳过同步,直接提交。`;
   if (!confirm(msg)) {
@@ -978,16 +975,33 @@ async function openDeployDialog() {
     <input id="mb-dep-ws" type="text" style="${inputCss}" value="${cfg.modal_workspace || ""}" placeholder="your-workspace">
     <label>Token ID <span style="color:#9aa;">(ak-...)</span></label>
     <input id="mb-dep-id" type="text" style="${inputCss}" value="${cfg.modal_token_id || ""}" placeholder="ak-xxxxxxxx">
-    <label>Token Secret <span style="color:#9aa;">(as-...)</span></label>
-    <input id="mb-dep-secret" type="password" style="${inputCss}" value="${cfg.modal_token_secret || ""}" placeholder="as-xxxxxxxx">
+    <label>Token Secret <span style="color:#9aa;">(as-...${cfg.has_token_secret ? ";已保存,留空=沿用" : ""})</span></label>
+    <input id="mb-dep-secret" type="password" style="${inputCss}" value="" placeholder="${cfg.has_token_secret ? "已保存(留空沿用,或粘贴新的覆盖)" : "as-xxxxxxxx"}">
     <label>默认 GPU</label>
     <select id="mb-dep-gpu" style="${inputCss}">${gpuOpts}</select>
     <div style="margin:10px 0;">
       <button id="mb-dep-go" style="padding:8px 18px;background:#2563eb;color:#fff;border:none;border-radius:6px;cursor:pointer;font-weight:600;">部署</button>
+      <button id="mb-dep-test" style="padding:8px 14px;margin-left:8px;background:#374151;color:#ddd;border:none;border-radius:6px;cursor:pointer;">测试连接</button>
       <button id="mb-dep-close" style="padding:8px 14px;margin-left:8px;background:#333;color:#ccc;border:none;border-radius:6px;cursor:pointer;">关闭</button>
       <span id="mb-dep-status" style="margin-left:12px;color:#9aa;"></span>
     </div>
     <pre id="mb-dep-log" style="display:none;background:#111;border:1px solid #333;border-radius:6px;padding:10px;max-height:280px;overflow:auto;white-space:pre-wrap;font:11px/1.4 monospace;color:#bdbdbd;"></pre>
+
+    <div style="margin-top:16px;border-top:1px solid #333;padding-top:12px;">
+      <div style="display:flex;align-items:center;justify-content:space-between;">
+        <span style="font-weight:600;">管理云端节点</span>
+        <button id="mb-nodes-load" style="padding:5px 12px;background:#374151;color:#ddd;border:none;border-radius:6px;cursor:pointer;font-size:12px;">加载镜像节点</button>
+      </div>
+      <div style="color:#9aa;margin-top:4px;font-size:12px;">
+        勾选 = 从云端镜像<b>移除</b>该节点 + 重部署。⚠ 别的电脑若用到会失败、需重新加(多机各装一部分时慎删)。
+      </div>
+      <div id="mb-nodes-list" style="margin-top:8px;max-height:200px;overflow:auto;"></div>
+      <div style="margin-top:8px;">
+        <button id="mb-nodes-prune" style="display:none;padding:7px 14px;background:#7f1d1d;color:#fff;border:none;border-radius:6px;cursor:pointer;font-weight:600;">移除勾选项并重部署</button>
+        <span id="mb-nodes-status" style="margin-left:10px;color:#9aa;font-size:12px;"></span>
+      </div>
+      <pre id="mb-nodes-log" style="display:none;background:#111;border:1px solid #333;border-radius:6px;padding:10px;margin-top:8px;max-height:200px;overflow:auto;white-space:pre-wrap;font:11px/1.4 monospace;color:#bdbdbd;"></pre>
+    </div>
   `;
   overlay.appendChild(panel);
   document.body.appendChild(overlay);
@@ -997,8 +1011,116 @@ async function openDeployDialog() {
   overlay.onclick = (e) => { if (e.target === overlay) close(); };
 
   const goBtn = panel.querySelector("#mb-dep-go");
+  const testBtn = panel.querySelector("#mb-dep-test");
   const statusEl = panel.querySelector("#mb-dep-status");
   const logEl = panel.querySelector("#mb-dep-log");
+
+  // 测试连接:真打一次 Modal /health,查出"app 被删 / endpoint 不通 / key 不对"——
+  // 这些光看本地 config 有没有 token 是查不出的(config 字段在不代表云端 app 还活着)。
+  testBtn.onclick = async () => {
+    testBtn.disabled = true;
+    statusEl.textContent = "测试中(冷启动时可能要等几秒)...";
+    statusEl.style.color = "#9aa";
+    logEl.style.display = "block";
+    logEl.textContent = "GET /modal_bridge/health …\n";
+    try {
+      const r = await api.fetchApi("/modal_bridge/health");
+      const data = await r.json();
+      // 只打 modal/error,不打 data.config(里面含 token)
+      logEl.textContent += JSON.stringify(data.modal ?? { error: data.error ?? "unknown" }, null, 2) + "\n";
+      logEl.scrollTop = logEl.scrollHeight;
+      if (r.ok && data.ok && data.modal?.healthy) {
+        const m = data.modal;
+        const nodes = Array.isArray(m.custom_nodes) ? m.custom_nodes.length : "?";
+        statusEl.textContent = `✓ 连接正常(warm=${m.warm_containers ?? 0}, 已装节点=${nodes})`;
+        statusEl.style.color = "#34d399";
+      } else {
+        const why = data.error || "endpoint 不可达";
+        statusEl.textContent = `✗ 连不上:${String(why).slice(0, 80)} — app 可能没部署/被删,请点「部署」`;
+        statusEl.style.color = "#f87171";
+      }
+    } catch (e) {
+      statusEl.textContent = "✗ 测试失败:" + (e.message || e);
+      statusEl.style.color = "#f87171";
+    } finally {
+      testBtn.disabled = false;
+    }
+  };
+
+  // ---- 管理云端节点(手动清理 / prune)----
+  const nodesLoadBtn = panel.querySelector("#mb-nodes-load");
+  const nodesListEl = panel.querySelector("#mb-nodes-list");
+  const nodesPruneBtn = panel.querySelector("#mb-nodes-prune");
+  const nodesStatusEl = panel.querySelector("#mb-nodes-status");
+  const nodesLogEl = panel.querySelector("#mb-nodes-log");
+  let loadedNodes = [];  // [{name,url,commit}]
+
+  nodesLoadBtn.onclick = async () => {
+    nodesLoadBtn.disabled = true;
+    nodesStatusEl.textContent = "加载中...";
+    nodesStatusEl.style.color = "#9aa";
+    try {
+      const r = await api.fetchApi("/modal_bridge/list_nodes");
+      const d = await r.json();
+      loadedNodes = d.nodes || [];
+      if (!loadedNodes.length) {
+        nodesListEl.innerHTML = `<div style="color:#9aa;font-size:12px;">镜像里没有 custom_node</div>`;
+        nodesPruneBtn.style.display = "none";
+      } else {
+        nodesListEl.innerHTML = loadedNodes.map((n, i) =>
+          `<label style="display:flex;align-items:center;gap:8px;padding:3px 0;font-size:12px;cursor:pointer;">
+             <input type="checkbox" class="mb-node-cb" data-i="${i}">
+             <span>${n.name}</span>
+             ${n.in_local_baked ? "" : `<span style="color:#fbbf24;font-size:10px;">(本地无 git 信息)</span>`}
+           </label>`).join("");
+        nodesPruneBtn.style.display = "inline-block";
+      }
+      nodesStatusEl.textContent = `镜像实装 ${loadedNodes.length} 个(来源:${d.source})`;
+      nodesStatusEl.style.color = "#9aa";
+    } catch (e) {
+      nodesStatusEl.textContent = "✗ 加载失败:" + (e.message || e);
+      nodesStatusEl.style.color = "#f87171";
+    } finally {
+      nodesLoadBtn.disabled = false;
+    }
+  };
+
+  nodesPruneBtn.onclick = async () => {
+    const checked = [...panel.querySelectorAll(".mb-node-cb:checked")]
+      .map((cb) => loadedNodes[parseInt(cb.dataset.i, 10)]);
+    if (!checked.length) { nodesStatusEl.textContent = "没勾选任何节点"; return; }
+    const removeNames = new Set(checked.map((n) => n.name));
+    const keep = loadedNodes.filter((n) => !removeNames.has(n.name));
+    const list = checked.map((n) => "  • " + n.name).join("\n");
+    if (!confirm(`确定从云端镜像移除这 ${checked.length} 个节点并重部署?\n\n${list}\n\n` +
+                 `⚠ 别的电脑若用到这些节点会失败,需要时重新加。`)) return;
+
+    nodesPruneBtn.disabled = true;
+    nodesStatusEl.textContent = "重部署中(约 1-3 分钟,别关窗口)...";
+    nodesStatusEl.style.color = "#9aa";
+    nodesLogEl.style.display = "block";
+    nodesLogEl.textContent = "";
+    try {
+      const rc = await streamPost("/modal_bridge/sync_nodes", {
+        new_baked: keep.map((n) => ({ name: n.name, url: n.url, commit: n.commit })),
+        summary: { add: 0, update: 0, prune: checked.length },
+      }, (line) => { nodesLogEl.textContent += line + "\n"; nodesLogEl.scrollTop = nodesLogEl.scrollHeight; });
+      if (rc === 0) {
+        nodesStatusEl.textContent = `✓ 已移除 ${checked.length} 个,镜像现 ${keep.length} 个`;
+        nodesStatusEl.style.color = "#34d399";
+        notify(`✓ 已从云端移除 ${checked.length} 个 custom_node`, "success");
+        nodesLoadBtn.onclick();  // 刷新列表
+      } else {
+        nodesStatusEl.textContent = `✗ 重部署失败 rc=${rc}(看日志)`;
+        nodesStatusEl.style.color = "#f87171";
+      }
+    } catch (e) {
+      nodesStatusEl.textContent = "✗ " + (e.message || e);
+      nodesStatusEl.style.color = "#f87171";
+    } finally {
+      nodesPruneBtn.disabled = false;
+    }
+  };
 
   goBtn.onclick = async () => {
     const payload = {
@@ -1007,8 +1129,12 @@ async function openDeployDialog() {
       token_secret: panel.querySelector("#mb-dep-secret").value.trim(),
       default_gpu: panel.querySelector("#mb-dep-gpu").value,
     };
-    if (!payload.token_id.startsWith("ak-") || !payload.token_secret.startsWith("as-") || !payload.workspace) {
-      statusEl.textContent = "请填对 workspace + ak-/as- token";
+    // token_secret 留空 = 沿用已存的(/config 不再回显它);只有填了才校验格式
+    const secretOk = payload.token_secret === "" ? cfg.has_token_secret : payload.token_secret.startsWith("as-");
+    if (!payload.token_id.startsWith("ak-") || !secretOk || !payload.workspace) {
+      statusEl.textContent = cfg.has_token_secret
+        ? "请填对 workspace + ak- token(secret 可留空沿用)"
+        : "请填对 workspace + ak-/as- token";
       statusEl.style.color = "#f87171";
       return;
     }
