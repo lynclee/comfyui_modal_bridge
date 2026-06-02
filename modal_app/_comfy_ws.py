@@ -122,11 +122,10 @@ def _parse_validation_error(err: dict):
     return details, is_missing_value
 
 
-def queue_workflow(workflow: dict, client_id: str, _retried: bool = False) -> dict:
-    payload = {"prompt": workflow, "client_id": client_id}
+def queue_workflow(workflow: dict, client_id: str) -> dict:
     r = requests.post(
         f"http://{COMFY_HOST}/prompt",
-        data=json.dumps(payload).encode("utf-8"),
+        data=json.dumps({"prompt": workflow, "client_id": client_id}).encode("utf-8"),
         headers={"Content-Type": "application/json"},
         timeout=30,
     )
@@ -135,19 +134,7 @@ def queue_workflow(workflow: dict, client_id: str, _retried: bool = False) -> di
             err = r.json()
         except json.JSONDecodeError:
             raise ValueError(f"ComfyUI 400: {r.text}")
-        details, is_missing_value = _parse_validation_error(err)
-        # warm 容器没看到运行时新上传的模型 → reload Volume + 刷新 ComfyUI 模型列表,重试一次
-        if is_missing_value and not _retried:
-            print("[bridge] 模型不在列表(warm 容器缓存旧),reload Volume + 刷新后重试...")
-            try:
-                import modal
-                modal.Volume.from_name(
-                    os.environ.get("MODAL_BRIDGE_VOLUME", "comfyui-bridge-models")
-                ).reload()
-            except Exception as e:
-                print(f"[bridge] volume reload 失败: {e}")
-            refresh_model_list()
-            return queue_workflow(workflow, client_id, _retried=True)
+        details, _ = _parse_validation_error(err)
         if details:
             raise ValueError("Workflow validation: " + "; ".join(details))
         raise ValueError(f"ComfyUI 400: {r.text}")

@@ -132,8 +132,13 @@ def _worker_run(workflow: dict, job_id: str, input_images: list | None = None) -
         time.sleep(0.1)
     job_state[job_id] = {**job_state.get(job_id, {}), "status": "running", "started_at": time.time()}
     try:
-        # Volume 已在 boot() reload;这里不能再 reload(ComfyUI 已打开文件会冲突)
-        from _comfy_ws import run_workflow
+        # ⭐ 每个 job 跑之前 reload Volume:warm 容器在 boot 那刻冻结了 Volume 视图,
+        # 运行时新上传的模型看不到 → 验证失败。这里在 ComfyUI 加载模型之前 reload(还没打开
+        # 模型文件,不冲突)+ 刷新 ComfyUI 模型列表,保证每次都拿到最新 Volume。这是根治
+        # "Volume 有了 worker 还说没有"的正解(取代之前的失败重试)。
+        models_vol.reload()
+        from _comfy_ws import run_workflow, refresh_model_list
+        refresh_model_list()  # 让 ComfyUI 重扫(boot 时缓存的列表可能旧)
         result = run_workflow(workflow=workflow, job_id=job_id, input_images=input_images)
     except Exception as e:
         import traceback
