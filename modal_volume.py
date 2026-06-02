@@ -157,14 +157,27 @@ def check_models(cfg: dict, required: list, resolver) -> dict:
 # ============================================================================
 # 上传:本地文件 → Volume(batch_upload,CAS 去重)
 # ============================================================================
+def _fmt_eta(sec: float) -> str:
+    sec = int(max(0, sec))
+    if sec < 60:
+        return f"{sec}s"
+    if sec < 3600:
+        return f"{sec // 60}m{sec % 60:02d}s"
+    return f"{sec // 3600}h{(sec % 3600) // 60:02d}m"
+
+
 def upload_models(cfg: dict, items: list, on_progress=None) -> dict:
     """
     items: [{type, filename, local_path}, ...]
-    on_progress(idx, total, item): 每个文件开始上传前回调(可选,流式日志用)
+    on_progress(event): 流式进度回调(可选)。event 形态:
+      {phase:"start", idx, total, name, size_mb, done_mb, total_mb, rate_mbps, eta}
+      {phase:"done",  idx, total, name, size_mb, secs, rate_mbps, done_mb, total_mb}
+    单个大文件内部 SDK 不给字节级进度,故按「已完成文件 + 累计平均速率」估算总体进度/ETA。
 
     返回 {uploaded: [...], skipped: [...], total_mb: int}
     Modal Volume CAS 块级去重:相同内容(网上通用大模型)秒过,只有新内容真正占上行带宽。
     """
+    import time
     if not items:
         return {"uploaded": [], "skipped": [], "total_mb": 0}
 
@@ -188,15 +201,36 @@ def upload_models(cfg: dict, items: list, on_progress=None) -> dict:
         pending.append((it, local))
 
     if pending:
+        # 预先算各文件大小 + 总量,用于整体进度/ETA
+        sizes = [max(1, Path(p[1]).stat().st_size // 1024 // 1024) for p in pending]
+        grand_total = sum(sizes)
         vol = get_volume(cfg)
+        done_mb = 0
+        t0 = time.time()
         with vol.batch_upload(force=False) as batch:
             for i, (it, local) in enumerate(pending):
-                size_mb = local.stat().st_size // 1024 // 1024
-                total_mb += size_mb
+                size_mb = sizes[i]
+                # 用「之前已传字节 / 已用时」估当前平均速率,推剩余 ETA(首个文件还没速率)
+                elapsed = time.time() - t0
+                rate = (done_mb / elapsed) if (done_mb and elapsed > 0) else 0  # MB/s
+                eta = _fmt_eta((grand_total - done_mb) / rate) if rate else "…"
                 if on_progress:
-                    on_progress(i, len(pending), {**it, "size_mb": size_mb})
+                    on_progress({"phase": "start", "idx": i, "total": len(pending),
+                                 "name": f"{it['type']}/{it['filename']}", "size_mb": size_mb,
+                                 "done_mb": done_mb, "total_mb": grand_total,
+                                 "rate_mbps": round(rate, 1), "eta": eta})
+                f0 = time.time()
                 batch.put_file(str(local), f"models/{it['type']}/{it['filename']}")
+                secs = time.time() - f0
+                done_mb += size_mb
+                total_mb += size_mb
                 uploaded.append({**it, "size_mb": size_mb})
+                if on_progress:
+                    fr = (size_mb / secs) if secs > 0 else 0
+                    on_progress({"phase": "done", "idx": i, "total": len(pending),
+                                 "name": f"{it['type']}/{it['filename']}", "size_mb": size_mb,
+                                 "secs": round(secs, 1), "rate_mbps": round(fr, 1),
+                                 "done_mb": done_mb, "total_mb": grand_total})
     return {"uploaded": uploaded, "skipped": skipped, "total_mb": total_mb}
 
 

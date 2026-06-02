@@ -96,10 +96,17 @@ def main():
         return
 
     print("\n开始上传(块级去重,相同内容秒过;新内容走你的上行带宽,耐心等)...")
-    result = modal_volume.upload_models(
-        cfg, items,
-        on_progress=lambda i, n, it: print(f"  ↑ [{i+1}/{n}] {it['type']}/{it['filename']} ({it['size_mb']} MB)"),
-    )
+
+    def _prog(ev):
+        if ev["phase"] == "start":
+            pct = int(ev["done_mb"] * 100 / ev["total_mb"]) if ev["total_mb"] else 0
+            speed = f"{ev['rate_mbps']} MB/s, ETA {ev['eta']}" if ev["rate_mbps"] else "测速中…"
+            print(f"  ↑ [{ev['idx']+1}/{ev['total']}] {ev['name']} ({ev['size_mb']} MB) "
+                  f"— {ev['done_mb']}/{ev['total_mb']} MB ({pct}%), {speed}")
+        else:
+            print(f"    ✓ {ev['name']} {ev['size_mb']}MB / {ev['secs']}s ({ev['rate_mbps']} MB/s)")
+
+    result = modal_volume.upload_models(cfg, items, on_progress=_prog)
     print(f"\n✓ 同步完成:{len(result['uploaded'])} 个,共 ~{result['total_mb']} MB。"
           f"这些模型现在 Volume 里有了,工作流用到时直接命中。")
 

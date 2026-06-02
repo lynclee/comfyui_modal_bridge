@@ -192,6 +192,11 @@ _STREAM_SENTINEL = object()
 # Volume 写同一个大模型撞车(用户实测 35GB flux2 dev 并发上传会失败)。
 _UPLOAD_LOCK = asyncio.Lock()
 
+# 部署串行化:写 _custom_nodes_data.py + modal deploy 这段必须独占——两个并发请求
+# (/sync_nodes 之间、或 /sync_nodes 与 /deploy)同时写清单会互相覆盖、两个 modal deploy
+# 打同一个 app 也会冲突。整段(写文件 + deploy)包进同一把锁。
+_DEPLOY_LOCK = asyncio.Lock()
+
 
 async def _run_blocking_streamed(resp: web.StreamResponse, fn):
     """在线程里跑一个阻塞函数 fn(emit),emit(line) 线程安全地把日志流式写回 resp。
@@ -429,8 +434,15 @@ def _setup_routes():
         await _emit(resp, "== Modal Volume 块级去重:网上通用大模型秒过,只有新内容真正占上行带宽 ==\n\n")
 
         def do_upload(emit):
-            def on_progress(i, n, it):
-                emit(f"  ↑ [{i+1}/{n}] {it['type']}/{it['filename']} ({it.get('size_mb', '?')} MB)\n")
+            def on_progress(ev):
+                if ev["phase"] == "start":
+                    pct = int(ev["done_mb"] * 100 / ev["total_mb"]) if ev["total_mb"] else 0
+                    speed = f"{ev['rate_mbps']} MB/s, 约剩 {ev['eta']}" if ev["rate_mbps"] else "测速中…"
+                    emit(f"  ↑ [{ev['idx']+1}/{ev['total']}] {ev['name']} ({ev['size_mb']} MB) "
+                         f"— 总进度 {ev['done_mb']}/{ev['total_mb']} MB ({pct}%), {speed}\n")
+                else:  # done
+                    emit(f"    ✓ {ev['name']} 完成 {ev['size_mb']} MB / {ev['secs']}s "
+                         f"({ev['rate_mbps']} MB/s)\n")
             return modal_volume.upload_models(cfg, items, on_progress=on_progress)
 
         # 串行化:有别的上传在跑就排队等(上传前会复查 Volume,等到时多半已有、直接跳过)
@@ -509,11 +521,7 @@ def _setup_routes():
                 continue
             clean.append({"name": name, "url": e.get("url", ""), "commit": e.get("commit", "")})
 
-        node_sync.write_baked_nodes(clean)
         summary = body.get("summary") or {}
-        print(f"[modal_bridge] sync_nodes: baked → {len(clean)} 条 (add={summary.get('add')} "
-              f"update={summary.get('update')} prune={summary.get('prune')})")
-
         cfg = cfg_mod.load_config()
         cwd = str(node_sync.MODAL_APP_DIR)
 
@@ -523,17 +531,25 @@ def _setup_routes():
         )
         await resp.prepare(request)
 
-        await _emit(resp, f"== 同步 custom_nodes:加 {summary.get('add', '?')} / 改 "
-                          f"{summary.get('update', '?')} / 删 {summary.get('prune', '?')} ==\n")
-        await _emit(resp, f"== 镜像清单现 {len(clean)} 条,重新部署(clone + 装依赖约 1-3 分钟,别关窗口)==\n\n")
+        if _DEPLOY_LOCK.locked():
+            await _emit(resp, "== 另有部署/节点同步进行中,排队等待(避免并发写清单 + deploy 撞车)…\n\n")
+        # 写清单 + deploy 整段独占:并发请求会互相覆盖 _custom_nodes_data.py、两个 deploy 也冲突
+        async with _DEPLOY_LOCK:
+            node_sync.write_baked_nodes(clean)
+            print(f"[modal_bridge] sync_nodes: baked → {len(clean)} 条 (add={summary.get('add')} "
+                  f"update={summary.get('update')} prune={summary.get('prune')})")
 
-        rc = await _ensure_modal(resp)
-        if rc != 0:
-            await _emit(resp, f"\n__DEPLOY_DONE__ rc={rc}\n")
-            await resp.write_eof()
-            return resp
+            await _emit(resp, f"== 同步 custom_nodes:加 {summary.get('add', '?')} / 改 "
+                              f"{summary.get('update', '?')} / 删 {summary.get('prune', '?')} ==\n")
+            await _emit(resp, f"== 镜像清单现 {len(clean)} 条,重新部署(clone + 装依赖约 1-3 分钟,别关窗口)==\n\n")
 
-        rc = await _run_streamed(resp, node_sync.deploy_command(), cwd=cwd, env=node_sync.deploy_env(cfg))
+            rc = await _ensure_modal(resp)
+            if rc != 0:
+                await _emit(resp, f"\n__DEPLOY_DONE__ rc={rc}\n")
+                await resp.write_eof()
+                return resp
+
+            rc = await _run_streamed(resp, node_sync.deploy_command(), cwd=cwd, env=node_sync.deploy_env(cfg))
         await _emit(resp, f"\n__DEPLOY_DONE__ rc={rc}\n")
         await resp.write_eof()
         return resp
@@ -610,31 +626,35 @@ def _setup_routes():
             await resp.write_eof()
             return resp
 
-        # 2) 建 / 更新 secret(放 HF / Civitai token)
-        await _emit(resp, "\n== 创建 Modal Secret ==\n")
-        rc = await _run_streamed(
-            resp, node_sync.secret_create_cmd(cfg, hf_token, civitai_token, bridge_key), cwd=cwd, env=env,
-        )
-        if rc != 0:
-            await _emit(resp, "== ✗ secret 创建失败(token 可能无效)==\n")
-            await _emit(resp, f"\n__DEPLOY_DONE__ rc={rc}\n")
-            await resp.write_eof()
-            return resp
+        if _DEPLOY_LOCK.locked():
+            await _emit(resp, "\n== 另有部署/节点同步进行中,排队等待…\n")
+        # secret + deploy + 写 config 整段独占(与 /sync_nodes 共用锁,避免并发 deploy 冲突)
+        async with _DEPLOY_LOCK:
+            # 2) 建 / 更新 secret(放 HF / Civitai token)
+            await _emit(resp, "\n== 创建 Modal Secret ==\n")
+            rc = await _run_streamed(
+                resp, node_sync.secret_create_cmd(cfg, hf_token, civitai_token, bridge_key), cwd=cwd, env=env,
+            )
+            if rc != 0:
+                await _emit(resp, "== ✗ secret 创建失败(token 可能无效)==\n")
+                await _emit(resp, f"\n__DEPLOY_DONE__ rc={rc}\n")
+                await resp.write_eof()
+                return resp
 
-        # 3) 部署 app(首次拉镜像 3-5 分钟)
-        await _emit(resp, "\n== modal deploy(首次拉镜像约 3-5 分钟,别关窗口)==\n")
-        rc = await _run_streamed(resp, node_sync.deploy_command(), cwd=cwd, env=env)
-        if rc != 0:
-            await _emit(resp, "== ✗ modal deploy 失败 ==\n")
-            await _emit(resp, f"\n__DEPLOY_DONE__ rc={rc}\n")
-            await resp.write_eof()
-            return resp
+            # 3) 部署 app(首次拉镜像 3-5 分钟)
+            await _emit(resp, "\n== modal deploy(首次拉镜像约 3-5 分钟,别关窗口)==\n")
+            rc = await _run_streamed(resp, node_sync.deploy_command(), cwd=cwd, env=env)
+            if rc != 0:
+                await _emit(resp, "== ✗ modal deploy 失败 ==\n")
+                await _emit(resp, f"\n__DEPLOY_DONE__ rc={rc}\n")
+                await resp.write_eof()
+                return resp
 
-        # 4) 写本地 config(在 ComfyUI 进程里,路径用 folder_paths,必对)
-        cfg_mod.save_config(cfg)
-        await _emit(resp, f"\n== ✓ config 已写入(endpoint={endpoint_base})==\n")
+            # 4) 写本地 config(在 ComfyUI 进程里,路径用 folder_paths,必对)
+            cfg_mod.save_config(cfg)
+            await _emit(resp, f"\n== ✓ config 已写入(endpoint={endpoint_base})==\n")
 
-        # 5) 验证 health
+        # 5) 验证 health(锁外即可)
         try:
             async with aiohttp.ClientSession() as s:
                 h = await modal_client.health(s, cfg)
