@@ -1007,10 +1007,10 @@ async function openDeployDialog() {
       <span style="color:${vColor};">${vHint}</span>
     </div>
     <div style="color:#9aa;margin-bottom:14px;">
-      全程在 ComfyUI 里完成,不用开终端。需要 Modal token(免费注册,送 $30):
+      全程在 ComfyUI 里完成,不用开终端。需要 Modal token(免费注册,每月送 $30):
       <a href="https://modal.com/settings/tokens" target="_blank" style="color:#6cf;">modal.com/settings/tokens</a>
     </div>
-    <label>Workspace <span style="color:#9aa;">(modal.com 个人主页 URL 那段,如 lync5134)</span></label>
+    <label>Workspace <span style="color:#9aa;">(modal.com 个人主页 URL 那段,如 your-workspace)</span></label>
     <input id="mb-dep-ws" type="text" style="${inputCss}" value="${cfg.modal_workspace || ""}" placeholder="your-workspace">
     <label>Token ID <span style="color:#9aa;">(ak-...)</span></label>
     <input id="mb-dep-id" type="text" style="${inputCss}" value="${cfg.modal_token_id || ""}" placeholder="ak-xxxxxxxx">

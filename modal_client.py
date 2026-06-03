@@ -9,7 +9,7 @@ import aiohttp
 
 
 def _endpoint(base: str, label: str) -> str:
-    """https://lync5134--comfyui-bridge + '-run' → https://lync5134--comfyui-bridge-run.modal.run"""
+    """https://<ws>--comfyui-bridge + '-run' → https://<ws>--comfyui-bridge-run.modal.run"""
     return f"{base.rstrip('/')}-{label}.modal.run"
 
 

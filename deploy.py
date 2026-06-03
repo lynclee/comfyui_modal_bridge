@@ -9,8 +9,8 @@ deploy.py — comfyui_modal_bridge 命令行部署(GUI 上点 [⚙️ Modal Setu
 
 用法:
     cd custom_nodes/comfyui_modal_bridge
-    python deploy.py --workspace lync5134 --token-id ak-xxx --token-secret as-xxx
-    python deploy.py --workspace lync5134            # token 走环境变量 MODAL_TOKEN_ID/SECRET
+    python deploy.py --workspace your-workspace --token-id ak-xxx --token-secret as-xxx
+    python deploy.py --workspace your-workspace      # token 走环境变量 MODAL_TOKEN_ID/SECRET
 """
 import argparse
 import json
@@ -36,7 +36,7 @@ def run(cmd, **kw):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--workspace", required=True, help="Modal workspace(modal.com 个人主页那段,如 lync5134)")
+    ap.add_argument("--workspace", required=True, help="Modal workspace(modal.com 个人主页那段,如 your-workspace)")
     ap.add_argument("--token-id", default=os.environ.get("MODAL_TOKEN_ID", ""), help="ak-...")
     ap.add_argument("--token-secret", default=os.environ.get("MODAL_TOKEN_SECRET", ""), help="as-...")
     ap.add_argument("--hf-token", default="", help="可选,下私有模型用(本方案模型走本地上传,一般不需要)")

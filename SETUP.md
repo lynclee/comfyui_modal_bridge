@@ -18,7 +18,7 @@
 
 1. 注册 Modal(送 $30/月免费额度,不绑卡):https://modal.com
 2. 拿 **Token ID**(`ak-…`)+ **Token Secret**(`as-…`):https://modal.com/settings/tokens
-3. 记下 **workspace 名**(modal.com 个人主页 URL 那段,如 `lync-lee`)。
+3. 记下 **workspace 名**(modal.com 个人主页 URL 那段,如 `your-workspace`)。
 
 ## 方式 A:GUI 部署(推荐,零终端)
 
@@ -122,7 +122,7 @@ Push the current ComfyUI workflow to a Modal Serverless GPU (H100) with one clic
 
 1. Sign up (free $30/mo, no card): https://modal.com
 2. Get **Token ID** (`ak-…`) + **Token Secret** (`as-…`): https://modal.com/settings/tokens
-3. Note your **workspace name** (the segment in your modal.com profile URL, e.g. `lync-lee`).
+3. Note your **workspace name** (the segment in your modal.com profile URL, e.g. `your-workspace`).
 
 ## Option A: GUI deploy (recommended, no terminal)
 
