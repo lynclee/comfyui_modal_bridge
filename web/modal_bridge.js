@@ -16,6 +16,150 @@ const log = (...a) => console.log("[modal_bridge]", ...a);
 const err = (...a) => console.error("[modal_bridge]", ...a);
 
 // =====================================================================
+// i18n —— 跟随 ComfyUI 的 Comfy.Locale 设置(zh/en),实时切换
+// t("key", {vars}) 取当前语言文案;字典 I18N 在文件末尾集中定义。
+// 注:ComfyUI Settings 项注册后无法实时切换(架构限制),取 _locale() 在注册时定语言,
+//     切语言需刷新页面;其余(对话框/弹窗/通知/进度)每次调 t() 实时跟随。
+// =====================================================================
+function _locale() {
+  try {
+    const v = app.ui?.settings?.getSettingValue?.("Comfy.Locale");
+    if (typeof v === "string" && v) return v.toLowerCase().startsWith("zh") ? "zh" : "en";
+    return (navigator.language || "en").toLowerCase().startsWith("zh") ? "zh" : "en";
+  } catch (e) { return "en"; }
+}
+// =====================================================================
+// i18n 字典 —— 所有用户可见文案的 zh/en。新增文案在此加一条,代码里用 t("key")。
+// =====================================================================
+const I18N = {
+  // —— Setup 部署对话框 ——
+  "dlg.title":        { zh: "☁️ 部署到 Modal", en: "☁️ Deploy to Modal" },
+  "dlg.intro":        { zh: "全程在 ComfyUI 里完成,不用开终端。需要 Modal token(免费注册,每月送 $30):",
+                        en: "All inside ComfyUI, no terminal. Needs a Modal token (free signup, $30/month free):" },
+  "dlg.ver.local":    { zh: "插件(本地):", en: "Plugin (local): " },
+  "dlg.ver.deployed": { zh: "云端部署:", en: "Deployed: " },
+  "dlg.ver.aligned":  { zh: "✓ 已对齐", en: "✓ aligned" },
+  "dlg.ver.mismatch": { zh: "⚠ 不一致,请点「部署」更新云端", en: "⚠ mismatch — click Deploy to update" },
+  "dlg.ver.unreach":  { zh: "云端未部署 / 连不上", en: "not deployed / unreachable" },
+  "dlg.ver.notconn":  { zh: "未连接", en: "not connected" },
+  "dlg.ws.hint":      { zh: "(modal.com 个人主页 URL 那段,如 your-workspace)",
+                        en: "(the segment in your modal.com profile URL, e.g. your-workspace)" },
+  "dlg.secret.saved": { zh: ";已保存,留空=沿用", en: "; saved, leave blank to reuse" },
+  "dlg.secret.ph_saved": { zh: "••••••••(已保存,留空沿用)", en: "•••••••• (saved, blank=reuse)" },
+  "dlg.gpu.note":     { zh: "GPU:H100 →(排不到)A100-80GB,所有工作流统一,无需选择。",
+                        en: "GPU: H100 → A100-80GB (fallback), unified for all workflows." },
+  "dlg.btn.deploy":   { zh: "部署", en: "Deploy" },
+  "dlg.btn.test":     { zh: "测试连接", en: "Test connection" },
+  "dlg.btn.close":    { zh: "关闭", en: "Close" },
+  "dlg.nodes.title":  { zh: "管理云端节点", en: "Manage cloud nodes" },
+  "dlg.nodes.load":   { zh: "加载镜像节点", en: "Load image nodes" },
+  "dlg.nodes.warn":   { zh: "勾选 = 从云端镜像移除该节点 + 重部署。⚠ 别的电脑若用到会失败、需重新加(多机各装一部分时慎删)。",
+                        en: "Checked = remove from cloud image + redeploy. ⚠ other machines using it will fail and need re-add." },
+  "dlg.nodes.prune":  { zh: "移除勾选项并重部署", en: "Remove selected & redeploy" },
+  // —— 测试连接 ——
+  "test.running":     { zh: "测试中(冷启动时可能要等几秒)...", en: "Testing (cold start may take a few seconds)..." },
+  "test.ok":          { zh: "✓ 连接正常(云端 {ver}, warm={warm}, 已装节点={nodes})",
+                        en: "✓ Connected (cloud {ver}, warm={warm}, nodes={nodes})" },
+  "test.fail":        { zh: "✗ 连不上:{why} — app 可能没部署/被删,请点「部署」",
+                        en: "✗ Unreachable: {why} — app may be undeployed/deleted, click Deploy" },
+  "test.err":         { zh: "✗ 测试失败:{e}", en: "✗ Test failed: {e}" },
+  "test.unreach":     { zh: "endpoint 不可达", en: "endpoint unreachable" },
+  // —— 部署按钮 / 节点管理动作 ——
+  "dep.fill_saved":   { zh: "请填对 workspace + ak- token(secret 可留空沿用)",
+                        en: "Fill workspace + ak- token (secret may be left blank)" },
+  "dep.fill_all":     { zh: "请填对 workspace + ak-/as- token", en: "Fill workspace + ak-/as- token" },
+  "dep.running":      { zh: "部署中(首次拉镜像约 3-5 分钟,别关窗口)...",
+                        en: "Deploying (first image pull ~3-5 min, keep window open)..." },
+  "dep.ok":           { zh: "✓ 部署成功!可以关掉这个窗口去出图了",
+                        en: "✓ Deployed! Close this window and start generating." },
+  "dep.ok.toast":     { zh: "✓ Modal 部署成功", en: "✓ Modal deployed" },
+  "dep.fail":         { zh: "✗ 部署失败 rc={rc}(看上面日志)", en: "✗ Deploy failed rc={rc} (see log above)" },
+  "dep.fail.toast":   { zh: "Modal 部署失败 rc={rc}", en: "Modal deploy failed rc={rc}" },
+  "nodes.redeploying":{ zh: "重部署中(约 1-3 分钟,别关窗口)...", en: "Redeploying (~1-3 min, keep window open)..." },
+  // —— 节点同步 ——
+  "node.scan":        { zh: "扫描工作流 custom nodes...", en: "Scanning workflow custom nodes..." },
+  "node.nogit":       { zh: "这些 custom_node 没有 git 信息,无法自动补:\n{list}",
+                        en: "These custom_nodes have no git info, cannot auto-add:\n{list}" },
+  "node.ok":          { zh: "nodes ok ({baked} custom + {builtin} builtin)", en: "nodes ok ({baked} custom + {builtin} builtin)" },
+  "node.confirm_skip":{ zh: "部分 custom_node 无法自动补,仍然提交?(很可能失败)",
+                        en: "Some custom_nodes can't be auto-added. Submit anyway? (likely to fail)" },
+  "node.sync_title":  { zh: "工作流需要的 custom_node 要同步到 Modal(镜像来源:{src}):\n\n{parts}\n\n点「确定」更新 Modal 镜像并重新部署(约 1-3 分钟,只这一次,之后秒进)。\n点「取消」则跳过同步,直接提交。",
+                        en: "Custom_nodes to sync to Modal (image source: {src}):\n\n{parts}\n\nOK = update Modal image & redeploy (~1-3 min, one-time, instant after).\nCancel = skip sync and submit." },
+  "node.add_head":    { zh: "➕ 新增(Modal 还没有):", en: "➕ Add (not on Modal yet):" },
+  "node.upd_head":    { zh: "🔄 更新(本地 commit 变了):", en: "🔄 Update (local commit changed):" },
+  "node.nodes_n":     { zh: "{n} 节点", en: "{n} nodes" },
+  "node.skip_confirm":{ zh: "不同步节点,直接提交?(可能失败)", en: "Submit without syncing nodes? (may fail)" },
+  "node.redeploy":    { zh: "Redeploying Modal image...", en: "Redeploying Modal image..." },
+  "node.updated":     { zh: "✓ image updated", en: "✓ image updated" },
+  "node.deploy_fail": { zh: "Modal 重部署失败(看进度窗 deploy 日志 / ComfyUI 控制台)",
+                        en: "Modal redeploy failed (see progress log / ComfyUI console)" },
+  // —— 模型同步 ——
+  "mdl.on_volume":    { zh: "{present}/{total} 已在 Volume", en: "{present}/{total} on Volume" },
+  "mdl.downloading":  { zh: "这些模型本地还在下载中,现在传会传成残缺文件:\n\n{list}\n\n建议:等本地下完再点 [☁️ Modal]。\n\n仍然继续提交?(会缺这些模型,大概率失败)",
+                        en: "These models are still downloading locally; uploading now would push partial files:\n\n{list}\n\nTip: wait until done, then click [☁️ Modal].\n\nSubmit anyway? (missing these, likely to fail)" },
+  "mdl.cancel_dl":    { zh: "Cancelled — 本地模型还在下载中", en: "Cancelled — local models still downloading" },
+  "mdl.no_source":    { zh: "下面这些模型 Modal Volume 没有,本地也找不到,无法自动同步:\n\n{list}\n\n解决:先在本地 ComfyUI 里把这些模型下到对应 models/<类型>/ 目录,再跑。\n\n仍然继续提交?(大概率失败)",
+                        en: "These models are on neither the Volume nor locally, can't auto-sync:\n\n{list}\n\nFix: download them locally into models/<type>/ first, then run.\n\nSubmit anyway? (likely to fail)" },
+  "mdl.cancel_miss":  { zh: "Cancelled — 缺本地模型", en: "Cancelled — missing local models" },
+  "mdl.all_present":  { zh: "模型齐全({present}/{total})✓", en: "All models present ({present}/{total}) ✓" },
+  "mdl.upload_confirm":{ zh: "这些模型本地有、Modal Volume 还没有,需要上传一次(共 ~{mb} MB):\n\n{list}\n\n点「确定」上传到 Volume(块级去重:网上通用大模型秒过,只有新内容真正占上行带宽;只这一次,之后秒进)。\n点「取消」则不传,直接提交。",
+                        en: "These models exist locally but not on the Volume, need a one-time upload (~{mb} MB):\n\n{list}\n\nOK = upload to Volume (block dedup: common big models are instant; one-time, instant after).\nCancel = skip and submit." },
+  "mdl.uploading":    { zh: "上传 {n} 个模型到 Volume...", en: "Uploading {n} models to Volume..." },
+  "mdl.upload_fail":  { zh: "模型上传失败(看进度窗日志 / ComfyUI 控制台)", en: "Model upload failed (see progress log / ComfyUI console)" },
+  "mdl.synced":       { zh: "{n} 个模型已同步 ✓", en: "{n} models synced ✓" },
+  // —— 通知 / 版本契约 / 恢复 ——
+  "toast.saved_no_node":{ zh: "图已存到 output/{sf}/(没找到对应输出节点)", en: "Image saved to output/{sf}/ (no matching output node)" },
+  "toast.bg_done":    { zh: "✓ 后台工作流出图完成,切到该 tab 即显示(也已存 output/{sf}/)",
+                        en: "✓ Background workflow done; switch to its tab to view (also saved to output/{sf}/)" },
+  "toast.not_deployed":{ zh: "还没部署到 Modal。先点右上角 [⚙️ Modal Setup] 填 token 一键部署(不用开终端)",
+                        en: "Not deployed yet. Click [⚙️ Modal Setup] top-right to deploy with your token (no terminal)." },
+  "toast.fail":       { zh: "✗ {wf} 失败:{msg}", en: "✗ {wf} failed: {msg}" },
+  "toast.recovered":  { zh: "✓ {wf} 恢复完成 → output/{sf}/", en: "✓ {wf} recovered → output/{sf}/" },
+  "toast.still":      { zh: "Job {id} 仍在 {status};重新点 [☁️ Modal] 监控", en: "Job {id} still {status}; click [☁️ Modal] again to monitor" },
+  "stage.still":      { zh: "still {status};重新点 [☁️ Modal] 监控", en: "still {status}; click [☁️ Modal] again" },
+  "ver.unreach_toast":{ zh: "云端连不上(app 可能没部署/被删)。点 [⚙️ Modal Setup] 重新部署",
+                        en: "Cloud unreachable (app maybe undeployed/deleted). Click [⚙️ Modal Setup] to redeploy." },
+  "ver.mismatch_toast":{ zh: "插件版本 {local} 与云端部署的 {deployed} 不一致,需重新部署。",
+                        en: "Plugin {local} differs from deployed {deployed}; redeploy needed." },
+  "ver.unreach_msg":  { zh: "云端 Modal 连不上(没部署 / app 被删)。\n\n点「确定」打开部署窗口。",
+                        en: "Cloud Modal unreachable (not deployed / app deleted).\n\nOK to open the deploy dialog." },
+  "ver.mismatch_msg": { zh: "⚠ 版本不一致:\n  插件(本地):{local}\n  云端部署:{deployed}\n\n你升级了插件但还没重新部署,云端跑的是旧代码,会出问题。\n\n点「确定」打开部署窗口重新部署。",
+                        en: "⚠ Version mismatch:\n  Plugin (local): {local}\n  Deployed: {deployed}\n\nYou upgraded the plugin but haven't redeployed; the cloud runs old code.\n\nOK to open the deploy dialog." },
+  // —— 管理云端节点 动作 ——
+  "mn.loading":       { zh: "加载中...", en: "Loading..." },
+  "mn.empty":         { zh: "镜像里没有 custom_node", en: "No custom_nodes on the image" },
+  "mn.installed":     { zh: "镜像实装 {n} 个(来源:{src})", en: "{n} installed on image (source: {src})" },
+  "mn.nogit_tag":     { zh: "(本地无 git 信息)", en: "(no local git info)" },
+  "mn.load_fail":     { zh: "✗ 加载失败:{e}", en: "✗ Load failed: {e}" },
+  "mn.none_checked":  { zh: "没勾选任何节点", en: "Nothing selected" },
+  "mn.confirm":       { zh: "确定从云端镜像移除这 {n} 个节点并重部署?\n\n{list}\n\n⚠ 别的电脑若用到这些节点会失败,需要时重新加。",
+                        en: "Remove these {n} nodes from the cloud image & redeploy?\n\n{list}\n\n⚠ Other machines using them will fail and need re-add." },
+  "mn.removed":       { zh: "✓ 已移除 {n} 个,镜像现 {keep} 个", en: "✓ Removed {n}, image now has {keep}" },
+  "mn.removed_toast": { zh: "✓ 已从云端移除 {n} 个 custom_node", en: "✓ Removed {n} custom_nodes from cloud" },
+  "mn.redeploy_fail": { zh: "✗ 重部署失败 rc={rc}(看日志)", en: "✗ Redeploy failed rc={rc} (see log)" },
+  // —— 成功 toast / Settings tooltip ——
+  "toast.done":       { zh: "✓ {wf} 完成 (job {id})", en: "✓ {wf} done (job {id})" },
+  "toast.done_n":     { zh: "✓ {wf} {n} 张完成", en: "✓ {wf} {n} done" },
+  "set.batch":        { zh: "一次点击跑几次(自动改 seed)", en: "How many runs per click (auto-reseed)" },
+  "set.poll":         { zh: "查询状态频率", en: "Status polling interval" },
+  "set.timeout":      { zh: "前端等出图的最长时间(秒),默认 900=15分钟,和 worker 单任务上限一致——worker 最多跑多久前端就等多久。出图后立刻返回,不会真等满;设大只是给冷启动+大模型留足空间。",
+                        en: "Max seconds the frontend waits for a result. Default 900=15min, matching the worker job limit. Returns instantly when done; large values just allow cold start + big models." },
+  "set.incognito":    { zh: "关闭后图会上传到 R2(需要 modal_app R2 凭据)", en: "If off, images upload to R2 (needs modal_app R2 creds)" },
+  "set.autosync_models":{ zh: "提交前检查 Modal Volume,工作流要、Volume 没、但本地有的模型自动上传(块级去重,通用大模型秒过)",
+                          en: "Before submit, auto-upload models the workflow needs that are missing on the Volume but present locally (block dedup, common big models instant)" },
+  "set.autosync_nodes": { zh: "提交前把工作流用到的 custom_node 与本地双向同步到 Modal:缺的加、commit 变的更新、本地已卸载的移除,再重部署",
+                          en: "Before submit, sync the workflow's custom_nodes with local: add missing, update changed commits, prune uninstalled, then redeploy" },
+};
+
+function t(key, vars) {
+  const lang = _locale();
+  const tbl = (typeof I18N !== "undefined") ? I18N[key] : null;
+  let s = (tbl && (tbl[lang] ?? tbl.en ?? tbl.zh)) ?? key;
+  if (vars) for (const k of Object.keys(vars)) s = String(s).replaceAll(`{${k}}`, vars[k]);
+  return s;
+}
+
+// =====================================================================
 // 工具
 // =====================================================================
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -225,7 +369,7 @@ async function syncNodes(plan, ctx) {
 
 // submit 前调:custom_node 与本地双向同步(加/改/删)。返回 true=可继续 / false=用户取消
 async function ensureNodesAvailable(prompt, ctx) {
-  ctx.stage("nodes", "Scanning workflow custom nodes...");
+  ctx.stage("nodes", t("node.scan"));
   let plan;
   try {
     plan = await checkNodesOnModal(prompt);
@@ -239,13 +383,13 @@ async function ensureNodesAvailable(prompt, ctx) {
 
   if (missing_no_git.length) {
     const list = missing_no_git.map((m) => `  ${m.folder} (${m.class_types.join(", ")})`).join("\n");
-    notify(`这些 custom_node 没有 git 信息,无法自动补:\n${list}`, "warn");
+    notify(t("node.nogit", { list }), "warn");
   }
 
   if (!plan.needs_deploy) {
-    ctx.stage("nodes", `nodes ok (${plan.ok_baked} custom + ${plan.ok_builtin} builtin)`);
+    ctx.stage("nodes", t("node.ok", { baked: plan.ok_baked, builtin: plan.ok_builtin }));
     if (missing_no_git.length) {
-      return confirm(`部分 custom_node 无法自动补,仍然提交?(很可能失败)`);
+      return confirm(t("node.confirm_skip"));
     }
     return true;
   }
@@ -253,30 +397,27 @@ async function ensureNodesAvailable(prompt, ctx) {
   // 组装确认文案(只加 / 改,不删 —— 多机并集,删走 Setup 的「管理云端节点」手动做)
   const parts = [];
   if (add.length) {
-    parts.push("➕ 新增(Modal 还没有):\n" + add.map((m) =>
-      `   • ${m.folder} (${m.class_types.length} 节点)` + (m.commit ? ` @ ${m.commit.slice(0, 8)}` : "")
+    parts.push(t("node.add_head") + "\n" + add.map((m) =>
+      `   • ${m.folder} (${t("node.nodes_n", { n: m.class_types.length })})` + (m.commit ? ` @ ${m.commit.slice(0, 8)}` : "")
     ).join("\n"));
   }
   if (update.length) {
-    parts.push("🔄 更新(本地 commit 变了):\n" + update.map((m) =>
+    parts.push(t("node.upd_head") + "\n" + update.map((m) =>
       `   • ${m.folder}  ${(m.old_commit || "—").slice(0, 8)} → ${m.commit.slice(0, 8)}`
     ).join("\n"));
   }
-  const msg =
-    `工作流需要的 custom_node 要同步到 Modal(镜像来源:${source}):\n\n${parts.join("\n\n")}\n\n` +
-    `点「确定」更新 Modal 镜像并重新部署(约 1-3 分钟,只这一次,之后秒进)。\n` +
-    `点「取消」则跳过同步,直接提交。`;
+  const msg = t("node.sync_title", { src: source, parts: parts.join("\n\n") });
   if (!confirm(msg)) {
-    return confirm("不同步节点,直接提交?(可能失败)");
+    return confirm(t("node.skip_confirm"));
   }
 
-  ctx.stage("deploying", "Redeploying Modal image...", false);
+  ctx.stage("deploying", t("node.redeploy"), false);
   ctx.bar(STATUS_PROGRESS.deploying[0]);
   const ok = await syncNodes(plan, ctx);
   if (!ok) {
-    throw new Error("Modal 重部署失败(看进度窗 deploy 日志 / ComfyUI 控制台)");
+    throw new Error(t("node.deploy_fail"));
   }
-  ctx.stage("deploying", "✓ image updated", false);
+  ctx.stage("deploying", t("node.updated"), false);
   return true;
 }
 
@@ -639,11 +780,11 @@ async function runOnceOnModal(workflowPrompt, outputNodeIds, ctx, submitGuard, b
   if (onFront) {
     const placed = displayInGraph(outputNodeIds, fetched.outputs);
     if (!placed && fetched.outputs?.length) {
-      notify(`图已存到 output/${sf}/(没找到对应输出节点)`, "warn");
+      notify(t("toast.saved_no_node", { sf }), "warn");
     }
   } else if (fetched.outputs?.length) {
     storePendingResult(wfKey, outputNodeIds, fetched.outputs);
-    notify(`✓ 后台工作流出图完成,切到该 tab 即显示(也已存 output/${sf}/)`, "info");
+    notify(t("toast.bg_done", { sf }), "info");
   }
   return { jobId, gpu, outputs: fetched.outputs };
 }
@@ -665,44 +806,35 @@ async function ensureModelsAvailable(prompt, ctx) {
   if (check.error) throw new Error(check.error);
 
   const { required = [], present = [], missing_local = [], downloading = [], missing_no_source = [] } = check;
-  ctx.stage("checking", `${present.length}/${required.length} 已在 Volume`);
+  ctx.stage("checking", t("mdl.on_volume", { present: present.length, total: required.length }));
   log(`models: required=${required.length} present=${present.length} missing_local=${missing_local.length} ` +
       `downloading=${downloading.length} missing_no_source=${missing_no_source.length}`);
 
   // 本地还在下载中的模型 → 不能传(会传成残缺),提示等下完
   if (downloading.length) {
     const list = downloading.map((u) => `  ${u.type}/${u.filename}`).join("\n");
-    const msg = `这些模型本地还在下载中,现在传会传成残缺文件:\n\n${list}\n\n` +
-                `建议:等本地下完再点 [☁️ Modal]。\n\n` +
-                `仍然继续提交?(会缺这些模型,大概率失败)`;
-    if (!confirm(msg)) throw new Error("Cancelled — 本地模型还在下载中");
+    if (!confirm(t("mdl.downloading", { list }))) throw new Error(t("mdl.cancel_dl"));
   }
 
   // Volume 和本地都没有 → 没法自动补
   if (missing_no_source.length) {
     const list = missing_no_source.map((u) => `  ${u.type}/${u.filename}`).join("\n");
-    const msg = `下面这些模型 Modal Volume 没有,本地也找不到,无法自动同步:\n\n${list}\n\n` +
-                `解决:先在本地 ComfyUI 里把这些模型下到对应 models/<类型>/ 目录,再跑。\n\n` +
-                `仍然继续提交?(大概率失败)`;
-    if (!confirm(msg)) throw new Error("Cancelled — 缺本地模型");
+    if (!confirm(t("mdl.no_source", { list }))) throw new Error(t("mdl.cancel_miss"));
   }
 
   if (!missing_local.length) {
-    ctx.stage("checking", `模型齐全(${present.length}/${required.length})✓`);
+    ctx.stage("checking", t("mdl.all_present", { present: present.length, total: required.length }));
     return;
   }
 
   // 本地有、Volume 没 → 上传
   const totalMb = missing_local.reduce((s, m) => s + (m.size_mb || 0), 0);
   const list = missing_local.map((m) => `  • ${m.type}/${m.filename} (${m.size_mb} MB)`).join("\n");
-  const msg = `这些模型本地有、Modal Volume 还没有,需要上传一次(共 ~${totalMb} MB):\n\n${list}\n\n` +
-              `点「确定」上传到 Volume(块级去重:网上通用大模型秒过,只有新内容真正占上行带宽;只这一次,之后秒进)。\n` +
-              `点「取消」则不传,直接提交。`;
-  if (!confirm(msg)) {
+  if (!confirm(t("mdl.upload_confirm", { mb: totalMb, list }))) {
     return; // 用户选择不传,直接提交(可能失败,交给 Modal 报错)
   }
 
-  ctx.stage("uploading", `上传 ${missing_local.length} 个模型到 Volume...`, false);
+  ctx.stage("uploading", t("mdl.uploading", { n: missing_local.length }), false);
   ctx.bar(STATUS_PROGRESS.uploading[0]);
   const [a, b] = STATUS_PROGRESS.uploading;
   let tick = 0;
@@ -716,8 +848,8 @@ async function ensureModelsAvailable(prompt, ctx) {
       ctx.stage("uploading", line.length > 72 ? line.slice(0, 72) + "…" : line);
     },
   );
-  if (rc !== 0) throw new Error("模型上传失败(看进度窗日志 / ComfyUI 控制台)");
-  ctx.stage("uploading", `${missing_local.length} 个模型已同步 ✓`, false);
+  if (rc !== 0) throw new Error(t("mdl.upload_fail"));
+  ctx.stage("uploading", t("mdl.synced", { n: missing_local.length }), false);
 }
 
 // =====================================================================
@@ -727,7 +859,7 @@ async function queueOnModal() {
   // 没部署/没配置就直接引导去 Setup,别走后面链路再失败
   const cfg0 = await fetchConfig();
   if (!isConfigured(cfg0)) {
-    notify("还没部署到 Modal。先点右上角 [⚙️ Modal Setup] 填 token 一键部署(不用开终端)", "warn");
+    notify(t("toast.not_deployed"), "warn");
     try { openDeployDialog(); } catch (e) {}
     return;
   }
@@ -778,15 +910,15 @@ async function queueOnModal() {
     const wf = ctx.wfName ? `「${ctx.wfName}」` : "";
     notify(
       batchCount > 1
-        ? `✓ ${wf} ${batchCount} 张完成`
-        : `✓ ${wf} 完成 (job ${allOutputs[0].jobId.slice(0, 8)})`,
+        ? t("toast.done_n", { wf, n: batchCount })
+        : t("toast.done", { wf, id: allOutputs[0].jobId.slice(0, 8) }),
       "success",
     );
   } catch (e) {
     err(e);
     ctx.finish(false, "✗ " + (e.message || "Error").slice(0, 40), e.stack || e.toString());
     const wf = ctx.wfName ? `「${ctx.wfName}」` : "";
-    notify(`✗ ${wf} 失败:${e.message}`, "error");
+    notify(t("toast.fail", { wf, msg: e.message }), "error");
   }
 }
 
@@ -831,13 +963,13 @@ async function recoverOne(pending) {
       if (fd.ok) {
         const sf = fd.outputs?.[0]?.subfolder || "modal_results";
         ctx.finish(true, "✓ Recovered");
-        notify(`✓ ${pending.wfName ? "「" + pending.wfName + "」" : ""} 恢复完成 → output/${sf}/`, "success");
+        notify(t("toast.recovered", { wf: pending.wfName ? "「" + pending.wfName + "」" : "", sf }), "success");
       } else {
         ctx.finish(false, "✗ Recover fetch failed", JSON.stringify(fd));
       }
     } else if (pData.status === "running" || pData.status === "queued") {
-      ctx.stage(pData.status, `still ${pData.status};重新点 [☁️ Modal] 监控`);
-      notify(`Job ${pending.jobId.slice(0, 8)} 仍在 ${pData.status};重新点 [☁️ Modal] 监控`, "warn");
+      ctx.stage(pData.status, t("stage.still", { status: pData.status }));
+      notify(t("toast.still", { id: pending.jobId.slice(0, 8), status: pData.status }), "warn");
       ctx.finish(true, `· ${pData.status}`);
     } else {
       ctx.finish(false, `✗ ${pData.status}`);
@@ -861,7 +993,7 @@ const SETTINGS = [
     type: "number",
     defaultValue: 1,
     attrs: { min: 1, max: 20, step: 1 },
-    tooltip: "一次点击跑几次(自动改 seed)",
+    tooltip: t("set.batch"),
   },
   {
     id: "ModalBridge.pollIntervalSec",
@@ -869,7 +1001,7 @@ const SETTINGS = [
     type: "number",
     defaultValue: 1.2,
     attrs: { min: 0.5, max: 10, step: 0.1 },
-    tooltip: "查询状态频率",
+    tooltip: t("set.poll"),
   },
   {
     id: "ModalBridge.timeoutSec",
@@ -877,30 +1009,28 @@ const SETTINGS = [
     type: "number",
     defaultValue: 900,
     attrs: { min: 60, max: 7200, step: 60 },
-    tooltip: "前端等出图的最长时间(秒),默认 900=15分钟,和 worker 单任务上限一致——" +
-      "worker 最多跑多久前端就等多久,谁都不会先放弃。出图后立刻返回,不会真等满;" +
-      "设大只是给冷启动+大模型留足空间,不会让任何东西变慢。",
+    tooltip: t("set.timeout"),
   },
   {
     id: "ModalBridge.incognito",
     name: "Modal Bridge: Incognito (return base64, skip R2)",
     type: "boolean",
     defaultValue: true,
-    tooltip: "关闭后图会上传到 R2(需要 modal_app R2 凭据)",
+    tooltip: t("set.incognito"),
   },
   {
     id: "ModalBridge.autoSyncModels",
-    name: "Modal Bridge: Auto-sync models (本地 → Volume)",
+    name: "Modal Bridge: Auto-sync models (local → Volume)",
     type: "boolean",
     defaultValue: true,
-    tooltip: "提交前检查 Modal Volume,工作流要、Volume 没、但本地有的模型自动上传上去(块级去重,通用大模型秒过)",
+    tooltip: t("set.autosync_models"),
   },
   {
     id: "ModalBridge.autoCheckNodes",
     name: "Modal Bridge: Auto-sync custom nodes",
     type: "boolean",
     defaultValue: true,
-    tooltip: "提交前把工作流用到的 custom_node 与本地双向同步到 Modal:缺的加、本地 commit 变的更新、本地已卸载的移除,再重部署",
+    tooltip: t("set.autosync_nodes"),
   },
 ];
 
@@ -935,14 +1065,13 @@ async function checkVersionOrBlock() {
   if (v.match) return true;  // 版本一致,放行
 
   if (!v.reachable) {
-    notify(`云端连不上(app 可能没部署/被删)。点 [⚙️ Modal Setup] 重新部署`, "warn");
+    notify(t("ver.unreach_toast"), "warn");
   } else {
-    notify(`插件版本 ${v.local} 与云端部署的 ${v.deployed} 不一致,需重新部署。`, "warn");
+    notify(t("ver.mismatch_toast", { local: v.local, deployed: v.deployed }), "warn");
   }
   const msg = !v.reachable
-    ? `云端 Modal 连不上(没部署 / app 被删)。\n\n点「确定」打开部署窗口。`
-    : `⚠ 版本不一致:\n  插件(本地):${v.local}\n  云端部署:${v.deployed}\n\n` +
-      `你升级了插件但还没重新部署,云端跑的是旧代码,会出问题。\n\n点「确定」打开部署窗口重新部署。`;
+    ? t("ver.unreach_msg")
+    : t("ver.mismatch_msg", { local: v.local, deployed: v.deployed });
   if (confirm(msg)) {
     try { openDeployDialog(); } catch (e) {}
   }
@@ -950,6 +1079,7 @@ async function checkVersionOrBlock() {
 }
 
 let deployDialogEl = null;
+let _dialogLang = null;  // 对话框创建时的语言;切语言后重开需重建,否则文案停在旧语言
 
 // 重新拉 /version 并更新 Setup 对话框顶部的版本徽标(部署成功 / 测试连接后调)
 async function refreshVerBanner(panel) {
@@ -957,20 +1087,23 @@ async function refreshVerBanner(panel) {
   if (!el) return;
   let v;
   try { v = await (await api.fetchApi("/modal_bridge/version")).json(); } catch (e) { return; }
-  const dep = v.reachable ? (v.deployed || "unknown") : "未连接";
+  const dep = v.reachable ? (v.deployed || "unknown") : t("dlg.ver.notconn");
   const color = v.match ? "#34d399" : (v.reachable ? "#fbbf24" : "#9aa");
-  const hint = v.match ? "✓ 已对齐"
-    : (v.reachable ? "⚠ 不一致,请点「部署」更新云端" : "云端未部署 / 连不上");
-  el.innerHTML = `插件(本地):<b style="color:#eee;">${v.local}</b>　·` +
-    ` 云端部署:<b style="color:${color};">${dep}</b> <span style="color:${color};">${hint}</span>`;
+  const hint = v.match ? t("dlg.ver.aligned")
+    : (v.reachable ? t("dlg.ver.mismatch") : t("dlg.ver.unreach"));
+  el.innerHTML = `${t("dlg.ver.local")}<b style="color:#eee;">${v.local}</b>　·` +
+    ` ${t("dlg.ver.deployed")}<b style="color:${color};">${dep}</b> <span style="color:${color};">${hint}</span>`;
 }
 
 async function openDeployDialog() {
-  if (deployDialogEl) {
+  // 缓存的对话框:语言没变才复用;语言变了则销毁重建(否则文案停在旧语言)
+  if (deployDialogEl && _dialogLang === _locale()) {
     deployDialogEl.style.display = "flex";
     refreshVerBanner(deployDialogEl.querySelector("div"));  // 重开时刷新版本徽标
     return;
   }
+  if (deployDialogEl) { deployDialogEl.remove(); deployDialogEl = null; }  // 语言变了,弃旧重建
+  _dialogLang = _locale();
   const cfg = await fetchConfig();
   // 拉版本信息(本地插件版本 vs 云端部署版本),用于标题区显示是否对齐
   let ver = { local: "?", deployed: null, match: false, reachable: false };
@@ -994,48 +1127,48 @@ async function openDeployDialog() {
     "width:100%;box-sizing:border-box;margin:4px 0 10px;padding:7px 9px;" +
     "background:#2a2a2a;border:1px solid #444;border-radius:6px;color:#eee;font:13px monospace;";
   // 版本对齐徽标:绿=一致 / 黄=不一致(需重新部署)/ 灰=云端连不上
-  const vDeployed = ver.reachable ? (ver.deployed || "unknown") : "未连接";
+  const vDeployed = ver.reachable ? (ver.deployed || "unknown") : t("dlg.ver.notconn");
   const vColor = ver.match ? "#34d399" : (ver.reachable ? "#fbbf24" : "#9aa");
-  const vHint = ver.match ? "✓ 已对齐"
-    : (ver.reachable ? "⚠ 不一致,请点「部署」更新云端" : "云端未部署 / 连不上");
+  const vHint = ver.match ? t("dlg.ver.aligned")
+    : (ver.reachable ? t("dlg.ver.mismatch") : t("dlg.ver.unreach"));
   panel.innerHTML = `
-    <div style="font-size:16px;font-weight:600;margin-bottom:4px;">☁️ 部署到 Modal</div>
+    <div style="font-size:16px;font-weight:600;margin-bottom:4px;">${t("dlg.title")}</div>
     <div id="mb-dep-ver" style="margin-bottom:10px;font-size:12px;padding:6px 10px;border-radius:6px;
          background:#222;border:1px solid #383838;">
-      插件(本地):<b style="color:#eee;">${ver.local}</b>　·
-      云端部署:<b style="color:${vColor};">${vDeployed}</b>
+      ${t("dlg.ver.local")}<b style="color:#eee;">${ver.local}</b>　·
+      ${t("dlg.ver.deployed")}<b style="color:${vColor};">${vDeployed}</b>
       <span style="color:${vColor};">${vHint}</span>
     </div>
     <div style="color:#9aa;margin-bottom:14px;">
-      全程在 ComfyUI 里完成,不用开终端。需要 Modal token(免费注册,每月送 $30):
+      ${t("dlg.intro")}
       <a href="https://modal.com/settings/tokens" target="_blank" style="color:#6cf;">modal.com/settings/tokens</a>
     </div>
-    <label>Workspace <span style="color:#9aa;">(modal.com 个人主页 URL 那段,如 your-workspace)</span></label>
+    <label>Workspace <span style="color:#9aa;">${t("dlg.ws.hint")}</span></label>
     <input id="mb-dep-ws" type="text" style="${inputCss}" value="${cfg.modal_workspace || ""}" placeholder="your-workspace">
     <label>Token ID <span style="color:#9aa;">(ak-...)</span></label>
     <input id="mb-dep-id" type="text" style="${inputCss}" value="${cfg.modal_token_id || ""}" placeholder="ak-xxxxxxxx">
-    <label>Token Secret <span style="color:#9aa;">(as-...${cfg.has_token_secret ? ";已保存,留空=沿用" : ""})</span></label>
-    <input id="mb-dep-secret" type="password" style="${inputCss}" value="" placeholder="${cfg.has_token_secret ? "••••••••(已保存,留空沿用)" : "as-xxxxxxxx"}">
-    <div style="margin:4px 0 10px;color:#9aa;">GPU:H100 →(排不到)A100-80GB,所有工作流统一,无需选择。</div>
+    <label>Token Secret <span style="color:#9aa;">(as-...${cfg.has_token_secret ? t("dlg.secret.saved") : ""})</span></label>
+    <input id="mb-dep-secret" type="password" style="${inputCss}" value="" placeholder="${cfg.has_token_secret ? t("dlg.secret.ph_saved") : "as-xxxxxxxx"}">
+    <div style="margin:4px 0 10px;color:#9aa;">${t("dlg.gpu.note")}</div>
     <div style="margin:10px 0;">
-      <button id="mb-dep-go" style="padding:8px 18px;background:#2563eb;color:#fff;border:none;border-radius:6px;cursor:pointer;font-weight:600;">部署</button>
-      <button id="mb-dep-test" style="padding:8px 14px;margin-left:8px;background:#374151;color:#ddd;border:none;border-radius:6px;cursor:pointer;">测试连接</button>
-      <button id="mb-dep-close" style="padding:8px 14px;margin-left:8px;background:#333;color:#ccc;border:none;border-radius:6px;cursor:pointer;">关闭</button>
+      <button id="mb-dep-go" style="padding:8px 18px;background:#2563eb;color:#fff;border:none;border-radius:6px;cursor:pointer;font-weight:600;">${t("dlg.btn.deploy")}</button>
+      <button id="mb-dep-test" style="padding:8px 14px;margin-left:8px;background:#374151;color:#ddd;border:none;border-radius:6px;cursor:pointer;">${t("dlg.btn.test")}</button>
+      <button id="mb-dep-close" style="padding:8px 14px;margin-left:8px;background:#333;color:#ccc;border:none;border-radius:6px;cursor:pointer;">${t("dlg.btn.close")}</button>
       <span id="mb-dep-status" style="margin-left:12px;color:#9aa;"></span>
     </div>
     <pre id="mb-dep-log" style="display:none;background:#111;border:1px solid #333;border-radius:6px;padding:10px;max-height:280px;overflow:auto;white-space:pre-wrap;font:11px/1.4 monospace;color:#bdbdbd;"></pre>
 
     <div style="margin-top:16px;border-top:1px solid #333;padding-top:12px;">
       <div style="display:flex;align-items:center;justify-content:space-between;">
-        <span style="font-weight:600;">管理云端节点</span>
-        <button id="mb-nodes-load" style="padding:5px 12px;background:#374151;color:#ddd;border:none;border-radius:6px;cursor:pointer;font-size:12px;">加载镜像节点</button>
+        <span style="font-weight:600;">${t("dlg.nodes.title")}</span>
+        <button id="mb-nodes-load" style="padding:5px 12px;background:#374151;color:#ddd;border:none;border-radius:6px;cursor:pointer;font-size:12px;">${t("dlg.nodes.load")}</button>
       </div>
       <div style="color:#9aa;margin-top:4px;font-size:12px;">
-        勾选 = 从云端镜像<b>移除</b>该节点 + 重部署。⚠ 别的电脑若用到会失败、需重新加(多机各装一部分时慎删)。
+        ${t("dlg.nodes.warn")}
       </div>
       <div id="mb-nodes-list" style="margin-top:8px;max-height:200px;overflow:auto;"></div>
       <div style="margin-top:8px;">
-        <button id="mb-nodes-prune" style="display:none;padding:7px 14px;background:#7f1d1d;color:#fff;border:none;border-radius:6px;cursor:pointer;font-weight:600;">移除勾选项并重部署</button>
+        <button id="mb-nodes-prune" style="display:none;padding:7px 14px;background:#7f1d1d;color:#fff;border:none;border-radius:6px;cursor:pointer;font-weight:600;">${t("dlg.nodes.prune")}</button>
         <span id="mb-nodes-status" style="margin-left:10px;color:#9aa;font-size:12px;"></span>
       </div>
       <pre id="mb-nodes-log" style="display:none;background:#111;border:1px solid #333;border-radius:6px;padding:10px;margin-top:8px;max-height:200px;overflow:auto;white-space:pre-wrap;font:11px/1.4 monospace;color:#bdbdbd;"></pre>
@@ -1057,7 +1190,7 @@ async function openDeployDialog() {
   // 这些光看本地 config 有没有 token 是查不出的(config 字段在不代表云端 app 还活着)。
   testBtn.onclick = async () => {
     testBtn.disabled = true;
-    statusEl.textContent = "测试中(冷启动时可能要等几秒)...";
+    statusEl.textContent = t("test.running");
     statusEl.style.color = "#9aa";
     logEl.style.display = "block";
     logEl.textContent = "GET /modal_bridge/health …\n";
@@ -1070,16 +1203,16 @@ async function openDeployDialog() {
       if (r.ok && data.ok && data.modal?.healthy) {
         const m = data.modal;
         const nodes = Array.isArray(m.custom_nodes) ? m.custom_nodes.length : "?";
-        statusEl.textContent = `✓ 连接正常(云端 ${m.deployed_version ?? "?"}, warm=${m.warm_containers ?? 0}, 已装节点=${nodes})`;
+        statusEl.textContent = t("test.ok", { ver: m.deployed_version ?? "?", warm: m.warm_containers ?? 0, nodes });
         statusEl.style.color = "#34d399";
         refreshVerBanner(panel);  // 顺带刷新顶部版本徽标
       } else {
-        const why = data.error || "endpoint 不可达";
-        statusEl.textContent = `✗ 连不上:${String(why).slice(0, 80)} — app 可能没部署/被删,请点「部署」`;
+        const why = data.error || t("test.unreach");
+        statusEl.textContent = t("test.fail", { why: String(why).slice(0, 80) });
         statusEl.style.color = "#f87171";
       }
     } catch (e) {
-      statusEl.textContent = "✗ 测试失败:" + (e.message || e);
+      statusEl.textContent = t("test.err", { e: e.message || e });
       statusEl.style.color = "#f87171";
     } finally {
       testBtn.disabled = false;
@@ -1096,28 +1229,28 @@ async function openDeployDialog() {
 
   nodesLoadBtn.onclick = async () => {
     nodesLoadBtn.disabled = true;
-    nodesStatusEl.textContent = "加载中...";
+    nodesStatusEl.textContent = t("mn.loading");
     nodesStatusEl.style.color = "#9aa";
     try {
       const r = await api.fetchApi("/modal_bridge/list_nodes");
       const d = await r.json();
       loadedNodes = d.nodes || [];
       if (!loadedNodes.length) {
-        nodesListEl.innerHTML = `<div style="color:#9aa;font-size:12px;">镜像里没有 custom_node</div>`;
+        nodesListEl.innerHTML = `<div style="color:#9aa;font-size:12px;">${t("mn.empty")}</div>`;
         nodesPruneBtn.style.display = "none";
       } else {
         nodesListEl.innerHTML = loadedNodes.map((n, i) =>
           `<label style="display:flex;align-items:center;gap:8px;padding:3px 0;font-size:12px;cursor:pointer;">
              <input type="checkbox" class="mb-node-cb" data-i="${i}">
              <span>${n.name}</span>
-             ${n.in_local_baked ? "" : `<span style="color:#fbbf24;font-size:10px;">(本地无 git 信息)</span>`}
+             ${n.in_local_baked ? "" : `<span style="color:#fbbf24;font-size:10px;">${t("mn.nogit_tag")}</span>`}
            </label>`).join("");
         nodesPruneBtn.style.display = "inline-block";
       }
-      nodesStatusEl.textContent = `镜像实装 ${loadedNodes.length} 个(来源:${d.source})`;
+      nodesStatusEl.textContent = t("mn.installed", { n: loadedNodes.length, src: d.source });
       nodesStatusEl.style.color = "#9aa";
     } catch (e) {
-      nodesStatusEl.textContent = "✗ 加载失败:" + (e.message || e);
+      nodesStatusEl.textContent = t("mn.load_fail", { e: e.message || e });
       nodesStatusEl.style.color = "#f87171";
     } finally {
       nodesLoadBtn.disabled = false;
@@ -1127,15 +1260,14 @@ async function openDeployDialog() {
   nodesPruneBtn.onclick = async () => {
     const checked = [...panel.querySelectorAll(".mb-node-cb:checked")]
       .map((cb) => loadedNodes[parseInt(cb.dataset.i, 10)]);
-    if (!checked.length) { nodesStatusEl.textContent = "没勾选任何节点"; return; }
+    if (!checked.length) { nodesStatusEl.textContent = t("mn.none_checked"); return; }
     const removeNames = new Set(checked.map((n) => n.name));
     const keep = loadedNodes.filter((n) => !removeNames.has(n.name));
     const list = checked.map((n) => "  • " + n.name).join("\n");
-    if (!confirm(`确定从云端镜像移除这 ${checked.length} 个节点并重部署?\n\n${list}\n\n` +
-                 `⚠ 别的电脑若用到这些节点会失败,需要时重新加。`)) return;
+    if (!confirm(t("mn.confirm", { n: checked.length, list }))) return;
 
     nodesPruneBtn.disabled = true;
-    nodesStatusEl.textContent = "重部署中(约 1-3 分钟,别关窗口)...";
+    nodesStatusEl.textContent = t("nodes.redeploying");
     nodesStatusEl.style.color = "#9aa";
     nodesLogEl.style.display = "block";
     nodesLogEl.textContent = "";
@@ -1145,12 +1277,12 @@ async function openDeployDialog() {
         summary: { add: 0, update: 0, prune: checked.length },
       }, (line) => { nodesLogEl.textContent += line + "\n"; nodesLogEl.scrollTop = nodesLogEl.scrollHeight; });
       if (rc === 0) {
-        nodesStatusEl.textContent = `✓ 已移除 ${checked.length} 个,镜像现 ${keep.length} 个`;
+        nodesStatusEl.textContent = t("mn.removed", { n: checked.length, keep: keep.length });
         nodesStatusEl.style.color = "#34d399";
-        notify(`✓ 已从云端移除 ${checked.length} 个 custom_node`, "success");
+        notify(t("mn.removed_toast", { n: checked.length }), "success");
         nodesLoadBtn.onclick();  // 刷新列表
       } else {
-        nodesStatusEl.textContent = `✗ 重部署失败 rc=${rc}(看日志)`;
+        nodesStatusEl.textContent = t("mn.redeploy_fail", { rc });
         nodesStatusEl.style.color = "#f87171";
       }
     } catch (e) {
@@ -1170,14 +1302,12 @@ async function openDeployDialog() {
     // token_secret 留空 = 沿用已存的(/config 不再回显它);只有填了才校验格式
     const secretOk = payload.token_secret === "" ? cfg.has_token_secret : payload.token_secret.startsWith("as-");
     if (!payload.token_id.startsWith("ak-") || !secretOk || !payload.workspace) {
-      statusEl.textContent = cfg.has_token_secret
-        ? "请填对 workspace + ak- token(secret 可留空沿用)"
-        : "请填对 workspace + ak-/as- token";
+      statusEl.textContent = cfg.has_token_secret ? t("dep.fill_saved") : t("dep.fill_all");
       statusEl.style.color = "#f87171";
       return;
     }
     goBtn.disabled = true;
-    statusEl.textContent = "部署中(首次拉镜像约 3-5 分钟,别关窗口)...";
+    statusEl.textContent = t("dep.running");
     statusEl.style.color = "#9aa";
     logEl.style.display = "block";
     logEl.textContent = "";
@@ -1187,15 +1317,15 @@ async function openDeployDialog() {
         logEl.scrollTop = logEl.scrollHeight;
       });
       if (rc === 0) {
-        statusEl.textContent = "✓ 部署成功!可以关掉这个窗口去出图了";
+        statusEl.textContent = t("dep.ok");
         statusEl.style.color = "#34d399";
-        notify("✓ Modal 部署成功", "success");
+        notify(t("dep.ok.toast"), "success");
         doHealthCheck();
         refreshVerBanner(panel);  // 部署成功 → 版本徽标翻绿(本地↔云端对齐)
       } else {
-        statusEl.textContent = `✗ 部署失败 rc=${rc}(看上面日志)`;
+        statusEl.textContent = t("dep.fail", { rc });
         statusEl.style.color = "#f87171";
-        notify(`Modal 部署失败 rc=${rc}`, "error");
+        notify(t("dep.fail.toast", { rc }), "error");
       }
     } catch (e) {
       statusEl.textContent = "✗ " + (e.message || e);
@@ -1209,8 +1339,10 @@ async function openDeployDialog() {
 // =====================================================================
 // actionBarButtons 注册
 // =====================================================================
-const BUTTON_TOOLTIP = "Queue on Modal (默认 H100,见 Settings)";
-const SETUP_TOOLTIP = "Modal Bridge 部署 / 设置(首次用先点这个)";
+// 注:这两个 tooltip 同时用作 DOM 选择器(下方 querySelector button[title=...]),
+// 不做 i18n(否则切语言后选择器对不上已注册的按钮)。保持稳定英文。
+const BUTTON_TOOLTIP = "Queue on Modal (H100, see Settings)";
+const SETUP_TOOLTIP = "Modal Bridge: deploy / settings (start here)";
 
 app.registerExtension({
   name: "ModalBridge.QueueButton",
@@ -1239,7 +1371,7 @@ app.registerExtension({
     // 没配置过 → 提示去点 Setup 部署(零终端)
     fetchConfig().then((cfg) => {
       if (!isConfigured(cfg)) {
-        notify("还没部署到 Modal。点右上角 [Modal Setup] 填 token 一键部署(不用开终端)", "warn");
+        notify(t("toast.not_deployed"), "warn");
       }
     });
 
@@ -1259,3 +1391,4 @@ app.registerExtension({
     recoverPendingJob();
   },
 });
+
