@@ -779,6 +779,21 @@ def _setup_routes():
             except Exception as e:
                 return web.json_response({"ok": False, "error": str(e)}, status=502)
 
+    @routes.get("/modal_bridge/platform_status")
+    async def _platform_status(request: web.Request):
+        """查 Modal 平台官方状态页(status.modal.com,BetterStack)的整体状态。
+        用于:连不上云端时区分'Modal 平台故障'还是'你没部署';启动时主动预警。
+        返回 {ok, state}  state ∈ operational/degraded/downtime/maintenance/unknown。"""
+        try:
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=8)) as s:
+                async with s.get("https://status.modal.com/index.json") as r:
+                    data = await r.json(content_type=None)
+            state = data.get("data", {}).get("attributes", {}).get("aggregate_state", "unknown")
+        except Exception as e:
+            print(f"[modal_bridge] platform_status 查询失败: {e}")
+            state = "unknown"
+        return web.json_response({"ok": True, "state": state})
+
     @routes.get("/modal_bridge/version")
     async def _version(request: web.Request):
         """版本契约:比对本地插件版本 vs 云端部署的版本。

@@ -126,6 +126,8 @@ const I18N = {
   "ver.mismatch_msg": { zh: "⚠ 版本不一致:\n  插件(本地):{local}\n  云端部署:{deployed}\n\n你升级了插件但还没重新部署,云端跑的是旧代码,会出问题。\n\n点「确定」打开部署窗口重新部署。",
                         en: "⚠ Version mismatch:\n  Plugin (local): {local}\n  Deployed: {deployed}\n\nYou upgraded the plugin but haven't redeployed; the cloud runs old code.\n\nOK to open the deploy dialog." },
   "ver.checking":     { zh: "检查云端中…", en: "Checking cloud…" },
+  "ver.platform_startup":{ zh: "⚠ Modal 平台当前异常(status.modal.com),出图可能失败,等平台恢复",
+                           en: "⚠ Modal platform is currently degraded (status.modal.com); jobs may fail until it recovers" },
   "ver.platform_toast":{ zh: "⚠ 连不上 Modal,可能是平台故障", en: "⚠ Can't reach Modal — possible platform outage" },
   "ver.platform_msg": { zh: "连不上 Modal 云端(超时)。\n\n这很可能是 Modal 平台故障,不是你的问题——重新部署也会失败。\n\n点「确定」打开 status.modal.com 查看平台状态;若显示故障,等恢复后再试即可。",
                         en: "Can't reach Modal cloud (timeout).\n\nThis is likely a Modal platform outage, not your fault — redeploying would also fail.\n\nOK to open status.modal.com; if it shows an outage, just wait for recovery." },
@@ -181,6 +183,16 @@ function reportJobEvent(jobId, event, detail) {
       body: JSON.stringify({ job_id: jobId, event, detail: detail || "" }),
     }).catch(() => {});
   } catch (e) {}
+}
+
+// 查 Modal 官方状态页(status.modal.com)的整体状态,判断是否平台故障。
+// 返回 true=平台异常(downtime/degraded/maintenance)。查询失败=false(不误报)。
+async function isModalOutage() {
+  try {
+    const r = await api.fetchApi("/modal_bridge/platform_status");
+    const d = await r.json();
+    return d.state && d.state !== "operational" && d.state !== "unknown";
+  } catch (e) { return false; }
 }
 
 const LS_KEYS = {
@@ -1061,7 +1073,8 @@ function isConfigured(cfg) {
 // 版本契约:本地插件版本 vs 云端部署版本不一致 → 拦截提交、引导重新部署。
 // 返回 true=放行 / false=拦截。version 检查本身出错(网络等)不拦(放行,别误伤)。
 async function checkVersionOrBlock() {
-  notify(t("ver.checking"), "info");  // 立即反馈,别让点击像没反应(检查最多等 ~6s)
+  // 不弹"检查中"提示(正常云端在时 <1s 返回、直接出图,用户无感;弹了反而烦)。
+  // 只有连不上/版本不一致才提示(下面)。
   let v;
   try {
     const r = await api.fetchApi("/modal_bridge/version");
@@ -1072,10 +1085,11 @@ async function checkVersionOrBlock() {
   }
   if (v.match) return true;  // 版本一致,放行
 
-  // 连不上:按错误类型区分。timeout/unreachable 多半是 Modal 平台故障 → 引导查状态页,
-  // 别瞎引导重新部署(平台挂时部署也会失败);not_deployed 才是真没部署 → 引导部署。
+  // 连不上:先查 Modal 官方状态页(权威)判断是不是平台故障。
+  // 平台故障 → 引导查状态页(部署也会失败,等恢复);否则按 err_kind 当没部署 → 引导部署。
   if (!v.reachable) {
-    const platform = v.err_kind === "timeout" || v.err_kind === "unreachable";
+    const outage = await isModalOutage();  // 查 status.modal.com 的 aggregate_state
+    const platform = outage || v.err_kind === "timeout" || v.err_kind === "unreachable";
     notify(platform ? t("ver.platform_toast") : t("ver.notdeployed_toast"), "warn");
     if (confirm(platform ? t("ver.platform_msg") : t("ver.notdeployed_msg"))) {
       if (platform) { try { window.open("https://status.modal.com", "_blank"); } catch (e) {} }
@@ -1381,10 +1395,12 @@ app.registerExtension({
     log("setup() running");
     doHealthCheck();
 
-    // 没配置过 → 提示去点 Setup 部署(零终端)
-    fetchConfig().then((cfg) => {
+    // 没配置过 → 提示去点 Setup 部署(零终端);配过了则查 Modal 平台状态,故障就主动预警
+    fetchConfig().then(async (cfg) => {
       if (!isConfigured(cfg)) {
         notify(t("toast.not_deployed"), "warn");
+      } else if (await isModalOutage()) {
+        notify(t("ver.platform_startup"), "warn");  // 启动主动预警:Modal 平台正故障
       }
     });
 
