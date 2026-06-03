@@ -24,7 +24,7 @@ DEFAULT_CONFIG = {
     "user_id": "local-dev",
     "incognito": True,         # base64 回流,不上 R2
     "poll_interval_sec": 1.5,
-    "timeout_sec": 1200,
+    "timeout_sec": 900,        # 前端等出图最长时间(秒),= worker 单任务上限 15min(老 /queue 路径用)
     "output_subfolder": "modal_results",
 
     # ── 模型自动同步(本地 → Modal Volume,SDK batch_upload,CAS 去重)──

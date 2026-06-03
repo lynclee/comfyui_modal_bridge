@@ -246,6 +246,9 @@ _UPLOAD_LOCK = asyncio.Lock()
 # 打同一个 app 也会冲突。整段(写文件 + deploy)包进同一把锁。
 _DEPLOY_LOCK = asyncio.Lock()
 
+# poll 记日志用:job_id → 上次见到的 status(只在变化时打日志,避免高频 poll 刷屏)
+_LAST_POLL_STATUS: dict = {}
+
 
 async def _run_blocking_streamed(resp: web.StreamResponse, fn):
     """在线程里跑一个阻塞函数 fn(emit),emit(line) 线程安全地把日志流式写回 resp。
@@ -313,7 +316,12 @@ def _setup_routes():
         cur = cfg_mod.load_config()
         cur.update(body)
         cfg_mod.save_config(cur)
-        return web.json_response(cur)
+        # 不回吐密钥(和 GET /config 一致):抹掉 token_secret / bridge_api_key
+        safe = dict(cur)
+        safe["has_token_secret"] = bool(safe.get("modal_token_secret"))
+        safe.pop("modal_token_secret", None)
+        safe.pop("bridge_api_key", None)
+        return web.json_response(safe)
 
     # -------- 异步提交(返回 job_id,不阻塞)--------
     @routes.post("/modal_bridge/submit")
@@ -372,7 +380,33 @@ def _setup_routes():
                     data = await r.json(content_type=None)
         except Exception as e:
             return web.json_response({"error": str(e)}, status=502)
+        # 只在 status 变化时记日志(poll 高频,避免刷屏);终态 failed 把 error 也记上。
+        # 这样即使前端超时/放弃,ComfyUI 日志里也能看到 job 走到了哪一步、为何失败。
+        st = data.get("status") if isinstance(data, dict) else None
+        if st and _LAST_POLL_STATUS.get(job_id) != st:
+            _LAST_POLL_STATUS[job_id] = st
+            if st == "failed":
+                print(f"[modal_bridge] ⚠ job {job_id} FAILED: {(data.get('error') or '')[:300]}")
+            else:
+                print(f"[modal_bridge] job {job_id} → {st}")
+            if st in ("completed", "failed", "cancelled"):
+                _LAST_POLL_STATUS.pop(job_id, None)  # 终态后清掉,不留内存
         return web.json_response(data)
+
+    # -------- 前端上报 job 客户端侧结局(超时/取消/错误)→ 记进后端日志 --------
+    @routes.post("/modal_bridge/job_event")
+    async def _job_event(request: web.Request):
+        """前端在 job 出现客户端侧结局(Polling timed out / 用户取消 / 出错)时调,
+        让 ComfyUI 后端日志留痕——否则这些只在浏览器,后端无记录(用户反馈'报错没进 log')。"""
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"ok": False}, status=400)
+        job_id = body.get("job_id") or "?"
+        event = body.get("event") or "unknown"
+        detail = (body.get("detail") or "")[:300]
+        print(f"[modal_bridge] ⚠ 前端上报 job {job_id}: {event} {('— ' + detail) if detail else ''}")
+        return web.json_response({"ok": True})
 
     # -------- 拉结果(完成后调,写文件 + 返回 outputs)--------
     @routes.post("/modal_bridge/fetch_result")
@@ -457,14 +491,13 @@ def _setup_routes():
 
         def do_upload(emit):
             def on_progress(ev):
-                if ev["phase"] == "start":
-                    pct = int(ev["done_mb"] * 100 / ev["total_mb"]) if ev["total_mb"] else 0
-                    speed = f"{ev['rate_mbps']} MB/s, 约剩 {ev['eta']}" if ev["rate_mbps"] else "测速中…"
-                    emit(f"  ↑ [{ev['idx']+1}/{ev['total']}] {ev['name']} ({ev['size_mb']} MB) "
-                         f"— 总进度 {ev['done_mb']}/{ev['total_mb']} MB ({pct}%), {speed}\n")
-                else:  # done
-                    emit(f"    ✓ {ev['name']} 完成 {ev['size_mb']} MB / {ev['secs']}s "
-                         f"({ev['rate_mbps']} MB/s)\n")
+                if ev["phase"] == "begin":
+                    emit(f"  ↑ 开始上传 {ev['count']} 个文件,共 ~{ev['total_mb']} MB(并行传,传完才有结果):\n")
+                    for f in ev["files"]:
+                        emit(f"      {f['name']} ({f['size_mb']} MB)\n")
+                else:  # end
+                    emit(f"  ✓ {ev['count']} 个文件上传完成,共 ~{ev['total_mb']} MB / "
+                         f"{ev['secs']}s(均速 {ev['rate_mbps']} MB/s)\n")
             return modal_volume.upload_models(cfg, items, on_progress=on_progress)
 
         # 串行化:有别的上传在跑就排队等(上传前会复查 Volume,等到时多半已有、直接跳过)
@@ -669,6 +702,7 @@ def _setup_routes():
 
         await _emit(resp, "== Modal 一键部署 ==\n")
         await _emit(resp, f"   workspace={workspace}  app={app_name}\n")
+        await _emit(resp, f"   plugin_version={node_sync.plugin_version()}  (会烤进云端 deployed_version)\n")
         await _emit(resp, f"   endpoint={endpoint_base}\n\n")
 
         # 1) modal 包
@@ -741,9 +775,31 @@ def _setup_routes():
         async with aiohttp.ClientSession() as s:
             try:
                 h = await modal_client.health(s, cfg)
-                return web.json_response({"ok": True, "modal": h, "config": cfg})
+                return web.json_response({"ok": True, "modal": h})  # 不回传 config(含 token)
             except Exception as e:
-                return web.json_response({"ok": False, "error": str(e), "config": cfg}, status=502)
+                return web.json_response({"ok": False, "error": str(e)}, status=502)
+
+    @routes.get("/modal_bridge/version")
+    async def _version(request: web.Request):
+        """版本契约:比对本地插件版本 vs 云端部署的版本。
+        返回 {ok, local, deployed, match, reachable}。
+          - match=False 且 reachable=True → 插件升级了但没重新部署 → 前端拦截、引导部署
+          - reachable=False → 连不上(没部署/app 删了)→ 也要引导部署
+        """
+        local = node_sync.plugin_version()
+        cfg = cfg_mod.load_config()
+        deployed, reachable = None, False
+        try:
+            async with aiohttp.ClientSession() as s:
+                h = await modal_client.health(s, cfg)
+            if isinstance(h, dict):
+                deployed = h.get("deployed_version")
+                reachable = True
+        except Exception as e:
+            print(f"[modal_bridge] version check: health 不可达 ({e})")
+        match = reachable and deployed == local
+        return web.json_response({"ok": True, "local": local, "deployed": deployed,
+                                  "match": match, "reachable": reachable})
 
     # -------- 主入口:提交工作流 --------
     @routes.post("/modal_bridge/queue")

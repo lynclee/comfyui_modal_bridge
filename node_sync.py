@@ -20,6 +20,20 @@ from pathlib import Path
 _HERE = Path(__file__).resolve().parent
 MODAL_APP_DIR = _HERE / "modal_app"
 DATA_FILE = MODAL_APP_DIR / "_custom_nodes_data.py"
+PYPROJECT = _HERE / "pyproject.toml"
+
+
+def plugin_version() -> str:
+    """读 pyproject.toml 的 version(版本契约的真源)。读不到返回 '0.0.0'。"""
+    try:
+        import re
+        m = re.search(r'^version\s*=\s*["\']([^"\']+)["\']',
+                      PYPROJECT.read_text(encoding="utf-8"), re.M)
+        if m:
+            return m.group(1)
+    except Exception:
+        pass
+    return "0.0.0"
 
 # ComfyUI 自带节点所在(相对 ComfyUI 根)的目录前缀 — 这些永远不算 custom_node
 _BUILTIN_DIRS = {"comfy_extras", "comfy", "comfy_api_nodes", "app"}
@@ -330,6 +344,7 @@ def deploy_env(cfg: dict) -> dict:
     env["MODAL_BRIDGE_SECRET"] = f"{app_name}-secrets"
     env["MODAL_BRIDGE_DEFAULT_GPU"] = cfg.get("default_gpu", "H100")
     env["MODAL_BRIDGE_SCALEDOWN"] = str(cfg.get("scaledown_window", 40))
+    env["MODAL_BRIDGE_VERSION"] = plugin_version()  # 版本契约:烤进 app,health 回传供前端比对
     if cfg.get("modal_token_id"):
         env["MODAL_TOKEN_ID"] = cfg["modal_token_id"]
     if cfg.get("modal_token_secret"):

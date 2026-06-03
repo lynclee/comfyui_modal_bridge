@@ -87,20 +87,49 @@ def upload_images(images: list[dict]) -> dict:
     return {"status": "success"}
 
 
-def refresh_model_list() -> None:
-    """让 ComfyUI 重扫模型目录(reload Volume 之后调)。
-    warm 容器复用时,ComfyUI 在 boot 那刻缓存了模型列表,运行时新上传到 Volume 的模型
-    它看不到 → 报 value_not_in_list。ComfyUI 有 /api/refresh-models / /refresh 接口可刷缓存,
-    版本不一逐个试,失败也不致命(caller 会判定重试结果)。"""
-    for path in ("/api/refresh-models", "/refresh", "/api/refresh"):
-        try:
-            r = requests.post(f"http://{COMFY_HOST}{path}", timeout=30)
-            if r.ok:
-                print(f"[bridge] refreshed model list via {path}")
-                return
-        except Exception:
-            pass
-    print("[bridge] WARN: 没有可用的 model refresh 接口(将依赖 reload 后的目录扫描)")
+def free_comfy_models() -> None:
+    """调 ComfyUI /free 卸载已加载模型 + 释放显存。
+    目的:关闭 ComfyUI 对模型文件的句柄,否则随后的 models_vol.reload() 会因
+    'open files preventing operation' 失败。下个 job 反正要重新加载模型,卸载无损,
+    还顺带清显存。失败不致命。"""
+    try:
+        r = requests.post(
+            f"http://{COMFY_HOST}/free",
+            data=json.dumps({"unload_models": True, "free_memory": True}).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            timeout=30,
+        )
+        if r.ok:
+            print("[bridge] freed ComfyUI models (released file handles)")
+    except Exception as e:
+        print(f"[bridge] /free 失败(忽略): {e}")
+
+
+# 注:ComfyUI 0.22 没有"刷新模型列表"的 HTTP 接口。它的 get_filename_list 按目录 mtime
+# 自动失效缓存(源码 folder_paths.cached_filename_list_ 比对 os.path.getmtime)——所以只要
+# models_vol.reload() 让挂载点目录 mtime 变了,ComfyUI 下次验证 /prompt 会自动重扫看到新模型,
+# 不需要也没有"主动 refresh"接口。之前那个 refresh_model_list 试的三个路径都不存在,已删。
+
+
+def _reload_volume_in_worker() -> None:
+    """worker 内 reload Volume(拿最新文件视图 + 更新挂载点 mtime → ComfyUI 自动重扫)。
+    先 free 卸载模型关句柄,否则 reload 撞 'open files'。失败不致命。"""
+    free_comfy_models()
+    try:
+        import modal
+        modal.Volume.from_name(
+            os.environ.get("MODAL_BRIDGE_VOLUME", "comfyui-bridge-models")
+        ).reload()
+        print("[bridge] volume reloaded (retry path)")
+    except Exception as e:
+        print(f"[bridge] retry reload 失败(忽略): {e}")
+
+
+# 按需重试:正常 job 不 free/reload(模型留显存,秒级)。只有验证失败(模型不在列表 = 刚上传
+# 还没看到 / 删 Volume 全新目录 / 最终一致延迟)时,才 free→reload→等→重试。free 只在这种
+# 极端场景付一次代价(会卸显存模型,下次加载慢),日常不碰。等待递增,最多 _RETRY_MAX 次。
+_RETRY_MAX = 5
+_RETRY_WAITS = [3, 5, 8, 12, 15]  # 秒,逐次拉长
 
 
 def _parse_validation_error(err: dict):
@@ -123,23 +152,39 @@ def _parse_validation_error(err: dict):
 
 
 def queue_workflow(workflow: dict, client_id: str) -> dict:
-    r = requests.post(
-        f"http://{COMFY_HOST}/prompt",
-        data=json.dumps({"prompt": workflow, "client_id": client_id}).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
-        timeout=30,
-    )
-    if r.status_code == 400:
+    """提交 workflow 到 ComfyUI /prompt。
+    若验证失败是"模型不在列表"(value_not_in_list)→ reload Volume + 等待 + 重试(最多 _RETRY_MAX 次):
+    覆盖"模型刚上传、worker 容器还没看到"的最终一致/全新目录场景,直到 ComfyUI 看到模型或重试用尽。
+    其它验证错误(真缺节点/参数错)立即抛,不重试。"""
+    attempt = 0
+    while True:
+        r = requests.post(
+            f"http://{COMFY_HOST}/prompt",
+            data=json.dumps({"prompt": workflow, "client_id": client_id}).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            timeout=30,
+        )
+        if r.status_code != 400:
+            r.raise_for_status()
+            return r.json()
+        # 400: 解析验证错误
         try:
             err = r.json()
         except json.JSONDecodeError:
             raise ValueError(f"ComfyUI 400: {r.text}")
-        details, _ = _parse_validation_error(err)
+        details, is_missing_value = _parse_validation_error(err)
+        # 只对"模型不在列表"重试(可能是刚上传没看到);其它错误立即抛
+        if is_missing_value and attempt < _RETRY_MAX:
+            wait = _RETRY_WAITS[min(attempt, len(_RETRY_WAITS) - 1)]
+            attempt += 1
+            print(f"[bridge] 模型不在列表,reload+等{wait}s 重试 {attempt}/{_RETRY_MAX} "
+                  f"(可能模型刚上传、容器还没看到)...")
+            _reload_volume_in_worker()
+            time.sleep(wait)
+            continue
         if details:
             raise ValueError("Workflow validation: " + "; ".join(details))
         raise ValueError(f"ComfyUI 400: {r.text}")
-    r.raise_for_status()
-    return r.json()
 
 
 def get_history(prompt_id: str) -> dict:

@@ -36,6 +36,7 @@ APP_NAME = os.environ.get("MODAL_BRIDGE_APP_NAME", "comfyui-bridge")
 VOLUME_NAME = os.environ.get("MODAL_BRIDGE_VOLUME", "comfyui-bridge-models")
 SECRET_NAME = os.environ.get("MODAL_BRIDGE_SECRET", "comfyui-bridge-secrets")
 SCALEDOWN = int(os.environ.get("MODAL_BRIDGE_SCALEDOWN", "40"))
+DEPLOYED_VERSION = os.environ.get("MODAL_BRIDGE_VERSION", "unknown")  # 部署时烤进,health 回传
 
 app = modal.App(APP_NAME)
 models_vol = modal.Volume.from_name(VOLUME_NAME, create_if_missing=True)
@@ -132,13 +133,11 @@ def _worker_run(workflow: dict, job_id: str, input_images: list | None = None) -
         time.sleep(0.1)
     job_state[job_id] = {**job_state.get(job_id, {}), "status": "running", "started_at": time.time()}
     try:
-        # ⭐ 每个 job 跑之前 reload Volume:warm 容器在 boot 那刻冻结了 Volume 视图,
-        # 运行时新上传的模型看不到 → 验证失败。这里在 ComfyUI 加载模型之前 reload(还没打开
-        # 模型文件,不冲突)+ 刷新 ComfyUI 模型列表,保证每次都拿到最新 Volume。这是根治
-        # "Volume 有了 worker 还说没有"的正解(取代之前的失败重试)。
-        models_vol.reload()
-        from _comfy_ws import run_workflow, refresh_model_list
-        refresh_model_list()  # 让 ComfyUI 重扫(boot 时缓存的列表可能旧)
+        # ⚠ 不在这里 free/reload!曾经"每 job 跑前 free+reload"会把 warm 容器显存里的模型卸掉,
+        # 导致每个 job 都得重新从 Volume 加载 flux2(~163s),彻底毁掉 warm 复用。
+        # 正确策略:正常直接跑(模型在显存,秒级);只有验证失败(模型不在列表)时,queue_workflow
+        # 内部才按需 free→reload→重试(只有删 Volume/缺模型的极端场景才付这个代价)。
+        from _comfy_ws import run_workflow
         result = run_workflow(workflow=workflow, job_id=job_id, input_images=input_images)
     except Exception as e:
         import traceback
@@ -270,7 +269,8 @@ def health_endpoint(key: str = ""):
     deny = _check(key)
     if deny:
         return deny
-    info: dict = {"healthy": True, "app": APP_NAME, "volume": VOLUME_NAME}
+    info: dict = {"healthy": True, "app": APP_NAME, "volume": VOLUME_NAME,
+                  "deployed_version": DEPLOYED_VERSION}
     try:
         warm = 0
         try:

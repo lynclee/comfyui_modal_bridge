@@ -8,6 +8,7 @@ clone + 装依赖这两层。
 
 模型不进镜像 — Volume 挂到 /comfy-volume/models/
 """
+import os as _os
 import modal
 from pathlib import Path
 
@@ -63,6 +64,10 @@ cuda_image = (
         "pyyaml",
     )
     .run_commands("mkdir -p /comfy-volume")
+    # 把部署时的插件版本烤进镜像环境 → 容器运行时(health endpoint)能读到 deployed_version。
+    # ⚠ 关键:modal deploy 子进程的 env(node_sync.deploy_env 注入)只在"部署解析期"可见,
+    # 不会自动进容器运行时。必须用 .env() 显式烤进镜像,否则容器里 os.environ 读不到 → unknown。
+    .env({"MODAL_BRIDGE_VERSION": _os.environ.get("MODAL_BRIDGE_VERSION", "unknown")})
     .add_local_file(str(_EXTRA_MODEL_PATHS_YAML), "/comfyui/extra_model_paths.yaml")
     .add_local_python_source("modal_image", "_comfy_ws", "_custom_nodes_data")
 )

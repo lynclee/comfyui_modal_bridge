@@ -16,6 +16,15 @@ from pathlib import Path
 
 MODEL_EXTS = {".safetensors", ".ckpt", ".pt", ".pth", ".bin", ".gguf", ".sft", ".onnx"}
 
+# 互为别名的模型目录(ComfyUI 同一池子):查 Volume 时一并查别名目录,否则模型传在
+# diffusion_models/ 但工作流声明 unet 会误判缺失、重传两份。和 routes._TYPE_ALIASES 对齐。
+_VOL_TYPE_ALIASES = {
+    "diffusion_models": ["unet"],
+    "unet": ["diffusion_models"],
+    "text_encoders": ["clip"],
+    "clip": ["text_encoders"],
+}
+
 # 下载中的临时 / 控制文件后缀(出现这些 = 旁边那个最终名文件还没下完)
 _INPROGRESS_SUFFIXES = (".part", ".tmp", ".download", ".incomplete", ".crdownload", ".aria2", ".st")
 
@@ -69,10 +78,17 @@ def get_volume(cfg: dict):
     return modal.Volume.from_name(vol_name, create_if_missing=True)
 
 
+def _listdir_names(vol, type_) -> set:
+    try:
+        return {Path(e.path).name for e in vol.listdir(f"models/{type_}")}
+    except Exception:
+        return set()  # 该 type 目录在 Volume 还不存在
+
+
 def volume_files_by_type(cfg, types) -> dict:
-    """返回 {type: set(filename)},一个 type 一次 listdir(只查需要的 type,省往返)。
-    查询前 reload() 刷新元数据:否则刚 batch_upload 提交的文件在最终一致性窗口内可能
-    listdir 看不到 → 误判"缺失"→ 又触发上传(用户遇到的"传过了还触发")。"""
+    """返回 {type: set(filename)}。查询前 reload() 刷新元数据:否则刚 batch_upload 提交的文件
+    在最终一致性窗口内可能 listdir 看不到 → 误判"缺失"→ 又触发上传(用户遇到的"传过了还触发")。
+    每个 type 连同其别名目录(unet↔diffusion_models 等)一并查,避免传在别名目录的模型被误判缺失。"""
     vol = get_volume(cfg)
     try:
         vol.reload()
@@ -80,10 +96,10 @@ def volume_files_by_type(cfg, types) -> dict:
         pass
     out = {}
     for t in sorted(set(types)):
-        try:
-            out[t] = {Path(e.path).name for e in vol.listdir(f"models/{t}")}
-        except Exception:
-            out[t] = set()  # 该 type 目录在 Volume 还不存在
+        names = _listdir_names(vol, t)
+        for alias in _VOL_TYPE_ALIASES.get(t, []):
+            names |= _listdir_names(vol, alias)  # 并入别名目录的文件
+        out[t] = names
     return out
 
 
@@ -164,6 +180,7 @@ def check_models(cfg: dict, required: list, resolver) -> dict:
 # 上传:本地文件 → Volume(batch_upload,CAS 去重)
 # ============================================================================
 def _fmt_eta(sec: float) -> str:
+    """秒 → 人类可读时长(通用小工具,有单测)。"""
     sec = int(max(0, sec))
     if sec < 60:
         return f"{sec}s"
@@ -176,9 +193,12 @@ def upload_models(cfg: dict, items: list, on_progress=None) -> dict:
     """
     items: [{type, filename, local_path}, ...]
     on_progress(event): 流式进度回调(可选)。event 形态:
-      {phase:"start", idx, total, name, size_mb, done_mb, total_mb, rate_mbps, eta}
-      {phase:"done",  idx, total, name, size_mb, secs, rate_mbps, done_mb, total_mb}
-    单个大文件内部 SDK 不给字节级进度,故按「已完成文件 + 累计平均速率」估算总体进度/ETA。
+      {phase:"begin", count, total_mb, files:[{name,size_mb}]}  # 开始前:列出要传的文件
+      {phase:"end",   count, total_mb, secs, rate_mbps}         # 全部传完:总耗时 + 均速
+
+    ⚠ 为什么没有逐文件实时进度:Modal 的 batch_upload 是 context manager,所有 put_file 只是
+    "登记",真正的上传/提交发生在 with 块退出那一刻(一次性并行传)。所以循环里测不到单文件
+    真实速率(测出来≈0,是假的)。这里只给"开始(列清单)+ 结束(总耗时/均速)"两个真实事件。
 
     返回 {uploaded: [...], skipped: [...], total_mb: int}
     Modal Volume CAS 块级去重:相同内容(网上通用大模型)秒过,只有新内容真正占上行带宽。
@@ -207,36 +227,24 @@ def upload_models(cfg: dict, items: list, on_progress=None) -> dict:
         pending.append((it, local))
 
     if pending:
-        # 预先算各文件大小 + 总量,用于整体进度/ETA
         sizes = [max(1, Path(p[1]).stat().st_size // 1024 // 1024) for p in pending]
         grand_total = sum(sizes)
+        if on_progress:
+            on_progress({"phase": "begin", "count": len(pending), "total_mb": grand_total,
+                         "files": [{"name": f"{it['type']}/{it['filename']}", "size_mb": sz}
+                                   for (it, _), sz in zip(pending, sizes)]})
         vol = get_volume(cfg)
-        done_mb = 0
         t0 = time.time()
-        with vol.batch_upload(force=False) as batch:
-            for i, (it, local) in enumerate(pending):
-                size_mb = sizes[i]
-                # 用「之前已传字节 / 已用时」估当前平均速率,推剩余 ETA(首个文件还没速率)
-                elapsed = time.time() - t0
-                rate = (done_mb / elapsed) if (done_mb and elapsed > 0) else 0  # MB/s
-                eta = _fmt_eta((grand_total - done_mb) / rate) if rate else "…"
-                if on_progress:
-                    on_progress({"phase": "start", "idx": i, "total": len(pending),
-                                 "name": f"{it['type']}/{it['filename']}", "size_mb": size_mb,
-                                 "done_mb": done_mb, "total_mb": grand_total,
-                                 "rate_mbps": round(rate, 1), "eta": eta})
-                f0 = time.time()
+        with vol.batch_upload(force=False) as batch:  # 真正上传在此 with 退出时一次性发生
+            for (it, local), sz in zip(pending, sizes):
                 batch.put_file(str(local), f"models/{it['type']}/{it['filename']}")
-                secs = time.time() - f0
-                done_mb += size_mb
-                total_mb += size_mb
-                uploaded.append({**it, "size_mb": size_mb})
-                if on_progress:
-                    fr = (size_mb / secs) if secs > 0 else 0
-                    on_progress({"phase": "done", "idx": i, "total": len(pending),
-                                 "name": f"{it['type']}/{it['filename']}", "size_mb": size_mb,
-                                 "secs": round(secs, 1), "rate_mbps": round(fr, 1),
-                                 "done_mb": done_mb, "total_mb": grand_total})
+                total_mb += sz
+                uploaded.append({**it, "size_mb": sz})
+        secs = time.time() - t0
+        if on_progress:
+            on_progress({"phase": "end", "count": len(pending), "total_mb": grand_total,
+                         "secs": round(secs, 1),
+                         "rate_mbps": round(grand_total / secs, 1) if secs > 0 else 0})
     return {"uploaded": uploaded, "skipped": skipped, "total_mb": total_mb}
 
 

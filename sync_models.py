@@ -98,13 +98,12 @@ def main():
     print("\n开始上传(块级去重,相同内容秒过;新内容走你的上行带宽,耐心等)...")
 
     def _prog(ev):
-        if ev["phase"] == "start":
-            pct = int(ev["done_mb"] * 100 / ev["total_mb"]) if ev["total_mb"] else 0
-            speed = f"{ev['rate_mbps']} MB/s, ETA {ev['eta']}" if ev["rate_mbps"] else "测速中…"
-            print(f"  ↑ [{ev['idx']+1}/{ev['total']}] {ev['name']} ({ev['size_mb']} MB) "
-                  f"— {ev['done_mb']}/{ev['total_mb']} MB ({pct}%), {speed}")
+        if ev["phase"] == "begin":
+            print(f"  ↑ 上传 {ev['count']} 个文件,共 ~{ev['total_mb']} MB(并行,传完才有结果):")
+            for f in ev["files"]:
+                print(f"      {f['name']} ({f['size_mb']} MB)")
         else:
-            print(f"    ✓ {ev['name']} {ev['size_mb']}MB / {ev['secs']}s ({ev['rate_mbps']} MB/s)")
+            print(f"  ✓ {ev['count']} 个完成,共 ~{ev['total_mb']} MB / {ev['secs']}s(均速 {ev['rate_mbps']} MB/s)")
 
     result = modal_volume.upload_models(cfg, items, on_progress=_prog)
     print(f"\n✓ 同步完成:{len(result['uploaded'])} 个,共 ~{result['total_mb']} MB。"

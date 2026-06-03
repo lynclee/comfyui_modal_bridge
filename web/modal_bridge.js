@@ -20,6 +20,18 @@ const err = (...a) => console.error("[modal_bridge]", ...a);
 // =====================================================================
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+// 上报 job 客户端侧结局(超时/取消/失败)给后端记日志——否则这些只在浏览器,
+// ComfyUI 后端 log 看不到(用户反馈"报错没进 log")。fire-and-forget,失败无所谓。
+function reportJobEvent(jobId, event, detail) {
+  try {
+    api.fetchApi("/modal_bridge/job_event", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ job_id: jobId, event, detail: detail || "" }),
+    }).catch(() => {});
+  } catch (e) {}
+}
+
 const LS_KEYS = {
   progressPos: "modal_bridge.progress_pos",
   activeJob: "modal_bridge.active_job",   // 持久化未完成 job
@@ -541,6 +553,7 @@ async function runOnceOnModal(workflowPrompt, outputNodeIds, ctx, submitGuard, b
   ctx.setCancel(jobId, async () => {
     if (!confirm(`Cancel Modal job ${jobId.slice(0, 8)}?`)) return;
     cancelled = true;
+    reportJobEvent(jobId, "user_cancelled", "用户点取消");
     // 立即结束卡片(不依赖后续 poll 拿到 cancelled —— 那可能慢或因竞态拿不到)
     removeActiveJob(jobId);
     ctx.finish(false, "✕ Cancelled");
@@ -556,7 +569,7 @@ async function runOnceOnModal(workflowPrompt, outputNodeIds, ctx, submitGuard, b
   ctx.stage("queued", `${batchSuffix}job=${jobId.slice(0, 8)} gpu=${gpu}`, true);
 
   const interval = getSetting("ModalBridge.pollIntervalSec", 1.2) * 1000;
-  const timeoutMs = getSetting("ModalBridge.timeoutSec", 1200) * 1000;
+  const timeoutMs = getSetting("ModalBridge.timeoutSec", 900) * 1000;  // 默认 900s=15min,与 worker 上限一致
   const deadline = Date.now() + timeoutMs;
 
   let final = null;
@@ -595,9 +608,16 @@ async function runOnceOnModal(workflowPrompt, outputNodeIds, ctx, submitGuard, b
   } finally {
     removeActiveJob(jobId);
   }
-  if (!final) throw new Error("Polling timed out");
-  if (final.status === "cancelled") throw new Error("Job cancelled");
+  if (!final) {
+    reportJobEvent(jobId, "polling_timed_out", `前端等待超时;Modal 可能仍在跑,图若出会在 output/`);
+    throw new Error("Polling timed out(前端等待超时;Modal 可能仍在跑,稍后看 output/modal_results/)");
+  }
+  if (final.status === "cancelled") {
+    reportJobEvent(jobId, "cancelled", "");
+    throw new Error("Job cancelled");
+  }
   if (final.status === "failed") {
+    reportJobEvent(jobId, "worker_failed", final.error || "");
     throw new Error(final.error || "Modal worker failed");
   }
 
@@ -711,6 +731,8 @@ async function queueOnModal() {
     try { openDeployDialog(); } catch (e) {}
     return;
   }
+  // ⭐ 版本契约:插件版本 vs 云端部署版本必须一致,否则拦截(防"升级了插件没重新部署")
+  if (!(await checkVersionOrBlock())) return;
   // 每次点击 = 一个独立的 job 卡片(多 workflow 并发互不覆盖),标题带工作流名
   const ctx = newProgress("preparing", activeWorkflowName());
   ctx.stage("preparing", "Serializing graph...");
@@ -753,16 +775,18 @@ async function queueOnModal() {
     }
 
     ctx.finish(true, batchCount > 1 ? `✓ ${batchCount} done` : "✓ Done");
+    const wf = ctx.wfName ? `「${ctx.wfName}」` : "";
     notify(
       batchCount > 1
-        ? `✓ ${batchCount} Modal jobs done`
-        : `✓ Modal job ${allOutputs[0].jobId.slice(0, 8)} done`,
+        ? `✓ ${wf} ${batchCount} 张完成`
+        : `✓ ${wf} 完成 (job ${allOutputs[0].jobId.slice(0, 8)})`,
       "success",
     );
   } catch (e) {
     err(e);
     ctx.finish(false, "✗ " + (e.message || "Error").slice(0, 40), e.stack || e.toString());
-    notify(`Failed: ${e.message}`, "error");
+    const wf = ctx.wfName ? `「${ctx.wfName}」` : "";
+    notify(`✗ ${wf} 失败:${e.message}`, "error");
   }
 }
 
@@ -807,7 +831,7 @@ async function recoverOne(pending) {
       if (fd.ok) {
         const sf = fd.outputs?.[0]?.subfolder || "modal_results";
         ctx.finish(true, "✓ Recovered");
-        notify(`✓ Recovered job ${pending.jobId.slice(0, 8)} → output/${sf}/`, "success");
+        notify(`✓ ${pending.wfName ? "「" + pending.wfName + "」" : ""} 恢复完成 → output/${sf}/`, "success");
       } else {
         ctx.finish(false, "✗ Recover fetch failed", JSON.stringify(fd));
       }
@@ -851,10 +875,11 @@ const SETTINGS = [
     id: "ModalBridge.timeoutSec",
     name: "Modal Bridge: Timeout (sec)",
     type: "number",
-    defaultValue: 60,
+    defaultValue: 900,
     attrs: { min: 60, max: 7200, step: 60 },
-    tooltip: "单 job 最长等待(秒)。注意:冷启动 30-40s + 大模型加载/推理常 >60s," +
-      "60s 下冷启动的首张图易超时;想兼顾冷启动建议设 180-300s。",
+    tooltip: "前端等出图的最长时间(秒),默认 900=15分钟,和 worker 单任务上限一致——" +
+      "worker 最多跑多久前端就等多久,谁都不会先放弃。出图后立刻返回,不会真等满;" +
+      "设大只是给冷启动+大模型留足空间,不会让任何东西变慢。",
   },
   {
     id: "ModalBridge.incognito",
@@ -896,11 +921,60 @@ function isConfigured(cfg) {
   );
 }
 
+// 版本契约:本地插件版本 vs 云端部署版本不一致 → 拦截提交、引导重新部署。
+// 返回 true=放行 / false=拦截。version 检查本身出错(网络等)不拦(放行,别误伤)。
+async function checkVersionOrBlock() {
+  let v;
+  try {
+    const r = await api.fetchApi("/modal_bridge/version");
+    v = await r.json();
+  } catch (e) {
+    log("version check failed, skip:", e);
+    return true;  // 检查本身失败不阻塞
+  }
+  if (v.match) return true;  // 版本一致,放行
+
+  if (!v.reachable) {
+    notify(`云端连不上(app 可能没部署/被删)。点 [⚙️ Modal Setup] 重新部署`, "warn");
+  } else {
+    notify(`插件版本 ${v.local} 与云端部署的 ${v.deployed} 不一致,需重新部署。`, "warn");
+  }
+  const msg = !v.reachable
+    ? `云端 Modal 连不上(没部署 / app 被删)。\n\n点「确定」打开部署窗口。`
+    : `⚠ 版本不一致:\n  插件(本地):${v.local}\n  云端部署:${v.deployed}\n\n` +
+      `你升级了插件但还没重新部署,云端跑的是旧代码,会出问题。\n\n点「确定」打开部署窗口重新部署。`;
+  if (confirm(msg)) {
+    try { openDeployDialog(); } catch (e) {}
+  }
+  return false;  // 拦截:不提交
+}
+
 let deployDialogEl = null;
 
+// 重新拉 /version 并更新 Setup 对话框顶部的版本徽标(部署成功 / 测试连接后调)
+async function refreshVerBanner(panel) {
+  const el = panel?.querySelector?.("#mb-dep-ver");
+  if (!el) return;
+  let v;
+  try { v = await (await api.fetchApi("/modal_bridge/version")).json(); } catch (e) { return; }
+  const dep = v.reachable ? (v.deployed || "unknown") : "未连接";
+  const color = v.match ? "#34d399" : (v.reachable ? "#fbbf24" : "#9aa");
+  const hint = v.match ? "✓ 已对齐"
+    : (v.reachable ? "⚠ 不一致,请点「部署」更新云端" : "云端未部署 / 连不上");
+  el.innerHTML = `插件(本地):<b style="color:#eee;">${v.local}</b>　·` +
+    ` 云端部署:<b style="color:${color};">${dep}</b> <span style="color:${color};">${hint}</span>`;
+}
+
 async function openDeployDialog() {
-  if (deployDialogEl) { deployDialogEl.style.display = "flex"; return; }
+  if (deployDialogEl) {
+    deployDialogEl.style.display = "flex";
+    refreshVerBanner(deployDialogEl.querySelector("div"));  // 重开时刷新版本徽标
+    return;
+  }
   const cfg = await fetchConfig();
+  // 拉版本信息(本地插件版本 vs 云端部署版本),用于标题区显示是否对齐
+  let ver = { local: "?", deployed: null, match: false, reachable: false };
+  try { ver = await (await api.fetchApi("/modal_bridge/version")).json(); } catch (e) {}
 
   const overlay = document.createElement("div");
   deployDialogEl = overlay;
@@ -919,8 +993,19 @@ async function openDeployDialog() {
   const inputCss =
     "width:100%;box-sizing:border-box;margin:4px 0 10px;padding:7px 9px;" +
     "background:#2a2a2a;border:1px solid #444;border-radius:6px;color:#eee;font:13px monospace;";
+  // 版本对齐徽标:绿=一致 / 黄=不一致(需重新部署)/ 灰=云端连不上
+  const vDeployed = ver.reachable ? (ver.deployed || "unknown") : "未连接";
+  const vColor = ver.match ? "#34d399" : (ver.reachable ? "#fbbf24" : "#9aa");
+  const vHint = ver.match ? "✓ 已对齐"
+    : (ver.reachable ? "⚠ 不一致,请点「部署」更新云端" : "云端未部署 / 连不上");
   panel.innerHTML = `
     <div style="font-size:16px;font-weight:600;margin-bottom:4px;">☁️ 部署到 Modal</div>
+    <div id="mb-dep-ver" style="margin-bottom:10px;font-size:12px;padding:6px 10px;border-radius:6px;
+         background:#222;border:1px solid #383838;">
+      插件(本地):<b style="color:#eee;">${ver.local}</b>　·
+      云端部署:<b style="color:${vColor};">${vDeployed}</b>
+      <span style="color:${vColor};">${vHint}</span>
+    </div>
     <div style="color:#9aa;margin-bottom:14px;">
       全程在 ComfyUI 里完成,不用开终端。需要 Modal token(免费注册,送 $30):
       <a href="https://modal.com/settings/tokens" target="_blank" style="color:#6cf;">modal.com/settings/tokens</a>
@@ -985,8 +1070,9 @@ async function openDeployDialog() {
       if (r.ok && data.ok && data.modal?.healthy) {
         const m = data.modal;
         const nodes = Array.isArray(m.custom_nodes) ? m.custom_nodes.length : "?";
-        statusEl.textContent = `✓ 连接正常(warm=${m.warm_containers ?? 0}, 已装节点=${nodes})`;
+        statusEl.textContent = `✓ 连接正常(云端 ${m.deployed_version ?? "?"}, warm=${m.warm_containers ?? 0}, 已装节点=${nodes})`;
         statusEl.style.color = "#34d399";
+        refreshVerBanner(panel);  // 顺带刷新顶部版本徽标
       } else {
         const why = data.error || "endpoint 不可达";
         statusEl.textContent = `✗ 连不上:${String(why).slice(0, 80)} — app 可能没部署/被删,请点「部署」`;
@@ -1105,6 +1191,7 @@ async function openDeployDialog() {
         statusEl.style.color = "#34d399";
         notify("✓ Modal 部署成功", "success");
         doHealthCheck();
+        refreshVerBanner(panel);  // 部署成功 → 版本徽标翻绿(本地↔云端对齐)
       } else {
         statusEl.textContent = `✗ 部署失败 rc=${rc}(看上面日志)`;
         statusEl.style.color = "#f87171";
