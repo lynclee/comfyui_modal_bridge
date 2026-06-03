@@ -788,17 +788,29 @@ def _setup_routes():
         """
         local = node_sync.plugin_version()
         cfg = cfg_mod.load_config()
-        deployed, reachable = None, False
+        deployed, reachable, err_kind = None, False, None
+        # 快速单次直查(不走 health 的 3×10s 重试,避免点 Modal 卡 30s 无反应)。
+        url = modal_client._endpoint(cfg["modal_endpoint_base"], "health")
         try:
-            async with aiohttp.ClientSession() as s:
-                h = await modal_client.health(s, cfg)
-            if isinstance(h, dict):
-                deployed = h.get("deployed_version")
-                reachable = True
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=6)) as s:
+                async with s.get(url, params={"key": modal_client._key(cfg)}) as r:
+                    if r.status == 200:
+                        h = await r.json(content_type=None)
+                        if isinstance(h, dict):
+                            deployed = h.get("deployed_version")
+                            reachable = True
+                    elif r.status == 404:
+                        err_kind = "not_deployed"  # endpoint 不存在 = app 没部署
+                    else:
+                        err_kind = "http_error"
+        except asyncio.TimeoutError:
+            err_kind = "timeout"   # 超时 = 多半 Modal 平台故障 / 冷启动慢
+            print("[modal_bridge] version check: health 超时(可能 Modal 平台故障,查 status.modal.com)")
         except Exception as e:
+            err_kind = "unreachable"
             print(f"[modal_bridge] version check: health 不可达 ({e})")
         match = reachable and deployed == local
-        return web.json_response({"ok": True, "local": local, "deployed": deployed,
+        return web.json_response({"ok": True, "local": local, "deployed": deployed, "err_kind": err_kind,
                                   "match": match, "reachable": reachable})
 
     # -------- 主入口:提交工作流 --------

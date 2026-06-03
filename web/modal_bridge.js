@@ -125,6 +125,13 @@ const I18N = {
                         en: "Cloud Modal unreachable (not deployed / app deleted).\n\nOK to open the deploy dialog." },
   "ver.mismatch_msg": { zh: "⚠ 版本不一致:\n  插件(本地):{local}\n  云端部署:{deployed}\n\n你升级了插件但还没重新部署,云端跑的是旧代码,会出问题。\n\n点「确定」打开部署窗口重新部署。",
                         en: "⚠ Version mismatch:\n  Plugin (local): {local}\n  Deployed: {deployed}\n\nYou upgraded the plugin but haven't redeployed; the cloud runs old code.\n\nOK to open the deploy dialog." },
+  "ver.checking":     { zh: "检查云端中…", en: "Checking cloud…" },
+  "ver.platform_toast":{ zh: "⚠ 连不上 Modal,可能是平台故障", en: "⚠ Can't reach Modal — possible platform outage" },
+  "ver.platform_msg": { zh: "连不上 Modal 云端(超时)。\n\n这很可能是 Modal 平台故障,不是你的问题——重新部署也会失败。\n\n点「确定」打开 status.modal.com 查看平台状态;若显示故障,等恢复后再试即可。",
+                        en: "Can't reach Modal cloud (timeout).\n\nThis is likely a Modal platform outage, not your fault — redeploying would also fail.\n\nOK to open status.modal.com; if it shows an outage, just wait for recovery." },
+  "ver.notdeployed_toast":{ zh: "云端 app 未部署。点 [⚙️ Modal Setup] 部署", en: "Cloud app not deployed. Click [⚙️ Modal Setup]" },
+  "ver.notdeployed_msg":{ zh: "云端 Modal app 不存在(没部署 / 被删)。\n\n点「确定」打开部署窗口。",
+                          en: "Cloud Modal app not found (undeployed / deleted).\n\nOK to open the deploy dialog." },
   // —— 管理云端节点 动作 ——
   "mn.loading":       { zh: "加载中...", en: "Loading..." },
   "mn.empty":         { zh: "镜像里没有 custom_node", en: "No custom_nodes on the image" },
@@ -1054,6 +1061,7 @@ function isConfigured(cfg) {
 // 版本契约:本地插件版本 vs 云端部署版本不一致 → 拦截提交、引导重新部署。
 // 返回 true=放行 / false=拦截。version 检查本身出错(网络等)不拦(放行,别误伤)。
 async function checkVersionOrBlock() {
+  notify(t("ver.checking"), "info");  // 立即反馈,别让点击像没反应(检查最多等 ~6s)
   let v;
   try {
     const r = await api.fetchApi("/modal_bridge/version");
@@ -1064,16 +1072,21 @@ async function checkVersionOrBlock() {
   }
   if (v.match) return true;  // 版本一致,放行
 
+  // 连不上:按错误类型区分。timeout/unreachable 多半是 Modal 平台故障 → 引导查状态页,
+  // 别瞎引导重新部署(平台挂时部署也会失败);not_deployed 才是真没部署 → 引导部署。
   if (!v.reachable) {
-    notify(t("ver.unreach_toast"), "warn");
+    const platform = v.err_kind === "timeout" || v.err_kind === "unreachable";
+    notify(platform ? t("ver.platform_toast") : t("ver.notdeployed_toast"), "warn");
+    if (confirm(platform ? t("ver.platform_msg") : t("ver.notdeployed_msg"))) {
+      if (platform) { try { window.open("https://status.modal.com", "_blank"); } catch (e) {} }
+      else { try { openDeployDialog(); } catch (e) {} }
+    }
   } else {
+    // 版本不一致(连得上,但本地↔云端版本不同)→ 引导重新部署
     notify(t("ver.mismatch_toast", { local: v.local, deployed: v.deployed }), "warn");
-  }
-  const msg = !v.reachable
-    ? t("ver.unreach_msg")
-    : t("ver.mismatch_msg", { local: v.local, deployed: v.deployed });
-  if (confirm(msg)) {
-    try { openDeployDialog(); } catch (e) {}
+    if (confirm(t("ver.mismatch_msg", { local: v.local, deployed: v.deployed }))) {
+      try { openDeployDialog(); } catch (e) {}
+    }
   }
   return false;  // 拦截:不提交
 }
