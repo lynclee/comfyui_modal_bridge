@@ -308,6 +308,13 @@ def _setup_routes():
         cfg.pop("bridge_api_key", None)
         return web.json_response(cfg)
 
+    @routes.get("/modal_bridge/bridge_key")
+    async def _bridge_key(request: web.Request):
+        """仅本机:导出脚本「嵌入 KEY」时取回自己的 bridge_api_key。
+        /config 故意抹掉 key 不回吐浏览器;这里单独给(同机、owner 自己的 key,显式动作才调)。"""
+        cfg = cfg_mod.load_config()
+        return web.json_response({"key": cfg.get("bridge_api_key", "")})
+
     @routes.post("/modal_bridge/config")
     async def _set_config(request: web.Request):
         body = await request.json()

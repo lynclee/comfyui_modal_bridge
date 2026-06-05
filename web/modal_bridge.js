@@ -136,6 +136,11 @@ const I18N = {
   "export.done":      { zh: "已导出 {name}_modal.py —— 给别人:让他装 requests、填 KEY、python 跑即可(模型/节点需已同步过)。",
                         en: "Exported {name}_modal.py — share it: recipient installs requests, fills KEY, runs python (models/nodes must be already synced)." },
   "export.fail":      { zh: "导出失败:取当前工作流出错", en: "Export failed: couldn't read the current workflow" },
+  "export.key.title": { zh: "要把你的 API KEY 写进文件吗?", en: "Embed your API KEY into the file?" },
+  "export.key.body":  { zh: "「嵌入」= 文件双击即跑,但 KEY 明文在内 = 你的 Modal 账单,谁拿到都能花你额度,泄露只能轮换 key 止损 —— 只发给可信的人 / 你自己后端。\n「用占位符」= 安全,接收方自己填 KEY(推荐对外)。", en: "Embed = file runs as-is, but your KEY (= your Modal billing) sits in plaintext; anyone with the file can spend your credits, and a leak means rotating the key. Only for trusted recipients / your own backend.\nUse placeholder = safe; the recipient fills the KEY (recommended for sharing)." },
+  "export.key.embed": { zh: "嵌入我的 KEY", en: "Embed my KEY" },
+  "export.key.placeholder":{ zh: "用占位符(推荐)", en: "Use placeholder (recommended)" },
+  "export.key.fail":  { zh: "取 KEY 失败,已改用占位符(需重启 ComfyUI 加载新后端)", en: "Couldn't fetch KEY; fell back to placeholder (restart ComfyUI to load the new backend)" },
   "ver.gpu_mismatch_toast":{ zh: "显卡已改为 {local},但云端部署的是 {deployed},必须重新部署才生效。",
                         en: "GPU changed to {local}, but cloud is deployed on {deployed}; redeploy required." },
   "ver.gpu_mismatch_msg": { zh: "⚠ 显卡不一致:\n  你选的:{local}\n  云端实际在跑:{deployed}\n\nModal 的显卡是部署时固定的,换卡必须重新部署才生效——否则会继续在旧卡 {deployed} 上跑。\n\n点「确定」打开部署窗口重新部署。",
@@ -1502,6 +1507,27 @@ async function exportModalApi() {
   const prereqText = prereq.size ? [...prereq].join("\n") : "#       (未检测到模型加载节点)";
   const wfB64 = btoa(unescape(encodeURIComponent(JSON.stringify(wf))));
 
+  // KEY:默认占位符(安全);用户确认「嵌入」才写真 key——从本机路由取(/config 不回吐 key)
+  let keyValue = "在此填入作者给的 bridge_api_key(bk-...)";
+  let keyNote =
+`    3) 把作者给的 API KEY 填到下面 KEY(bk-...)。
+       注意:KEY = 作者的 Modal 账单,别公开、别提交到仓库。`;
+  const embed = await confirmDialog(
+    t("export.key.title"), t("export.key.body"),
+    t("export.key.embed"), t("export.key.placeholder"),
+  );
+  if (embed) {
+    try {
+      const kd = await (await api.fetchApi("/modal_bridge/bridge_key")).json();
+      if (kd && kd.key) {
+        keyValue = kd.key;
+        keyNote =
+`    3) ⚠ 本文件已内嵌作者的 API KEY = 作者的 Modal 账单。
+       别公开、别传仓库、别群发;一旦泄露,只能让作者轮换 key 止损。`;
+      } else { notify(t("export.key.fail"), "warn"); }
+    } catch (e) { notify(t("export.key.fail"), "warn"); }
+  }
+
   const py = `#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
@@ -1519,8 +1545,7 @@ ${wfname} — Modal API 单文件客户端(comfyui_modal_bridge 导出)
     1) app 已部署到 Modal:${base}
     2) 以下模型已同步到云端 Volume(否则 worker 找不到),以及工作流用到的自定义节点已在云端镜像:
 ${prereqText}
-    3) 把作者给的 API KEY 填到下面 KEY(bk-...)。
-       注意:KEY = 作者的 Modal 账单,别公开、别提交到仓库。
+${keyNote}
 """
 import argparse, base64, json, sys, time
 try:
@@ -1529,7 +1554,7 @@ except ImportError:
     sys.exit("缺 requests:  pip install requests")
 
 BASE = "${base}"
-KEY  = "在此填入作者给的 bridge_api_key(bk-...)"
+KEY  = "${keyValue}"
 TIER = "${tier}"
 
 _WF_B64 = "${wfB64}"
