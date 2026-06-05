@@ -133,6 +133,9 @@ const I18N = {
                         en: "Cloud Modal unreachable (not deployed / app deleted).\n\nOK to open the deploy dialog." },
   "ver.mismatch_msg": { zh: "⚠ 版本不一致:\n  插件(本地):{local}\n  云端部署:{deployed}\n\n你升级了插件但还没重新部署,云端跑的是旧代码,会出问题。\n\n点「确定」打开部署窗口重新部署。",
                         en: "⚠ Version mismatch:\n  Plugin (local): {local}\n  Deployed: {deployed}\n\nYou upgraded the plugin but haven't redeployed; the cloud runs old code.\n\nOK to open the deploy dialog." },
+  "export.done":      { zh: "已导出 {name}_modal.py —— 给别人:让他装 requests、填 KEY、python 跑即可(模型/节点需已同步过)。",
+                        en: "Exported {name}_modal.py — share it: recipient installs requests, fills KEY, runs python (models/nodes must be already synced)." },
+  "export.fail":      { zh: "导出失败:取当前工作流出错", en: "Export failed: couldn't read the current workflow" },
   "ver.gpu_mismatch_toast":{ zh: "显卡已改为 {local},但云端部署的是 {deployed},必须重新部署才生效。",
                         en: "GPU changed to {local}, but cloud is deployed on {deployed}; redeploy required." },
   "ver.gpu_mismatch_msg": { zh: "⚠ 显卡不一致:\n  你选的:{local}\n  云端实际在跑:{deployed}\n\nModal 的显卡是部署时固定的,换卡必须重新部署才生效——否则会继续在旧卡 {deployed} 上跑。\n\n点「确定」打开部署窗口重新部署。",
@@ -1457,10 +1460,159 @@ async function openDeployDialog() {
 // =====================================================================
 // actionBarButtons 注册
 // =====================================================================
+// 浏览器内触发文本文件下载(无需后端)
+function downloadText(filename, text) {
+  const blob = new Blob([text], { type: "text/x-python;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url; a.download = filename;
+  document.body.appendChild(a); a.click();
+  a.remove(); URL.revokeObjectURL(url);
+}
+
+// 把当前画布工作流导成「自包含单文件 Modal API 客户端」——别人 python xxx.py 就能云端出图,
+// 不需要 ComfyUI / 本机 GPU / 作者机器开机(直连已部署的 -run / -status)。纯前端,不碰后端。
+async function exportModalApi() {
+  const cfg = await fetchConfig();
+  if (!isConfigured(cfg)) {
+    notify(t("toast.not_deployed"), "warn");
+    try { openDeployDialog(); } catch (e) {}
+    return;
+  }
+  let p;
+  try { p = await app.graphToPrompt(); }
+  catch (e) { notify(t("export.fail"), "error"); return; }
+  const wf = p.output;
+  const base = cfg.modal_endpoint_base;
+  const tier = getVramTier(wf);
+  const wfname = (activeWorkflowName() || "workflow").replace(/[^\w.-]+/g, "_");
+
+  // 探测可覆盖的提示词/种子节点 + 列出依赖模型(供接收方/作者核对已同步)
+  const promptNodes = [], seedNodes = [], prereq = new Set();
+  for (const [nid, node] of Object.entries(wf)) {
+    const ct = (node && node.class_type) || "";
+    const ins = (node && node.inputs) || {};
+    if (/TextEncode/i.test(ct) && typeof ins.text === "string") promptNodes.push(nid);
+    if (typeof ins.seed === "number" || typeof ins.noise_seed === "number") seedNodes.push(nid);
+    for (const v of Object.values(ins)) {
+      if (typeof v === "string" && /\.(safetensors|ckpt|pt|pth|gguf|bin|sft)$/i.test(v))
+        prereq.add(`#       - ${ct}: ${v}`);
+    }
+  }
+  const prereqText = prereq.size ? [...prereq].join("\n") : "#       (未检测到模型加载节点)";
+  const wfB64 = btoa(unescape(encodeURIComponent(JSON.stringify(wf))));
+
+  const py = `#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+${wfname} — Modal API 单文件客户端(comfyui_modal_bridge 导出)
+
+把这套 ComfyUI 工作流在云端 Modal GPU 上跑、出图存本地。
+不需要 ComfyUI、不需要本机 GPU、不用作者的机器开机。
+
+用法:
+    pip install requests
+    python ${wfname}_modal.py
+    python ${wfname}_modal.py --prompt "a cat" --seed 123 --out out.png
+
+前提(作者保证,只需一次):
+    1) app 已部署到 Modal:${base}
+    2) 以下模型已同步到云端 Volume(否则 worker 找不到),以及工作流用到的自定义节点已在云端镜像:
+${prereqText}
+    3) 把作者给的 API KEY 填到下面 KEY(bk-...)。
+       注意:KEY = 作者的 Modal 账单,别公开、别提交到仓库。
+"""
+import argparse, base64, json, sys, time
+try:
+    import requests
+except ImportError:
+    sys.exit("缺 requests:  pip install requests")
+
+BASE = "${base}"
+KEY  = "在此填入作者给的 bridge_api_key(bk-...)"
+TIER = "${tier}"
+
+_WF_B64 = "${wfB64}"
+WORKFLOW = json.loads(base64.b64decode(_WF_B64).decode("utf-8"))
+
+PROMPT_NODES = ${JSON.stringify(promptNodes)}   # --prompt 覆盖这些节点的 text
+SEED_NODES   = ${JSON.stringify(seedNodes)}     # --seed 覆盖这些节点的 seed/noise_seed
+
+
+def _apply(wf, prompt, seed):
+    if prompt is not None:
+        for nid in PROMPT_NODES:
+            wf.get(nid, {}).get("inputs", {})["text"] = prompt
+    if seed is not None:
+        for nid in SEED_NODES:
+            ins = wf.get(nid, {}).get("inputs", {})
+            for k in ("seed", "noise_seed"):
+                if k in ins:
+                    ins[k] = seed
+    return wf
+
+
+def run(wf, timeout=900):
+    if not KEY.startswith("bk-"):
+        sys.exit("请先在脚本顶部 KEY 填入作者给的 bridge_api_key(bk-...)")
+    # 提交(带重试,容忍偶发网络/冷启动抖动)
+    jid = None
+    for _ in range(5):
+        try:
+            jid = requests.post(BASE + "-run.modal.run",
+                json={"workflow": wf, "tier": TIER, "auth_key": KEY}, timeout=60).json().get("id")
+            if jid:
+                break
+        except Exception as e:
+            print("提交重试:", e)
+        time.sleep(3)
+    if not jid:
+        sys.exit("提交失败(网络或鉴权问题)")
+    print("job:", jid, "(首次冷启动约 3-5 分钟,别急)")
+    # 轮询(单次网络抖动不致命,下一轮自动重试)
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        try:
+            s = requests.get(BASE + "-status.modal.run",
+                             params={"job_id": jid, "key": KEY}, timeout=30).json()
+        except Exception as e:
+            print("轮询抖动,重试:", e)
+            time.sleep(3)
+            continue
+        st = s.get("status")
+        if st == "completed":
+            return [base64.b64decode(im["data_base64"]) for im in s.get("images", [])]
+        if st == "failed":
+            sys.exit("失败: " + str(s.get("error")))
+        time.sleep(2)
+    sys.exit("超时(>" + str(timeout) + "s)")
+
+
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser(description="${wfname} on Modal")
+    ap.add_argument("--prompt", help="覆盖正向提示词")
+    ap.add_argument("--seed", type=int, help="覆盖随机种子")
+    ap.add_argument("--out", default="${wfname}_out.png", help="输出文件名")
+    a = ap.parse_args()
+    wf = _apply(json.loads(json.dumps(WORKFLOW)), a.prompt, a.seed)
+    imgs = run(wf)
+    if not imgs:
+        sys.exit("没拿到图")
+    for i, b in enumerate(imgs):
+        fn = a.out if i == 0 else a.out.rsplit(".", 1)[0] + "_" + str(i) + ".png"
+        with open(fn, "wb") as f:
+            f.write(b)
+        print("saved:", fn)
+`;
+  downloadText(`${wfname}_modal.py`, py);
+  notify(t("export.done", { name: wfname }), "success");
+}
+
 // 注:这两个 tooltip 同时用作 DOM 选择器(下方 querySelector button[title=...]),
 // 不做 i18n(否则切语言后选择器对不上已注册的按钮)。保持稳定英文。
 const BUTTON_TOOLTIP = "Queue on Modal (H100, see Settings)";
 const SETUP_TOOLTIP = "Modal Bridge: deploy / settings (start here)";
+const EXPORT_TOOLTIP = "Export current workflow as a standalone Modal API client (.py)";
 
 app.registerExtension({
   name: "ModalBridge.QueueButton",
@@ -1473,6 +1625,12 @@ app.registerExtension({
       tooltip: BUTTON_TOOLTIP,
       label: "RunModal",
       onClick: queueOnModal,
+    },
+    {
+      icon: "pi pi-file-export",
+      tooltip: EXPORT_TOOLTIP,
+      label: "Export API",
+      onClick: exportModalApi,
     },
     {
       icon: "pi pi-cog",
