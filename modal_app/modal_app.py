@@ -281,7 +281,7 @@ def health_endpoint(key: str = ""):
     if deny:
         return deny
     info: dict = {"healthy": True, "app": APP_NAME, "volume": VOLUME_NAME,
-                  "deployed_version": DEPLOYED_VERSION}
+                  "deployed_version": DEPLOYED_VERSION, "deployed_gpu": _PRIMARY_GPU}
     try:
         warm = 0
         try:

@@ -834,7 +834,8 @@ def _setup_routes():
         """
         local = node_sync.plugin_version()
         cfg = cfg_mod.load_config()
-        deployed, reachable, err_kind = None, False, None
+        local_gpu = (cfg.get("default_gpu") or "H100")
+        deployed, deployed_gpu, reachable, err_kind = None, None, False, None
         # 快速单次直查(不走 health 的 3×10s 重试,避免点 Modal 卡 30s 无反应)。
         url = modal_client._endpoint(cfg["modal_endpoint_base"], "health")
         try:
@@ -844,6 +845,7 @@ def _setup_routes():
                         h = await r.json(content_type=None)
                         if isinstance(h, dict):
                             deployed = h.get("deployed_version")
+                            deployed_gpu = h.get("deployed_gpu")
                             reachable = True
                     elif r.status == 404:
                         err_kind = "not_deployed"  # endpoint 不存在 = app 没部署
@@ -856,8 +858,12 @@ def _setup_routes():
             err_kind = "unreachable"
             print(f"[modal_bridge] version check: health 不可达 ({e})")
         match = reachable and deployed == local
+        # GPU 契约:云端真在跑的卡 ≠ 本地所选 → 必须重新部署才能用新卡。
+        # 老镜像不上报 deployed_gpu(None)时不拦 —— 交给版本契约先逼出一次重部署,之后云端才会上报 gpu。
+        gpu_match = (not reachable) or (deployed_gpu is None) or (deployed_gpu == local_gpu)
         return web.json_response({"ok": True, "local": local, "deployed": deployed, "err_kind": err_kind,
-                                  "match": match, "reachable": reachable})
+                                  "match": match, "reachable": reachable,
+                                  "local_gpu": local_gpu, "deployed_gpu": deployed_gpu, "gpu_match": gpu_match})
 
     # -------- 主入口:提交工作流 --------
     @routes.post("/modal_bridge/queue")

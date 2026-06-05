@@ -48,8 +48,8 @@ const I18N = {
   "dlg.secret.ph_saved": { zh: "••••••••(已保存,留空沿用)", en: "•••••••• (saved, blank=reuse)" },
   "dlg.gpu.label":    { zh: "(部署时固定;换显卡需重新部署生效)",
                         en: "(fixed at deploy; switching needs a redeploy)" },
-  "dlg.gpu.note":     { zh: "选显卡后点「部署」才生效。点 Modal 前会用 模型总显存×1.15 对比所选卡,超了弹警告。",
-                        en: "Pick a GPU, then Deploy to apply. Before running, model VRAM ×1.15 is checked vs the selected GPU." },
+  "dlg.gpu.note":     { zh: "换显卡必须点「部署」才生效:改了不部署,点 RunModal 会被拦住要求重新部署。点 RunModal 前还会用 模型总显存×1.15 对比所选卡,超了弹警告。",
+                        en: "Switching GPU requires Deploy to take effect: change without redeploy and RunModal will block and ask you to redeploy. Before running, model VRAM ×1.15 is also checked vs the selected GPU." },
   "vram.warn.title":  { zh: "⚠ 显存可能不够", en: "⚠ VRAM may be tight" },
   "vram.warn.body":   { zh: "预估需 ~{est}GB(模型 {model}GB ×1.15),超过所选 {gpu}({cap}GB)。可能 offload 变慢甚至 OOM。",
                         en: "Est. ~{est}GB ({model}GB models ×1.15) exceeds the selected {gpu} ({cap}GB). May offload (slow) or OOM." },
@@ -133,6 +133,10 @@ const I18N = {
                         en: "Cloud Modal unreachable (not deployed / app deleted).\n\nOK to open the deploy dialog." },
   "ver.mismatch_msg": { zh: "⚠ 版本不一致:\n  插件(本地):{local}\n  云端部署:{deployed}\n\n你升级了插件但还没重新部署,云端跑的是旧代码,会出问题。\n\n点「确定」打开部署窗口重新部署。",
                         en: "⚠ Version mismatch:\n  Plugin (local): {local}\n  Deployed: {deployed}\n\nYou upgraded the plugin but haven't redeployed; the cloud runs old code.\n\nOK to open the deploy dialog." },
+  "ver.gpu_mismatch_toast":{ zh: "显卡已改为 {local},但云端部署的是 {deployed},必须重新部署才生效。",
+                        en: "GPU changed to {local}, but cloud is deployed on {deployed}; redeploy required." },
+  "ver.gpu_mismatch_msg": { zh: "⚠ 显卡不一致:\n  你选的:{local}\n  云端实际在跑:{deployed}\n\nModal 的显卡是部署时固定的,换卡必须重新部署才生效——否则会继续在旧卡 {deployed} 上跑。\n\n点「确定」打开部署窗口重新部署。",
+                        en: "⚠ GPU mismatch:\n  Selected: {local}\n  Actually running on cloud: {deployed}\n\nModal's GPU is fixed at deploy time; switching GPU needs a redeploy — otherwise it keeps running on the old {deployed}.\n\nOK to open the deploy dialog to redeploy." },
   "ver.checking":     { zh: "检查云端中…", en: "Checking cloud…" },
   "ver.platform_startup":{ zh: "⚠ Modal 平台当前异常(status.modal.com),出图可能失败,等平台恢复",
                            en: "⚠ Modal platform is currently degraded (status.modal.com); jobs may fail until it recovers" },
@@ -1156,7 +1160,16 @@ async function checkVersionOrBlock() {
     log("version check failed, skip:", e);
     return true;  // 检查本身失败不阻塞
   }
-  if (v.match) return true;  // 版本一致,放行
+  if (v.match && v.gpu_match !== false) return true;  // 版本 + 显卡都一致,放行
+
+  // 版本一致但显卡改了没重新部署(云端真跑的卡 ≠ 所选)→ 强制重新部署,不让在旧卡上偷偷跑
+  if (v.match && v.gpu_match === false) {
+    notify(t("ver.gpu_mismatch_toast", { local: v.local_gpu, deployed: v.deployed_gpu }), "warn");
+    if (confirm(t("ver.gpu_mismatch_msg", { local: v.local_gpu, deployed: v.deployed_gpu }))) {
+      try { openDeployDialog(); } catch (e) {}
+    }
+    return false;  // 拦截:必须重新部署
+  }
 
   // 连不上:先查 Modal 官方状态页(权威)判断是不是平台故障。
   // 平台故障 → 引导查状态页(部署也会失败,等恢复);否则按 err_kind 当没部署 → 引导部署。
@@ -1458,7 +1471,7 @@ app.registerExtension({
     {
       icon: "pi pi-cloud-upload",
       tooltip: BUTTON_TOOLTIP,
-      label: "Modal",
+      label: "RunModal",
       onClick: queueOnModal,
     },
     {
