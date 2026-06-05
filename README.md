@@ -8,7 +8,7 @@
 
 ## ✨ 核心优势
 
-- 🖥️ **不挑机器,本地零显卡要求** — Mac、轻薄本、核显本都行。FLUX.2 这种吃显存的大模型,**算力全在云端 H100**,本地只负责发起工作流、收图。本地再弱也能跑 flux2,不用为了跑图换电脑。
+- 🖥️ **不挑机器,本地零显卡要求** — Mac、轻薄本、核显本都行。FLUX.2 这种吃显存的大模型,**算力全在云端 GPU**(可选 L40S/A100-80G/H100/H200),本地只负责发起工作流、收图。本地再弱也能跑 flux2,不用为了跑图换电脑。
 - ⚡ **多任务并发** — 多个工作流可同时提交、同时跑,各有独立进度卡片(可拖动 / 取消 / 关闭),互不阻塞、互不覆盖。
 - 🚀 **全自动部署,零终端** — GUI 填一次 Modal token,后端自动 `pip install modal`、建密钥、`modal deploy`、写配置。全程不碰命令行,首次拉镜像约 3-5 分钟,之后秒进。
 - 🧩 **custom node 自动同步** — 工作流用到的自定义节点,云端镜像没有就**自动装进镜像并重部署**;多台机器各装一部分时取**并集、互不删**,换机无缝。
@@ -22,7 +22,7 @@
 
 - **零终端部署**:点 `⚙️ Modal Setup` 填 Modal token → 后端自动 `pip install modal`、建 Secret、`modal deploy`、写配置并验证 health。
 - **不挑本地机器**:本地只做序列化 + 上传 + 收图,**不跑推理**,所以对本地显卡/显存无要求;Mac / Windows / Linux 一致(子进程串流部署日志,绕开 Windows 事件循环坑)。
-- **统一 H100**:所有工作流跑 H100,排不到自动降级 A100-80GB(Modal 原生 fallback),不按显存分档把小模型丢到弱卡。
+- **多档 GPU 可选 + 显存预警**:Modal Setup 里选显卡(**L40S 48G / A100-80G / H100 80G(默认) / H200 141G**),每档带 Modal 原生 fallback;点 Modal 前自动用「**模型总显存 ×1.15**」对比所选卡,超了弹警告(可"仍要跑"或"去换显卡")。GPU 部署时固定,换卡重新部署生效。
 - **多任务并发 & 进度**:多工作流并发各有独立进度卡片(可拖动/取消/关闭);上传带速率 + ETA;job 状态自动清理,不会互相覆盖。
 - **custom_node 自动同步 + 多机友好**:自动加工作流需要的节点并重部署(只这一次);多机取并集、互不删;清理走 Setup 的「管理云端节点」手动勾选。
 - **模型本地 → Volume**:模型在本地 ComfyUI 下好,提交时自动把云端缺的传上去;**块级去重(CAS)让通用大模型秒过**,只有自训练/私有模型才真占上行带宽。不从 HF 下载、不依赖手维护的 registry。
@@ -74,7 +74,7 @@ MIT
 
 ## ✨ Why use it
 
-- 🖥️ **Runs on any machine — zero local GPU required.** Mac, thin laptops, iGPU-only — all fine. VRAM-hungry models like FLUX.2 run **entirely on a cloud H100**; your machine only serializes the workflow and receives images. Run flux2 on a potato.
+- 🖥️ **Runs on any machine — zero local GPU required.** Mac, thin laptops, iGPU-only — all fine. VRAM-hungry models like FLUX.2 run **entirely on a cloud GPU** (pick L40S/A100-80G/H100/H200); your machine only serializes the workflow and receives images. Run flux2 on a potato.
 - ⚡ **Multi-task concurrency.** Submit and run multiple workflows at once — each gets its own progress card (draggable / cancelable / closable), no blocking, no clobbering.
 - 🚀 **Fully automatic deploy, zero terminal.** Enter your Modal token once in the GUI; the backend auto `pip install modal`, creates the secret, runs `modal deploy`, writes config. Never touch the command line. First image-pull ~3-5 min, instant afterward.
 - 🧩 **Custom nodes auto-sync.** Nodes your workflow uses but the cloud lacks are **auto-baked into the image and redeployed**; across machines the image is the **union, never cross-deleted** — switch machines seamlessly.
@@ -88,7 +88,7 @@ You don't have a big-VRAM GPU locally (Mac / thin laptop / a 4090 that can't fit
 
 - **Zero-terminal deploy**: click `⚙️ Modal Setup`, enter your Modal token → the backend auto `pip install modal`, creates the Secret, runs `modal deploy`, writes config, verifies health.
 - **Machine-agnostic local side**: locally it only serializes + uploads + receives — **no inference** — so it has no requirement on your GPU/VRAM; consistent across Mac / Windows / Linux (streams deploy logs via a subprocess to dodge the Windows event-loop pitfall).
-- **Unified H100**: every workflow runs H100, falling back to A100-80GB automatically (Modal native fallback) — no VRAM tiering that drops small models onto weak cards.
+- **Multiple GPUs + VRAM preflight**: pick a GPU in Modal Setup (**L40S 48G / A100-80G / H100 80G (default) / H200 141G**), each with native fallback; before running, **model VRAM ×1.15** is checked against the selected GPU and warns if it won't fit ("run anyway" / "switch GPU"). GPU is fixed at deploy time — switching needs a redeploy.
 - **Multi-task concurrency & progress**: each concurrent workflow gets its own progress card (draggable / cancelable / closable); uploads show rate + ETA; job state auto-cleans without clobbering.
 - **Custom-node auto-sync & multi-machine**: auto-adds nodes the workflow needs and redeploys (one time); across machines it's the **union, never cross-deleted**; cleanup is manual via "Manage cloud nodes" in Setup.
 - **Local → Volume models**: download models locally; missing ones upload on submit; **block-level dedup (CAS) makes common big models instant** — only custom/private models actually use upstream bandwidth. No HF download, no hand-maintained registry.

@@ -46,8 +46,16 @@ const I18N = {
                         en: "(the segment in your modal.com profile URL, e.g. your-workspace)" },
   "dlg.secret.saved": { zh: ";已保存,留空=沿用", en: "; saved, leave blank to reuse" },
   "dlg.secret.ph_saved": { zh: "••••••••(已保存,留空沿用)", en: "•••••••• (saved, blank=reuse)" },
-  "dlg.gpu.note":     { zh: "GPU:H100 →(排不到)A100-80GB,所有工作流统一,无需选择。",
-                        en: "GPU: H100 → A100-80GB (fallback), unified for all workflows." },
+  "dlg.gpu.label":    { zh: "(部署时固定;换显卡需重新部署生效)",
+                        en: "(fixed at deploy; switching needs a redeploy)" },
+  "dlg.gpu.note":     { zh: "选显卡后点「部署」才生效。点 Modal 前会用 模型总显存×1.15 对比所选卡,超了弹警告。",
+                        en: "Pick a GPU, then Deploy to apply. Before running, model VRAM ×1.15 is checked vs the selected GPU." },
+  "vram.warn.title":  { zh: "⚠ 显存可能不够", en: "⚠ VRAM may be tight" },
+  "vram.warn.body":   { zh: "预估需 ~{est}GB(模型 {model}GB ×1.15),超过所选 {gpu}({cap}GB)。可能 offload 变慢甚至 OOM。",
+                        en: "Est. ~{est}GB ({model}GB models ×1.15) exceeds the selected {gpu} ({cap}GB). May offload (slow) or OOM." },
+  "vram.warn.unknown":{ zh: "(另有 {n} 个模型本地没找到,实际可能更高)", en: " ({n} models not found locally; real usage may be higher)" },
+  "vram.warn.run":    { zh: "仍要跑", en: "Run anyway" },
+  "vram.warn.switch": { zh: "去 Setup 换显卡", en: "Switch GPU in Setup" },
   "dlg.btn.deploy":   { zh: "部署", en: "Deploy" },
   "dlg.btn.test":     { zh: "测试连接", en: "Test connection" },
   "dlg.btn.close":    { zh: "关闭", en: "Close" },
@@ -747,8 +755,11 @@ async function runOnceOnModal(workflowPrompt, outputNodeIds, ctx, submitGuard, b
         log("poll error (will retry)", e);
         continue;
       }
-      if (pData.error) {
-        log("poll resp error:", pData);
+      // 只有「纯接口错误」(有 error 但没有 status)才当临时错误重试。
+      // job 执行失败的响应也带 error,但同时有 status:"failed" —— 不能在这里 continue,
+      // 否则漏掉终态、一直 poll 到超时,把真正的失败原因吞掉(报错不回前端的根因)。
+      if (pData.error && !pData.status) {
+        log("poll resp error (will retry):", pData);
         continue;
       }
       if (pData.status !== lastStatus) {
@@ -874,6 +885,60 @@ async function ensureModelsAvailable(prompt, ctx) {
 // =====================================================================
 // 主入口:批量包装
 // =====================================================================
+// GPU 显存表(GB)。键与 Setup 下拉/后端 default_gpu 一致。
+const GPU_VRAM = { "L40S": 48, "A100-80GB": 80, "H100": 80, "H200": 141 };
+
+// 显存预警:点 Modal 前用「模型总显存 ×1.15」对比所选显卡。超了弹确认。
+// 返回 true=继续, false=用户中止(去换显卡)。任何异常都放行 —— 预警是辅助,不该挡正常流程。
+async function vramPreflightOrConfirm(prompt, cfgNow) {
+  try {
+    const gpu = cfgNow.default_gpu || "H100";
+    const cap = GPU_VRAM[gpu];
+    if (!cap) return true;
+    const r = await api.fetchApi("/modal_bridge/estimate_vram", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ prompt }),
+    });
+    const d = await r.json();
+    if (!r.ok || d.error || !d.total_mb) return true;  // 估不出就不挡
+    const modelGB = d.total_mb / 1024;
+    const estGB = modelGB * 1.15;
+    if (estGB <= cap) return true;  // 没超 → 放行
+    const unknownNote = (d.unknown && d.unknown.length)
+      ? t("vram.warn.unknown", { n: d.unknown.length }) : "";
+    return await confirmDialog(
+      t("vram.warn.title"),
+      t("vram.warn.body", { est: estGB.toFixed(0), model: modelGB.toFixed(0), gpu, cap }) + unknownNote,
+      t("vram.warn.run"), t("vram.warn.switch"),
+    );
+  } catch (e) { log("vram preflight skipped:", e); return true; }
+}
+
+// 轻量 async 确认弹窗,返回 Promise<boolean>(主按钮=true / 次按钮或点遮罩=false)。
+function confirmDialog(title, body, okText, cancelText) {
+  return new Promise((resolve) => {
+    const ov = document.createElement("div");
+    Object.assign(ov.style, { position: "fixed", inset: "0", zIndex: "10002",
+      background: "rgba(0,0,0,0.55)", display: "flex", alignItems: "center", justifyContent: "center" });
+    const box = document.createElement("div");
+    Object.assign(box.style, { background: "#1e1e1e", color: "#eee", width: "440px", maxWidth: "92vw",
+      borderRadius: "10px", padding: "20px", font: "13px/1.6 system-ui,sans-serif",
+      boxShadow: "0 10px 40px rgba(0,0,0,0.5)" });
+    box.innerHTML = `
+      <div style="font-size:15px;font-weight:600;margin-bottom:8px;color:#fbbf24;">${title}</div>
+      <div style="color:#ddd;margin-bottom:16px;">${body}</div>
+      <div style="text-align:right;">
+        <button id="mb-vram-cancel" style="padding:7px 14px;margin-right:8px;background:#374151;color:#ddd;border:none;border-radius:6px;cursor:pointer;">${cancelText}</button>
+        <button id="mb-vram-ok" style="padding:7px 16px;background:#2563eb;color:#fff;border:none;border-radius:6px;cursor:pointer;font-weight:600;">${okText}</button>
+      </div>`;
+    ov.appendChild(box); document.body.appendChild(ov);
+    const done = (v) => { ov.remove(); resolve(v); };
+    box.querySelector("#mb-vram-ok").onclick = () => done(true);
+    box.querySelector("#mb-vram-cancel").onclick = () => done(false);
+    ov.onclick = (e) => { if (e.target === ov) done(false); };
+  });
+}
+
 async function queueOnModal() {
   // 没部署/没配置就直接引导去 Setup,别走后面链路再失败
   const cfg0 = await fetchConfig();
@@ -902,6 +967,14 @@ async function queueOnModal() {
         ctx.finish(false, "✕ Cancelled");
         return;
       }
+    }
+
+    // ⭐ 显存预警:模型总显存×1.15 超所选显卡 → 弹确认(可继续 / 去换卡)
+    const okVram = await vramPreflightOrConfirm(p.output, cfg0);
+    if (!okVram) {
+      ctx.finish(false, "✕ Cancelled");
+      try { openDeployDialog(); } catch (e) {}
+      return;
     }
 
     // ⭐ 模型自动同步:本地 → Volume(默认开启,Settings 可关)
@@ -1176,7 +1249,11 @@ async function openDeployDialog() {
     <input id="mb-dep-id" type="text" style="${inputCss}" value="${cfg.modal_token_id || ""}" placeholder="ak-xxxxxxxx">
     <label>Token Secret <span style="color:#9aa;">(as-...${cfg.has_token_secret ? t("dlg.secret.saved") : ""})</span></label>
     <input id="mb-dep-secret" type="password" style="${inputCss}" value="" placeholder="${cfg.has_token_secret ? t("dlg.secret.ph_saved") : "as-xxxxxxxx"}">
-    <div style="margin:4px 0 10px;color:#9aa;">${t("dlg.gpu.note")}</div>
+    <label>GPU <span style="color:#9aa;">${t("dlg.gpu.label")}</span></label>
+    <select id="mb-dep-gpu" style="${inputCss}">
+      ${[["L40S","48G"],["A100-80GB","80G"],["H100","80G"],["H200","141G"]].map(([g,m])=>`<option value="${g}"${(cfg.default_gpu||"H100")===g?" selected":""}>${g} (${m})${g==="H100"?" — default":""}</option>`).join("")}
+    </select>
+    <div style="margin:0 0 10px;color:#9aa;font-size:12px;">${t("dlg.gpu.note")}</div>
     <div style="margin:10px 0;">
       <button id="mb-dep-go" style="padding:8px 18px;background:#2563eb;color:#fff;border:none;border-radius:6px;cursor:pointer;font-weight:600;">${t("dlg.btn.deploy")}</button>
       <button id="mb-dep-test" style="padding:8px 14px;margin-left:8px;background:#374151;color:#ddd;border:none;border-radius:6px;cursor:pointer;">${t("dlg.btn.test")}</button>
@@ -1325,6 +1402,7 @@ async function openDeployDialog() {
       workspace: panel.querySelector("#mb-dep-ws").value.trim(),
       token_id: panel.querySelector("#mb-dep-id").value.trim(),
       token_secret: panel.querySelector("#mb-dep-secret").value.trim(),
+      default_gpu: panel.querySelector("#mb-dep-gpu").value,
     };
     // token_secret 留空 = 沿用已存的(/config 不再回显它);只有填了才校验格式
     const secretOk = payload.token_secret === "" ? cfg.has_token_secret : payload.token_secret.startsWith("as-");

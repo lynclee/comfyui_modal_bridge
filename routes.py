@@ -461,6 +461,37 @@ def _setup_routes():
             return web.json_response({"error": f"check_models(SDK) failed: {e}"}, status=502)
         return web.json_response(result)
 
+    @routes.post("/modal_bridge/estimate_vram")
+    async def _estimate_vram(request: web.Request):
+        """估工作流要加载的模型本地总大小(MB),供前端 ×1.3 对比所选显卡做显存预警。
+        body: {prompt}
+        返回: {total_mb, known_count, required_count, unknown:[本地查不到的模型]}
+        粗估:仅按模型文件大小求和,不含激活/reference;本地缺的模型计 unknown、不入 total
+        (前端据此提示"估算可能偏低")。"""
+        body = await request.json()
+        prompt = body.get("prompt")
+        if not isinstance(prompt, dict):
+            return web.json_response({"error": "prompt required"}, status=400)
+        required = extract_required_models(prompt)
+        resolver = _local_model_resolver()
+        total_bytes, known, unknown = 0, 0, []
+        for m in required:
+            p = resolver(m["type"], m["filename"])
+            try:
+                if p and Path(p).exists():
+                    total_bytes += Path(p).stat().st_size
+                    known += 1
+                else:
+                    unknown.append(f"{m['type']}/{m['filename']}")
+            except OSError:
+                unknown.append(f"{m['type']}/{m['filename']}")
+        return web.json_response({
+            "total_mb": total_bytes // 1024 // 1024,
+            "known_count": known,
+            "required_count": len(required),
+            "unknown": unknown,
+        })
+
     @routes.post("/modal_bridge/sync_models")
     async def _sync_models(request: web.Request):
         """

@@ -158,9 +158,19 @@ def _worker_run(workflow: dict, job_id: str, input_images: list | None = None) -
     return result
 
 
-# 统一所有工作流都跑 H100,排不到自动降级 A100-80GB(用户要求:别把小模型丢到 L40S 反而慢)。
-# 单 worker class —— 不再按显存分档(那会让 klein 等小模型落到 L40S/弱卡)。
-@app.cls(gpu=["H100", "A100-80GB"], **_WORKER_KW)
+# GPU 在部署时由 config.default_gpu 决定(deploy_env 传 MODAL_BRIDGE_DEFAULT_GPU)。
+# ⚠ Modal 的 gpu 是部署时固定的,运行时不可变 —— 换显卡需重新部署。
+# 每档带 Modal 原生 fallback(排不到主卡自动降级到链里下一个)。
+_PRIMARY_GPU = os.environ.get("MODAL_BRIDGE_DEFAULT_GPU", "H100")
+_GPU_CHAIN = {
+    "H100":      ["H100", "A100-80GB"],   # 主卡排不到降 A100-80G
+    "H200":      ["H200", "H100"],         # 141G 大卡,降级到 H100
+    "A100-80GB": ["A100-80GB"],
+    "L40S":      ["L40S"],                  # 选 L40S 是为省钱,不 fallback 到贵卡
+}
+_GPU_LIST = _GPU_CHAIN.get(_PRIMARY_GPU, [_PRIMARY_GPU])
+
+@app.cls(gpu=_GPU_LIST, **_WORKER_KW)
 @modal.concurrent(max_inputs=1)
 class ComfyWorker:
     @modal.enter()
@@ -176,9 +186,10 @@ class ComfyWorker:
         return _worker_run(workflow, job_id, input_images)
 
 
-# tier 入参保留兼容(前端仍可能传 80g/40g),但都指向同一个 H100 worker。
+# tier 入参保留兼容(前端仍可能传 80g/40g),但 GPU 由部署时的 default_gpu 决定,不再按 tier 分档。
 _TIER_WORKERS = {"80g": ComfyWorker, "40g": ComfyWorker}
-_TIER_GPU_DISPLAY = {"80g": "H100→A100-80G", "40g": "H100→A100-80G"}
+_GPU_DISPLAY = "→".join(_GPU_LIST)  # 如 "H100→A100-80GB",进度卡/日志显示真实显卡
+_TIER_GPU_DISPLAY = {"80g": _GPU_DISPLAY, "40g": _GPU_DISPLAY}
 
 
 # ============================================================================
