@@ -136,9 +136,9 @@ const I18N = {
   "export.done":      { zh: "已导出 {name}_modal.py —— 给别人:让他装 requests、填 KEY、python 跑即可(模型/节点需已同步过)。",
                         en: "Exported {name}_modal.py — share it: recipient installs requests, fills KEY, runs python (models/nodes must be already synced)." },
   "export.fail":      { zh: "导出失败:取当前工作流出错", en: "Export failed: couldn't read the current workflow" },
-  "export.key.title": { zh: "要把你的 API KEY 写进文件吗?", en: "Embed your API KEY into the file?" },
-  "export.key.body":  { zh: "「嵌入」= 文件双击即跑,但 KEY 明文在内 = 你的 Modal 账单,谁拿到都能花你额度,泄露只能轮换 key 止损 —— 只发给可信的人 / 你自己后端。\n「用占位符」= 安全,接收方自己填 KEY(推荐对外)。", en: "Embed = file runs as-is, but your KEY (= your Modal billing) sits in plaintext; anyone with the file can spend your credits, and a leak means rotating the key. Only for trusted recipients / your own backend.\nUse placeholder = safe; the recipient fills the KEY (recommended for sharing)." },
-  "export.key.embed": { zh: "嵌入我的 KEY", en: "Embed my KEY" },
+  "export.key.title": { zh: "要把你的 API KEY 写进导出文件吗?", en: "Write your API KEY into the exported file?" },
+  "export.key.body":  { zh: "这把 key = 你的 Modal 账单:谁拿到都能花你的钱,泄露只能整把换 key。\n\n【嵌入 KEY】文件直接能跑,但 key 明文写在里面 —— 只发可信的人 / 自己后端。\n【用占位符(推荐)】文件不含 key,对方用你私下给的 key 自己填 —— 对外分享选这个。", en: "This key = your Modal billing: anyone who has it can spend your money; a leak means rotating the key.\n\n[Embed KEY] Runs as-is, but the key sits in the file in plaintext — trusted people / your own backend only.\n[Use placeholder (recommended)] No key in the file; the recipient fills in the key you give them privately — pick this for sharing." },
+  "export.key.embed": { zh: "嵌入 KEY", en: "Embed KEY" },
   "export.key.placeholder":{ zh: "用占位符(推荐)", en: "Use placeholder (recommended)" },
   "export.key.fail":  { zh: "取 KEY 失败,已改用占位符(需重启 ComfyUI 加载新后端)", en: "Couldn't fetch KEY; fell back to placeholder (restart ComfyUI to load the new backend)" },
   "ver.gpu_mismatch_toast":{ zh: "显卡已改为 {local},但云端部署的是 {deployed},必须重新部署才生效。",
@@ -927,7 +927,9 @@ async function vramPreflightOrConfirm(prompt, cfgNow) {
 }
 
 // 轻量 async 确认弹窗,返回 Promise<boolean>(主按钮=true / 次按钮或点遮罩=false)。
-function confirmDialog(title, body, okText, cancelText) {
+function confirmDialog(title, body, okText, cancelText, opts = {}) {
+  const cancelBg = opts.dangerCancel ? "#b91c1c" : "#374151";
+  const cancelFg = opts.dangerCancel ? "#fff" : "#ddd";
   return new Promise((resolve) => {
     const ov = document.createElement("div");
     Object.assign(ov.style, { position: "fixed", inset: "0", zIndex: "10002",
@@ -938,9 +940,9 @@ function confirmDialog(title, body, okText, cancelText) {
       boxShadow: "0 10px 40px rgba(0,0,0,0.5)" });
     box.innerHTML = `
       <div style="font-size:15px;font-weight:600;margin-bottom:8px;color:#fbbf24;">${title}</div>
-      <div style="color:#ddd;margin-bottom:16px;">${body}</div>
+      <div style="color:#ddd;margin-bottom:16px;white-space:pre-line;">${body}</div>
       <div style="text-align:right;">
-        <button id="mb-vram-cancel" style="padding:7px 14px;margin-right:8px;background:#374151;color:#ddd;border:none;border-radius:6px;cursor:pointer;">${cancelText}</button>
+        <button id="mb-vram-cancel" style="padding:7px 14px;margin-right:8px;background:${cancelBg};color:${cancelFg};border:none;border-radius:6px;cursor:pointer;">${cancelText}</button>
         <button id="mb-vram-ok" style="padding:7px 16px;background:#2563eb;color:#fff;border:none;border-radius:6px;cursor:pointer;font-weight:600;">${okText}</button>
       </div>`;
     ov.appendChild(box); document.body.appendChild(ov);
@@ -1512,11 +1514,13 @@ async function exportModalApi() {
   let keyNote =
 `    3) 把作者给的 API KEY 填到下面 KEY(bk-...)。
        注意:KEY = 作者的 Modal 账单,别公开、别提交到仓库。`;
-  const embed = await confirmDialog(
+  // 右(主蓝)= 用占位符(推荐/安全);左(红)= 嵌入 KEY(危险)。返回 true=占位符,false=嵌入
+  const safe = await confirmDialog(
     t("export.key.title"), t("export.key.body"),
-    t("export.key.embed"), t("export.key.placeholder"),
+    t("export.key.placeholder"), t("export.key.embed"),
+    { dangerCancel: true },
   );
-  if (embed) {
+  if (!safe) {
     try {
       const kd = await (await api.fetchApi("/modal_bridge/bridge_key")).json();
       if (kd && kd.key) {
