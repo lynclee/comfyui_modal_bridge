@@ -13,7 +13,7 @@
 - 🚀 **全自动部署,零终端** — GUI 填一次 Modal token,后端自动 `pip install modal`、建密钥、`modal deploy`、写配置。全程不碰命令行,首次拉镜像约 3-5 分钟,之后秒进。
 - 🧩 **custom node 自动同步** — 工作流用到的自定义节点,云端镜像没有就**自动装进镜像并重部署**;多台机器各装一部分时取**并集、互不删**,换机无缝。
 - 📤 **一键导出 API** — 点 `Export API` 把当前工作流导成一个**自包含单文件 `.py`**,别人 `python xxx.py` 就能云端出图,**不需要 ComfyUI / 本机 GPU / 你开机**;可改 `--prompt`/`--seed`,key 默认占位符(可选嵌入,带账单风险提示)。
-- 💰 **按秒计费,空闲归零** — 用你自己的 Modal 账号(注册送 $30/月额度,不绑卡),**不出图不花钱**,闲置自动缩到零。
+- 💰 **按秒计费,空闲归零** — 用你自己的 Modal 账号(注册送 $30/月额度,需绑卡),**不出图不花钱**,闲置自动缩到零。
 
 ## 它解决什么
 
@@ -81,7 +81,7 @@ MIT
 - 🚀 **Fully automatic deploy, zero terminal.** Enter your Modal token once in the GUI; the backend auto `pip install modal`, creates the secret, runs `modal deploy`, writes config. Never touch the command line. First image-pull ~3-5 min, instant afterward.
 - 🧩 **Custom nodes auto-sync.** Nodes your workflow uses but the cloud lacks are **auto-baked into the image and redeployed**; across machines the image is the **union, never cross-deleted** — switch machines seamlessly.
 - 📤 **One-click Export API.** Click `Export API` to export the current workflow as a **self-contained single `.py`** — anyone can `python xxx.py` to generate on the cloud, **no ComfyUI / local GPU / your machine running required**; supports `--prompt`/`--seed`; key is a placeholder by default (optional embed, with a billing-risk warning).
-- 💰 **Per-second billing, scales to zero.** Uses your own Modal account ($30/mo free credit, no card); **you pay nothing when not generating**, idle scales to zero.
+- 💰 **Per-second billing, scales to zero.** Uses your own Modal account ($30/mo free credit, card required); **you pay nothing when not generating**, idle scales to zero.
 
 ## What it solves
 
