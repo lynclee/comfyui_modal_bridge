@@ -127,10 +127,12 @@ async def _write_results(final: dict, job_id: str, subfolder: str) -> list:
 
     def _dedup(fn: str) -> str:
         if fn not in seen:
-            seen.add(fn); return fn
+            seen.add(fn)
+            return fn
         stem, _, ext = fn.rpartition(".")
         fn2 = f"{stem}_{len(seen)}.{ext}" if ext else f"{fn}_{len(seen)}"
-        seen.add(fn2); return fn2
+        seen.add(fn2)
+        return fn2
 
     images = final.get("images")
     if isinstance(images, list) and images:

@@ -71,12 +71,14 @@ def main():
     rc = run(node_sync.secret_create_cmd(cfg, args.hf_token, "", cfg["bridge_api_key"]),
              cwd=str(MODAL_APP_DIR), env=env)
     if rc != 0:
-        print("✗ secret 创建失败(token 可能无效)"); sys.exit(rc)
+        print("✗ secret 创建失败(token 可能无效)")
+        sys.exit(rc)
 
     print("\n== 部署(首次拉镜像约 3-5 分钟)==")
     rc = run(node_sync.deploy_command(), cwd=str(MODAL_APP_DIR), env=env)
     if rc != 0:
-        print("✗ deploy 失败"); sys.exit(rc)
+        print("✗ deploy 失败")
+        sys.exit(rc)
 
     CONFIG_DST.parent.mkdir(parents=True, exist_ok=True)
     CONFIG_DST.write_text(json.dumps(cfg, indent=2, ensure_ascii=False), encoding="utf-8")

@@ -191,7 +191,8 @@ def test_check_models_classification(monkeypatch=None):
         assert [x["filename"] for x in r["missing_no_source"]] == ["none.safetensors"]
     finally:
         modal_volume.file_in_progress = fs
-        import importlib; importlib.reload(modal_volume)
+        import importlib
+        importlib.reload(modal_volume)
 
 
 # ============================================================================
@@ -200,14 +201,16 @@ def test_check_models_classification(monkeypatch=None):
 def test_file_in_progress_zero_byte(tmp_path=None):
     import tempfile
     d = Path(tempfile.mkdtemp())
-    f = d / "m.safetensors"; f.write_bytes(b"")
+    f = d / "m.safetensors"
+    f.write_bytes(b"")
     assert modal_volume.file_in_progress(f, settle_check=False) is True  # 0 字节 = 在下
 
 
 def test_file_in_progress_with_aria2_sibling():
     import tempfile
     d = Path(tempfile.mkdtemp())
-    f = d / "m.safetensors"; f.write_bytes(b"x" * 100)
+    f = d / "m.safetensors"
+    f.write_bytes(b"x" * 100)
     (d / "m.safetensors.aria2").write_bytes(b"ctrl")
     assert modal_volume.file_in_progress(f, settle_check=False) is True  # 有 .aria2 控制文件
 
@@ -215,7 +218,8 @@ def test_file_in_progress_with_aria2_sibling():
 def test_file_in_progress_complete():
     import tempfile
     d = Path(tempfile.mkdtemp())
-    f = d / "m.safetensors"; f.write_bytes(b"x" * 100)
+    f = d / "m.safetensors"
+    f.write_bytes(b"x" * 100)
     assert modal_volume.file_in_progress(f, settle_check=False) is False  # 正常完成
 
 
