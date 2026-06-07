@@ -64,10 +64,18 @@ cuda_image = (
         "pyyaml",
     )
     .run_commands("mkdir -p /comfy-volume")
-    # 把部署时的插件版本烤进镜像环境 → 容器运行时(health endpoint)能读到 deployed_version。
+    # 把部署时的 MODAL_BRIDGE_* 配置烤进镜像环境 → 容器运行时能读到真实值。
     # ⚠ 关键:modal deploy 子进程的 env(node_sync.deploy_env 注入)只在"部署解析期"可见,
-    # 不会自动进容器运行时。必须用 .env() 显式烤进镜像,否则容器里 os.environ 读不到 → unknown。
-    .env({"MODAL_BRIDGE_VERSION": _os.environ.get("MODAL_BRIDGE_VERSION", "unknown")})
+    # 不会自动进容器运行时。必须用 .env() 显式烤进镜像,否则容器里 os.environ 读不到 → 回退默认值。
+    # 这些都在 modal_app.py 模块顶层(容器运行时也会重新 import)被读:
+    #   - VERSION       → health.deployed_version(版本契约)
+    #   - DEFAULT_GPU   → health.deployed_gpu(GPU 契约;漏烤会让非 H100 显卡永远上报 H100 → 前端死循环重部署)
+    #   - APP_NAME      → health.app + warm-stats 的 Cls.from_name(自定义 app 名时必须对)
+    #   - VOLUME/SECRET → 运行时 reload Volume / from_name(自定义名时必须对)
+    .env({k: _os.environ[k] for k in (
+        "MODAL_BRIDGE_VERSION", "MODAL_BRIDGE_DEFAULT_GPU", "MODAL_BRIDGE_APP_NAME",
+        "MODAL_BRIDGE_VOLUME", "MODAL_BRIDGE_SECRET",
+    ) if _os.environ.get(k)})
     .add_local_file(str(_EXTRA_MODEL_PATHS_YAML), "/comfyui/extra_model_paths.yaml")
     .add_local_python_source("modal_image", "_comfy_ws", "_custom_nodes_data")
 )
