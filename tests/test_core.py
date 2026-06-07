@@ -16,6 +16,8 @@ sys.path.insert(0, str(ROOT))
 
 import node_sync  # noqa: E402
 import modal_volume  # noqa: E402
+import model_deps  # noqa: E402
+import contract  # noqa: E402
 
 
 # ============================================================================
@@ -179,7 +181,6 @@ def test_check_models_classification(monkeypatch=None):
     ]
     try:
         # 让 missing_local 分支的 .stat() 不真去读盘
-        import os
         def fake_resolver(t, fn):
             p = orig_resolver(t, fn)
             return _P(str(p)) if p is not None else None
@@ -226,6 +227,70 @@ def test_fmt_eta():
     assert modal_volume._fmt_eta(90) == "1m30s"
     assert modal_volume._fmt_eta(3725) == "1h02m"
     assert modal_volume._fmt_eta(-5) == "0s"
+
+
+# ============================================================================
+# model_deps — 模型解析(LOADER_MAP 命中 + 通用扩展名兜底)
+# ============================================================================
+def test_loader_models_flux2():
+    """flux2 风格:UNETLoader / DualCLIPLoader / VAELoader → 正确 type + filename。"""
+    prompt = {
+        "1": {"class_type": "UNETLoader", "inputs": {"unet_name": "flux2_dev_fp8.safetensors"}},
+        "2": {"class_type": "DualCLIPLoader",
+              "inputs": {"clip_name1": "a.safetensors", "clip_name2": "b.safetensors"}},
+        "3": {"class_type": "VAELoader", "inputs": {"vae_name": "ae.safetensors"}},
+    }
+    pairs = {(m["type"], m["filename"]) for m in model_deps.extract_loader_models(prompt)}
+    assert ("diffusion_models", "flux2_dev_fp8.safetensors") in pairs
+    assert ("text_encoders", "a.safetensors") in pairs
+    assert ("text_encoders", "b.safetensors") in pairs
+    assert ("vae", "ae.safetensors") in pairs
+
+
+def test_generic_catches_unknown_loader():
+    """不在 LOADER_MAP 的节点,但 input 指向模型文件 → 通用兜底捕获(取 basename)。"""
+    prompt = {"9": {"class_type": "SomeFutureLoader",
+                    "inputs": {"weird_field": "models/sub/cool_model.gguf", "x": 7}}}
+    assert model_deps.extract_generic_filenames(prompt) == {"cool_model.gguf"}
+
+
+def test_generic_ignores_images_and_nonmodel():
+    """LoadImage 的 .png / 普通文本 input 不被通用兜底误中(扩展名集合是模型专属)。"""
+    prompt = {"1": {"class_type": "LoadImage", "inputs": {"image": "ref.png"}},
+              "2": {"class_type": "CLIPTextEncode", "inputs": {"text": "a cat"}}}
+    assert model_deps.extract_generic_filenames(prompt) == set()
+
+
+# ============================================================================
+# contract.compute_contract — 版本 / GPU 契约
+# ============================================================================
+def test_contract_version_match():
+    c = contract.compute_contract("0.2.9", "0.2.9", True, "H100", "H100")
+    assert c["match"] is True and c["gpu_match"] is True
+
+
+def test_contract_version_mismatch():
+    c = contract.compute_contract("0.2.9", "0.2.8", True, "H100", "H100")
+    assert c["match"] is False
+
+
+def test_contract_unreachable_not_blocked_on_gpu():
+    """不可达 → match=False,但显卡不拦(交版本契约先逼一次重部署)。"""
+    c = contract.compute_contract("0.2.9", None, False, "L40S", None)
+    assert c["match"] is False and c["reachable"] is False
+    assert c["gpu_match"] is True
+
+
+def test_contract_gpu_mismatch_blocks():
+    """版本一致但所选显卡 ≠ 云端在跑 → gpu_match=False(前端据此拦 + 逼重部署)。"""
+    c = contract.compute_contract("0.2.9", "0.2.9", True, "L40S", "H100")
+    assert c["match"] is True and c["gpu_match"] is False
+
+
+def test_contract_old_image_gpu_none_not_blocked():
+    """老镜像不上报 deployed_gpu(None)→ 不拦显卡。"""
+    c = contract.compute_contract("0.2.9", "0.2.9", True, "L40S", None)
+    assert c["gpu_match"] is True
 
 
 # ============================================================================

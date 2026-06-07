@@ -1,0 +1,26 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.9", "3.10", "3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install ruff
+        run: pip install ruff
+      # 核心纯函数单测:自带 modal / nodes / folder_paths 桩,无需真实依赖。
+      - name: Unit tests
+        run: python tests/test_core.py
+      - name: Lint (ruff)
+        run: ruff check .

@@ -6,16 +6,16 @@ import asyncio
 import base64
 import os
 import subprocess
-import time
-import uuid
 from pathlib import Path
 
 import aiohttp
 from aiohttp import web
 
 from . import config as cfg_mod
+from . import contract
 from . import modal_client
 from . import modal_volume
+from . import model_deps
 from . import node_sync
 
 
@@ -66,47 +66,43 @@ def _local_model_resolver():
 
 
 # ── 从 workflow prompt 解析需要的模型 ──
-LOADER_MAP = {
-    "CheckpointLoaderSimple":  ("checkpoints",     ["ckpt_name"]),
-    "CheckpointLoader":        ("checkpoints",     ["ckpt_name"]),
-    "UNETLoader":              ("diffusion_models",["unet_name"]),
-    "DiffusionModelLoader":    ("diffusion_models",["model_name"]),
-    "VAELoader":               ("vae",             ["vae_name"]),
-    "CLIPLoader":              ("text_encoders",   ["clip_name"]),
-    "DualCLIPLoader":          ("text_encoders",   ["clip_name1", "clip_name2"]),
-    "TripleCLIPLoader":        ("text_encoders",   ["clip_name1", "clip_name2", "clip_name3"]),
-    "CLIPVisionLoader":        ("clip_vision",     ["clip_name"]),
-    "StyleModelLoader":        ("style_models",    ["style_model_name"]),
-    "LoraLoader":              ("loras",           ["lora_name"]),
-    "LoraLoaderModelOnly":     ("loras",           ["lora_name"]),
-    "ControlNetLoader":        ("controlnet",      ["control_net_name"]),
-    "UpscaleModelLoader":      ("upscale_models",  ["model_name"]),
-    "GLIGENLoader":            ("gligen",          ["gligen_name"]),
-    "PulidFluxModelLoader":    ("pulid",           ["pulid_file"]),
-}
+# 纯解析(LOADER_MAP 命中 + 通用扩展名兜底)在 model_deps.py(可单测)。这里只补需要
+# 文件系统的那一步:通用兜底拿到的文件名不知道 type,按本地命中位置反推 type。
+def _resolve_model_anywhere(filename: str) -> str | None:
+    """在本地所有模型 folder 类型里按文件名定位 → 返回命中的 type。
+    供通用兜底(LOADER_MAP 外的 loader)反推模型属于哪个 models/<type>/。找不到返回 None。"""
+    base = Path(filename).name
+    if folder_paths is None:
+        return None
+    try:
+        types_ = list(folder_paths.folder_names_and_paths.keys())
+    except Exception:
+        return None
+    for t in types_:
+        try:
+            if folder_paths.get_full_path(t, base):
+                return t
+        except Exception:
+            pass
+    return None
+
 
 def extract_required_models(prompt: dict) -> list[dict]:
-    """返回 [{type, filename}, ...] 去重"""
-    deps: list[dict] = []
-    seen: set[tuple] = set()
-    for node in prompt.values():
-        if not isinstance(node, dict):
+    """返回 [{type, filename}, ...] 去重。
+    = LOADER_MAP 已知 type 的模型 + 通用兜底(扫到的模型文件名,按本地位置反推 type)。
+    通用兜底只收"本地能定位到、因而能推出 type"的:本地都没有的模型反正传不上去,
+    维持原行为(不强行入列),由云端验证阶段报缺。"""
+    loader_models = model_deps.extract_loader_models(prompt)
+    out = list(loader_models)
+    seen_base = {Path(m["filename"]).name for m in loader_models}
+    for fn in sorted(model_deps.extract_generic_filenames(prompt)):
+        if fn in seen_base:
             continue
-        cls = node.get("class_type", "")
-        spec = LOADER_MAP.get(cls)
-        if not spec:
-            continue
-        type_, fields = spec
-        ins = node.get("inputs") or {}
-        for f in fields:
-            name = ins.get(f)
-            if isinstance(name, str) and name.strip():
-                key = (type_, name)
-                if key in seen:
-                    continue
-                seen.add(key)
-                deps.append({"type": type_, "filename": name})
-    return deps
+        t = _resolve_model_anywhere(fn)
+        if t:
+            out.append({"type": t, "filename": fn})
+            seen_base.add(fn)
+    return out
 
 
 def _input_dir() -> Path:
@@ -864,95 +860,9 @@ def _setup_routes():
         except Exception as e:
             err_kind = "unreachable"
             print(f"[modal_bridge] version check: health 不可达 ({e})")
-        match = reachable and deployed == local
-        # GPU 契约:云端真在跑的卡 ≠ 本地所选 → 必须重新部署才能用新卡。
-        # 老镜像不上报 deployed_gpu(None)时不拦 —— 交给版本契约先逼出一次重部署,之后云端才会上报 gpu。
-        gpu_match = (not reachable) or (deployed_gpu is None) or (deployed_gpu == local_gpu)
-        return web.json_response({"ok": True, "local": local, "deployed": deployed, "err_kind": err_kind,
-                                  "match": match, "reachable": reachable,
-                                  "local_gpu": local_gpu, "deployed_gpu": deployed_gpu, "gpu_match": gpu_match})
-
-    # -------- 主入口:提交工作流 --------
-    @routes.post("/modal_bridge/queue")
-    async def _queue(request: web.Request):
-        body = await request.json()
-        prompt = body.get("prompt")
-        if not isinstance(prompt, dict):
-            return web.json_response({"error": "prompt (object) required"}, status=400)
-
-        cfg = cfg_mod.load_config()
-        tier = (body.get("tier") or "40g").lower()
-
-        # 1) 解析 prompt 找 LoadImage,准备 base64
-        try:
-            image_names = _extract_input_image_names(prompt)
-            input_images = [_read_input_as_b64(n) for n in image_names]
-        except FileNotFoundError as e:
-            return web.json_response({"error": str(e)}, status=400)
-        except Exception as e:
-            return web.json_response({"error": f"prepare images failed: {e}"}, status=500)
-
-        if input_images:
-            sizes = sum(len(im["image"]) for im in input_images)
-            print(f"[modal_bridge] uploading {len(input_images)} input image(s), ~{sizes//1024} KB total")
-
-        # 2) 提交 + 轮询
-        t_start = time.time()
-        job_id = None
-        try:
-            timeout = aiohttp.ClientTimeout(total=None)
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                submit_result = await modal_client.submit_job(
-                    session, cfg, workflow=prompt,
-                    input_images=input_images or None, tier=tier,
-                )
-                job_id = submit_result.get("id")
-                gpu = submit_result.get("gpu") or tier
-                print(f"[modal_bridge] submitted job {job_id} (tier={tier}, gpu={gpu})")
-
-                def _on_progress(status, data):
-                    print(f"[modal_bridge] job {job_id} status={status}")
-
-                final = await modal_client.poll_status(session, cfg, job_id, on_progress=_on_progress)
-        except Exception as e:
-            return web.json_response(
-                {"error": str(e), "job_id": job_id, "elapsed_sec": round(time.time() - t_start, 1)},
-                status=502,
-            )
-
-        elapsed = round(time.time() - t_start, 1)
-
-        # 3) 处理结果
-        status = final.get("status")
-        if status != "completed":
-            return web.json_response(
-                {
-                    "error": f"Modal job ended with status={status}",
-                    "modal_state": final,
-                    "job_id": job_id,
-                    "elapsed_sec": elapsed,
-                },
-                status=502,
-            )
-
-        # 4) 写出图(多图/单图共用 helper)→ output/<subfolder>/<job_id>/
-        subfolder = cfg.get("output_subfolder", "modal_results")
-        try:
-            outputs = await _write_results(final, job_id, subfolder)
-        except Exception as e:
-            return web.json_response({"error": f"write result failed: {e}", "modal_state": final}, status=502)
-        if not outputs:
-            return web.json_response({"error": "no image returned", "modal_state": final}, status=502)
-
-        print(f"[modal_bridge] ✓ job {job_id} done in {elapsed}s → {subfolder}/{job_id}/ ({len(outputs)} img)")
-
-        return web.json_response({
-            "ok": True,
-            "job_id": job_id,
-            "gpu": final.get("gpu") or gpu,
-            "elapsed_sec": elapsed,
-            "outputs": outputs,
-        })
+        # 契约计算抽到 contract.compute_contract(纯函数,有单测)。
+        c = contract.compute_contract(local, deployed, reachable, local_gpu, deployed_gpu)
+        return web.json_response({"ok": True, "err_kind": err_kind, **c})
 
 
 _setup_routes()

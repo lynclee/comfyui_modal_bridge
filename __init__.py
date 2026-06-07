@@ -3,7 +3,7 @@ comfyui_modal_bridge — 把当前工作流推送到 Modal Serverless 跑,结果
 
 第一版职责:
   1. 注册 web 资源(放按钮 JS)
-  2. 注册本地 HTTP routes(/modal_bridge/queue 等)
+  2. 注册本地 HTTP routes(/modal_bridge/submit、/poll、/fetch_result 等)
   3. 启动时确保配置文件存在
 
 不提供 ComfyUI 节点(纯 bridge,不出现在画板节点列表)。

@@ -2,7 +2,6 @@
 modal_client.py — 调用 Modal endpoint(私有 endpoint,自建鉴权:GET 走 ?key=,POST 走 body auth_key)
 """
 import asyncio
-import time
 from typing import Optional
 
 import aiohttp
@@ -68,38 +67,6 @@ async def submit_job(
             print(f"[modal_bridge] /run attempt {attempt+1} network err: {e}, retrying...")
             await asyncio.sleep(1.5)
     raise last_err or RuntimeError("submit_job failed after retries")
-
-
-async def poll_status(session, cfg, job_id, on_progress=None) -> dict:
-    """GET /status,轮询直到 completed / failed / cancelled"""
-    url = _endpoint(cfg["modal_endpoint_base"], "status")
-    interval = float(cfg.get("poll_interval_sec", 1.5))
-    timeout = float(cfg.get("timeout_sec", 1200))
-    deadline = time.time() + timeout
-    last_status = None
-    while time.time() < deadline:
-        async with session.get(
-            url, params={"job_id": job_id, "key": _key(cfg)},
-            timeout=aiohttp.ClientTimeout(total=15),
-        ) as r:
-            text = await r.text()
-            if r.status >= 400:
-                raise RuntimeError(f"Modal /status {r.status}: {text[:500]}")
-            try:
-                data = await r.json(content_type=None)
-            except Exception:
-                raise RuntimeError(f"Modal /status non-JSON: {text[:500]}")
-        if "error" in data:
-            raise RuntimeError(f"Modal /status error: {data['error']}")
-        status = data.get("status")
-        if status != last_status:
-            last_status = status
-            if on_progress:
-                on_progress(status, data)
-        if status in ("completed", "failed", "cancelled"):
-            return data
-        await asyncio.sleep(interval)
-    raise TimeoutError(f"Modal job {job_id} timed out after {timeout}s")
 
 
 async def health(session, cfg) -> dict:
