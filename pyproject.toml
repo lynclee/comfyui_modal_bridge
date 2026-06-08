@@ -4,7 +4,7 @@ description = "一键把当前 ComfyUI 工作流推到 Modal Serverless GPU(H100
 version = "0.2.10"
 license = { text = "MIT" }
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 dependencies = [
     "aiohttp",
     "pyyaml",
