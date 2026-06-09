@@ -262,6 +262,9 @@ function findOutputNodes(prompt) {
   const types = new Set([
     "SaveImage", "PreviewImage", "SaveImageWebsocket",
     "SaveImageAdvanced", "Image Save", "VHS_VideoCombine",
+    // 原生视频/动图输出节点(ComfyUI core):它们的产出在 history 里也走 images 输出键
+    // (PreviewVideo.as_dict = {images, animated}),所以同样能被回填/保存。
+    "SaveVideo", "SaveWEBM", "SaveAnimatedWEBP", "SaveAnimatedPNG",
   ]);
   const ids = [];
   for (const [id, n] of Object.entries(prompt || {})) {
@@ -299,6 +302,10 @@ function activeWorkflowName() {
 // 回填到「当前前台」工作流的节点。ComfyUI 单 graph,只能渲染当前前台;调用方负责
 // 确保这是该结果对应的工作流。走原生 executed 事件(ComfyUI 自己写 nodeOutputStore/
 // nodeOutputs + 调 onExecuted,跨版本可靠)。返回成功回填的节点数。
+// 视频 / 动图扩展名:这些产出在 ComfyUI 里也走 images 输出键,但要带 animated 标记
+// 前端才会用 <video>/动图方式预览(原生 PreviewVideo.as_dict 即 {images, animated:(True,)})。
+const VIDEO_EXT_RE = /\.(mp4|webm|mov|mkv|avi|flv|m4v|gif|webp|apng)$/i;
+
 function displayInGraph(outputNodeIds, modalOutputs) {
   if (!outputNodeIds?.length || !modalOutputs?.length) return 0;
   const imagesMeta = modalOutputs.map((o) => ({
@@ -306,16 +313,19 @@ function displayInGraph(outputNodeIds, modalOutputs) {
     subfolder: o.subfolder,
     type: o.type || "output",
   }));
+  // 任一产出是视频/动图 → 带上 animated 标记,让回填节点走视频/动图预览。
+  const isAnimated = modalOutputs.some((o) => VIDEO_EXT_RE.test(o.filename || ""));
+  const out = isAnimated ? { images: imagesMeta, animated: [true] } : { images: imagesMeta };
   let placed = 0;
   for (const nid of outputNodeIds) {
     const node = app.graph.getNodeById(parseInt(nid, 10)) || app.graph.getNodeById(nid);
     if (!node) continue;
     try {
       api.dispatchEvent(new CustomEvent("executed", {
-        detail: { node: String(nid), display_node: String(nid), output: { images: imagesMeta } },
+        detail: { node: String(nid), display_node: String(nid), output: out },
       }));
     } catch (e) {}
-    try { node.onExecuted?.({ images: imagesMeta }); } catch (e) {}
+    try { node.onExecuted?.(out); } catch (e) {}
     placed++;
   }
   try { app.graph.setDirtyCanvas(true, true); } catch (e) {}

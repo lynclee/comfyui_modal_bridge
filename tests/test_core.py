@@ -149,6 +149,67 @@ def test_baked_roundtrip(tmp_path=None):
 
 
 # ============================================================================
+# node_sync.folder_git_info — .git 主路径 + pyproject 兜底(CNR / 压缩包装的节点)
+# ============================================================================
+def test_pyproject_repo_url_extracts_github():
+    import tempfile
+    d = Path(tempfile.mkdtemp())
+    (d / "pyproject.toml").write_text(
+        '[project]\nname = "ComfyUI-GGUF"\n\n[project.urls]\n'
+        'Repository = "https://github.com/city96/ComfyUI-GGUF"\n', encoding="utf-8")
+    assert node_sync._pyproject_repo_url(d) == "https://github.com/city96/ComfyUI-GGUF"
+
+
+def test_pyproject_repo_url_sanitizes_subpath():
+    """Homepage 指向 /tree/main#readme 之类 → 截回 owner/repo 这一层。"""
+    import tempfile
+    d = Path(tempfile.mkdtemp())
+    (d / "pyproject.toml").write_text(
+        '[project.urls]\nHomepage = "https://github.com/a/b/tree/main#readme"\n', encoding="utf-8")
+    assert node_sync._pyproject_repo_url(d) == "https://github.com/a/b"
+
+
+def test_pyproject_repo_url_none_when_absent():
+    import tempfile
+    d = Path(tempfile.mkdtemp())
+    (d / "pyproject.toml").write_text('[project]\nname = "x"\n', encoding="utf-8")
+    assert node_sync._pyproject_repo_url(d) is None
+
+
+def test_folder_git_info_fallback_to_pyproject():
+    """没有 .git 但 pyproject 有仓库地址 → has_git=True、url 解析出、commit 留空。"""
+    import tempfile
+    root = Path(tempfile.mkdtemp())
+    nd = root / "custom_nodes" / "ComfyUI-GGUF"
+    nd.mkdir(parents=True)
+    (nd / "pyproject.toml").write_text(
+        '[project.urls]\nRepository = "https://github.com/city96/ComfyUI-GGUF"\n', encoding="utf-8")
+    node_sync._comfyui_root = lambda: root
+    node_sync._git = lambda args, cwd: None  # 模拟无 .git
+    try:
+        info = node_sync.folder_git_info("ComfyUI-GGUF")
+        assert info["has_git"] is True
+        assert info["url"] == "https://github.com/city96/ComfyUI-GGUF"
+        assert info["commit"] == ""
+    finally:
+        _restore()
+
+
+def test_folder_git_info_none_when_no_metadata():
+    """没有 .git 也没有 pyproject → has_git=False(仍归 missing_no_git)。"""
+    import tempfile
+    root = Path(tempfile.mkdtemp())
+    (root / "custom_nodes" / "weird-node").mkdir(parents=True)
+    node_sync._comfyui_root = lambda: root
+    node_sync._git = lambda args, cwd: None
+    try:
+        info = node_sync.folder_git_info("weird-node")
+        assert info["has_git"] is False and info["url"] is None
+    finally:
+        _restore()
+
+
+# ============================================================================
 # modal_volume.check_models — present / missing_local / downloading / missing_no_source
 # ============================================================================
 def test_check_models_classification(monkeypatch=None):

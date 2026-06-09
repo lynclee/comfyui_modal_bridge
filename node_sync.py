@@ -14,6 +14,7 @@ import ast
 import inspect
 import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -27,7 +28,6 @@ PYPROJECT = _HERE / "pyproject.toml"
 def plugin_version() -> str:
     """读 pyproject.toml 的 version(版本契约的真源)。读不到返回 '0.0.0'。"""
     try:
-        import re
         m = re.search(r'^version\s*=\s*["\']([^"\']+)["\']',
                       PYPROJECT.read_text(encoding="utf-8"), re.M)
         if m:
@@ -119,19 +119,55 @@ def _normalize_git_url(url: str) -> str:
     return url
 
 
+_GIT_HOSTS = ("github.com", "gitlab.com", "codeberg.org", "bitbucket.org", "gitee.com")
+
+
+def _sanitize_repo_url(url: str) -> str:
+    """截到 owner/repo 这一层,去掉 /tree/... /blob/... 等子路径和 #frag / ?query。
+    结尾的 .git / 斜杠交给 git 自己处理。"""
+    url = (url or "").strip()
+    m = re.match(r"(https?://[^/]+/[^/#?]+/[^/#?]+)", url)
+    return m.group(1) if m else url
+
+
+def _pyproject_repo_url(path: Path) -> str | None:
+    """没有 .git 的节点(ComfyUI-Manager 的 CNR / Registry / 压缩包安装)兜底:
+    从 pyproject.toml 读仓库地址。取指向已知 git 托管站的第一个 URL
+    (优先 Repository / Source / Code / Git / Homepage 这些 key)。
+    这样无论节点是 git clone 还是 CNR 装的,都能解析出可克隆地址,换台机器也一致。"""
+    pp = path / "pyproject.toml"
+    try:
+        text = pp.read_text(encoding="utf-8")
+    except Exception:
+        return None
+    best = None  # (priority, url):priority 越小越优先
+    for m in re.finditer(r'(?im)^\s*([A-Za-z][\w .-]*?)\s*=\s*["\']([^"\']+)["\']', text):
+        key, val = m.group(1).strip().lower(), m.group(2).strip()
+        if any(h in val for h in _GIT_HOSTS):
+            pri = 0 if key in ("repository", "source", "code", "git", "homepage") else 1
+            if best is None or pri < best[0]:
+                best = (pri, val)
+    return _sanitize_repo_url(best[1]) if best else None
+
+
 def folder_git_info(folder: str) -> dict:
-    """读本地 custom_nodes/<folder> 的 git url + commit。"""
+    """读本地 custom_nodes/<folder> 的可克隆地址 + commit。
+    主路径读 .git(remote.origin.url + HEAD commit);CNR / Registry / 压缩包装的节点
+    没有 .git,则兜底读 pyproject.toml 的仓库地址(commit 留空 = 跟随默认分支 HEAD)。
+    has_git 在此表示「解析得到可克隆 url」(未必真有本地 .git)。"""
     path = _comfyui_root() / "custom_nodes" / folder
     if not path.exists():
         return {"folder": folder, "has_git": False, "url": None, "commit": None}
     url = _git(["config", "--get", "remote.origin.url"], path)
     commit = _git(["rev-parse", "HEAD"], path)
-    return {
-        "folder": folder,
-        "has_git": bool(url and commit),
-        "url": _normalize_git_url(url) if url else None,
-        "commit": commit,
-    }
+    if url and commit:
+        return {"folder": folder, "has_git": True,
+                "url": _normalize_git_url(url), "commit": commit}
+    repo = _pyproject_repo_url(path)
+    if repo:
+        return {"folder": folder, "has_git": True,
+                "url": _normalize_git_url(repo), "commit": ""}
+    return {"folder": folder, "has_git": False, "url": None, "commit": None}
 
 
 def _class_source_folder(class_type: str) -> str | None | bool:
