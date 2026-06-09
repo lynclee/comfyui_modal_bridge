@@ -148,6 +148,34 @@ def test_baked_roundtrip(tmp_path=None):
         _restore()
 
 
+def test_ensure_baked_file_creates_when_absent():
+    """_custom_nodes_data.py 是 gitignore 的本地状态:缺失时 ensure 写空清单(供部署/打包用)。"""
+    import tempfile
+    d = Path(tempfile.mkdtemp())
+    node_sync.DATA_FILE = d / "_custom_nodes_data.py"
+    try:
+        assert not node_sync.DATA_FILE.exists()
+        node_sync.ensure_baked_file()
+        assert node_sync.DATA_FILE.exists()
+        assert node_sync.read_baked_nodes() == []  # 空清单且可被正常解析
+    finally:
+        _restore()
+
+
+def test_ensure_baked_file_keeps_existing():
+    """已存在则不覆盖(不能把同步好的清单清空)。"""
+    import tempfile
+    d = Path(tempfile.mkdtemp())
+    node_sync.DATA_FILE = d / "_custom_nodes_data.py"
+    try:
+        nodes = [{"name": "X", "url": "https://x.git", "commit": "c"}]
+        node_sync.write_baked_nodes(nodes)
+        node_sync.ensure_baked_file()
+        assert node_sync.read_baked_nodes() == nodes
+    finally:
+        _restore()
+
+
 # ============================================================================
 # node_sync.folder_git_info — .git 主路径 + pyproject 兜底(CNR / 压缩包装的节点)
 # ============================================================================

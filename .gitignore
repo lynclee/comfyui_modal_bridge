@@ -2,6 +2,10 @@
 secrets.toml
 config.json
 
+# 本地状态:Modal 镜像要装的 custom_node 清单,由节点同步按机器维护、自愈,不入库
+# (modal_image.py 缺文件会自建空清单;comfy publish 只打包 git 跟踪文件,故也不进 Registry 包)
+modal_app/_custom_nodes_data.py
+
 # Python
 __pycache__/
 *.pyc

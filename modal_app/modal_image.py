@@ -12,10 +12,20 @@ import os as _os
 import modal
 from pathlib import Path
 
-from _custom_nodes_data import CUSTOM_NODES
-
 _HERE = Path(__file__).resolve().parent
 _EXTRA_MODEL_PATHS_YAML = _HERE / "extra_model_paths.yaml"
+
+# _custom_nodes_data.py 是本地状态(.gitignore,不入库;由 ComfyUI 的节点同步维护)。
+# 全新安装 / 还没同步过节点时它可能不存在 → 自建空清单,避免下面的 import 和后面的
+# add_local_python_source 因文件缺失而炸。内联实现(刻意不 import node_sync):本文件在
+# Modal 容器运行时也会被重新 import,而容器里没有 node_sync(它不在 add_local_python_source 里)。
+_DATA_FILE = _HERE / "_custom_nodes_data.py"
+if not _DATA_FILE.exists():
+    _DATA_FILE.write_text("CUSTOM_NODES = []\n", encoding="utf-8")
+try:
+    from _custom_nodes_data import CUSTOM_NODES
+except Exception:
+    CUSTOM_NODES = []
 
 
 def _clone_one(n: dict) -> str:

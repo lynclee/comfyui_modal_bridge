@@ -79,6 +79,13 @@ def baked_node_names() -> set[str]:
     return {n.get("name", "") for n in read_baked_nodes() if n.get("name")}
 
 
+def ensure_baked_file() -> None:
+    """确保 _custom_nodes_data.py 存在(它是 .gitignore 的本地状态,可能缺失)。
+    缺则写空清单 —— 部署前调用,保证 modal_image 的 import / 打包不因文件缺失失败。"""
+    if not DATA_FILE.exists():
+        write_baked_nodes([])
+
+
 def write_baked_nodes(nodes: list[dict]) -> None:
     """用固定模板重写 _custom_nodes_data.py(保证格式稳定,可被反复机改)。"""
     lines = [_DATA_HEADER, "CUSTOM_NODES = ["]

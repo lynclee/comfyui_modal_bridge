@@ -764,6 +764,7 @@ def _setup_routes():
                 return resp
 
             # 3) 部署 app(首次拉镜像 3-5 分钟)
+            node_sync.ensure_baked_file()  # 本地清单是 .gitignore 状态,缺则建空,免得 modal_image 打包炸
             await _emit(resp, "\n== modal deploy(首次拉镜像约 3-5 分钟,别关窗口)==\n")
             rc = await _run_streamed(resp, node_sync.deploy_command(), cwd=cwd, env=env)
             if rc != 0:

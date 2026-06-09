@@ -1,0 +1,4 @@
+# comfy node publish 打包排除(gitwildmatch 语法)。
+# publish 本就只打包 git 跟踪的文件,这里再显式排除一层,确保本地状态文件
+# 即便在非 git 目录下发布也不会进 Registry 包。
+modal_app/_custom_nodes_data.py
