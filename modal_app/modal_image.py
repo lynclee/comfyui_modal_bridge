@@ -42,12 +42,14 @@ _CLONE_CMD = " && ".join([
     *[_clone_one(n) for n in CUSTOM_NODES],
 ])
 
+# ⚠ 空清单(全新安装 / 没同步过节点)时 join 出空串 → .run_commands("") 会生成空 RUN,
+# Modal 直接拒绝("the 'RUN' Dockerfile command is not supported")。所以空时兜底成一个 no-op。
 _INSTALL_REQS_CMD = " && ".join(
     f"if [ -f /comfyui/custom_nodes/{n['name']}/requirements.txt ]; then "
     f"pip install -r /comfyui/custom_nodes/{n['name']}/requirements.txt; "
     f"else echo 'no requirements for {n['name']}'; fi"
     for n in CUSTOM_NODES
-)
+) or "echo 'no custom_nodes — skip requirements'"
 
 cuda_image = (
     modal.Image.from_registry(
