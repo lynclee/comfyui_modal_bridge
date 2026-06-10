@@ -57,6 +57,16 @@ const I18N = {
   "vram.warn.video":  { zh: "(视频类:显存还要算多帧激活,估算偏粗,务必留余量)", en: " (video: multi-frame activations add VRAM; estimate is rough, leave headroom)" },
   "vram.warn.run":    { zh: "仍要跑", en: "Run anyway" },
   "vram.warn.switch": { zh: "去 Setup 换显卡", en: "Switch GPU in Setup" },
+  "dlg.comfy.hint":   { zh: "(可选,工作流含 API 节点才需要)", en: "(optional, only if your workflow uses API nodes)" },
+  "dlg.comfy.ph":     { zh: "platform.comfy.org 生成的 API key", en: "API key from platform.comfy.org" },
+  "dlg.comfy.ph_saved":{ zh: "已保存(留空=沿用)", en: "saved (blank = keep)" },
+  "dlg.comfy.note":   { zh: "⚠ 存进云端 Secret,worker 用它跑 API 节点 —— 账单走你的 comfy.org 额度。",
+                        en: "⚠ Stored in the cloud Secret; the worker uses it to run API nodes — billed to your comfy.org credits." },
+  "api.warn.title":   { zh: "⚠ 工作流含 API 节点", en: "⚠ Workflow uses API nodes" },
+  "api.warn.body":    { zh: "这个工作流用了 ComfyUI API 节点(Kling/Luma/OpenAI 等),在云端跑需要 comfy.org API key,但你还没配。\n\n现在跑这些 API 节点会 401 失败。\n\n建议先去 Setup 填 comfy.org API key。",
+                        en: "This workflow uses ComfyUI API nodes (Kling/Luma/OpenAI, etc.). Running them in the cloud needs a comfy.org API key, which isn't configured.\n\nThose API nodes will fail (401) if you run now.\n\nAdd your comfy.org API key in Setup first." },
+  "api.warn.run":     { zh: "仍要跑", en: "Run anyway" },
+  "api.warn.setup":   { zh: "去 Setup 配置", en: "Configure in Setup" },
   "dlg.btn.deploy":   { zh: "部署", en: "Deploy" },
   "dlg.btn.test":     { zh: "测试连接", en: "Test connection" },
   "dlg.btn.close":    { zh: "关闭", en: "Close" },
@@ -272,6 +282,18 @@ function findOutputNodes(prompt) {
     if (types.has(n?.class_type)) ids.push(id);
   }
   return ids;
+}
+
+// 工作流是否含 ComfyUI API 节点(comfy_api_nodes,如 Kling/Luma/OpenAI):这些节点要 comfy.org
+// 账号鉴权才能跑。ComfyUI 给 API 节点的节点定义标了 api_node:true,据此检测(拿不到定义则视为无)。
+function workflowHasApiNodes() {
+  try {
+    for (const n of (app.graph?._nodes || [])) {
+      const nd = n?.constructor?.nodeData || n?.nodeData;
+      if (nd && nd.api_node) return true;
+    }
+  } catch (e) { log("api node detect skipped:", e); }
+  return false;
 }
 
 // 当前活动工作流的标识(切 tab 会变)。用于判断结果该不该回填到当前画板。
@@ -988,6 +1010,13 @@ async function queueOnModal() {
     const submitGuard = { wfKey: activeWorkflowKey() };
     log("output nodes:", outputNodeIds, "wfKey:", submitGuard.wfKey);
 
+    // API 节点预警:工作流含 ComfyUI API 节点但没配 comfy.org key → 云端会 401,提前提示(早于节点/模型同步)
+    if (workflowHasApiNodes() && !cfg0.has_comfy_api_key) {
+      const proceed = await confirmDialog(
+        t("api.warn.title"), t("api.warn.body"), t("api.warn.run"), t("api.warn.setup"));
+      if (!proceed) { ctx.finish(false, "✕ Cancelled"); try { openDeployDialog(); } catch (e) {} return; }
+    }
+
     // ⭐ custom_node 自动同步(默认开启,Settings 可关)
     const autoCheckNodes = getSetting("ModalBridge.autoCheckNodes", true);
     if (autoCheckNodes) {
@@ -1054,6 +1083,34 @@ async function doHealthCheck() {
   } catch (e) {
     err("health check failed", e);
   }
+}
+
+// RunModal 按钮随部署状态变色:就绪(云端可达 + 本地↔云端版本一致 + 显卡一致)= 白,
+// 否则 = 灰(默认外观,提示"没部署好 / 需重新部署")。状态由各处已有的 /version 顺带更新,
+// 不新增轮询;一个轻量定时器只按缓存状态重涂,防 ComfyUI 重渲染动作栏后样式丢失。
+let _runReady = false;
+function applyRunButtonStyle() {
+  const el = document.querySelector(
+    `button[aria-label="${BUTTON_TOOLTIP}"], button[title="${BUTTON_TOOLTIP}"]`
+  );
+  if (!el) return;
+  if (_runReady) {
+    el.style.color = "#ffffff";   // 就绪 → 白
+    el.style.opacity = "1";
+  } else {
+    el.style.color = "";          // 还原默认(灰)
+    el.style.opacity = "";
+  }
+}
+function setRunReady(v) {
+  // 就绪条件 = checkVersionOrBlock 的放行条件:可达 + 版本一致 + 显卡一致
+  _runReady = !!(v && v.reachable && v.match && v.gpu_match !== false);
+  applyRunButtonStyle();
+}
+async function refreshRunReady() {
+  try {
+    setRunReady(await (await api.fetchApi("/modal_bridge/version")).json());
+  } catch (e) { setRunReady(null); }
 }
 
 async function recoverPendingJob() {
@@ -1185,6 +1242,7 @@ async function checkVersionOrBlock() {
     log("version check failed, skip:", e);
     return true;  // 检查本身失败不阻塞
   }
+  setRunReady(v);  // 顺便据此把 RunModal 按钮置白(就绪)/灰(需部署)
   if (v.match && v.gpu_match !== false) return true;  // 版本 + 显卡都一致,放行
 
   // 版本一致但显卡改了没重新部署(云端真跑的卡 ≠ 所选)→ 强制重新部署,不让在旧卡上偷偷跑
@@ -1225,6 +1283,7 @@ async function refreshVerBanner(panel) {
   if (!el) return;
   let v;
   try { v = await (await api.fetchApi("/modal_bridge/version")).json(); } catch (e) { return; }
+  setRunReady(v);  // Setup 里刷新版本时,顺带更新 RunModal 按钮颜色
   const dep = v.reachable ? (v.deployed || "unknown") : t("dlg.ver.notconn");
   const color = v.match ? "#34d399" : (v.reachable ? "#fbbf24" : "#9aa");
   const hint = v.match ? t("dlg.ver.aligned")
@@ -1292,6 +1351,9 @@ async function openDeployDialog() {
       ${[["L40S","48G"],["A100-80GB","80G"],["H100","80G"],["H200","141G"]].map(([g,m])=>`<option value="${g}"${(cfg.default_gpu||"H100")===g?" selected":""}>${g} (${m})${g==="H100"?" — default":""}</option>`).join("")}
     </select>
     <div style="margin:0 0 10px;color:#9aa;font-size:12px;">${t("dlg.gpu.note")}</div>
+    <label>comfy.org API Key <span style="color:#9aa;">${t("dlg.comfy.hint")}</span></label>
+    <input id="mb-dep-comfy" type="password" style="${inputCss}" value="" placeholder="${cfg.has_comfy_api_key ? t("dlg.comfy.ph_saved") : t("dlg.comfy.ph")}">
+    <div style="margin:0 0 10px;color:#9aa;font-size:12px;">${t("dlg.comfy.note")}</div>
     <div style="margin:10px 0;">
       <button id="mb-dep-go" style="padding:8px 18px;background:#2563eb;color:#fff;border:none;border-radius:6px;cursor:pointer;font-weight:600;">${t("dlg.btn.deploy")}</button>
       <button id="mb-dep-test" style="padding:8px 14px;margin-left:8px;background:#374151;color:#ddd;border:none;border-radius:6px;cursor:pointer;">${t("dlg.btn.test")}</button>
@@ -1445,6 +1507,7 @@ async function openDeployDialog() {
       token_id: panel.querySelector("#mb-dep-id").value.trim(),
       token_secret: panel.querySelector("#mb-dep-secret").value.trim(),
       default_gpu: panel.querySelector("#mb-dep-gpu").value,
+      comfy_api_key: panel.querySelector("#mb-dep-comfy").value.trim(),
     };
     // token_secret 留空 = 沿用已存的(/config 不再回显它);只有填了才校验格式
     const secretOk = payload.token_secret === "" ? cfg.has_token_secret : payload.token_secret.startsWith("as-");
@@ -1691,6 +1754,10 @@ app.registerExtension({
   async setup() {
     log("setup() running");
     doHealthCheck();
+
+    // RunModal 按钮变色:启动查一次部署状态;定时器只按缓存状态重涂(防动作栏重渲染丢样式)
+    refreshRunReady();
+    setInterval(applyRunButtonStyle, 2000);
 
     // 没配置过 → 提示去点 Setup 部署(零终端);配过了则查 Modal 平台状态,故障就主动预警
     fetchConfig().then(async (cfg) => {

@@ -156,11 +156,18 @@ def queue_workflow(workflow: dict, client_id: str) -> dict:
     若验证失败是"模型不在列表"(value_not_in_list)→ reload Volume + 等待 + 重试(最多 _RETRY_MAX 次):
     覆盖"模型刚上传、worker 容器还没看到"的最终一致/全新目录场景,直到 ComfyUI 看到模型或重试用尽。
     其它验证错误(真缺节点/参数错)立即抛,不重试。"""
+    # API 节点(comfy_api_nodes)鉴权:把 comfy.org API key 通过 /prompt 的 extra_data 传进去
+    # (ComfyUI 从 extra_data.api_key_comfy_org 取,见 execution.py)。没配 key 就不带,普通工作流不受影响。
+    body = {"prompt": workflow, "client_id": client_id}
+    _comfy_key = os.environ.get("COMFY_API_KEY_COMFY_ORG")
+    if _comfy_key:
+        body["extra_data"] = {"api_key_comfy_org": _comfy_key}
+    payload = json.dumps(body).encode("utf-8")
     attempt = 0
     while True:
         r = requests.post(
             f"http://{COMFY_HOST}/prompt",
-            data=json.dumps({"prompt": workflow, "client_id": client_id}).encode("utf-8"),
+            data=payload,
             headers={"Content-Type": "application/json"},
             timeout=30,
         )

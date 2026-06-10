@@ -370,8 +370,9 @@ def deploy_command() -> list[str]:
 
 
 def secret_create_cmd(cfg: dict, hf_token: str = "", civitai_token: str = "",
-                      bridge_key: str = "") -> list[str]:
-    """建/更新 Modal Secret:BRIDGE_API_KEY(私有鉴权)+ HF / Civitai token(下私有模型)。"""
+                      bridge_key: str = "", comfy_api_key: str = "") -> list[str]:
+    """建/更新 Modal Secret:BRIDGE_API_KEY(私有鉴权)+ HF / Civitai token(下私有模型)
+    + COMFY_API_KEY_COMFY_ORG(可选,工作流里的 ComfyUI API 节点鉴权,worker 注入 /prompt extra_data)。"""
     app_name = cfg.get("modal_app_name", "comfyui-bridge")
     secret_name = f"{app_name}-secrets"
     pairs = []
@@ -381,6 +382,8 @@ def secret_create_cmd(cfg: dict, hf_token: str = "", civitai_token: str = "",
         pairs += [f"HF_TOKEN={hf_token}", f"HUGGING_FACE_HUB_TOKEN={hf_token}"]
     if civitai_token:
         pairs.append(f"CIVITAI_TOKEN={civitai_token}")
+    if comfy_api_key:
+        pairs.append(f"COMFY_API_KEY_COMFY_ORG={comfy_api_key}")
     if not pairs:
         pairs.append("EMPTY=1")  # 空 secret 占位,避免 worker from_name 报错
     return [sys.executable, "-m", "modal", "secret", "create", "--force", secret_name, *pairs]

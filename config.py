@@ -18,6 +18,7 @@ DEFAULT_CONFIG = {
     "modal_token_id": "",      # ak-xxx(account token,仅本机 deploy 用)
     "modal_token_secret": "",  # as-xxx
     "bridge_api_key": "",      # 部署时随机生成,调私有 endpoint 用(自建鉴权)
+    "comfy_api_key": "",       # 可选:comfy.org API key,供工作流里的 ComfyUI API 节点鉴权(账单走你的 comfy.org)
 
     # ── 运行选项 ──
     "default_gpu": "H100",

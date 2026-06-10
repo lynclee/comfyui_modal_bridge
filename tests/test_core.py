@@ -357,6 +357,18 @@ def test_generic_ignores_images_and_nonmodel():
 
 
 # ============================================================================
+# node_sync.secret_create_cmd — comfy.org API key(API 节点鉴权)进 secret
+# ============================================================================
+def test_secret_cmd_includes_comfy_api_key():
+    """传了 comfy.org API key → secret 命令带 COMFY_API_KEY_COMFY_ORG;没传则不出现(不污染普通部署)。"""
+    cmd = node_sync.secret_create_cmd({"modal_app_name": "comfyui-bridge"},
+                                      bridge_key="bk-x", comfy_api_key="comfy-KEY")
+    assert any("COMFY_API_KEY_COMFY_ORG=comfy-KEY" in a for a in cmd)
+    cmd2 = node_sync.secret_create_cmd({"modal_app_name": "comfyui-bridge"}, bridge_key="bk-x")
+    assert not any("COMFY_API_KEY" in a for a in cmd2)
+
+
+# ============================================================================
 # categories — 工作流类别画像(显存 / 时长按类别)
 # ============================================================================
 def test_classify_video_by_savevideo():

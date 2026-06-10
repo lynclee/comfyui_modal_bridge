@@ -303,8 +303,10 @@ def _setup_routes():
         # + 一个 has_token_secret 标志(部署框据此显示"已保存,留空=沿用")。
         cfg = dict(cfg_mod.load_config())
         cfg["has_token_secret"] = bool(cfg.get("modal_token_secret"))
+        cfg["has_comfy_api_key"] = bool(cfg.get("comfy_api_key"))
         cfg.pop("modal_token_secret", None)
         cfg.pop("bridge_api_key", None)
+        cfg.pop("comfy_api_key", None)  # 账单凭据,不回吐浏览器(同 bridge_api_key)
         return web.json_response(cfg)
 
     @routes.get("/modal_bridge/bridge_key")
@@ -325,8 +327,10 @@ def _setup_routes():
         # 不回吐密钥(和 GET /config 一致):抹掉 token_secret / bridge_api_key
         safe = dict(cur)
         safe["has_token_secret"] = bool(safe.get("modal_token_secret"))
+        safe["has_comfy_api_key"] = bool(safe.get("comfy_api_key"))
         safe.pop("modal_token_secret", None)
         safe.pop("bridge_api_key", None)
+        safe.pop("comfy_api_key", None)
         return web.json_response(safe)
 
     # -------- 异步提交(返回 job_id,不阻塞)--------
@@ -723,6 +727,8 @@ def _setup_routes():
         scaledown = int(body.get("scaledown_window") or cfg.get("scaledown_window") or 40)
         hf_token = (body.get("hf_token") or "").strip()
         civitai_token = (body.get("civitai_token") or "").strip()
+        # comfy.org API key(API 节点用):留空 = 沿用已存的(/config 不回显)。持久化进 config,重部署不丢。
+        comfy_api_key = (body.get("comfy_api_key") or "").strip() or cfg.get("comfy_api_key", "")
         endpoint_base = f"https://{workspace}--{app_name}"
         # 私有鉴权 key:已有就复用(不让旧 config 失效),否则新生成
         bridge_key = cfg.get("bridge_api_key") or node_sync.gen_bridge_key()
@@ -738,6 +744,7 @@ def _setup_routes():
             "modal_token_id": token_id,
             "modal_token_secret": token_secret,
             "bridge_api_key": bridge_key,
+            "comfy_api_key": comfy_api_key,
         })
         env = node_sync.deploy_env(cfg)
         cwd = str(node_sync.MODAL_APP_DIR)
@@ -761,7 +768,8 @@ def _setup_routes():
             # 2) 建 / 更新 secret(放 HF / Civitai token)
             await _emit(resp, "\n== 创建 Modal Secret ==\n")
             rc = await _run_streamed(
-                resp, node_sync.secret_create_cmd(cfg, hf_token, civitai_token, bridge_key), cwd=cwd, env=env,
+                resp, node_sync.secret_create_cmd(cfg, hf_token, civitai_token, bridge_key, comfy_api_key),
+                cwd=cwd, env=env,
             )
             if rc != 0:
                 await _emit(resp, "== ✗ secret 创建失败(token 可能无效)==\n")
