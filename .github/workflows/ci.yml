@@ -4,6 +4,11 @@ on:
   push:
   pull_request:
 
+# 同一分支新推一次就取消上一次还在跑的(省 runner、结果更快)
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -19,8 +24,31 @@ jobs:
           python-version: ${{ matrix.python-version }}
       - name: Install ruff
         run: pip install ruff
+
+      # 编译全部模块(含 tests 不 import 的 routes / modal_app / _comfy_ws 等):
+      # 只编译不执行,无需真实依赖(aiohttp/modal/...),按版本捕获语法错(如 3.9 的 PEP604 坑)。
+      - name: Compile all modules
+        run: python -m compileall -q .
+
       # 核心纯函数单测:自带 modal / nodes / folder_paths 桩,无需真实依赖。
       - name: Unit tests
         run: python tests/test_core.py
+
       - name: Lint (ruff)
         run: ruff check .
+
+      # ComfyUI Registry 发布时的安全检查会拒绝 exec(S102)和行内多语句(E702)。
+      # 这里提前在 CI 卡住,避免回归后发布被拒(历史上踩过)。
+      - name: Registry security rules (no exec / no inline semicolons)
+        run: ruff check --select S102,E702 .
+
+  lint-js:
+    # 前端是半个代码库(web/modal_bridge.js),但 Python 那条管不到它 —— 单独跑一次语法检查。
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Check JS syntax
+        run: node --check web/modal_bridge.js
