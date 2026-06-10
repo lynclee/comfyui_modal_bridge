@@ -189,6 +189,10 @@ const I18N = {
                           en: "Before submit, auto-upload models the workflow needs that are missing on the Volume but present locally (block dedup, common big models instant)" },
   "set.autosync_nodes": { zh: "提交前把工作流用到的 custom_node 与本地双向同步到 Modal:缺的加、commit 变的更新、本地已卸载的移除,再重部署",
                           en: "Before submit, sync the workflow's custom_nodes with local: add missing, update changed commits, prune uninstalled, then redeploy" },
+  "set.snapshot":     { zh: "实验:Modal 容器内存快照(CPU+GPU),冷启 ~30s→~5s。改后需在 Setup 重新部署生效;按 GPU 档需验证(挂了自动退化为普通冷启,不会更差)。",
+                        en: "Experimental: Modal container memory snapshot (CPU+GPU), cold start ~30s→~5s. Redeploy in Setup to take effect; verify per GPU tier (self-heals to a normal cold start if unsupported)." },
+  "set.snapshot.on":  { zh: "已开启内存快照 —— 去 Setup 重新部署才生效(实验,前 2-3 次冷启偏慢=制作快照)", en: "Snapshot ON — redeploy in Setup to take effect (experimental; first 2-3 cold starts slower while snapshotting)" },
+  "set.snapshot.off": { zh: "已关闭内存快照 —— 去 Setup 重新部署生效", en: "Snapshot OFF — redeploy in Setup to take effect" },
 };
 
 function t(key, vars) {
@@ -1171,6 +1175,21 @@ async function recoverOne(pending) {
 // =====================================================================
 // 注册 ComfyUI Settings
 // =====================================================================
+// 内存快照开关:Setting 存前端,但部署读后端 config.json → onChange 要同步写回 config。
+// _snapReady:ComfyUI 启动期会用存储值触发 onChange,先挡掉,避免在 setup() 用 config 初始化前回写覆盖。
+let _snapReady = false;
+async function syncSnapshotToConfig(value) {
+  if (!_snapReady) return;  // 启动期/初始化触发的 onChange 不回写
+  try {
+    await api.fetchApi("/modal_bridge/config", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ enable_snapshot: !!value }),
+    });
+    log("enable_snapshot →", !!value, "(写回 config;重新部署后生效)");
+    notify(value ? t("set.snapshot.on") : t("set.snapshot.off"), "info");
+  } catch (e) { err("sync snapshot to config failed", e); }
+}
+
 const SETTINGS = [
   // 注:GPU 已统一为 H100→A100-80GB(原生 fallback),不再有显存档选项。
   {
@@ -1217,6 +1236,14 @@ const SETTINGS = [
     type: "boolean",
     defaultValue: true,
     tooltip: t("set.autosync_nodes"),
+  },
+  {
+    id: "ModalBridge.enableSnapshot",
+    name: "Modal Bridge: Memory snapshot (experimental, faster cold start)",
+    type: "boolean",
+    defaultValue: true,
+    tooltip: t("set.snapshot"),
+    onChange: (v) => syncSnapshotToConfig(v),
   },
 ];
 
@@ -1769,6 +1796,9 @@ app.registerExtension({
 
     // 没配置过 → 提示去点 Setup 部署(零终端);配过了则查 Modal 平台状态,故障就主动预警
     fetchConfig().then(async (cfg) => {
+      // 用后端 config 的真实值初始化快照开关(UI 对齐部署现实),之后才放行 onChange 回写
+      try { app.ui.settings.setSettingValue("ModalBridge.enableSnapshot", !!cfg.enable_snapshot); } catch (e) {}
+      _snapReady = true;
       if (!isConfigured(cfg)) {
         notify(t("toast.not_deployed"), "warn");
       } else if (await isModalOutage()) {

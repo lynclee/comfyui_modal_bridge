@@ -22,7 +22,7 @@ DEFAULT_CONFIG = {
 
     # ── 运行选项 ──
     "default_gpu": "H100",
-    "enable_snapshot": False,  # 内存快照(实验):冷启 ~30s→~5s。需按 GPU 档 bench 验证后再开;换值需重新部署
+    "enable_snapshot": True,   # 内存快照(实验):冷启 ~30s→~5s。默认开;不支持的 GPU 档自动退化为普通冷启(不更差)。换值需重新部署
     "user_id": "local-dev",
     "incognito": True,         # base64 回流,不上 R2
     "poll_interval_sec": 1.5,
