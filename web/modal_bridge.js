@@ -974,10 +974,12 @@ async function queueOnModal() {
     try { openDeployDialog(); } catch (e) {}
     return;
   }
-  // ⭐ 版本契约:插件版本 vs 云端部署版本必须一致,否则拦截(防"升级了插件没重新部署")
-  if (!(await checkVersionOrBlock())) return;
-  // 每次点击 = 一个独立的 job 卡片(多 workflow 并发互不覆盖),标题带工作流名
+  // 先立刻出进度卡,再做云端版本检查:checkVersionOrBlock 打 /version→/health(冷启动/超时最长 6s),
+  // 放到 UI 之后,避免"点了 RunModal 几秒没反应"像卡死。每次点击 = 一个独立 job 卡片(多 workflow 并发互不覆盖)。
   const ctx = newProgress("preparing", activeWorkflowName());
+  ctx.stage("checking", t("ver.checking"));
+  // ⭐ 版本契约:插件版本 vs 云端部署版本必须一致,否则拦截(防"升级了插件没重新部署")
+  if (!(await checkVersionOrBlock())) { ctx.finish(false, "✕"); return; }
   ctx.stage("preparing", "Serializing graph...");
   try {
     const p = await app.graphToPrompt();
@@ -1240,10 +1242,10 @@ async function openDeployDialog() {
   }
   if (deployDialogEl) { deployDialogEl.remove(); deployDialogEl = null; }  // 语言变了,弃旧重建
   _dialogLang = _locale();
-  const cfg = await fetchConfig();
-  // 拉版本信息(本地插件版本 vs 云端部署版本),用于标题区显示是否对齐
-  let ver = { local: "?", deployed: null, match: false, reachable: false };
-  try { ver = await (await api.fetchApi("/modal_bridge/version")).json(); } catch (e) {}
+  const cfg = await fetchConfig();   // 本地 /config,快
+  // 版本徽标改成异步填(见对话框末尾 refreshVerBanner):不再在这里 await /version,
+  // 否则首次打开要先等云端 /health(冷启动/超时最长 6s),对话框迟迟不出 → 像卡死。
+  const ver = { local: "?", deployed: null, match: false, reachable: false };
 
   const overlay = document.createElement("div");
   deployDialogEl = overlay;
@@ -1316,6 +1318,10 @@ async function openDeployDialog() {
   `;
   overlay.appendChild(panel);
   document.body.appendChild(overlay);
+  // 版本徽标异步填:先显示"检查云端中…"立刻出对话框,再异步刷新真实版本(不 await /health)
+  const _verEl = panel.querySelector("#mb-dep-ver");
+  if (_verEl) _verEl.textContent = t("ver.checking");
+  refreshVerBanner(panel);
 
   const close = () => { overlay.style.display = "none"; };
   panel.querySelector("#mb-dep-close").onclick = close;
