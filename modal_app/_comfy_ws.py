@@ -289,7 +289,7 @@ def run_workflow(workflow: dict, job_id: str, input_images: list[dict] | None = 
                 })
 
         if not images:
-            raise ValueError(f"No usable images in output. errors={errors}")
+            raise ValueError(f"No usable output (images/videos) in result. errors={errors}")
         return {
             "image_url": None,
             "images": images,

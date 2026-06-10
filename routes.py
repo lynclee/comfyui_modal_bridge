@@ -11,6 +11,7 @@ from pathlib import Path
 import aiohttp
 from aiohttp import web
 
+from . import categories
 from . import config as cfg_mod
 from . import contract
 from . import modal_client
@@ -140,7 +141,7 @@ async def _write_results(final: dict, job_id: str, subfolder: str) -> list:
             b64 = img.get("data_base64")
             if not b64:
                 continue
-            fn = _dedup(img.get("filename") or "output.png")
+            fn = _dedup(Path(img.get("filename") or "output.png").name)  # basename 防路径逃逸
             data = base64.b64decode(b64)
             (out_dir / fn).write_bytes(data)
             outputs.append({"filename": fn, "subfolder": f"{subfolder}/{job_id}",
@@ -148,7 +149,7 @@ async def _write_results(final: dict, job_id: str, subfolder: str) -> list:
         return outputs
 
     # 单图回退
-    fn = final.get("filename") or "output.png"
+    fn = Path(final.get("filename") or "output.png").name  # basename 防路径逃逸
     b64 = final.get("data_base64")
     image_url = final.get("image_url")
     if b64:
@@ -490,11 +491,16 @@ def _setup_routes():
                     unknown.append(f"{m['type']}/{m['filename']}")
             except OSError:
                 unknown.append(f"{m['type']}/{m['filename']}")
+        # 按类别(image/video/…)估显存:视频权重小但多帧激活大,系数+开销见 categories.py。
+        category = categories.classify(prompt)
+        model_gb = total_bytes / (1024 ** 3)
         return web.json_response({
             "total_mb": total_bytes // 1024 // 1024,
             "known_count": known,
             "required_count": len(required),
             "unknown": unknown,
+            "category": category,
+            "est_vram_gb": round(categories.estimate_vram_gb(model_gb, category), 1),
         })
 
     @routes.post("/modal_bridge/sync_models")

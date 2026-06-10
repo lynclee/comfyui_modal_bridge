@@ -48,12 +48,13 @@ const I18N = {
   "dlg.secret.ph_saved": { zh: "••••••••(已保存,留空沿用)", en: "•••••••• (saved, blank=reuse)" },
   "dlg.gpu.label":    { zh: "(部署时固定;换显卡需重新部署生效)",
                         en: "(fixed at deploy; switching needs a redeploy)" },
-  "dlg.gpu.note":     { zh: "换显卡必须点「部署」才生效:改了不部署,点 RunModal 会被拦住要求重新部署。点 RunModal 前还会用 模型总显存×1.15 对比所选卡,超了弹警告。",
-                        en: "Switching GPU requires Deploy to take effect: change without redeploy and RunModal will block and ask you to redeploy. Before running, model VRAM ×1.15 is also checked vs the selected GPU." },
+  "dlg.gpu.note":     { zh: "换显卡必须点「部署」才生效:改了不部署,点 RunModal 会被拦住要求重新部署。点 RunModal 前还会按工作流类别估算显存对比所选卡(视频含多帧激活开销),超了弹警告。",
+                        en: "Switching GPU requires Deploy to take effect: change without redeploy and RunModal will block and ask you to redeploy. Before running, VRAM is estimated per workflow category (video includes multi-frame activations) and checked vs the selected GPU." },
   "vram.warn.title":  { zh: "⚠ 显存可能不够", en: "⚠ VRAM may be tight" },
-  "vram.warn.body":   { zh: "预估需 ~{est}GB(模型 {model}GB ×1.15),超过所选 {gpu}({cap}GB)。可能 offload 变慢甚至 OOM。",
-                        en: "Est. ~{est}GB ({model}GB models ×1.15) exceeds the selected {gpu} ({cap}GB). May offload (slow) or OOM." },
+  "vram.warn.body":   { zh: "预估需 ~{est}GB(模型 {model}GB),超过所选 {gpu}({cap}GB)。可能 offload 变慢甚至 OOM。",
+                        en: "Est. ~{est}GB ({model}GB models) exceeds the selected {gpu} ({cap}GB). May offload (slow) or OOM." },
   "vram.warn.unknown":{ zh: "(另有 {n} 个模型本地没找到,实际可能更高)", en: " ({n} models not found locally; real usage may be higher)" },
+  "vram.warn.video":  { zh: "(视频类:显存还要算多帧激活,估算偏粗,务必留余量)", en: " (video: multi-frame activations add VRAM; estimate is rough, leave headroom)" },
   "vram.warn.run":    { zh: "仍要跑", en: "Run anyway" },
   "vram.warn.switch": { zh: "去 Setup 换显卡", en: "Switch GPU in Setup" },
   "dlg.btn.deploy":   { zh: "部署", en: "Deploy" },
@@ -759,7 +760,7 @@ async function runOnceOnModal(workflowPrompt, outputNodeIds, ctx, submitGuard, b
   ctx.stage("queued", `${batchSuffix}job=${jobId.slice(0, 8)} gpu=${gpu}`, true);
 
   const interval = getSetting("ModalBridge.pollIntervalSec", 1.2) * 1000;
-  const timeoutMs = getSetting("ModalBridge.timeoutSec", 900) * 1000;  // 默认 900s=15min,与 worker 上限一致
+  const timeoutMs = getSetting("ModalBridge.timeoutSec", 1800) * 1000;  // 默认 1800s=30min,覆盖最慢类别(视频),与 worker 超时上限一致
   const deadline = Date.now() + timeoutMs;
 
   let final = null;
@@ -924,10 +925,12 @@ async function vramPreflightOrConfirm(prompt, cfgNow) {
     const d = await r.json();
     if (!r.ok || d.error || !d.total_mb) return true;  // 估不出就不挡
     const modelGB = d.total_mb / 1024;
-    const estGB = modelGB * 1.15;
+    // 显存估算交后端按类别算(视频=权重×系数+多帧激活开销);拿不到则兜底旧的 ×1.15。
+    const estGB = (d.est_vram_gb != null) ? d.est_vram_gb : modelGB * 1.15;
     if (estGB <= cap) return true;  // 没超 → 放行
-    const unknownNote = (d.unknown && d.unknown.length)
+    let unknownNote = (d.unknown && d.unknown.length)
       ? t("vram.warn.unknown", { n: d.unknown.length }) : "";
+    if (d.category === "video") unknownNote += t("vram.warn.video");
     return await confirmDialog(
       t("vram.warn.title"),
       t("vram.warn.body", { est: estGB.toFixed(0), model: modelGB.toFixed(0), gpu, cap }) + unknownNote,
@@ -1512,7 +1515,7 @@ async function exportModalApi() {
     if (/TextEncode/i.test(ct) && typeof ins.text === "string") promptNodes.push(nid);
     if (typeof ins.seed === "number" || typeof ins.noise_seed === "number") seedNodes.push(nid);
     for (const v of Object.values(ins)) {
-      if (typeof v === "string" && /\.(safetensors|ckpt|pt|pth|gguf|bin|sft)$/i.test(v))
+      if (typeof v === "string" && /\.(safetensors|ckpt|pt|pth|gguf|bin|sft|onnx)$/i.test(v))
         prereq.add(`#       - ${ct}: ${v}`);
     }
   }

@@ -36,6 +36,9 @@ APP_NAME = os.environ.get("MODAL_BRIDGE_APP_NAME", "comfyui-bridge")
 VOLUME_NAME = os.environ.get("MODAL_BRIDGE_VOLUME", "comfyui-bridge-models")
 SECRET_NAME = os.environ.get("MODAL_BRIDGE_SECRET", "comfyui-bridge-secrets")
 SCALEDOWN = int(os.environ.get("MODAL_BRIDGE_SCALEDOWN", "40"))
+# worker 单任务超时上限(s)。部署时由 config.worker_timeout_sec 决定(覆盖最慢类别,如视频)。
+# ⚠ Modal 的 timeout 是部署期固定的,运行时不可变 —— 换值需重新部署。
+WORKER_TIMEOUT = int(os.environ.get("MODAL_BRIDGE_TIMEOUT", "1800"))
 DEPLOYED_VERSION = os.environ.get("MODAL_BRIDGE_VERSION", "unknown")  # 部署时烤进,health 回传
 
 app = modal.App(APP_NAME)
@@ -100,7 +103,7 @@ _WORKER_KW = dict(
     volumes={"/comfy-volume": models_vol},
     secrets=[bridge_secret],
     scaledown_window=SCALEDOWN,
-    timeout=900,
+    timeout=WORKER_TIMEOUT,
     min_containers=0,
     max_containers=10,
 )

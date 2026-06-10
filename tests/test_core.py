@@ -18,6 +18,8 @@ import node_sync  # noqa: E402
 import modal_volume  # noqa: E402
 import model_deps  # noqa: E402
 import contract  # noqa: E402
+import categories  # noqa: E402
+import config  # noqa: E402
 
 
 # ============================================================================
@@ -352,6 +354,40 @@ def test_generic_ignores_images_and_nonmodel():
     prompt = {"1": {"class_type": "LoadImage", "inputs": {"image": "ref.png"}},
               "2": {"class_type": "CLIPTextEncode", "inputs": {"text": "a cat"}}}
     assert model_deps.extract_generic_filenames(prompt) == set()
+
+
+# ============================================================================
+# categories — 工作流类别画像(显存 / 时长按类别)
+# ============================================================================
+def test_classify_video_by_savevideo():
+    """工作流含 SaveVideo / VHS_VideoCombine → 归 video。"""
+    assert categories.classify(
+        {"1": {"class_type": "SaveVideo", "inputs": {}}}) == "video"
+    assert categories.classify(
+        {"9": {"class_type": "VHS_VideoCombine", "inputs": {}}}) == "video"
+
+
+def test_classify_image_default():
+    """没有视频输出节点 → 默认 image。"""
+    assert categories.classify(
+        {"1": {"class_type": "SaveImage", "inputs": {}},
+         "2": {"class_type": "KSampler", "inputs": {}}}) == "image"
+    assert categories.classify({}) == "image"
+
+
+def test_estimate_vram_video_has_overhead():
+    """同样权重大小,video 估算应高于 image(多帧激活开销 + 更大系数)。"""
+    img = categories.estimate_vram_gb(10.0, "image")
+    vid = categories.estimate_vram_gb(10.0, "video")
+    assert vid > img
+    assert img == 10.0 * 1.15            # image: 纯权重×系数,无额外开销
+    assert vid == 10.0 * 1.3 + 8.0       # video: 权重×系数 + 多帧开销
+
+
+def test_config_default_covers_slowest_category():
+    """配置默认的 worker 超时上限必须 ≥ 最慢类别的时长 —— 否则视频会被提前杀。
+    加了更慢的新类别却忘了抬高默认值,这条会失败(强制同步)。"""
+    assert config.DEFAULT_CONFIG["worker_timeout_sec"] >= categories.max_worker_timeout_s()
 
 
 # ============================================================================
