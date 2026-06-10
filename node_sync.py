@@ -399,6 +399,7 @@ def deploy_env(cfg: dict) -> dict:
     env["MODAL_BRIDGE_DEFAULT_GPU"] = cfg.get("default_gpu", "H100")
     env["MODAL_BRIDGE_SCALEDOWN"] = str(cfg.get("scaledown_window", 40))
     env["MODAL_BRIDGE_TIMEOUT"] = str(cfg.get("worker_timeout_sec", 1800))  # worker 超时上限(覆盖最慢类别)
+    env["MODAL_BRIDGE_SNAPSHOT"] = "1" if cfg.get("enable_snapshot") else "0"  # 内存快照开关(实验)
     env["MODAL_BRIDGE_VERSION"] = plugin_version()  # 版本契约:烤进 app,health 回传供前端比对
     if cfg.get("modal_token_id"):
         env["MODAL_TOKEN_ID"] = cfg["modal_token_id"]

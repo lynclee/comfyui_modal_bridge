@@ -39,6 +39,10 @@ SCALEDOWN = int(os.environ.get("MODAL_BRIDGE_SCALEDOWN", "40"))
 # worker 单任务超时上限(s)。部署时由 config.worker_timeout_sec 决定(覆盖最慢类别,如视频)。
 # ⚠ Modal 的 timeout 是部署期固定的,运行时不可变 —— 换值需重新部署。
 WORKER_TIMEOUT = int(os.environ.get("MODAL_BRIDGE_TIMEOUT", "1800"))
+# 内存快照(可选,默认关):冷启 ~30s→~5s。开关 = config.enable_snapshot → MODAL_BRIDGE_SNAPSHOT。
+# 必须连 GPU 快照一起开(ComfyUI boot 探 CUDA;只 CPU 快照会以 CPU 模式初始化、恢复后切不回卡)。
+# experimental,按 GPU 档需各自 bench;失败兜底见 ComfyWorker.ensure_comfy_alive(退化为普通冷启,不更差)。
+_SNAPSHOT = os.environ.get("MODAL_BRIDGE_SNAPSHOT", "0") == "1"
 DEPLOYED_VERSION = os.environ.get("MODAL_BRIDGE_VERSION", "unknown")  # 部署时烤进,health 回传
 
 app = modal.App(APP_NAME)
@@ -173,11 +177,31 @@ _GPU_CHAIN = {
 }
 _GPU_LIST = _GPU_CHAIN.get(_PRIMARY_GPU, [_PRIMARY_GPU])
 
-@app.cls(gpu=_GPU_LIST, **_WORKER_KW)
+# 开快照时追加两个 decorator 参数;关时为空 dict → @app.cls 行为和原来完全一致。
+_SNAP_KW = (dict(enable_memory_snapshot=True,
+                 experimental_options={"enable_gpu_snapshot": True}) if _SNAPSHOT else {})
+
+
+@app.cls(gpu=_GPU_LIST, **_WORKER_KW, **_SNAP_KW)
 @modal.concurrent(max_inputs=1)
 class ComfyWorker:
-    @modal.enter()
+    @modal.enter(snap=_SNAPSHOT)   # 开快照:这一段进快照(snap 阶段 GPU 可见,正常 boot)
     def boot(self):
+        _worker_boot(self)
+
+    @modal.enter(snap=False)       # 恢复路径上的正确性闸门 + 自愈(快照关时直接返回,保持原行为)
+    def ensure_comfy_alive(self):
+        if not _SNAPSHOT:
+            return
+        import requests
+        try:
+            if requests.get("http://127.0.0.1:8188/system_stats", timeout=5).ok:
+                return
+        except Exception:
+            pass
+        # 探活失败:原地重启子进程(代价=一次普通 boot,不比无快照更糟),而非 raise 杀容器进重试。
+        print("[bridge] restore 探活失败,重启 ComfyUI 子进程(退化为普通冷启)")
+        _worker_shutdown(self)
         _worker_boot(self)
 
     @modal.exit()
