@@ -279,7 +279,7 @@ def run_workflow(workflow: dict, job_id: str, input_images: list[dict] | None = 
 
         outputs = history[prompt_id].get("outputs", {})
         images = []  # 收集所有非 temp 图(多 SaveImage / batch)
-        for _, node_output in outputs.items():
+        for node_id, node_output in outputs.items():
             for image_info in node_output.get("images", []):
                 filename = image_info.get("filename")
                 subfolder = image_info.get("subfolder", "")
@@ -293,6 +293,7 @@ def run_workflow(workflow: dict, job_id: str, input_images: list[dict] | None = 
                 images.append({
                     "filename": filename,
                     "data_base64": base64.b64encode(image_bytes).decode("utf-8"),
+                    "node_id": str(node_id),  # 来源节点 → 前端按节点回填,多 SaveImage 不互相串图
                 })
 
         if not images:

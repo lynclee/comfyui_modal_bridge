@@ -331,18 +331,26 @@ const VIDEO_EXT_RE = /\.(mp4|webm|mov|mkv|avi|flv|m4v|gif|webp|apng)$/i;
 
 function displayInGraph(outputNodeIds, modalOutputs) {
   if (!outputNodeIds?.length || !modalOutputs?.length) return 0;
-  const imagesMeta = modalOutputs.map((o) => ({
-    filename: o.filename,
-    subfolder: o.subfolder,
-    type: o.type || "output",
-  }));
-  // 任一产出是视频/动图 → 带上 animated 标记,让回填节点走视频/动图预览。
-  const isAnimated = modalOutputs.some((o) => VIDEO_EXT_RE.test(o.filename || ""));
-  const out = isAnimated ? { images: imagesMeta, animated: [true] } : { images: imagesMeta };
+  // 像 ComfyUI 本地执行那样按来源节点分发:每个 SaveImage 只回填它自己产出的图,
+  // 多 SaveImage 不再互相串图。node_id 由新 worker 提供;老 worker(没 node_id)→
+  // 回退成"全部图广播给每个输出节点"(旧行为,保证不破坏未重部署的用户)。
+  const hasNodeId = modalOutputs.some((o) => o.node_id != null);
+  const byNode = {};
+  for (const o of modalOutputs) (byNode[String(o.node_id)] ??= []).push(o);
+
+  const toOut = (list) => {
+    const imagesMeta = list.map((o) => ({ filename: o.filename, subfolder: o.subfolder, type: o.type || "output" }));
+    const isAnimated = list.some((o) => VIDEO_EXT_RE.test(o.filename || ""));  // 视频/动图带 animated 标记
+    return isAnimated ? { images: imagesMeta, animated: [true] } : { images: imagesMeta };
+  };
+
   let placed = 0;
   for (const nid of outputNodeIds) {
     const node = app.graph.getNodeById(parseInt(nid, 10)) || app.graph.getNodeById(nid);
     if (!node) continue;
+    const mine = hasNodeId ? (byNode[String(nid)] || []) : modalOutputs;
+    if (!mine.length) continue;  // 这个输出节点本次没产图 → 不回填(避免清空/串图)
+    const out = toOut(mine);
     try {
       api.dispatchEvent(new CustomEvent("executed", {
         detail: { node: String(nid), display_node: String(nid), output: out },
@@ -352,7 +360,7 @@ function displayInGraph(outputNodeIds, modalOutputs) {
     placed++;
   }
   try { app.graph.setDirtyCanvas(true, true); } catch (e) {}
-  log(`displayInGraph: ids=[${outputNodeIds.join(",")}] placed=${placed}`);
+  log(`displayInGraph: ids=[${outputNodeIds.join(",")}] placed=${placed} byNode=${hasNodeId}`);
   return placed;
 }
 

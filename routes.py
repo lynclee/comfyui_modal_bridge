@@ -145,7 +145,8 @@ async def _write_results(final: dict, job_id: str, subfolder: str) -> list:
             data = base64.b64decode(b64)
             (out_dir / fn).write_bytes(data)
             outputs.append({"filename": fn, "subfolder": f"{subfolder}/{job_id}",
-                            "type": "output", "size_bytes": len(data)})
+                            "type": "output", "size_bytes": len(data),
+                            "node_id": img.get("node_id")})  # 来源节点 → 前端按节点回填
         return outputs
 
     # 单图回退
