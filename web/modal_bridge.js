@@ -1001,6 +1001,15 @@ function confirmDialog(title, body, okText, cancelText, opts = {}) {
 }
 
 async function queueOnModal() {
+  // ⭐ 一进来立刻锁定"此刻点的这张图":同步抓工作流身份 + 立即序列化 prompt。
+  // 必须在任何 await(fetchConfig / 版本检查)之前——否则那几秒里用户切了 tab,
+  // 本任务会懒读到"当前图"=别的工作流,造成并发跨 tab 串台(卡片显示别人的模型上传)。
+  const wfName = activeWorkflowName();
+  const wfKey = activeWorkflowKey();
+  const hasApiNodes = workflowHasApiNodes();
+  const p = await app.graphToPrompt();
+  const outputNodeIds = findOutputNodes(p.output);
+
   // 没部署/没配置就直接引导去 Setup,别走后面链路再失败
   const cfg0 = await fetchConfig();
   if (!isConfigured(cfg0)) {
@@ -1010,20 +1019,18 @@ async function queueOnModal() {
   }
   // 先立刻出进度卡,再做云端版本检查:checkVersionOrBlock 打 /version→/health(冷启动/超时最长 6s),
   // 放到 UI 之后,避免"点了 RunModal 几秒没反应"像卡死。每次点击 = 一个独立 job 卡片(多 workflow 并发互不覆盖)。
-  const ctx = newProgress("preparing", activeWorkflowName());
+  const ctx = newProgress("preparing", wfName);
   ctx.stage("checking", t("ver.checking"));
   // ⭐ 版本契约:插件版本 vs 云端部署版本必须一致,否则拦截(防"升级了插件没重新部署")
   if (!(await checkVersionOrBlock())) { ctx.finish(false, "✕"); return; }
   ctx.stage("preparing", "Serializing graph...");
   try {
-    const p = await app.graphToPrompt();
-    const outputNodeIds = findOutputNodes(p.output);
-    // 提交时记下当前工作流(tab)身份;结果回来时据此判断该直接回填还是暂存(等切回该 tab)
-    const submitGuard = { wfKey: activeWorkflowKey() };
-    log("output nodes:", outputNodeIds, "wfKey:", submitGuard.wfKey);
+    // p / outputNodeIds / wfKey / hasApiNodes 已在函数开头快照(防跨 tab 串台),这里直接用。
+    const submitGuard = { wfKey };  // 结果回填也用这份身份:切了 tab 就暂存,不填到别的工作流
+    log("output nodes:", outputNodeIds, "wfKey:", wfKey);
 
     // API 节点预警:工作流含 ComfyUI API 节点但没配 comfy.org key → 云端会 401,提前提示(早于节点/模型同步)
-    if (workflowHasApiNodes() && !cfg0.has_comfy_api_key) {
+    if (hasApiNodes && !cfg0.has_comfy_api_key) {
       const proceed = await confirmDialog(
         t("api.warn.title"), t("api.warn.body"), t("api.warn.run"), t("api.warn.setup"));
       if (!proceed) { ctx.finish(false, "✕ Cancelled"); try { openDeployDialog(); } catch (e) {} return; }
