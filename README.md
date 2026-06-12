@@ -2,7 +2,7 @@
 
 > 中文 | [English](#english)
 
-**ComfyUI Desktop 插件:一键把当前工作流推到你自己的 Modal Serverless GPU(H100)上跑,出图回流本地画板。** 本地不用好显卡、不用开终端、不用搭云端 ComfyUI —— 装上、填一次 token、点一下,就跑。
+**ComfyUI Desktop 插件:一键把当前工作流推到你自己的 Modal Serverless GPU 上跑,图 / 视频 / 3D 回流本地画板。** 本地不用好显卡、不用开终端、不用搭云端 ComfyUI —— 装上、填一次 token、点一下,就跑。
 
 > Registry: `comfyui_modal_bridge`(publisher `lynclee`)· 在 ComfyUI Manager 搜 **Modal Bridge** 即可安装。
 
@@ -12,8 +12,9 @@
 - ⚡ **多任务并发** — 多个工作流可同时提交、同时跑,各有独立进度卡片(可拖动 / 取消 / 关闭),互不阻塞、互不覆盖。
 - 🚀 **全自动部署,零终端** — GUI 填一次 Modal token,后端自动 `pip install modal`、建密钥、`modal deploy`、写配置。全程不碰命令行,首次拉镜像约 3-5 分钟,之后秒进。
 - 🧩 **custom node 自动同步** — 工作流用到的自定义节点,云端镜像没有就**自动装进镜像并重部署**;多台机器各装一部分时取**并集、互不删**,换机无缝。
-- 📤 **一键导出 API** — 点 `Export API` 把当前工作流导成一个**自包含单文件 `.py`**,别人 `python xxx.py` 就能云端出图,**不需要 ComfyUI / 本机 GPU / 你开机**;可改 `--prompt`/`--seed`,key 默认占位符(可选嵌入,带账单风险提示)。
-- 💰 **按秒计费,空闲归零** — 用你自己的 Modal 账号(注册送 $30/月额度,需绑卡),**不出图不花钱**,闲置自动缩到零。
+- 🎨 **图 / 视频 / 3D 全支持** — SaveImage / SaveVideo / SaveGLB / Preview3D 的产物都回流本地,并直接回填画板预览(3D 出可转动的网格);大文件(视频 / 网格)自动走 Volume 直连取回,不受 base64 体积限制。
+- 🤖 **API 节点 + 自动省钱** — 工作流含 ComfyUI API 节点(Kling / Luma / Tripo / OpenAI 等)也能跑(Setup 填一次 comfy.org key);**没有本地模型的纯 API 工作流自动路由到 CPU 容器,GPU 账单≈0**。
+- 💰 **按秒计费,空闲归零** — 用你自己的 Modal 账号(注册送 $30/月额度,需绑卡),**不出图不花钱**,闲置自动缩到零。可选「内存快照」把冷启从 ~30s 降到 ~5s。
 
 ## 它解决什么
 
@@ -24,7 +25,10 @@
 - **零终端部署**:点 `⚙️ Modal Setup` 填 Modal token → 后端自动 `pip install modal`、建 Secret、`modal deploy`、写配置并验证 health。
 - **不挑本地机器**:本地只做序列化 + 上传 + 收图,**不跑推理**,所以对本地显卡/显存无要求;Mac / Windows / Linux 一致(子进程串流部署日志,绕开 Windows 事件循环坑)。
 - **多档 GPU 可选 + 显存预警 + 改卡强制重部署**:Modal Setup 里选显卡(**L40S 48G / A100-80G / H100 80G(默认) / H200 141G**),每档带 Modal 原生 fallback;点 RunModal 前自动用「**模型总显存 ×1.15**」对比所选卡,超了弹警告(可"仍要跑"或"去换显卡")。Modal 的卡**部署时固定**,所以**改了卡不重新部署会被拦住**(云端上报真实在跑的卡,与所选不一致即强制去重部署),杜绝"以为换了卡其实还在旧卡上跑"。
-- **一键导出 API**:点 `Export API` → 当前工作流导出为自包含 `<名字>_modal.py`(内嵌工作流 + submit/轮询/存图 + `--prompt`/`--seed` + 依赖模型清单 + 提交/轮询重试)。别人不用装 ComfyUI、不用 GPU、不用你开机即可云端出图。前提:该工作流的模型/节点已同步过一次;key 默认占位符,导出时可选嵌入(弹窗红字提示=你的账单)。
+- **图 / 视频 / 3D 输出 + 画板预览**:扫工作流所有输出节点收产物 —— SaveImage/SaveVideo 出图、视频,**SaveGLB / Preview3D 出 3D 网格并在画板内渲染转盘**(按来源节点回填,多输出不串台);大文件(视频 / 网格 >8MB)走 **Volume 直连取回**,绕开 base64/Dict 体积上限,小文件仍 base64。
+- **CPU / GPU 自动路由**:提交时判断工作流要不要 GPU(有没有引用本地模型)—— **纯 API / 无模型的轻工作流自动落 CPU 容器(账单≈0)**,要 sample 的才上 GPU。
+- **ComfyUI API 节点**:工作流含 API 节点(Kling/Luma/Tripo/OpenAI…)时,Setup 填的 comfy.org API key 经云端 Secret 注入鉴权;前端检测到 API 节点但没配 key 会提前提示(账单走你的 comfy.org 额度)。
+- **更快冷启(可选)**:Setting 开「内存快照」后,容器冷启从 ~30s 降到 ~5s(experimental,按 GPU 档需自测;CPU worker 用 GA 的 CPU 快照,稳)。
 - **多任务并发 & 进度**:多工作流并发各有独立进度卡片(可拖动/取消/关闭);上传带速率 + ETA;job 状态自动清理,不会互相覆盖。
 - **custom_node 自动同步 + 多机友好**:自动加工作流需要的节点并重部署(只这一次);多机取并集、互不删;清理走 Setup 的「管理云端节点」手动勾选。
 - **模型本地 → Volume**:模型在本地 ComfyUI 下好,提交时自动把云端缺的传上去;**块级去重(CAS)让通用大模型秒过**,只有自训练/私有模型才真占上行带宽。不从 HF 下载、不依赖手维护的 registry。
@@ -41,9 +45,11 @@ custom_node 同步   工作流用到、云端镜像没有的节点 → 自动加
 模型同步          工作流要的模型,云端 Volume 没、本地有 → 用 modal SDK 直传 Volume
   │              (CAS 块级去重:网上通用大模型秒过)
   ▼
-提交 Modal /run → 轮询 → base64 回流 → 写 output/modal_results/<job_id>/
+路由             无本地模型(纯 API)→ CPU 容器;要 sample → GPU 容器
   ▼
-回填到画板的 SaveImage 节点(支持多 SaveImage / 多输入)
+提交 Modal /run → 轮询 → 小文件 base64 / 大文件走 Volume 直连 → 写 output/modal_results/<job_id>/
+  ▼
+按来源节点回填画板:SaveImage 出图、SaveVideo 出视频、SaveGLB / Preview3D 出 3D 转盘
 ```
 
 ## 安装
@@ -70,7 +76,7 @@ MIT
 
 > [中文](#comfyui_modal_bridge) | English
 
-**A ComfyUI Desktop plugin: push the current workflow to your own Modal Serverless GPU (H100) with one click; the image flows back to your local canvas.** No good GPU locally, no terminal, no self-hosted cloud ComfyUI — install, enter a token once, click, done.
+**A ComfyUI Desktop plugin: push the current workflow to your own Modal Serverless GPU with one click; images / video / 3D flow back to your local canvas.** No good GPU locally, no terminal, no self-hosted cloud ComfyUI — install, enter a token once, click, done.
 
 > Registry: `comfyui_modal_bridge` (publisher `lynclee`) · Search **Modal Bridge** in ComfyUI Manager to install.
 
@@ -80,8 +86,9 @@ MIT
 - ⚡ **Multi-task concurrency.** Submit and run multiple workflows at once — each gets its own progress card (draggable / cancelable / closable), no blocking, no clobbering.
 - 🚀 **Fully automatic deploy, zero terminal.** Enter your Modal token once in the GUI; the backend auto `pip install modal`, creates the secret, runs `modal deploy`, writes config. Never touch the command line. First image-pull ~3-5 min, instant afterward.
 - 🧩 **Custom nodes auto-sync.** Nodes your workflow uses but the cloud lacks are **auto-baked into the image and redeployed**; across machines the image is the **union, never cross-deleted** — switch machines seamlessly.
-- 📤 **One-click Export API.** Click `Export API` to export the current workflow as a **self-contained single `.py`** — anyone can `python xxx.py` to generate on the cloud, **no ComfyUI / local GPU / your machine running required**; supports `--prompt`/`--seed`; key is a placeholder by default (optional embed, with a billing-risk warning).
-- 💰 **Per-second billing, scales to zero.** Uses your own Modal account ($30/mo free credit, card required); **you pay nothing when not generating**, idle scales to zero.
+- 🎨 **Images / video / 3D — all supported.** Outputs from SaveImage / SaveVideo / SaveGLB / Preview3D flow back locally and render right on the canvas (3D shows a rotatable mesh); large files (video / meshes) are pulled back directly via the Volume, free of the base64 size ceiling.
+- 🤖 **API nodes + auto cost-saving.** Workflows with ComfyUI API nodes (Kling / Luma / Tripo / OpenAI, etc.) run too (enter a comfy.org key once in Setup); **pure-API workflows with no local model auto-route to a CPU container — GPU bill ≈ 0**.
+- 💰 **Per-second billing, scales to zero.** Uses your own Modal account ($30/mo free credit, card required); **you pay nothing when not generating**, idle scales to zero. Optional memory snapshot cuts cold start from ~30s to ~5s.
 
 ## What it solves
 
@@ -92,7 +99,10 @@ You don't have a big-VRAM GPU locally (Mac / thin laptop / a 4090 that can't fit
 - **Zero-terminal deploy**: click `⚙️ Modal Setup`, enter your Modal token → the backend auto `pip install modal`, creates the Secret, runs `modal deploy`, writes config, verifies health.
 - **Machine-agnostic local side**: locally it only serializes + uploads + receives — **no inference** — so it has no requirement on your GPU/VRAM; consistent across Mac / Windows / Linux (streams deploy logs via a subprocess to dodge the Windows event-loop pitfall).
 - **Multiple GPUs + VRAM preflight + redeploy-enforced GPU switch**: pick a GPU in Modal Setup (**L40S 48G / A100-80G / H100 80G (default) / H200 141G**), each with native fallback; before running, **model VRAM ×1.15** is checked against the selected GPU and warns if it won't fit ("run anyway" / "switch GPU"). Modal's GPU is **fixed at deploy time**, so **changing the GPU without redeploying is blocked** (the cloud reports the GPU it actually runs on; a mismatch forces a redeploy) — no more "thought I switched but it's still on the old GPU".
-- **One-click Export API**: click `Export API` → export the current workflow as a self-contained `<name>_modal.py` (embedded workflow + submit/poll/save + `--prompt`/`--seed` + model prereq list + submit/poll retry). Others run it on the cloud with no ComfyUI / no GPU / your machine off. Prereq: that workflow's models/nodes were synced once; key is a placeholder by default, optionally embedded at export (dialog warns it's your billing).
+- **Images / video / 3D output + canvas preview**: collects outputs from every output node — SaveImage/SaveVideo for images/video, **SaveGLB / Preview3D for 3D meshes rendered as a turntable on the canvas** (routed per source node, no cross-bleed across multiple outputs); large files (video / meshes >8MB) come back via **direct Volume download**, bypassing the base64/Dict size ceiling, small ones stay base64.
+- **CPU / GPU auto-routing**: on submit, detect whether the workflow needs a GPU (does it reference a local model) — **pure-API / model-less lightweight workflows auto-land on a CPU container (bill ≈ 0)**, only sampling ones go to GPU.
+- **ComfyUI API nodes**: for workflows with API nodes (Kling/Luma/Tripo/OpenAI…), the comfy.org API key entered in Setup is injected from the cloud Secret; the frontend warns up front if API nodes are present but no key is configured (billed to your comfy.org credits).
+- **Faster cold start (optional)**: enable "Memory snapshot" in Settings to cut container cold start from ~30s to ~5s (experimental, verify per GPU tier; the CPU worker uses the GA CPU snapshot, reliable).
 - **Multi-task concurrency & progress**: each concurrent workflow gets its own progress card (draggable / cancelable / closable); uploads show rate + ETA; job state auto-cleans without clobbering.
 - **Custom-node auto-sync & multi-machine**: auto-adds nodes the workflow needs and redeploys (one time); across machines it's the **union, never cross-deleted**; cleanup is manual via "Manage cloud nodes" in Setup.
 - **Local → Volume models**: download models locally; missing ones upload on submit; **block-level dedup (CAS) makes common big models instant** — only custom/private models actually use upstream bandwidth. No HF download, no hand-maintained registry.
@@ -109,9 +119,11 @@ node sync      Nodes the workflow uses but the cloud image lacks → auto-add + 
 model sync     Models the workflow needs, missing on the Volume but present locally
   │            → uploaded directly via modal SDK (CAS block dedup: common big models are instant)
   ▼
-submit Modal /run → poll → base64 back → write output/modal_results/<job_id>/
+routing        no local model (pure API) → CPU container; needs sampling → GPU container
   ▼
-display on the canvas SaveImage node (multi-SaveImage / multi-input supported)
+submit Modal /run → poll → small files base64 / large files via direct Volume → write output/modal_results/<job_id>/
+  ▼
+fill back per source node: SaveImage for images, SaveVideo for video, SaveGLB / Preview3D for a 3D turntable
 ```
 
 ## Install

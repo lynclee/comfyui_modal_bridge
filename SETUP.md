@@ -37,14 +37,16 @@ python deploy.py --workspace <你的workspace> --token-id ak-xxx --token-secret 
 # token 也可走环境变量 MODAL_TOKEN_ID / MODAL_TOKEN_SECRET
 ```
 
-## 出图(点 [RunModal] 之后)
+## 出图 / 视频 / 3D(点 [RunModal] 之后)
 
 1. 序列化当前工作流
 2. **版本 + 显卡校验**:插件版本与云端不一致、或所选显卡与云端实际在跑的卡不一致 → 拦住并引导重新部署
-3. **custom_node 同步**:工作流用到、云端没有的节点 → 自动加 + 重部署(只这一次,之后秒进)
-4. **显存预检**:模型总显存 ×1.15 超所选卡 → 弹警告(可仍要跑 / 去换卡)
-5. **模型同步**:云端 Volume 缺、本地有 → 上传(CAS 去重);云端和本地都没有 → 提示先在本地下好
-6. 提交 Modal → 轮询 → base64 回流 → 写 `output/modal_results/<job_id>/` → 回填画板 SaveImage
+3. **API 节点检测**:工作流含 ComfyUI API 节点但没配 comfy.org key → 提交前提示(否则云端会 401)
+4. **custom_node 同步**:工作流用到、云端没有的节点 → 自动加 + 重部署(只这一次,之后秒进)
+5. **显存预检**:模型总显存(按类别估,视频含多帧激活开销)超所选卡 → 弹警告(可仍要跑 / 去换卡)
+6. **模型同步**:云端 Volume 缺、本地有 → 上传(CAS 去重);云端和本地都没有 → 提示先在本地下好
+7. **CPU / GPU 路由**:工作流无本地模型(纯 API)→ CPU 容器(账单≈0);要 sample → GPU 容器
+8. 提交 Modal → 轮询 → 小文件 base64 / 大文件走 Volume 直连 → 写 `output/modal_results/<job_id>/` → 按来源节点回填:SaveImage 出图、SaveVideo 出视频、**SaveGLB / Preview3D 出 3D 转盘**
 
 ## GPU(可选 + 改卡强制重部署)
 
@@ -52,18 +54,27 @@ Modal Setup 里选显卡:**L40S 48G / A100-80G / H100 80G(默认) / H200 141G**,
 **Modal 的卡是部署时固定的** —— 选完点「部署」才生效。改了卡**不重新部署**,点 RunModal 会被**拦住、强制去重部署**(云端 health 上报真实在跑的卡,与所选不一致即判定),杜绝"以为换了卡其实还跑在旧卡上"。
 点 RunModal 前还会用「模型总显存 ×1.15」对比所选卡,超了弹警告(可"仍要跑"/"去换显卡")。
 
-## 导出 API(给别人 / 接后端用)
+## 图 / 视频 / 3D 输出 + 画板预览
 
-点 **[Export API]** 把当前工作流导成一个自包含 `<名字>_modal.py`:内嵌工作流(base64)+ 提交/轮询/存图 + `--prompt`/`--seed` 覆盖 + 依赖模型清单 + 网络重试。别人:
+bridge 扫工作流**所有输出节点**取产物并回填画板:
+- **SaveImage / SaveVideo / SaveWEBM**:图、视频,画板预览;
+- **SaveGLB**(`3d` 键)/ **Preview3D**(`result` 键):3D 网格,**画板内渲染可转动的转盘**;
+- 产物按**来源节点**回填,多个输出节点各归各、不串台。
+- **大文件**(视频 / 网格 >8MB)走 **Volume 直连取回**(worker 写进 Volume → 本地 SDK 直接下),绕开 base64/modal.Dict 体积上限;小文件仍 base64。阈值 `config.volume_threshold_mb`(默认 8,换值需重新部署)。
 
-```bash
-pip install requests
-python <名字>_modal.py --prompt "..." --seed 123 --out out.png
-```
+## CPU / GPU 自动路由(省钱)
 
-不需要 ComfyUI / 本机 GPU / 你开机(直连已部署的 `-run`/`-status`)。
-- **前提**:该工作流的模型 + 自定义节点已用 RunModal 跑通过一次(已同步到云端),否则 worker 找不到。
-- **KEY**:默认占位符(接收方填你私下给的 key);导出时可选「嵌入 KEY」—— key = 你的 Modal 账单,只发可信的人,别公开,泄露需轮换 key。
+提交时后端按"工作流有没有引用本地模型"判要不要 GPU:
+- **无本地模型**(纯 API / 轻节点)→ **CPU 容器**,GPU 账单≈0;
+- **有模型要 sample** → GPU 容器。
+
+进度卡会显示 `CPU` 或显卡名。CPU worker 用同一镜像、`--cpu` 跑(ComfyUI CPU 模式)。
+
+## ComfyUI API 节点(Kling / Luma / Tripo / OpenAI…)
+
+工作流含 API 节点时需要 comfy.org 的 API key(platform.comfy.org 生成):Setup 里填「**comfy.org API Key**」→ 部署时进云端 Secret,worker 跑 API 节点时从 `extra_data` 注入鉴权。
+- ⚠ 账单走**你的 comfy.org 额度**;
+- 前端检测到工作流有 API 节点但没配 key,会在提交前提示。
 
 ## 模型策略(本地 → Volume)
 
@@ -102,17 +113,19 @@ comfyui_modal_bridge/
 ├── deploy.py             命令行部署(= GUI [Modal Setup])
 ├── web/modal_bridge.js   前端按钮 + 进度卡片 + 同步流程
 ├── tests/test_core.py    核心纯函数单测
+├── categories.py        工作流类别画像(图/视频:显存估算 + 超时)
 └── modal_app/
-    ├── modal_app.py          Modal app(4 endpoint + H100 worker)
-    ├── modal_image.py        镜像 DSL(读 _custom_nodes_data)
-    ├── _custom_nodes_data.py 镜像要装的 custom_nodes 清单
-    ├── _comfy_ws.py          容器内跑 ComfyUI + 取图
+    ├── modal_app.py          Modal app(4 endpoint + GPU worker + CPU worker + 路由)
+    ├── modal_image.py        镜像 DSL(读 _custom_nodes_data,缺失自愈)
+    ├── _custom_nodes_data.py 镜像要装的 custom_nodes 清单(本地状态,.gitignore)
+    ├── _comfy_ws.py          容器内跑 ComfyUI + 取图/视频/3D(大文件写 Volume)
+    ├── snapshot_bench.py     内存快照隔离 bench(按 GPU 档验证用)
     └── extra_model_paths.yaml Volume 模型路径
 ```
 
 ## Settings(齿轮面板)
 
-`Batch count` / `Poll interval` / `Timeout` / `Incognito` / `Auto-sync models` / `Auto-sync custom nodes`。
+`Batch count` / `Poll interval` / `Timeout` / `Incognito` / `Auto-sync models` / `Auto-sync custom nodes` / `Memory snapshot`(内存快照,加速冷启 ~30s→~5s,实验;改后需在 Setup 重新部署生效)。
 
 ---
 
@@ -157,14 +170,16 @@ python deploy.py --workspace <your-workspace> --token-id ak-xxx --token-secret a
 # token may also come from env MODAL_TOKEN_ID / MODAL_TOKEN_SECRET
 ```
 
-## Generating (after clicking [RunModal])
+## Generating images / video / 3D (after clicking [RunModal])
 
 1. Serialize the current workflow
 2. **Version + GPU check**: if the plugin version differs from the cloud, or the selected GPU differs from the one actually running → block and guide a redeploy
-3. **Node sync**: nodes the workflow uses but the cloud lacks → auto-add + redeploy (one time)
-4. **VRAM preflight**: model VRAM ×1.15 over the selected GPU → warn (run anyway / switch GPU)
-5. **Model sync**: missing on Volume but present locally → upload (CAS dedup); missing both places → prompt to download locally first
-6. Submit Modal → poll → base64 back → write `output/modal_results/<job_id>/` → display on canvas SaveImage
+3. **API node check**: workflow has ComfyUI API nodes but no comfy.org key configured → warn before submit (otherwise the cloud 401s)
+4. **Node sync**: nodes the workflow uses but the cloud lacks → auto-add + redeploy (one time)
+5. **VRAM preflight**: model VRAM (estimated per category; video includes multi-frame activations) over the selected GPU → warn (run anyway / switch GPU)
+6. **Model sync**: missing on Volume but present locally → upload (CAS dedup); missing both places → prompt to download locally first
+7. **CPU / GPU routing**: no local model (pure API) → CPU container (bill ≈ 0); needs sampling → GPU container
+8. Submit Modal → poll → small files base64 / large files via direct Volume → write `output/modal_results/<job_id>/` → fill back per source node: SaveImage for images, SaveVideo for video, **SaveGLB / Preview3D for a 3D turntable**
 
 ## GPU (selectable + redeploy-enforced switch)
 
@@ -172,18 +187,27 @@ Pick a GPU in Modal Setup: **L40S 48G / A100-80G / H100 80G (default) / H200 141
 **Modal's GPU is fixed at deploy time** — pick it, then Deploy to apply. Change the GPU **without redeploying** and RunModal will **block and force a redeploy** (the cloud's health reports the GPU it actually runs on; a mismatch with your selection is caught), so you never silently run on the old GPU.
 Before running, model VRAM ×1.15 is also checked against the selected GPU; over → warn (run anyway / switch GPU).
 
-## Export API (for others / your backend)
+## Images / video / 3D output + canvas preview
 
-Click **[Export API]** to export the current workflow as a self-contained `<name>_modal.py`: embedded workflow (base64) + submit/poll/save + `--prompt`/`--seed` overrides + model prereq list + network retry. Others run:
+The bridge collects outputs from **every output node** and fills them back on the canvas:
+- **SaveImage / SaveVideo / SaveWEBM**: images, video, previewed on the canvas;
+- **SaveGLB** (`3d` key) / **Preview3D** (`result` key): 3D meshes, **rendered as a rotatable turntable on the canvas**;
+- outputs are filled back **per source node** — multiple output nodes each get their own, no cross-bleed.
+- **Large files** (video / meshes >8MB) come back via **direct Volume download** (worker writes to the Volume → local SDK pulls it), bypassing the base64/modal.Dict size ceiling; small files stay base64. Threshold: `config.volume_threshold_mb` (default 8, redeploy to change).
 
-```bash
-pip install requests
-python <name>_modal.py --prompt "..." --seed 123 --out out.png
-```
+## CPU / GPU auto-routing (cost saving)
 
-No ComfyUI / no local GPU / your machine off (it talks directly to the deployed `-run`/`-status`).
-- **Prereq**: that workflow's models + custom nodes were synced once via RunModal, otherwise the worker can't find them.
-- **KEY**: placeholder by default (the recipient fills in the key you give them privately); optionally **embed the KEY** at export — the key = your Modal billing, so only share with trusted people, never publicly; a leak means rotating the key.
+On submit the backend decides whether a GPU is needed by "does the workflow reference a local model":
+- **No local model** (pure API / lightweight) → **CPU container**, GPU bill ≈ 0;
+- **Has a model to sample** → GPU container.
+
+The progress card shows `CPU` or the GPU name. The CPU worker uses the same image launched with `--cpu` (ComfyUI CPU mode).
+
+## ComfyUI API nodes (Kling / Luma / Tripo / OpenAI…)
+
+Workflows with API nodes need a comfy.org API key (generated at platform.comfy.org): enter **"comfy.org API Key"** in Setup → it goes into the cloud Secret on deploy, and the worker injects it via `extra_data` when running API nodes.
+- ⚠ Billed to **your comfy.org credits**;
+- the frontend warns before submit if the workflow has API nodes but no key is configured.
 
 ## Model strategy (local → Volume)
 
@@ -223,13 +247,14 @@ comfyui_modal_bridge/
 ├── web/modal_bridge.js   frontend buttons + progress cards + sync flow
 ├── tests/test_core.py    unit tests for core pure functions
 └── modal_app/
-    ├── modal_app.py          Modal app (4 endpoints + H100 worker)
-    ├── modal_image.py        image DSL (reads _custom_nodes_data)
-    ├── _custom_nodes_data.py custom_nodes baked into the image
-    ├── _comfy_ws.py          run ComfyUI in-container + fetch images
+    ├── modal_app.py          Modal app (4 endpoints + GPU worker + CPU worker + routing)
+    ├── modal_image.py        image DSL (reads _custom_nodes_data, self-heals if absent)
+    ├── _custom_nodes_data.py custom_nodes baked into the image (local state, .gitignore)
+    ├── _comfy_ws.py          run ComfyUI in-container + fetch images/video/3D (large files to Volume)
+    ├── snapshot_bench.py     isolated memory-snapshot bench (verify per GPU tier)
     └── extra_model_paths.yaml Volume model paths
 ```
 
 ## Settings (gear panel)
 
-`Batch count` / `Poll interval` / `Timeout` / `Incognito` / `Auto-sync models` / `Auto-sync custom nodes`.
+`Batch count` / `Poll interval` / `Timeout` / `Incognito` / `Auto-sync models` / `Auto-sync custom nodes` / `Memory snapshot` (cuts cold start ~30s→~5s, experimental; redeploy in Setup to apply).
