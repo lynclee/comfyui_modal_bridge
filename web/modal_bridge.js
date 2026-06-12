@@ -281,8 +281,9 @@ function findOutputNodes(prompt) {
     // 原生视频/动图输出节点(ComfyUI core):它们的产出在 history 里也走 images 输出键
     // (PreviewVideo.as_dict = {images, animated}),所以同样能被回填/保存。
     "SaveVideo", "SaveWEBM", "SaveAnimatedWEBP", "SaveAnimatedPNG",
-    // 3D:SaveGLB 走 "3d" 输出键,前端 saveMesh.ts 渲染(支持 subfolder)→ 画板内 3D 预览。
-    "SaveGLB",
+    // 3D:SaveGLB 走 "3d" 键(saveMesh.ts);Preview3D 走 "result" 键(load3d.ts,从 output 加载)。
+    // 两者都能画板内 3D 预览(buildOutput 按键分别拼对应结构)。
+    "SaveGLB", "Preview3D", "Preview3DAdvanced",
   ]);
   const ids = [];
   for (const [id, n] of Object.entries(prompt || {})) {
@@ -335,11 +336,11 @@ function activeWorkflowName() {
 // 视频 / 动图扩展名:这些产出在 ComfyUI 里也走 images 输出键,但要带 animated 标记
 // 前端才会用 <video>/动图方式预览(原生 PreviewVideo.as_dict 即 {images, animated:(True,)})。
 const VIDEO_EXT_RE = /\.(mp4|webm|mov|mkv|avi|flv|m4v|gif|webp|apng)$/i;
-// 3D 产物扩展名:用于"还有 3D 文件已落盘"的提示(SaveGLB 能画板预览;Preview3D 仅落盘)。
+// 3D 产物扩展名:也用于 Preview3D 的 result 键里挑出"3D 模型那个文件"(result 里可能还含 bg 图)。
 const MODEL3D_EXT_RE = /\.(glb|gltf|obj|fbx|stl|ply|splat|spz|ksplat)$/i;
-// 能直接派发给节点 widget 渲染的输出键(dict 形态 {filename,subfolder,type}):
-// images(SaveImage/SaveVideo)、gifs(VHS)、videos、3d(SaveGLB)。Preview3D 的 result 是
-// 裸字符串+camera_info,远程无法完整重建 → 不派发(文件已落盘,另有提示)。
+// dict 形态({filename,subfolder,type})能直接派发渲染的输出键:
+// images(SaveImage/SaveVideo)、gifs(VHS)、videos、3d(SaveGLB)。
+// result(Preview3D)单独处理:它要的是 {result:[路径字符串,...]},loadFolder 前端写死 output。
 const DISPATCHABLE_KEYS = new Set(["images", "gifs", "videos", "3d"]);
 
 function displayInGraph(outputNodeIds, modalOutputs) {
@@ -355,8 +356,16 @@ function displayInGraph(outputNodeIds, modalOutputs) {
     const out = {};
     let animated = false;
     for (const o of list) {
+      // Preview3D:result=[filePath, cameraState?, bg?, ...],result[0] 是路径(load3d.ts 从 output 加载)。
+      // 只回填 3D 模型那个文件为 result[0](camera/bg 省略,用默认视角即可渲染)。
+      if (o.key === "result") {
+        if (MODEL3D_EXT_RE.test(o.filename || "")) {
+          out.result = [(o.subfolder ? o.subfolder + "/" : "") + o.filename];
+        }
+        continue;
+      }
       const key = o.key == null ? "images" : (DISPATCHABLE_KEYS.has(o.key) ? o.key : null);
-      if (key == null) continue;  // result 等不可重建的键 → 跳过
+      if (key == null) continue;  // 未知/不可重建的键 → 跳过(文件仍已落盘)
       (out[key] ??= []).push({ filename: o.filename, subfolder: o.subfolder, type: o.type || "output" });
       if (key === "images" && VIDEO_EXT_RE.test(o.filename || "")) animated = true;
     }
