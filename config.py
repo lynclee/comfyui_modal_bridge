@@ -30,6 +30,8 @@ DEFAULT_CONFIG = {
     # 是上限不是每任务时长:高上限不拖慢快任务(按实际运行计费)。换值需重新部署生效。
     "worker_timeout_sec": 1800,
     "output_subfolder": "modal_results",
+    # 产物大于此(MB)走 Volume 直连取回(避开 base64/modal.Dict 上限);小的仍 base64。换值需重新部署。
+    "volume_threshold_mb": 8,
 
     # ── 模型自动同步(本地 → Modal Volume,SDK batch_upload,CAS 去重)──
     # 提交前检查 Volume,工作流要、Volume 没、但本地有的模型自动上传上去。

@@ -118,10 +118,10 @@ def _output_dir() -> Path:
     return Path(__file__).resolve().parents[2] / "output"
 
 
-async def _write_results(final: dict, job_id: str, subfolder: str) -> list:
-    """把 Modal 返回的图写到 output/<subfolder>/<job_id>/,返回 outputs 列表。
-    多图(final.images=[{filename,data_base64}])优先;否则回退单图 data_base64 / image_url。
-    写失败 raise(由调用方转 502)。"""
+async def _write_results(final: dict, job_id: str, subfolder: str, cfg: dict) -> list:
+    """把 Modal 返回的产物写到 output/<subfolder>/<job_id>/,返回 outputs 列表。
+    每个产物二选一:小文件 data_base64(解码落盘);大文件 volume_path(从 Volume 直连下载落盘)。
+    否则回退单图 data_base64 / image_url。写失败 raise(由调用方转 502)。"""
     out_dir = _output_dir() / subfolder / job_id
     out_dir.mkdir(parents=True, exist_ok=True)
     outputs, seen = [], set()
@@ -138,15 +138,27 @@ async def _write_results(final: dict, job_id: str, subfolder: str) -> list:
     images = final.get("images")
     if isinstance(images, list) and images:
         for img in images:
+            vp = img.get("volume_path")
             b64 = img.get("data_base64")
-            if not b64:
+            if not vp and not b64:
                 continue
             fn = _dedup(Path(img.get("filename") or "output.png").name)  # basename 防路径逃逸
-            data = base64.b64decode(b64)
-            (out_dir / fn).write_bytes(data)
+            local = out_dir / fn
+            if vp:
+                # 大文件:从 Volume 直连下载(不走 base64/Dict),下完删 Volume 上的副本
+                try:
+                    size = await asyncio.to_thread(modal_volume.download_volume_file, cfg, vp, str(local))
+                except Exception as e:
+                    raise RuntimeError(f"volume download {vp} failed: {e}")
+                await asyncio.to_thread(modal_volume.remove_volume_path, cfg, vp)
+            else:
+                data = base64.b64decode(b64)
+                local.write_bytes(data)
+                size = len(data)
             outputs.append({"filename": fn, "subfolder": f"{subfolder}/{job_id}",
-                            "type": "output", "size_bytes": len(data),
-                            "node_id": img.get("node_id")})  # 来源节点 → 前端按节点回填
+                            "type": "output", "size_bytes": size,
+                            "node_id": img.get("node_id"),  # 来源节点 → 前端按节点回填
+                            "key": img.get("key")})          # 原始输出键 → 前端按键派发渲染
         return outputs
 
     # 单图回退
@@ -344,6 +356,8 @@ def _setup_routes():
 
         cfg = cfg_mod.load_config()
         tier = (body.get("tier") or "40g").lower()
+        # 工作流无本地模型节点(纯 API / 轻节点)= 不需要 GPU → 路由到 CPU worker(账单≈0);否则 GPU worker。
+        needs_gpu = bool(extract_required_models(prompt))
 
         try:
             image_names = _extract_input_image_names(prompt)
@@ -361,14 +375,14 @@ def _setup_routes():
             async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=60)) as session:
                 submit_result = await modal_client.submit_job(
                     session, cfg, workflow=prompt,
-                    input_images=input_images or None, tier=tier,
+                    input_images=input_images or None, tier=tier, needs_gpu=needs_gpu,
                 )
         except Exception as e:
             return web.json_response({"error": str(e)}, status=502)
 
         job_id = submit_result.get("id")
         gpu = submit_result.get("gpu") or tier
-        print(f"[modal_bridge] submitted job {job_id} (tier={tier}, gpu={gpu}, refs={len(input_images)})")
+        print(f"[modal_bridge] submitted job {job_id} (needs_gpu={needs_gpu}, gpu={gpu}, refs={len(input_images)})")
         return web.json_response({
             "ok": True,
             "job_id": job_id,
@@ -431,7 +445,7 @@ def _setup_routes():
         cfg = cfg_mod.load_config()
         subfolder = cfg.get("output_subfolder", "modal_results")
         try:
-            outputs = await _write_results(final, job_id, subfolder)
+            outputs = await _write_results(final, job_id, subfolder, cfg)
         except Exception as e:
             return web.json_response({"error": f"write result failed: {e}"}, status=502)
         if not outputs:

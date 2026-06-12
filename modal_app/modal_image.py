@@ -87,7 +87,7 @@ cuda_image = (
     .env({k: _os.environ[k] for k in (
         "MODAL_BRIDGE_VERSION", "MODAL_BRIDGE_DEFAULT_GPU", "MODAL_BRIDGE_APP_NAME",
         "MODAL_BRIDGE_VOLUME", "MODAL_BRIDGE_SECRET", "MODAL_BRIDGE_TIMEOUT",
-        "MODAL_BRIDGE_SNAPSHOT",
+        "MODAL_BRIDGE_SNAPSHOT", "MODAL_BRIDGE_VOLUME_THRESHOLD_MB",
     ) if _os.environ.get(k)})
     .add_local_file(str(_EXTRA_MODEL_PATHS_YAML), "/comfyui/extra_model_paths.yaml")
     .add_local_python_source("modal_image", "_comfy_ws", "_custom_nodes_data")

@@ -113,16 +113,22 @@ _WORKER_KW = dict(
 )
 
 
-def _worker_boot(self):
+def _worker_boot(self, cpu: bool = False):
+    # cpu=True:CPU-only 容器(无 GPU)→ 给 ComfyUI 传 --cpu 强制 CPU 模式,根本不碰 CUDA 初始化,
+    # 避免 CUDA 版 torch 在无驱动机器上自动探测的边角风险。GPU 容器走默认(自动用 CUDA)。
+    self._cpu = cpu
     models_vol.reload()  # 启动前同步 Volume(ComfyUI 还没打开文件,不冲突)
-    self.proc = subprocess.Popen([
+    cmd = [
         "python", "/comfyui/main.py",
         "--listen", "127.0.0.1", "--port", "8188",
         "--extra-model-paths-config", "/comfyui/extra_model_paths.yaml",
-    ])
+    ]
+    if cpu:
+        cmd.append("--cpu")
+    self.proc = subprocess.Popen(cmd)
     from _comfy_ws import wait_comfy_ready
     wait_comfy_ready(timeout_s=180)
-    print("[bridge] ComfyUI ready")
+    print(f"[bridge] ComfyUI ready ({'CPU' if cpu else 'GPU'})")
 
 
 def _worker_shutdown(self):
@@ -130,6 +136,22 @@ def _worker_shutdown(self):
         self.proc.terminate()
     except Exception:
         pass
+
+
+def _worker_ensure_alive(self):
+    """快照恢复路径上的正确性闸门 + 自愈(GPU/CPU worker 共用):快照关时直接返回;开时探活失败
+    就原地重启子进程(退化为一次普通 boot,不比无快照更糟),而非 raise 杀容器进重试循环。"""
+    if not _SNAPSHOT:
+        return
+    import requests
+    try:
+        if requests.get("http://127.0.0.1:8188/system_stats", timeout=5).ok:
+            return
+    except Exception:
+        pass
+    print("[bridge] restore 探活失败,重启 ComfyUI 子进程(退化为普通冷启)")
+    _worker_shutdown(self)
+    _worker_boot(self, cpu=getattr(self, "_cpu", False))  # 沿用本 worker 的 CPU/GPU 模式
 
 
 def _worker_run(workflow: dict, job_id: str, input_images: list | None = None) -> dict:
@@ -152,6 +174,12 @@ def _worker_run(workflow: dict, job_id: str, input_images: list | None = None) -
         job_state[job_id] = {**job_state.get(job_id, {}), "status": "failed",
                              "error": str(e), "trace": tb[-2000:], "completed_at": time.time()}
         raise
+    # 大文件走了 Volume(item 带 volume_path)→ commit 一次,本地 SDK 才看得到刚写进 _outputs 的文件
+    if any(i.get("volume_path") for i in (result.get("images") or [])):
+        try:
+            models_vol.commit()
+        except Exception as e:
+            print(f"[bridge] volume commit 失败: {e}")
     # 有 images(多图)就只存 images,不再冗余存 data_base64/filename(那是 images[0] 的重复,
     # 白白让 job_state 体积翻倍);只有极老回退路径(没 images)才退回单图字段。
     done = {**job_state.get(job_id, {}), "status": "completed",
@@ -189,20 +217,34 @@ class ComfyWorker:
     def boot(self):
         _worker_boot(self)
 
-    @modal.enter(snap=False)       # 恢复路径上的正确性闸门 + 自愈(快照关时直接返回,保持原行为)
+    @modal.enter(snap=False)       # 恢复路径上的正确性闸门 + 自愈(见 _worker_ensure_alive)
     def ensure_comfy_alive(self):
-        if not _SNAPSHOT:
-            return
-        import requests
-        try:
-            if requests.get("http://127.0.0.1:8188/system_stats", timeout=5).ok:
-                return
-        except Exception:
-            pass
-        # 探活失败:原地重启子进程(代价=一次普通 boot,不比无快照更糟),而非 raise 杀容器进重试。
-        print("[bridge] restore 探活失败,重启 ComfyUI 子进程(退化为普通冷启)")
+        _worker_ensure_alive(self)
+
+    @modal.exit()
+    def shutdown(self):
         _worker_shutdown(self)
-        _worker_boot(self)
+
+    @modal.method()
+    def run(self, workflow: dict, job_id: str, input_images: list | None = None) -> dict:
+        return _worker_run(workflow, job_id, input_images)
+
+
+# CPU-only worker:无 GPU 需求的工作流(纯 API / 无本地模型节点)走这,GPU 账单≈0。
+# 同镜像、无 gpu;CPU 内存快照是 GA(不实验、不需要 gpu_snapshot),所以只 enable_memory_snapshot。
+_SNAP_KW_CPU = (dict(enable_memory_snapshot=True) if _SNAPSHOT else {})
+
+
+@app.cls(**_WORKER_KW, **_SNAP_KW_CPU)
+@modal.concurrent(max_inputs=1)
+class ComfyWorkerCPU:
+    @modal.enter(snap=_SNAPSHOT)
+    def boot(self):
+        _worker_boot(self, cpu=True)   # 无 GPU 容器 → 强制 ComfyUI CPU 模式
+
+    @modal.enter(snap=False)
+    def ensure_comfy_alive(self):
+        _worker_ensure_alive(self)
 
     @modal.exit()
     def shutdown(self):
@@ -249,12 +291,19 @@ def run_endpoint(payload: dict):
     if not workflow:
         return {"error": "Missing 'workflow' in payload"}
     input_images = payload.get("images")
-    # 前端按工作流总显存需求判断 tier;默认 40g。每档自带 GPU 原生 fallback。
-    tier = (payload.get("tier") or "40g").lower()
-    if tier not in _TIER_WORKERS:
-        tier = "40g"
-    worker = _TIER_WORKERS[tier]
-    gpu_display = _TIER_GPU_DISPLAY[tier]
+    # 路由:工作流无本地模型节点(纯 API / 轻节点)= 不需要 GPU → CPU worker(账单≈0);否则 GPU worker。
+    # needs_gpu 由后端 /submit 据 extract_required_models 判定后传入(缺省 True,稳妥)。
+    needs_gpu = bool(payload.get("needs_gpu", True))
+    if needs_gpu:
+        tier = (payload.get("tier") or "40g").lower()
+        if tier not in _TIER_WORKERS:
+            tier = "40g"
+        worker = _TIER_WORKERS[tier]
+        gpu_display = _TIER_GPU_DISPLAY[tier]
+    else:
+        worker = ComfyWorkerCPU
+        gpu_display = "CPU"
+        tier = "cpu"
 
     _sweep_job_state()  # 顺手清理过期/超量的旧 job(防 Dict 无限膨胀)
     job_state[job_id] = {"status": "queued", "queued_at": time.time(), "gpu": gpu_display, "tier": tier}

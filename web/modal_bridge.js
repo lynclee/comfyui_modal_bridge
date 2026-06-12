@@ -128,6 +128,7 @@ const I18N = {
   "mdl.synced":       { zh: "{n} 个模型已同步 ✓", en: "{n} models synced ✓" },
   // —— 通知 / 版本契约 / 恢复 ——
   "toast.saved_no_node":{ zh: "图已存到 output/{sf}/(没找到对应输出节点)", en: "Image saved to output/{sf}/ (no matching output node)" },
+  "toast.saved_3d":   { zh: "🧊 3D 模型已存到 output/{sf}/", en: "🧊 3D model saved to output/{sf}/" },
   "toast.bg_done":    { zh: "✓ 后台工作流出图完成,切到该 tab 即显示(也已存 output/{sf}/)",
                         en: "✓ Background workflow done; switch to its tab to view (also saved to output/{sf}/)" },
   "toast.not_deployed":{ zh: "还没部署到 Modal。先点右上角 [⚙️ Modal Setup] 填 token 一键部署(不用开终端)",
@@ -280,6 +281,8 @@ function findOutputNodes(prompt) {
     // 原生视频/动图输出节点(ComfyUI core):它们的产出在 history 里也走 images 输出键
     // (PreviewVideo.as_dict = {images, animated}),所以同样能被回填/保存。
     "SaveVideo", "SaveWEBM", "SaveAnimatedWEBP", "SaveAnimatedPNG",
+    // 3D:SaveGLB 走 "3d" 输出键,前端 saveMesh.ts 渲染(支持 subfolder)→ 画板内 3D 预览。
+    "SaveGLB",
   ]);
   const ids = [];
   for (const [id, n] of Object.entries(prompt || {})) {
@@ -332,20 +335,33 @@ function activeWorkflowName() {
 // 视频 / 动图扩展名:这些产出在 ComfyUI 里也走 images 输出键,但要带 animated 标记
 // 前端才会用 <video>/动图方式预览(原生 PreviewVideo.as_dict 即 {images, animated:(True,)})。
 const VIDEO_EXT_RE = /\.(mp4|webm|mov|mkv|avi|flv|m4v|gif|webp|apng)$/i;
+// 3D 产物扩展名:用于"还有 3D 文件已落盘"的提示(SaveGLB 能画板预览;Preview3D 仅落盘)。
+const MODEL3D_EXT_RE = /\.(glb|gltf|obj|fbx|stl|ply|splat|spz|ksplat)$/i;
+// 能直接派发给节点 widget 渲染的输出键(dict 形态 {filename,subfolder,type}):
+// images(SaveImage/SaveVideo)、gifs(VHS)、videos、3d(SaveGLB)。Preview3D 的 result 是
+// 裸字符串+camera_info,远程无法完整重建 → 不派发(文件已落盘,另有提示)。
+const DISPATCHABLE_KEYS = new Set(["images", "gifs", "videos", "3d"]);
 
 function displayInGraph(outputNodeIds, modalOutputs) {
   if (!outputNodeIds?.length || !modalOutputs?.length) return 0;
-  // 像 ComfyUI 本地执行那样按来源节点分发:每个 SaveImage 只回填它自己产出的图,
-  // 多 SaveImage 不再互相串图。node_id 由新 worker 提供;老 worker(没 node_id)→
-  // 回退成"全部图广播给每个输出节点"(旧行为,保证不破坏未重部署的用户)。
+  // 按来源节点分发(node_id 由新 worker 提供;老 worker 没有 → 回退广播,保持旧行为不破坏)。
   const hasNodeId = modalOutputs.some((o) => o.node_id != null);
   const byNode = {};
   for (const o of modalOutputs) (byNode[String(o.node_id)] ??= []).push(o);
 
-  const toOut = (list) => {
-    const imagesMeta = list.map((o) => ({ filename: o.filename, subfolder: o.subfolder, type: o.type || "output" }));
-    const isAnimated = list.some((o) => VIDEO_EXT_RE.test(o.filename || ""));  // 视频/动图带 animated 标记
-    return isAnimated ? { images: imagesMeta, animated: [true] } : { images: imagesMeta };
+  // 按"原始输出键"重建 executed 事件:节点本来发什么键就回填什么键,各自 widget(图/视频/3D)
+  // 就会渲染。老 worker 没 key → 当 images(旧行为)。
+  const buildOutput = (list) => {
+    const out = {};
+    let animated = false;
+    for (const o of list) {
+      const key = o.key == null ? "images" : (DISPATCHABLE_KEYS.has(o.key) ? o.key : null);
+      if (key == null) continue;  // result 等不可重建的键 → 跳过
+      (out[key] ??= []).push({ filename: o.filename, subfolder: o.subfolder, type: o.type || "output" });
+      if (key === "images" && VIDEO_EXT_RE.test(o.filename || "")) animated = true;
+    }
+    if (animated) out.animated = [true];
+    return out;
   };
 
   let placed = 0;
@@ -353,8 +369,9 @@ function displayInGraph(outputNodeIds, modalOutputs) {
     const node = app.graph.getNodeById(parseInt(nid, 10)) || app.graph.getNodeById(nid);
     if (!node) continue;
     const mine = hasNodeId ? (byNode[String(nid)] || []) : modalOutputs;
-    if (!mine.length) continue;  // 这个输出节点本次没产图 → 不回填(避免清空/串图)
-    const out = toOut(mine);
+    if (!mine.length) continue;
+    const out = buildOutput(mine);
+    if (!Object.keys(out).length) continue;  // 全是不可重建的键 → 不派发(文件仍已落盘)
     try {
       api.dispatchEvent(new CustomEvent("executed", {
         detail: { node: String(nid), display_node: String(nid), output: out },
@@ -862,17 +879,19 @@ async function runOnceOnModal(workflowPrompt, outputNodeIds, ctx, submitGuard, b
   // ComfyUI 单 graph:提交时的工作流当前在前台才能直接回填;在后台 tab 的先暂存,
   // 等用户切回该 tab 再渲染(图始终也在 output 里,一张不丢)。
   const sf = fetched.outputs?.[0]?.subfolder || "modal_results";
+  const has3d = (fetched.outputs || []).some((o) => MODEL3D_EXT_RE.test(o.filename || ""));
   const wfKey = submitGuard?.wfKey;
   const onFront = wfKey == null || activeWorkflowKey() === wfKey;
   if (onFront) {
     const placed = displayInGraph(outputNodeIds, fetched.outputs);
-    if (!placed && fetched.outputs?.length) {
+    if (!placed && fetched.outputs?.length && !has3d) {  // 3D 已有专门提示,不再叠 saved_no_node
       notify(t("toast.saved_no_node", { sf }), "warn");
     }
   } else if (fetched.outputs?.length) {
     storePendingResult(wfKey, outputNodeIds, fetched.outputs);
     notify(t("toast.bg_done", { sf }), "info");
   }
+  if (has3d) notify(t("toast.saved_3d", { sf }), "info");  // 3D 产物:画板不渲染,明确提示文件位置
   return { jobId, gpu, outputs: fetched.outputs };
 }
 

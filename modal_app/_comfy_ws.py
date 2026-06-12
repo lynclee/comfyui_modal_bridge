@@ -19,6 +19,20 @@ COMFY_HOST = "127.0.0.1:8188"
 WS_RECONNECT_ATTEMPTS = 5
 WS_RECONNECT_DELAY_S = 3
 
+# 产物文件扩展名(图 / 视频 / 3D):用于从异构 history 输出里识别"这是个要回传的产物文件"。
+# dict 形态({filename,subfolder,type},如 images/gifs/videos)保持原行为、不按扩展名过滤;
+# 只有裸文件名字符串(如 Preview3D 的 result=[文件名, camera_info, bg])才按扩展名筛,
+# 避免把 camera_info 之类非文件串也抓进来。
+_OUTPUT_EXTS = {
+    ".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp",                  # 图
+    ".mp4", ".webm", ".mov", ".mkv", ".avi", ".flv", ".m4v", ".apng",   # 视频 / 动图
+    ".glb", ".gltf", ".obj", ".fbx", ".stl", ".ply", ".splat", ".spz", ".ksplat",  # 3D
+}
+
+# 大于此字节数的产物走 Volume 直连取回(本地 SDK 读),小的仍 base64。0 = 关(全 base64)。
+# 阈值由部署烤进镜像 env(MODAL_BRIDGE_VOLUME_THRESHOLD_MB,默认 8MB)。
+_VOL_THRESHOLD = int(os.environ.get("MODAL_BRIDGE_VOLUME_THRESHOLD_MB", "8")) * 1024 * 1024
+
 
 def wait_comfy_ready(timeout_s: int = 180) -> None:
     """轮询 /system_stats 直到 ComfyUI HTTP 起来,超时 raise。"""
@@ -278,31 +292,62 @@ def run_workflow(workflow: dict, job_id: str, input_images: list[dict] | None = 
             raise ValueError(f"Prompt {prompt_id} not in history")
 
         outputs = history[prompt_id].get("outputs", {})
-        images = []  # 收集所有非 temp 图(多 SaveImage / batch)
+        # 收集所有非 temp 产物(图 / 视频 / 3D)。扫每个输出节点的每个输出键:
+        #   - dict 形态({filename,...},images/gifs/videos 等):按原样收
+        #   - 裸文件名字符串(Preview3D 的 result=[文件名,camera_info,bg]):按扩展名筛收
+        # 每条带来源 node_id(前端按节点回填,多 SaveImage 不串图)+ 输出键。去重。
+        images = []
+        seen = set()
         for node_id, node_output in outputs.items():
-            for image_info in node_output.get("images", []):
-                filename = image_info.get("filename")
-                subfolder = image_info.get("subfolder", "")
-                img_type = image_info.get("type")
-                if img_type == "temp" or not filename:
+            if not isinstance(node_output, dict):
+                continue
+            for out_key, val in node_output.items():
+                if not isinstance(val, list):
                     continue
-                image_bytes = get_image_data(filename, subfolder, img_type)
-                if not image_bytes:
-                    errors.append(f"failed to fetch {filename}")
-                    continue
-                images.append({
-                    "filename": filename,
-                    "data_base64": base64.b64encode(image_bytes).decode("utf-8"),
-                    "node_id": str(node_id),  # 来源节点 → 前端按节点回填,多 SaveImage 不互相串图
-                })
+                for item in val:
+                    if isinstance(item, dict):
+                        filename = item.get("filename")
+                        subfolder = item.get("subfolder", "")
+                        img_type = item.get("type", "output")
+                        if not filename:
+                            continue
+                    elif isinstance(item, str):
+                        if os.path.splitext(item)[1].lower() not in _OUTPUT_EXTS:
+                            continue
+                        filename, subfolder, img_type = item, "", "output"
+                    else:
+                        continue
+                    if img_type == "temp":
+                        continue
+                    dkey = (str(node_id), filename, subfolder)
+                    if dkey in seen:
+                        continue
+                    seen.add(dkey)
+                    image_bytes = get_image_data(filename, subfolder, img_type)
+                    if not image_bytes:
+                        errors.append(f"failed to fetch {filename}")
+                        continue
+                    rec = {"filename": filename, "node_id": str(node_id), "key": out_key}
+                    if _VOL_THRESHOLD and len(image_bytes) > _VOL_THRESHOLD:
+                        # 大文件:写进挂载的 Volume(_outputs/<job>/<node>__<fn>)→ 本地 SDK 直连取回,不走 base64。
+                        # commit 由 modal_app._worker_run 在跑完后统一做(这里只写挂载点文件)。
+                        vp = f"_outputs/{job_id}/{node_id}__{filename}"
+                        dst = "/comfy-volume/" + vp
+                        os.makedirs(os.path.dirname(dst), exist_ok=True)
+                        with open(dst, "wb") as f:
+                            f.write(image_bytes)
+                        rec["volume_path"] = vp
+                    else:
+                        rec["data_base64"] = base64.b64encode(image_bytes).decode("utf-8")
+                    images.append(rec)
 
         if not images:
-            raise ValueError(f"No usable output (images/videos) in result. errors={errors}")
+            raise ValueError(f"No usable output (image/video/3d) in result. errors={errors}")
         return {
             "image_url": None,
             "images": images,
-            "filename": images[0]["filename"],        # 向后兼容
-            "data_base64": images[0]["data_base64"],   # 向后兼容
+            "filename": images[0]["filename"],          # 向后兼容
+            "data_base64": images[0].get("data_base64"),  # 向后兼容(Volume 项无 base64 → None)
             "errors": errors,
         }
     finally:

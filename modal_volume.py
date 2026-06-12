@@ -248,6 +248,27 @@ def upload_models(cfg: dict, items: list, on_progress=None) -> dict:
     return {"uploaded": uploaded, "skipped": skipped, "total_mb": total_mb}
 
 
+def download_volume_file(cfg: dict, vol_path: str, local_path: str) -> int:
+    """从 Volume 把 vol_path 直连下载到本地 local_path(同步阻塞)。返回字节数。
+    大产物(视频/3D)走这条,避开 base64+modal.Dict 上限 + 省一道浏览器中转。"""
+    vol = get_volume(cfg)
+    try:
+        vol.reload()  # 最终一致:worker 刚 commit,本地读前刷新一下视图
+    except Exception:
+        pass
+    Path(local_path).parent.mkdir(parents=True, exist_ok=True)
+    with open(local_path, "wb") as f:
+        return vol.read_file_into_fileobj(vol_path, f)
+
+
+def remove_volume_path(cfg: dict, vol_path: str) -> None:
+    """下完删掉 Volume 上的 vol_path(避免 _outputs 堆积)。失败忽略。"""
+    try:
+        get_volume(cfg).remove_file(vol_path, recursive=True)
+    except Exception:
+        pass
+
+
 def modal_importable() -> bool:
     try:
         import modal  # noqa: F401

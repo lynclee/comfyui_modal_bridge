@@ -23,14 +23,16 @@ async def submit_job(
     workflow: dict,
     input_images: Optional[list] = None,
     tier: str = "40g",
+    needs_gpu: bool = True,
     max_retries: int = 1,
 ) -> dict:
-    """POST /run,带鉴权,自动重试 1 次。tier=显存档(80g/40g),后端按档选带原生 fallback 的 worker"""
+    """POST /run,带鉴权,自动重试 1 次。needs_gpu=False → 后端路由到 CPU worker(纯 API/无模型工作流,省钱)。"""
     url = _endpoint(cfg["modal_endpoint_base"], "run")
     payload = {
         "workflow": workflow,
         "user_id": cfg.get("user_id", "local-dev"),
         "tier": tier,
+        "needs_gpu": bool(needs_gpu),
         "incognito": bool(cfg.get("incognito", True)),
         "auth_key": _key(cfg),
     }
