@@ -1798,12 +1798,13 @@ app.registerExtension({
       label: "RunModal",
       onClick: queueOnModal,
     },
-    {
-      icon: "pi pi-file-export",
-      tooltip: EXPORT_TOOLTIP,
-      label: "Export API",
-      onClick: exportModalApi,
-    },
+    // Export API 按钮先从 UI 摘掉(暂不暴露);exportModalApi / EXPORT_TOOLTIP 代码保留,以后可一键恢复。
+    // {
+    //   icon: "pi pi-file-export",
+    //   tooltip: EXPORT_TOOLTIP,
+    //   label: "Export API",
+    //   onClick: exportModalApi,
+    // },
     {
       icon: "pi pi-cog",
       tooltip: SETUP_TOOLTIP,
