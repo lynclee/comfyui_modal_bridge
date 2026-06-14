@@ -85,7 +85,8 @@ cuda_image = (
     #   - APP_NAME      → health.app + warm-stats 的 Cls.from_name(自定义 app 名时必须对)
     #   - VOLUME/SECRET → 运行时 reload Volume / from_name(自定义名时必须对)
     .env({k: _os.environ[k] for k in (
-        "MODAL_BRIDGE_VERSION", "MODAL_BRIDGE_DEFAULT_GPU", "MODAL_BRIDGE_APP_NAME",
+        "MODAL_BRIDGE_VERSION", "MODAL_BRIDGE_DEFAULT_GPU", "MODAL_BRIDGE_CHEAP_GPU",
+        "MODAL_BRIDGE_TOP_GPU", "MODAL_BRIDGE_APP_NAME",
         "MODAL_BRIDGE_VOLUME", "MODAL_BRIDGE_SECRET", "MODAL_BRIDGE_TIMEOUT",
         "MODAL_BRIDGE_SNAPSHOT", "MODAL_BRIDGE_VOLUME_THRESHOLD_MB",
     ) if _os.environ.get(k)})

@@ -24,15 +24,19 @@ async def submit_job(
     input_images: Optional[list] = None,
     tier: str = "40g",
     needs_gpu: bool = True,
+    gpu_class: str = "primary",
     max_retries: int = 1,
 ) -> dict:
-    """POST /run,带鉴权,自动重试 1 次。needs_gpu=False → 后端路由到 CPU worker(纯 API/无模型工作流,省钱)。"""
+    """POST /run,带鉴权,自动重试 1 次。
+    needs_gpu=False → 后端路由到 CPU worker(纯 API/无模型工作流,省钱)。
+    gpu_class='cheap' → 显存放得下的工作流降到便宜卡(L40S);'primary' → 主卡(H100)。"""
     url = _endpoint(cfg["modal_endpoint_base"], "run")
     payload = {
         "workflow": workflow,
         "user_id": cfg.get("user_id", "local-dev"),
         "tier": tier,
         "needs_gpu": bool(needs_gpu),
+        "gpu_class": gpu_class,
         "incognito": bool(cfg.get("incognito", True)),
         "auth_key": _key(cfg),
     }

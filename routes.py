@@ -106,6 +106,62 @@ def extract_required_models(prompt: dict) -> list[dict]:
     return out
 
 
+# 各 GPU 显存(GB)。用于"按工作流估算显存自动选便宜档"。与前端 GPU_VRAM 保持一致。
+_GPU_VRAM_GB = {"L40S": 48, "A100-80GB": 80, "H100": 80, "H200": 141, "A10G": 24, "L4": 24}
+_CHEAP_MARGIN_GB = 6  # 余量:估算 + 激活波动,est_vram 要比便宜卡显存低这么多才敢降档(防 OOM)
+
+
+def _estimate_workflow_vram(prompt: dict) -> tuple[float, str, int]:
+    """估工作流显存需求(GB)+ 类别 + 本地查不到大小的模型数。供自动选档 / 预警端点复用。"""
+    resolver = _local_model_resolver()
+    total_bytes, unknown = 0, 0
+    for m in extract_required_models(prompt):
+        p = resolver(m["type"], m["filename"])
+        try:
+            if p and Path(p).exists():
+                total_bytes += Path(p).stat().st_size
+            else:
+                unknown += 1
+        except OSError:
+            unknown += 1
+    category = categories.classify(prompt)
+    est = categories.estimate_vram_gb(total_bytes / (1024 ** 3), category)
+    return est, category, unknown
+
+
+def _pick_gpu_class(prompt: dict, cfg: dict) -> tuple[str, str]:
+    """按估算显存在 GPU 档梯子上选档,返回 (gpu_class, reason)。gpu_class ∈ {'cheap','primary','top'}。
+    梯子(成本低→高):cheap(L40S 48G)→ primary(H100 80G)→ top(H200 141G)。
+      1) 升档(正确性,防 OOM):估算 > 主卡容量−余量 → top。不受 auto_downgrade 控制,视频也适用。
+      2) 降档(省钱):auto_downgrade 开 + cheap≠主卡 + 非视频 + 大小已知 + 放得下便宜卡 → cheap。
+      3) 否则 → primary。
+    本地查不到大小(unknown>0)时估算不可信:不升不降,留 primary(稳妥)。"""
+    cheap_gpu = (cfg.get("cheap_gpu") or "L40S").strip()
+    primary_gpu = (cfg.get("default_gpu") or "H100").strip()
+    top_gpu = (cfg.get("top_gpu") or "").strip()
+    est, category, unknown = _estimate_workflow_vram(prompt)
+    primary_vram = _GPU_VRAM_GB.get(primary_gpu, 80)
+
+    # 1) 升档:超过主卡容量(留余量)→ 顶配卡(防 OOM)。需有可信估算(unknown==0)。
+    if (top_gpu and top_gpu != primary_gpu and unknown == 0
+            and est > primary_vram - _CHEAP_MARGIN_GB):
+        return "top", f"估算 {est:.1f}G > 主卡 {primary_gpu}({primary_vram}G) → 升档 {top_gpu}"
+
+    # 2) 降档:省钱档放得下 → 便宜卡。
+    if (cfg.get("auto_downgrade", True) and cheap_gpu != primary_gpu
+            and category != "video" and unknown == 0):
+        cap = _GPU_VRAM_GB.get(cheap_gpu, 48) - _CHEAP_MARGIN_GB
+        if est <= cap:
+            return "cheap", f"估算 {est:.1f}G ≤ {cap}G → 降档 {cheap_gpu}"
+
+    # 3) 主卡兜底。
+    if unknown:
+        return "primary", f"{unknown} 个模型本地查不到大小,估算不可信 → 稳妥用 {primary_gpu}"
+    if category == "video":
+        return "primary", f"视频类 → {primary_gpu}"
+    return "primary", f"估算 {est:.1f}G → {primary_gpu}"
+
+
 def _input_dir() -> Path:
     if folder_paths:
         return Path(folder_paths.get_input_directory())
@@ -358,6 +414,11 @@ def _setup_routes():
         tier = (body.get("tier") or "40g").lower()
         # 工作流无本地模型节点(纯 API / 轻节点)= 不需要 GPU → 路由到 CPU worker(账单≈0);否则 GPU worker。
         needs_gpu = bool(extract_required_models(prompt))
+        # 需要 GPU 时再按估算显存自动选档:放得下便宜卡 → cheap(L40S),否则 primary(H100)。
+        gpu_class = "primary"
+        if needs_gpu:
+            gpu_class, gpu_reason = _pick_gpu_class(prompt, cfg)
+            print(f"[modal_bridge] GPU 路由: {gpu_class}  ({gpu_reason})")
 
         try:
             image_names = _extract_input_image_names(prompt)
@@ -376,6 +437,7 @@ def _setup_routes():
                 submit_result = await modal_client.submit_job(
                     session, cfg, workflow=prompt,
                     input_images=input_images or None, tier=tier, needs_gpu=needs_gpu,
+                    gpu_class=gpu_class,
                 )
         except Exception as e:
             return web.json_response({"error": str(e)}, status=502)

@@ -205,6 +205,18 @@ _GPU_CHAIN = {
 }
 _GPU_LIST = _GPU_CHAIN.get(_PRIMARY_GPU, [_PRIMARY_GPU])
 
+# 省钱档 GPU(默认 L40S)。估算显存放得下的工作流自动降到这张卡跑(路由见 run_endpoint)。
+# 与主卡相同(用户把 default 设成 L40S 之类)则不启用,所有 GPU 任务仍走主 worker。
+_CHEAP_GPU = os.environ.get("MODAL_BRIDGE_CHEAP_GPU", "L40S")
+_CHEAP_GPU_LIST = _GPU_CHAIN.get(_CHEAP_GPU, [_CHEAP_GPU])
+_CHEAP_ENABLED = _CHEAP_GPU != _PRIMARY_GPU
+
+# 顶配档 GPU(默认 H200 141G):估算显存超过主卡的工作流升到这跑,防 OOM(升档 = 正确性兜底)。
+# ⚠ 升档档不向下 fallback(对 >80G 的活退到小卡 = OOM),所以固定单卡列表,宁可排队等也不降级。
+_TOP_GPU = os.environ.get("MODAL_BRIDGE_TOP_GPU", "H200")
+_TOP_GPU_LIST = [_TOP_GPU]
+_TOP_ENABLED = _TOP_GPU != _PRIMARY_GPU
+
 # 开快照时追加两个 decorator 参数;关时为空 dict → @app.cls 行为和原来完全一致。
 _SNAP_KW = (dict(enable_memory_snapshot=True,
                  experimental_options={"enable_gpu_snapshot": True}) if _SNAPSHOT else {})
@@ -218,6 +230,50 @@ class ComfyWorker:
         _worker_boot(self)
 
     @modal.enter(snap=False)       # 恢复路径上的正确性闸门 + 自愈(见 _worker_ensure_alive)
+    def ensure_comfy_alive(self):
+        _worker_ensure_alive(self)
+
+    @modal.exit()
+    def shutdown(self):
+        _worker_shutdown(self)
+
+    @modal.method()
+    def run(self, workflow: dict, job_id: str, input_images: list | None = None) -> dict:
+        return _worker_run(workflow, job_id, input_images)
+
+
+# 省钱档 worker:估算显存放得下便宜卡(默认 L40S)且非视频的 GPU 工作流路由到这。
+# 与主 worker 完全同构,只是 gpu 不同;min_containers=0 → 不被路由到时 0 容器 = $0,定义在这儿不花钱。
+@app.cls(gpu=_CHEAP_GPU_LIST, **_WORKER_KW, **_SNAP_KW)
+@modal.concurrent(max_inputs=1)
+class ComfyWorkerCheap:
+    @modal.enter(snap=_SNAPSHOT)
+    def boot(self):
+        _worker_boot(self)
+
+    @modal.enter(snap=False)
+    def ensure_comfy_alive(self):
+        _worker_ensure_alive(self)
+
+    @modal.exit()
+    def shutdown(self):
+        _worker_shutdown(self)
+
+    @modal.method()
+    def run(self, workflow: dict, job_id: str, input_images: list | None = None) -> dict:
+        return _worker_run(workflow, job_id, input_images)
+
+
+# 顶配档 worker:估算显存超过主卡的工作流(如 >80G)升到这(默认 H200 141G),防 OOM。
+# 同构,只是 gpu 不同且不向下 fallback;min_containers=0 → 不被路由时 0 容器 = $0。
+@app.cls(gpu=_TOP_GPU_LIST, **_WORKER_KW, **_SNAP_KW)
+@modal.concurrent(max_inputs=1)
+class ComfyWorkerTop:
+    @modal.enter(snap=_SNAPSHOT)
+    def boot(self):
+        _worker_boot(self)
+
+    @modal.enter(snap=False)
     def ensure_comfy_alive(self):
         _worker_ensure_alive(self)
 
@@ -259,6 +315,8 @@ class ComfyWorkerCPU:
 _TIER_WORKERS = {"80g": ComfyWorker, "40g": ComfyWorker}
 _GPU_DISPLAY = "→".join(_GPU_LIST)  # 如 "H100→A100-80GB",进度卡/日志显示真实显卡
 _TIER_GPU_DISPLAY = {"80g": _GPU_DISPLAY, "40g": _GPU_DISPLAY}
+_CHEAP_GPU_DISPLAY = "→".join(_CHEAP_GPU_LIST)  # 省钱档显示(如 "L40S")
+_TOP_GPU_DISPLAY = "→".join(_TOP_GPU_LIST)        # 顶配档显示(如 "H200")
 
 
 # ============================================================================
@@ -293,17 +351,28 @@ def run_endpoint(payload: dict):
     input_images = payload.get("images")
     # 路由:工作流无本地模型节点(纯 API / 轻节点)= 不需要 GPU → CPU worker(账单≈0);否则 GPU worker。
     # needs_gpu 由后端 /submit 据 extract_required_models 判定后传入(缺省 True,稳妥)。
+    # 四档路由(成本从低到高):无 GPU → CPU;放得下便宜卡 → cheap(L40S);超过主卡 → top(H200);否则 → 主卡。
+    # gpu_class 由后端 /submit 据 estimate_vram 判定后传入(缺省 primary,稳妥)。
     needs_gpu = bool(payload.get("needs_gpu", True))
-    if needs_gpu:
+    gpu_class = (payload.get("gpu_class") or "primary").lower()
+    if not needs_gpu:
+        worker = ComfyWorkerCPU
+        gpu_display = "CPU"
+        tier = "cpu"
+    elif gpu_class == "cheap" and _CHEAP_ENABLED:
+        worker = ComfyWorkerCheap
+        gpu_display = _CHEAP_GPU_DISPLAY
+        tier = "cheap"
+    elif gpu_class == "top" and _TOP_ENABLED:
+        worker = ComfyWorkerTop
+        gpu_display = _TOP_GPU_DISPLAY
+        tier = "top"
+    else:
         tier = (payload.get("tier") or "40g").lower()
         if tier not in _TIER_WORKERS:
             tier = "40g"
         worker = _TIER_WORKERS[tier]
         gpu_display = _TIER_GPU_DISPLAY[tier]
-    else:
-        worker = ComfyWorkerCPU
-        gpu_display = "CPU"
-        tier = "cpu"
 
     _sweep_job_state()  # 顺手清理过期/超量的旧 job(防 Dict 无限膨胀)
     job_state[job_id] = {"status": "queued", "queued_at": time.time(), "gpu": gpu_display, "tier": tier}
@@ -357,7 +426,9 @@ def health_endpoint(key: str = ""):
     if deny:
         return deny
     info: dict = {"healthy": True, "app": APP_NAME, "volume": VOLUME_NAME,
-                  "deployed_version": DEPLOYED_VERSION, "deployed_gpu": _PRIMARY_GPU}
+                  "deployed_version": DEPLOYED_VERSION, "deployed_gpu": _PRIMARY_GPU,
+                  "deployed_cheap_gpu": (_CHEAP_GPU if _CHEAP_ENABLED else None),
+                  "deployed_top_gpu": (_TOP_GPU if _TOP_ENABLED else None)}
     try:
         warm = 0
         try:

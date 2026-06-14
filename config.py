@@ -21,7 +21,14 @@ DEFAULT_CONFIG = {
     "comfy_api_key": "",       # 可选:comfy.org API key,供工作流里的 ComfyUI API 节点鉴权(账单走你的 comfy.org)
 
     # ── 运行选项 ──
-    "default_gpu": "H100",
+    "default_gpu": "H100",      # 主卡(大工作流 / 默认)。换值需重新部署
+    # 省钱档:估算显存放得下便宜卡(默认 L40S 48G)且非视频的工作流,自动降到这张卡跑
+    # (如 Z-Image-Turbo → L40S,FLUX.2-dev → 仍 H100)。换值需重新部署。
+    "cheap_gpu": "L40S",
+    # 顶配档:估算显存超过主卡容量(如 >80G)的工作流自动升到这张卡(默认 H200 141G),防 OOM。
+    # 升档是正确性兜底,不受 auto_downgrade 控制;设成与 default_gpu 相同则不启用。换值需重新部署。
+    "top_gpu": "H200",
+    "auto_downgrade": True,     # 开:按 estimate_vram 自动在 default_gpu / cheap_gpu 间选档(本地路由决策,改它不必重部署)
     "enable_snapshot": True,   # 内存快照(实验):冷启 ~30s→~5s。默认开;不支持的 GPU 档自动退化为普通冷启(不更差)。换值需重新部署
     "user_id": "local-dev",
     "incognito": True,         # base64 回流,不上 R2
