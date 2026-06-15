@@ -8,7 +8,7 @@
 
 ## ✨ 核心优势
 
-- 🖥️ **不挑机器,本地零显卡要求** — Mac、轻薄本、核显本都行。FLUX.2 这种吃显存的大模型,**算力全在云端 GPU**(可选 L40S/A100-80G/H100/H200),本地只负责发起工作流、收图。本地再弱也能跑 flux2,不用为了跑图换电脑。
+- 🖥️ **不挑机器,本地零显卡要求** — Mac、轻薄本、核显本都行。FLUX.2 这种吃显存的大模型,**算力全在云端 GPU**(Auto 模式按显存自动选 L40S/H100/H200,省钱),本地只负责发起工作流、收图。本地再弱也能跑 flux2,不用为了跑图换电脑。
 - ⚡ **多任务并发** — 多个工作流可同时提交、同时跑,各有独立进度卡片(可拖动 / 取消 / 关闭),互不阻塞、互不覆盖。
 - 🚀 **全自动部署,零终端** — GUI 填一次 Modal token,后端自动 `pip install modal`、建密钥、`modal deploy`、写配置。全程不碰命令行,首次拉镜像约 3-5 分钟,之后秒进。
 - 🧩 **custom node 自动同步** — 工作流用到的自定义节点,云端镜像没有就**自动装进镜像并重部署**;多台机器各装一部分时取**并集、互不删**,换机无缝。
@@ -24,7 +24,7 @@
 
 - **零终端部署**:点 `⚙️ Modal Setup` 填 Modal token → 后端自动 `pip install modal`、建 Secret、`modal deploy`、写配置并验证 health。
 - **不挑本地机器**:本地只做序列化 + 上传 + 收图,**不跑推理**,所以对本地显卡/显存无要求;Mac / Windows / Linux 一致(子进程串流部署日志,绕开 Windows 事件循环坑)。
-- **多档 GPU 可选 + 显存预警 + 改卡强制重部署**:Modal Setup 里选显卡(**L40S 48G / A100-80G / H100 80G(默认) / H200 141G**),每档带 Modal 原生 fallback;点 RunModal 前自动用「**模型总显存 ×1.15**」对比所选卡,超了弹警告(可"仍要跑"或"去换显卡")。Modal 的卡**部署时固定**,所以**改了卡不重新部署会被拦住**(云端上报真实在跑的卡,与所选不一致即强制去重部署),杜绝"以为换了卡其实还在旧卡上跑"。
+- **GPU 两种模式 + 自动按显存选卡(省钱)**:Modal Setup 里选 **Auto(更省钱,默认)** 或 **H100(固定)**。Auto 按工作流估算显存自动选最省又够用的卡 —— 小图(如 **Z-Image-Turbo**)走 **L40S**、常规(如 **FLUX.2-dev**)走 **H100/A100**、真超 80G 才上 **H200**(防 OOM);H100 模式则一律 H100。点 RunModal 前还会按类别估算显存预警(视频含多帧激活)。四档 worker(CPU/L40S/H100/H200)**一次部署全部建好**,空闲各自 scale-to-zero,**没被路由到的档 0 成本**。
 - **图 / 视频 / 3D 输出 + 画板预览**:扫工作流所有输出节点收产物 —— SaveImage/SaveVideo 出图、视频,**SaveGLB / Preview3D 出 3D 网格并在画板内渲染转盘**(按来源节点回填,多输出不串台);大文件(视频 / 网格 >8MB)走 **Volume 直连取回**,绕开 base64/Dict 体积上限,小文件仍 base64。
 - **CPU / GPU 自动路由**:提交时判断工作流要不要 GPU(有没有引用本地模型)—— **纯 API / 无模型的轻工作流自动落 CPU 容器(账单≈0)**,要 sample 的才上 GPU。
 - **ComfyUI API 节点**:工作流含 API 节点(Kling/Luma/Tripo/OpenAI…)时,Setup 填的 comfy.org API key 经云端 Secret 注入鉴权;前端检测到 API 节点但没配 key 会提前提示(账单走你的 comfy.org 额度)。
@@ -82,7 +82,7 @@ MIT
 
 ## ✨ Why use it
 
-- 🖥️ **Runs on any machine — zero local GPU required.** Mac, thin laptops, iGPU-only — all fine. VRAM-hungry models like FLUX.2 run **entirely on a cloud GPU** (pick L40S/A100-80G/H100/H200); your machine only serializes the workflow and receives images. Run flux2 on a potato.
+- 🖥️ **Runs on any machine — zero local GPU required.** Mac, thin laptops, iGPU-only — all fine. VRAM-hungry models like FLUX.2 run **entirely on a cloud GPU** (Auto mode picks L40S/H100/H200 by VRAM to save cost); your machine only serializes the workflow and receives images. Run flux2 on a potato.
 - ⚡ **Multi-task concurrency.** Submit and run multiple workflows at once — each gets its own progress card (draggable / cancelable / closable), no blocking, no clobbering.
 - 🚀 **Fully automatic deploy, zero terminal.** Enter your Modal token once in the GUI; the backend auto `pip install modal`, creates the secret, runs `modal deploy`, writes config. Never touch the command line. First image-pull ~3-5 min, instant afterward.
 - 🧩 **Custom nodes auto-sync.** Nodes your workflow uses but the cloud lacks are **auto-baked into the image and redeployed**; across machines the image is the **union, never cross-deleted** — switch machines seamlessly.
@@ -98,7 +98,7 @@ You don't have a big-VRAM GPU locally (Mac / thin laptop / a 4090 that can't fit
 
 - **Zero-terminal deploy**: click `⚙️ Modal Setup`, enter your Modal token → the backend auto `pip install modal`, creates the Secret, runs `modal deploy`, writes config, verifies health.
 - **Machine-agnostic local side**: locally it only serializes + uploads + receives — **no inference** — so it has no requirement on your GPU/VRAM; consistent across Mac / Windows / Linux (streams deploy logs via a subprocess to dodge the Windows event-loop pitfall).
-- **Multiple GPUs + VRAM preflight + redeploy-enforced GPU switch**: pick a GPU in Modal Setup (**L40S 48G / A100-80G / H100 80G (default) / H200 141G**), each with native fallback; before running, **model VRAM ×1.15** is checked against the selected GPU and warns if it won't fit ("run anyway" / "switch GPU"). Modal's GPU is **fixed at deploy time**, so **changing the GPU without redeploying is blocked** (the cloud reports the GPU it actually runs on; a mismatch forces a redeploy) — no more "thought I switched but it's still on the old GPU".
+- **Two GPU modes + auto VRAM-based card pick (cost-saving)**: in Modal Setup choose **Auto (cheaper, default)** or **H100 (fixed)**. Auto estimates each workflow's VRAM and picks the cheapest card that fits — small images (e.g. **Z-Image-Turbo**) → **L40S**, normal (e.g. **FLUX.2-dev**) → **H100/A100**, truly over 80G → **H200** (avoids OOM); H100 mode always uses H100. Before running, VRAM is estimated per category (video includes multi-frame activations) and warned on. All four workers (CPU/L40S/H100/H200) are **deployed at once**, each scales to zero when idle — **an un-routed tier costs $0**.
 - **Images / video / 3D output + canvas preview**: collects outputs from every output node — SaveImage/SaveVideo for images/video, **SaveGLB / Preview3D for 3D meshes rendered as a turntable on the canvas** (routed per source node, no cross-bleed across multiple outputs); large files (video / meshes >8MB) come back via **direct Volume download**, bypassing the base64/Dict size ceiling, small ones stay base64.
 - **CPU / GPU auto-routing**: on submit, detect whether the workflow needs a GPU (does it reference a local model) — **pure-API / model-less lightweight workflows auto-land on a CPU container (bill ≈ 0)**, only sampling ones go to GPU.
 - **ComfyUI API nodes**: for workflows with API nodes (Kling/Luma/Tripo/OpenAI…), the comfy.org API key entered in Setup is injected from the cloud Secret; the frontend warns up front if API nodes are present but no key is configured (billed to your comfy.org credits).

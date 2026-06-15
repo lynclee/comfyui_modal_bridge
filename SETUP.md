@@ -48,11 +48,19 @@ python deploy.py --workspace <你的workspace> --token-id ak-xxx --token-secret 
 7. **CPU / GPU 路由**:工作流无本地模型(纯 API)→ CPU 容器(账单≈0);要 sample → GPU 容器
 8. 提交 Modal → 轮询 → 小文件 base64 / 大文件走 Volume 直连 → 写 `output/modal_results/<job_id>/` → 按来源节点回填:SaveImage 出图、SaveVideo 出视频、**SaveGLB / Preview3D 出 3D 转盘**
 
-## GPU(可选 + 改卡强制重部署)
+## GPU 模式(Auto 省钱 / H100 固定)
 
-Modal Setup 里选显卡:**L40S 48G / A100-80G / H100 80G(默认) / H200 141G**,每档带 Modal 原生 fallback。
-**Modal 的卡是部署时固定的** —— 选完点「部署」才生效。改了卡**不重新部署**,点 RunModal 会被**拦住、强制去重部署**(云端 health 上报真实在跑的卡,与所选不一致即判定),杜绝"以为换了卡其实还跑在旧卡上"。
-点 RunModal 前还会用「模型总显存 ×1.15」对比所选卡,超了弹警告(可"仍要跑"/"去换显卡")。
+Modal Setup 里选两种模式之一:
+
+- **Auto(更省钱,默认)**:提交时按工作流估算显存,自动选**最省又够用**的卡:
+  - 小图(如 **Z-Image-Turbo**,est ~18–24G)→ **L40S 48G**(最便宜)
+  - 常规(如 **FLUX.2-dev**,est ~71–80G)→ **H100/A100-80G**
+  - 真超 80G(大视频 / fp16 大模型叠大 stack)→ **H200 141G**(防 OOM)
+- **H100(固定)**:一律 H100,不降也不升。`>80G` 的工作流会在 RunModal 前显存预警,提示切 Auto。
+
+四档 worker(CPU / L40S / H100 / H200)**一次部署全部建好**,空闲各自 scale-to-zero —— 没被路由到的档 **0 容器 = 0 成本**,所以多档不额外花钱。切换模式后点「部署」生效(首次升级到本版本也需部署一次)。
+
+> 显存估算 = 工作流引用的模型文件总大小 × 类别系数(图像 ×1.15;视频 ×1.3 + 多帧激活开销);本地查不到大小的模型按"稳妥"留在 H100,不乱降也不乱升。
 
 ## 图 / 视频 / 3D 输出 + 画板预览
 
@@ -181,11 +189,19 @@ python deploy.py --workspace <your-workspace> --token-id ak-xxx --token-secret a
 7. **CPU / GPU routing**: no local model (pure API) → CPU container (bill ≈ 0); needs sampling → GPU container
 8. Submit Modal → poll → small files base64 / large files via direct Volume → write `output/modal_results/<job_id>/` → fill back per source node: SaveImage for images, SaveVideo for video, **SaveGLB / Preview3D for a 3D turntable**
 
-## GPU (selectable + redeploy-enforced switch)
+## GPU mode (Auto = cheaper / H100 = fixed)
 
-Pick a GPU in Modal Setup: **L40S 48G / A100-80G / H100 80G (default) / H200 141G**, each with Modal native fallback.
-**Modal's GPU is fixed at deploy time** — pick it, then Deploy to apply. Change the GPU **without redeploying** and RunModal will **block and force a redeploy** (the cloud's health reports the GPU it actually runs on; a mismatch with your selection is caught), so you never silently run on the old GPU.
-Before running, model VRAM ×1.15 is also checked against the selected GPU; over → warn (run anyway / switch GPU).
+Pick one of two modes in Modal Setup:
+
+- **Auto (cheaper, default)**: on submit, estimate the workflow's VRAM and pick the **cheapest GPU that fits**:
+  - small images (e.g. **Z-Image-Turbo**, est ~18–24G) → **L40S 48G** (cheapest)
+  - normal (e.g. **FLUX.2-dev**, est ~71–80G) → **H100/A100-80G**
+  - truly over 80G (big video / fp16 model + heavy stack) → **H200 141G** (avoids OOM)
+- **H100 (fixed)**: always H100, no downgrade/escalation. Workflows `>80G` get a VRAM warning before RunModal suggesting you switch to Auto.
+
+All four workers (CPU / L40S / H100 / H200) are **deployed at once** and each scales to zero when idle — an un-routed tier is **0 containers = $0**, so extra tiers cost nothing. Click Deploy to apply a mode change (and once when upgrading to this version).
+
+> VRAM estimate = total size of the workflow's referenced model files × a category factor (image ×1.15; video ×1.3 + multi-frame activation overhead). Models whose size can't be found locally stay on H100 ("safe") — no wrong downgrade or escalation.
 
 ## Images / video / 3D output + canvas preview
 
