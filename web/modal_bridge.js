@@ -869,15 +869,15 @@ async function runOnceOnModal(workflowPrompt, outputNodeIds, ctx, submitGuard, b
   }
   if (!final) {
     reportJobEvent(jobId, "polling_timed_out", `前端等待超时;Modal 可能仍在跑,图若出会在 output/`);
-    throw new Error("Polling timed out(前端等待超时;Modal 可能仍在跑,稍后看 output/modal_results/)");
+    throw new Error(`[job ${jobId}] Polling timed out(前端等待超时;Modal 可能仍在跑,稍后看 output/modal_results/)`);
   }
   if (final.status === "cancelled") {
     reportJobEvent(jobId, "cancelled", "");
-    throw new Error("Job cancelled");
+    throw new Error(`[job ${jobId}] Job cancelled`);
   }
   if (final.status === "failed") {
     reportJobEvent(jobId, "worker_failed", final.error || "");
-    throw new Error(final.error || "Modal worker failed");
+    throw new Error(`[job ${jobId}] ${final.error || "Modal worker failed"}`);
   }
 
   ctx.stage("downloading", `${batchSuffix}Decoding base64...`, false);
@@ -888,7 +888,7 @@ async function runOnceOnModal(workflowPrompt, outputNodeIds, ctx, submitGuard, b
   });
   const fetched = await fetchRes.json();
   if (!fetchRes.ok || !fetched.ok) {
-    throw new Error(fetched.error || `fetch HTTP ${fetchRes.status}`);
+    throw new Error(`[job ${jobId}] ${fetched.error || `fetch HTTP ${fetchRes.status}`}`);
   }
   // ComfyUI 单 graph:提交时的工作流当前在前台才能直接回填;在后台 tab 的先暂存,
   // 等用户切回该 tab 再渲染(图始终也在 output 里,一张不丢)。

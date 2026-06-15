@@ -6,6 +6,10 @@ config.json
 # (modal_image.py 缺文件会自建空清单;comfy publish 只打包 git 跟踪文件,故也不进 Registry 包)
 modal_app/_custom_nodes_data.py
 
+# 本地状态:云端模型搜索路径,部署时按本机模型目录类型生成(node_sync.write_extra_model_paths),
+# 缺则 modal_image 自愈写标准基线。同样不入库、不进 Registry 包。
+modal_app/extra_model_paths.yaml
+
 # Python
 __pycache__/
 *.pyc

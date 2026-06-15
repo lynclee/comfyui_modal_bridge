@@ -101,6 +101,69 @@ def resolve_comfyui_tag(version: str, tags: list[str]) -> tuple[str, str]:
     return best, f"本机 ComfyUI v{'.'.join(map(str, lv))} 无对应 tag → 云端用最接近的 {best}"
 
 
+# ============================================================================
+# 云端模型目录映射:云端 extra_model_paths.yaml 跟随本机注册的模型目录类型,
+# 这样自定义类别(geometry_estimation / optical_flow / liveportrait / ...)里的模型
+# 也能被云端 ComfyUI 看到(否则 LoadMoGeModel 这类节点下拉为空 → 'not in []')。
+# 部署时生成,是本地状态(.gitignore + 缺则自愈,和 _custom_nodes_data.py 一样)。
+# ============================================================================
+EXTRA_MODEL_PATHS_YAML = MODAL_APP_DIR / "extra_model_paths.yaml"
+
+# 标准模型类型(folder_paths 取不到时的兜底,也始终并入)。
+STANDARD_MODEL_TYPES = [
+    "checkpoints", "diffusion_models", "unet", "vae", "clip", "text_encoders",
+    "clip_vision", "style_models", "loras", "controlnet", "upscale_models",
+    "embeddings", "hypernetworks", "photomaker", "gligen", "diffusers",
+    "vae_approx", "pulid", "inpaint", "insightface", "onnx", "sams", "ultralytics",
+]
+# 永不映射到 Volume(映射过去云端启动 os.listdir 会崩 / 无意义)
+_MODEL_TYPE_DENY = {"custom_nodes", "configs"}
+
+
+def local_model_folder_types() -> list[str]:
+    """本机 ComfyUI 注册的所有模型目录类型(folder_paths)∪ 标准基线,去黑名单、排序去重。
+    取不到 folder_paths 时退回标准基线。"""
+    types = set(STANDARD_MODEL_TYPES)
+    try:
+        import folder_paths  # type: ignore
+        types |= set(folder_paths.folder_names_and_paths.keys())
+    except Exception:
+        pass
+    return sorted(t for t in types if t and t not in _MODEL_TYPE_DENY)
+
+
+def render_extra_model_paths_yaml(types: list[str]) -> str:
+    """生成云端 extra_model_paths.yaml 内容(纯函数)。每个 type → models/<type>/,
+    与 bridge 上传路径(modal_volume 用 models/<type>/)严格一致。"""
+    lines = [
+        "# ComfyUI 模型搜索路径 — Modal worker 用(部署时由 node_sync 按本机模型目录类型生成)",
+        "# base_path 指向挂载的 Volume:/comfy-volume;每个 type → /comfy-volume/models/<type>/",
+        "",
+        "comfyui-bridge:",
+        "    base_path: /comfy-volume/",
+        "    is_default: true",
+        "",
+    ]
+    lines += [f"    {t}: models/{t}/" for t in types]
+    lines.append("")
+    lines.append("    # ⚠ 不映射 custom_nodes 到 Volume —— Volume 无此目录,云端启动 os.listdir 会崩。")
+    return "\n".join(lines) + "\n"
+
+
+def write_extra_model_paths(types: list[str] | None = None) -> list[str]:
+    """部署前调:把生成的 yaml 写到 baked 文件。返回实际写入的 type 列表。"""
+    types = types if types is not None else local_model_folder_types()
+    EXTRA_MODEL_PATHS_YAML.write_text(render_extra_model_paths_yaml(types), encoding="utf-8")
+    return types
+
+
+def ensure_extra_model_paths_file() -> None:
+    """缺则写标准基线(供 modal_image 打包兜底,和 ensure_baked_file 同理)。"""
+    if not EXTRA_MODEL_PATHS_YAML.exists():
+        EXTRA_MODEL_PATHS_YAML.write_text(
+            render_extra_model_paths_yaml(STANDARD_MODEL_TYPES), encoding="utf-8")
+
+
 # ComfyUI 自带节点所在(相对 ComfyUI 根)的目录前缀 — 这些永远不算 custom_node
 _BUILTIN_DIRS = {"comfy_extras", "comfy", "comfy_api_nodes", "app"}
 

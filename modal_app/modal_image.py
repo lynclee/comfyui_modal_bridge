@@ -27,6 +27,17 @@ try:
 except Exception:
     CUSTOM_NODES = []
 
+# extra_model_paths.yaml 也是部署期生成的本地状态(.gitignore;由 node_sync.write_extra_model_paths
+# 按本机模型目录类型生成)。缺则写标准基线,避免下面的 add_local_file 因文件不存在而炸。
+if not _EXTRA_MODEL_PATHS_YAML.exists():
+    _STD_TYPES = ["checkpoints", "diffusion_models", "unet", "vae", "clip", "text_encoders",
+                  "clip_vision", "style_models", "loras", "controlnet", "upscale_models",
+                  "embeddings", "hypernetworks", "photomaker", "gligen", "diffusers",
+                  "vae_approx", "pulid", "inpaint", "insightface", "onnx", "sams", "ultralytics"]
+    _yaml = ["comfyui-bridge:", "    base_path: /comfy-volume/", "    is_default: true", ""]
+    _yaml += [f"    {_t}: models/{_t}/" for _t in _STD_TYPES]
+    _EXTRA_MODEL_PATHS_YAML.write_text("\n".join(_yaml) + "\n", encoding="utf-8")
+
 
 def _clone_one(n: dict) -> str:
     """生成单个 custom_node 的 clone(+ 可选 checkout)命令。"""

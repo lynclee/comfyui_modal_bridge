@@ -873,6 +873,11 @@ def _setup_routes():
 
             # 3) 部署 app(首次拉镜像 3-5 分钟)
             node_sync.ensure_baked_file()  # 本地清单是 .gitignore 状态,缺则建空,免得 modal_image 打包炸
+            # 云端模型目录跟随本机:生成 extra_model_paths.yaml(覆盖自定义类别如 geometry_estimation)
+            _mtypes = node_sync.write_extra_model_paths()
+            _custom_mtypes = [t for t in _mtypes if t not in node_sync.STANDARD_MODEL_TYPES]
+            await _emit(resp, f"   云端模型目录类型:{len(_mtypes)} 个"
+                              f"(自定义 {len(_custom_mtypes)}:{', '.join(_custom_mtypes) or '无'})\n")
             await _emit(resp, "\n== modal deploy(首次拉镜像约 3-5 分钟,别关窗口)==\n")
             rc = await _run_streamed(resp, node_sync.deploy_command(), cwd=cwd, env=env)
             if rc != 0:

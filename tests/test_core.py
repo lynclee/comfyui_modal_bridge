@@ -515,6 +515,24 @@ def test_contract_comfyui_same():
 
 
 # ============================================================================
+# node_sync.render_extra_model_paths_yaml — 云端模型目录映射(纯函数)
+# ============================================================================
+def test_render_extra_model_paths_custom_category():
+    y = node_sync.render_extra_model_paths_yaml(["checkpoints", "geometry_estimation"])
+    assert "base_path: /comfy-volume/" in y
+    # 自定义类别也映射,且与上传路径 models/<type>/ 一致
+    assert "geometry_estimation: models/geometry_estimation/" in y
+    assert "checkpoints: models/checkpoints/" in y
+
+
+def test_local_model_folder_types_includes_standard():
+    # folder_paths 不可用时退回标准基线(CI 环境无 ComfyUI)
+    types = node_sync.local_model_folder_types()
+    assert "checkpoints" in types and "loras" in types
+    assert "custom_nodes" not in types  # 黑名单
+
+
+# ============================================================================
 # 无 pytest 时的简易运行器
 # ============================================================================
 if __name__ == "__main__":
