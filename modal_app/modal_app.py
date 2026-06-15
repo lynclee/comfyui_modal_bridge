@@ -44,6 +44,7 @@ WORKER_TIMEOUT = int(os.environ.get("MODAL_BRIDGE_TIMEOUT", "1800"))
 # experimental,按 GPU 档需各自 bench;失败兜底见 ComfyWorker.ensure_comfy_alive(退化为普通冷启,不更差)。
 _SNAPSHOT = os.environ.get("MODAL_BRIDGE_SNAPSHOT", "0") == "1"
 DEPLOYED_VERSION = os.environ.get("MODAL_BRIDGE_VERSION", "unknown")  # 部署时烤进,health 回传
+DEPLOYED_COMFYUI_TAG = os.environ.get("MODAL_BRIDGE_COMFYUI_TAG", "v0.22.0")  # 云端 clone 的 ComfyUI tag
 
 app = modal.App(APP_NAME)
 models_vol = modal.Volume.from_name(VOLUME_NAME, create_if_missing=True)
@@ -428,7 +429,8 @@ def health_endpoint(key: str = ""):
     info: dict = {"healthy": True, "app": APP_NAME, "volume": VOLUME_NAME,
                   "deployed_version": DEPLOYED_VERSION, "deployed_gpu": _PRIMARY_GPU,
                   "deployed_cheap_gpu": (_CHEAP_GPU if _CHEAP_ENABLED else None),
-                  "deployed_top_gpu": (_TOP_GPU if _TOP_ENABLED else None)}
+                  "deployed_top_gpu": (_TOP_GPU if _TOP_ENABLED else None),
+                  "deployed_comfyui_tag": DEPLOYED_COMFYUI_TAG}
     try:
         warm = 0
         try:

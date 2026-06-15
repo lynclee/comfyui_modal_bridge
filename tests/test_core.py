@@ -435,6 +435,86 @@ def test_contract_old_image_gpu_none_not_blocked():
 
 
 # ============================================================================
+# node_sync.resolve_comfyui_tag — ComfyUI 版本跟随(纯函数)
+# ============================================================================
+def test_resolve_comfyui_tag_exact():
+    tag, note = node_sync.resolve_comfyui_tag("0.22.0", ["v0.21.0", "v0.22.0", "v0.23.0"])
+    assert tag == "v0.22.0" and note == ""
+
+
+def test_resolve_comfyui_tag_closest_prefers_older():
+    # 0.22.3 无对应 tag → 最接近(平手/更近取 ≤ 本机的 v0.22.0,不让云端比本地新)
+    tag, note = node_sync.resolve_comfyui_tag("0.22.3", ["v0.22.0", "v0.23.0"])
+    assert tag == "v0.22.0" and note != ""
+
+
+def test_resolve_comfyui_tag_unknown_version():
+    tag, note = node_sync.resolve_comfyui_tag("", ["v0.22.0"])
+    assert tag == node_sync.DEFAULT_COMFYUI_TAG and note != ""
+
+
+def test_resolve_comfyui_tag_no_tags():
+    tag, note = node_sync.resolve_comfyui_tag("0.22.0", [])
+    assert tag == node_sync.DEFAULT_COMFYUI_TAG and note != ""
+
+
+# ============================================================================
+# comfy_log.parse_import_failures — 节点导入结果解析(纯函数)
+# ============================================================================
+def _comfy_log():
+    sys.path.insert(0, str(ROOT / "modal_app"))
+    import comfy_log
+    return comfy_log
+
+
+def test_parse_import_failures_basic():
+    cl = _comfy_log()
+    log = (
+        "Import times for custom nodes:\n"
+        "   0.0 seconds: /comfyui/custom_nodes/websocket_image_save.py\n"
+        "   0.1 seconds: /comfyui/custom_nodes/rgthree-comfy\n"
+        "   0.5 seconds (IMPORT FAILED): /comfyui/custom_nodes/ComfyUI-Broken\n"
+        "Starting server\n"
+    )
+    r = cl.parse_import_failures(log)
+    assert "rgthree-comfy" in r["ok"] and "websocket_image_save" in r["ok"]
+    assert [f["name"] for f in r["failed"]] == ["ComfyUI-Broken"]
+
+
+def test_parse_import_failures_with_error():
+    cl = _comfy_log()
+    log = (
+        "Cannot import /comfyui/custom_nodes/ComfyUI-Broken module for custom nodes: No module named 'foo'\n"
+        "Import times for custom nodes:\n"
+        "   0.5 seconds (IMPORT FAILED): /comfyui/custom_nodes/ComfyUI-Broken\n"
+        "Starting server\n"
+    )
+    r = cl.parse_import_failures(log)
+    assert r["failed"][0]["error"] == "No module named 'foo'"
+
+
+# ============================================================================
+# contract.compute_contract — ComfyUI 版本契约
+# ============================================================================
+def test_contract_comfyui_default_no_info():
+    # 无 comfyui 信息(老 config / 没传)→ comfyui_match True,向后兼容不拦
+    c = contract.compute_contract("0.5.1", "0.5.1", True, "H100", "H100")
+    assert c["comfyui_match"] is True
+
+
+def test_contract_comfyui_changed_soft():
+    c = contract.compute_contract("0.5.1", "0.5.1", True, "H100", "H100",
+                                  local_comfyui="0.23.0", deploy_comfyui="0.22.0")
+    assert c["comfyui_match"] is False
+
+
+def test_contract_comfyui_same():
+    c = contract.compute_contract("0.5.1", "0.5.1", True, "H100", "H100",
+                                  local_comfyui="0.22.0", deploy_comfyui="0.22.0")
+    assert c["comfyui_match"] is True
+
+
+# ============================================================================
 # 无 pytest 时的简易运行器
 # ============================================================================
 if __name__ == "__main__":

@@ -21,6 +21,9 @@ DEFAULT_CONFIG = {
     "comfy_api_key": "",       # 可选:comfy.org API key,供工作流里的 ComfyUI API 节点鉴权(账单走你的 comfy.org)
 
     # ── 运行选项 ──
+    # 云端 ComfyUI 版本跟随本机:部署时自动检测本机 ComfyUI 版本并解析成 git tag(无对应取最接近)。
+    "comfyui_version": "",      # 部署时检测到的本机 ComfyUI 版本(契约:本机升级后提示重部署)
+    "comfyui_tag": "",          # 解析出的云端 clone tag(如 v0.22.0);空 = 镜像兜底默认
     "default_gpu": "H100",      # 主卡(大工作流 / 默认)。换值需重新部署
     # 省钱档:估算显存放得下便宜卡(默认 L40S 48G)且非视频的工作流,自动降到这张卡跑
     # (如 Z-Image-Turbo → L40S,FLUX.2-dev → 仍 H100)。换值需重新部署。

@@ -36,6 +36,71 @@ def plugin_version() -> str:
         pass
     return "0.0.0"
 
+# ============================================================================
+# ComfyUI 版本跟随:云端镜像 clone 的 ComfyUI tag 跟本机版本走,
+# 让"本地能跑的节点云端也能跑"。本机版本无对应 git tag 时取最接近的 tag(只警告,不中止)。
+# ============================================================================
+DEFAULT_COMFYUI_TAG = "v0.22.0"          # 兜底:本机版本测不到 / tag 拉不到时用
+COMFYUI_REPO = "https://github.com/comfyanonymous/ComfyUI"
+
+
+def detect_local_comfyui_version() -> str:
+    """本机 ComfyUI 版本(插件跑在 ComfyUI 进程里,直接 import 官方版本模块)。读不到返回 ''。"""
+    try:
+        import comfyui_version  # type: ignore
+        return (getattr(comfyui_version, "__version__", "") or "").strip()
+    except Exception:
+        return ""
+
+
+def _parse_ver(s: str):
+    """'v0.22.3' / '0.22.3' → (0,22,3);解析不了返回 None。"""
+    m = re.match(r"^(\d+)\.(\d+)\.(\d+)", (s or "").strip().lstrip("v"))
+    return tuple(int(x) for x in m.groups()) if m else None
+
+
+def list_comfyui_tags(repo: str = COMFYUI_REPO, timeout: int = 20) -> list[str]:
+    """git ls-remote 拿 ComfyUI 仓库的 vX.Y.Z tag 列表(去掉 ^{} 解引用行)。失败返回 []。"""
+    try:
+        out = subprocess.run(["git", "ls-remote", "--tags", repo],
+                             capture_output=True, text=True, timeout=timeout)
+        if out.returncode != 0:
+            return []
+        tags = []
+        for line in out.stdout.splitlines():
+            if line.rstrip().endswith("^{}"):
+                continue
+            m = re.search(r"refs/tags/(v?\d+\.\d+\.\d+)$", line)
+            if m:
+                tags.append(m.group(1))
+        return sorted(set(tags))
+    except Exception:
+        return []
+
+
+def resolve_comfyui_tag(version: str, tags: list[str]) -> tuple[str, str]:
+    """纯函数:本机版本 + 可用 tag 列表 → (选用的 tag, 警告说明)。
+    精确命中 → ('vX.Y.Z', '')。无精确 → 取 semver 距离最近的(平手取更老的 ≤ 本机,避免云端比本地新),
+    返回说明。版本测不到 / tag 列表空 → 默认 tag + 说明。"""
+    lv = _parse_ver(version)
+    if not lv:
+        return DEFAULT_COMFYUI_TAG, f"本机 ComfyUI 版本未知 → 云端用默认 {DEFAULT_COMFYUI_TAG}"
+    cand = [(pv, t) for t in tags if (pv := _parse_ver(t))]
+    if not cand:
+        return DEFAULT_COMFYUI_TAG, f"拉不到 ComfyUI tag 列表 → 云端用默认 {DEFAULT_COMFYUI_TAG}"
+    exact = [t for pv, t in cand if pv == lv]
+    if exact:
+        return next((t for t in exact if t.startswith("v")), exact[0]), ""
+
+    def dist(pv):
+        a, b = lv + (0,) * (3 - len(lv)), pv + (0,) * (3 - len(pv))
+        return abs((a[0] - b[0]) * 10**6 + (a[1] - b[1]) * 10**3 + (a[2] - b[2]))
+
+    cand.sort(key=lambda x: (dist(x[0]), 0 if x[0] <= lv else 1))
+    best = cand[0][1]
+    return best, f"本机 ComfyUI v{'.'.join(map(str, lv))} 无对应 tag → 云端用最接近的 {best}"
+
+
 # ComfyUI 自带节点所在(相对 ComfyUI 根)的目录前缀 — 这些永远不算 custom_node
 _BUILTIN_DIRS = {"comfy_extras", "comfy", "comfy_api_nodes", "app"}
 
@@ -369,6 +434,11 @@ def deploy_command() -> list[str]:
     return [sys.executable, "-m", "modal", "deploy", "modal_app.py"]
 
 
+def node_compat_check_command() -> list[str]:
+    """部署后跑:隔离 app 在同一镜像里 boot 一次 ComfyUI,报告每个自定义节点导入成功/失败。"""
+    return [sys.executable, "-m", "modal", "run", "node_compat_check.py"]
+
+
 def secret_create_cmd(cfg: dict, hf_token: str = "", civitai_token: str = "",
                       bridge_key: str = "", comfy_api_key: str = "") -> list[str]:
     """建/更新 Modal Secret:BRIDGE_API_KEY(私有鉴权)+ HF / Civitai token(下私有模型)
@@ -396,6 +466,7 @@ def deploy_env(cfg: dict) -> dict:
     env["MODAL_BRIDGE_APP_NAME"] = app_name
     env["MODAL_BRIDGE_VOLUME"] = cfg.get("modal_volume_name", "comfyui-bridge-models")
     env["MODAL_BRIDGE_SECRET"] = f"{app_name}-secrets"
+    env["MODAL_BRIDGE_COMFYUI_TAG"] = cfg.get("comfyui_tag") or DEFAULT_COMFYUI_TAG  # 云端 ComfyUI 版本(跟随本机)
     env["MODAL_BRIDGE_DEFAULT_GPU"] = cfg.get("default_gpu", "H100")
     env["MODAL_BRIDGE_CHEAP_GPU"] = cfg.get("cheap_gpu", "L40S")  # 省钱档 GPU(自动降档目标)
     env["MODAL_BRIDGE_TOP_GPU"] = cfg.get("top_gpu", "H200")      # 顶配档 GPU(>主卡显存时自动升档,防 OOM)

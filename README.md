@@ -31,6 +31,8 @@
 - **更快冷启(可选)**:Setting 开「内存快照」后,容器冷启从 ~30s 降到 ~5s(experimental,按 GPU 档需自测;CPU worker 用 GA 的 CPU 快照,稳)。
 - **多任务并发 & 进度**:多工作流并发各有独立进度卡片(可拖动/取消/关闭);上传带速率 + ETA;job 状态自动清理,不会互相覆盖。
 - **custom_node 自动同步 + 多机友好**:自动加工作流需要的节点并重部署(只这一次);多机取并集、互不删;清理走 Setup 的「管理云端节点」手动勾选。
+- **云端 ComfyUI 版本跟随本机**:部署时自动检测本机 ComfyUI 版本,云端镜像 clone **同一个 tag**(本机版本无对应 tag 时取最接近的,只警告不中止);本机升级后点 RunModal 会提示重新部署让云端跟上 —— 本地能跑的节点云端基本就能跑。
+- **节点兼容自检(每次部署)**:部署成功后自动在云端**同镜像**里 boot 一次 ComfyUI,逐个报告自定义节点导入成功 / 失败(失败 = 与该 ComfyUI 版本不兼容 / 缺依赖 / commit 坏)。**只警告不阻断**:坏节点不影响其它工作流。
 - **模型本地 → Volume**:模型在本地 ComfyUI 下好,提交时自动把云端缺的传上去;**块级去重(CAS)让通用大模型秒过**,只有自训练/私有模型才真占上行带宽。不从 HF 下载、不依赖手维护的 registry。
 - **私有鉴权**:endpoint 用自建 `BRIDGE_API_KEY` 校验,只有你的 key 能调用,无 key 一律 401。
 
@@ -105,6 +107,8 @@ You don't have a big-VRAM GPU locally (Mac / thin laptop / a 4090 that can't fit
 - **Faster cold start (optional)**: enable "Memory snapshot" in Settings to cut container cold start from ~30s to ~5s (experimental, verify per GPU tier; the CPU worker uses the GA CPU snapshot, reliable).
 - **Multi-task concurrency & progress**: each concurrent workflow gets its own progress card (draggable / cancelable / closable); uploads show rate + ETA; job state auto-cleans without clobbering.
 - **Custom-node auto-sync & multi-machine**: auto-adds nodes the workflow needs and redeploys (one time); across machines it's the **union, never cross-deleted**; cleanup is manual via "Manage cloud nodes" in Setup.
+- **Cloud ComfyUI version follows your machine**: at deploy time it detects your local ComfyUI version and clones the **same tag** into the cloud image (no exact tag → nearest one, warn-only); after you upgrade locally, RunModal nudges you to redeploy so the cloud catches up — nodes that work locally work in the cloud.
+- **Node compatibility self-check (every deploy)**: after a successful deploy it boots ComfyUI once in the **same cloud image** and reports each custom node's import OK / FAILED (failed = incompatible with that ComfyUI version / missing deps / bad commit). **Warn-only, never blocks** — a broken node doesn't affect other workflows.
 - **Local → Volume models**: download models locally; missing ones upload on submit; **block-level dedup (CAS) makes common big models instant** — only custom/private models actually use upstream bandwidth. No HF download, no hand-maintained registry.
 - **Private auth**: endpoints verify a self-issued `BRIDGE_API_KEY`; only your key can call them, missing key always returns 401.
 

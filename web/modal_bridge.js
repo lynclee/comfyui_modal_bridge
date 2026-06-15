@@ -160,6 +160,8 @@ const I18N = {
                         en: "GPU changed to {local}, but cloud is deployed on {deployed}; redeploy required." },
   "ver.gpu_mismatch_msg": { zh: "⚠ 显卡不一致:\n  你选的:{local}\n  云端实际在跑:{deployed}\n\nModal 的显卡是部署时固定的,换卡必须重新部署才生效——否则会继续在旧卡 {deployed} 上跑。\n\n点「确定」打开部署窗口重新部署。",
                         en: "⚠ GPU mismatch:\n  Selected: {local}\n  Actually running on cloud: {deployed}\n\nModal's GPU is fixed at deploy time; switching GPU needs a redeploy — otherwise it keeps running on the old {deployed}.\n\nOK to open the deploy dialog to redeploy." },
+  "ver.comfyui_changed_toast":{ zh: "本机 ComfyUI 已升级({local}),云端还是部署时的 {deployed} —— 建议重新部署让云端跟上(不影响本次出图)。",
+                        en: "Local ComfyUI upgraded ({local}); cloud still on {deployed} from last deploy — redeploy to sync (this run still proceeds)." },
   "ver.checking":     { zh: "检查云端中…", en: "Checking cloud…" },
   "ver.platform_startup":{ zh: "⚠ Modal 平台当前异常(status.modal.com),出图可能失败,等平台恢复",
                            en: "⚠ Modal platform is currently degraded (status.modal.com); jobs may fail until it recovers" },
@@ -1319,7 +1321,13 @@ async function checkVersionOrBlock() {
     return true;  // 检查本身失败不阻塞
   }
   setRunReady(v);  // 顺便据此把 RunModal 按钮置白(就绪)/灰(需部署)
-  if (v.match && v.gpu_match !== false) return true;  // 版本 + 显卡都一致,放行
+  if (v.match && v.gpu_match !== false) {
+    // 本机 ComfyUI 升级过、云端还是旧版 → 只警告不拦(stale 但能跑),提示重新部署让云端跟上
+    if (v.comfyui_match === false) {
+      notify(t("ver.comfyui_changed_toast", { local: v.local_comfyui || "?", deployed: v.deploy_comfyui || "?" }), "warn");
+    }
+    return true;  // 版本 + 显卡都一致,放行
+  }
 
   // 版本一致但显卡改了没重新部署(云端真跑的卡 ≠ 所选)→ 强制重新部署,不让在旧卡上偷偷跑
   if (v.match && v.gpu_match === false) {

@@ -816,6 +816,11 @@ def _setup_routes():
         # 私有鉴权 key:已有就复用(不让旧 config 失效),否则新生成
         bridge_key = cfg.get("bridge_api_key") or node_sync.gen_bridge_key()
 
+        # ComfyUI 版本跟随本机:检测本机版本 → 解析云端 clone tag(无对应取最接近,只警告不中止)
+        comfyui_version = node_sync.detect_local_comfyui_version()
+        _tags = await asyncio.get_event_loop().run_in_executor(None, node_sync.list_comfyui_tags)
+        comfyui_tag, _tag_note = node_sync.resolve_comfyui_tag(comfyui_version, _tags)
+
         # 合并出完整 config(用于 deploy_env + 最终落盘)
         cfg.update({
             "modal_endpoint_base": endpoint_base,
@@ -825,6 +830,8 @@ def _setup_routes():
             "scaledown_window": scaledown,
             "default_gpu": default_gpu,
             "auto_downgrade": bool(body.get("auto_downgrade", cfg.get("auto_downgrade", True))),
+            "comfyui_version": comfyui_version,
+            "comfyui_tag": comfyui_tag,
             "modal_token_id": token_id,
             "modal_token_secret": token_secret,
             "bridge_api_key": bridge_key,
@@ -835,6 +842,9 @@ def _setup_routes():
 
         await _emit(resp, "== Modal 一键部署 ==\n")
         await _emit(resp, f"   workspace={workspace}  app={app_name}\n")
+        if _tag_note:
+            await _emit(resp, f"   ⚠ {_tag_note}\n")
+        await _emit(resp, f"   ComfyUI: 本机={comfyui_version or '未知'} → 云端 clone {comfyui_tag}\n")
         await _emit(resp, f"   plugin_version={node_sync.plugin_version()}  (会烤进云端 deployed_version)\n")
         await _emit(resp, f"   endpoint={endpoint_base}\n\n")
 
@@ -882,6 +892,16 @@ def _setup_routes():
             await _emit(resp, f"== ✓ /health: {h} ==\n")
         except Exception as e:
             await _emit(resp, f"== ⚠ /health 暂不可达(endpoint 可能还在初始化,稍后重试):{e} ==\n")
+
+        # 6) 自定义节点兼容性检测(隔离 app,同镜像 boot 一次 ComfyUI,报每个节点导入成功/失败)。
+        #    只警告不阻断:坏节点不影响其它工作流,部署照样 rc=0。
+        await _emit(resp, "\n== 自定义节点兼容性检测(云端同镜像 boot 一次 ComfyUI,约 1 分钟)==\n")
+        try:
+            crc = await _run_streamed(resp, node_sync.node_compat_check_command(), cwd=cwd, env=env)
+            if crc != 0:
+                await _emit(resp, "== ⚠ 兼容性检测未跑完(不影响部署);可稍后手动 `modal run node_compat_check.py` ==\n")
+        except Exception as e:
+            await _emit(resp, f"== ⚠ 兼容性检测启动失败(忽略):{e} ==\n")
 
         await _emit(resp, "\n__DEPLOY_DONE__ rc=0\n")
         await resp.write_eof()
@@ -939,6 +959,8 @@ def _setup_routes():
         local = node_sync.plugin_version()
         cfg = cfg_mod.load_config()
         local_gpu = (cfg.get("default_gpu") or "H100")
+        local_comfyui = node_sync.detect_local_comfyui_version()   # 当前本机 ComfyUI 版本
+        deploy_comfyui = cfg.get("comfyui_version") or None         # 上次部署时检测到的版本
         deployed, deployed_gpu, reachable, err_kind = None, None, False, None
         # 快速单次直查(不走 health 的 3×10s 重试,避免点 Modal 卡 30s 无反应)。
         url = modal_client._endpoint(cfg["modal_endpoint_base"], "health")
@@ -962,7 +984,8 @@ def _setup_routes():
             err_kind = "unreachable"
             print(f"[modal_bridge] version check: health 不可达 ({e})")
         # 契约计算抽到 contract.compute_contract(纯函数,有单测)。
-        c = contract.compute_contract(local, deployed, reachable, local_gpu, deployed_gpu)
+        c = contract.compute_contract(local, deployed, reachable, local_gpu, deployed_gpu,
+                                      local_comfyui=local_comfyui, deploy_comfyui=deploy_comfyui)
         return web.json_response({"ok": True, "err_kind": err_kind, **c})
 
 

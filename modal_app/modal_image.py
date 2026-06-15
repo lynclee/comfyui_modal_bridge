@@ -58,7 +58,10 @@ cuda_image = (
     )
     .apt_install("git", "wget", "libgl1", "libglib2.0-0", "libsm6", "libxext6", "libxrender1", "ffmpeg")
     .run_commands(
-        "git clone --depth=1 --branch v0.22.0 https://github.com/comfyanonymous/ComfyUI /comfyui"
+        # ComfyUI 版本跟随本机:部署时 node_sync 把本机版本解析成 tag 注入 MODAL_BRIDGE_COMFYUI_TAG。
+        # 没注入(老流程 / 直接 modal deploy)则兜底 v0.22.0。改 tag → 重 build 这层及之后。
+        f"git clone --depth=1 --branch {_os.environ.get('MODAL_BRIDGE_COMFYUI_TAG', 'v0.22.0')} "
+        f"https://github.com/comfyanonymous/ComfyUI /comfyui"
     )
     .pip_install(
         "torch==2.11.*", "torchvision", "torchaudio",
@@ -85,11 +88,12 @@ cuda_image = (
     #   - APP_NAME      → health.app + warm-stats 的 Cls.from_name(自定义 app 名时必须对)
     #   - VOLUME/SECRET → 运行时 reload Volume / from_name(自定义名时必须对)
     .env({k: _os.environ[k] for k in (
-        "MODAL_BRIDGE_VERSION", "MODAL_BRIDGE_DEFAULT_GPU", "MODAL_BRIDGE_CHEAP_GPU",
+        "MODAL_BRIDGE_VERSION", "MODAL_BRIDGE_COMFYUI_TAG",
+        "MODAL_BRIDGE_DEFAULT_GPU", "MODAL_BRIDGE_CHEAP_GPU",
         "MODAL_BRIDGE_TOP_GPU", "MODAL_BRIDGE_APP_NAME",
         "MODAL_BRIDGE_VOLUME", "MODAL_BRIDGE_SECRET", "MODAL_BRIDGE_TIMEOUT",
         "MODAL_BRIDGE_SNAPSHOT", "MODAL_BRIDGE_VOLUME_THRESHOLD_MB",
     ) if _os.environ.get(k)})
     .add_local_file(str(_EXTRA_MODEL_PATHS_YAML), "/comfyui/extra_model_paths.yaml")
-    .add_local_python_source("modal_image", "_comfy_ws", "_custom_nodes_data")
+    .add_local_python_source("modal_image", "_comfy_ws", "_custom_nodes_data", "comfy_log")
 )

@@ -96,6 +96,18 @@ bridge 扫工作流**所有输出节点**取产物并回填画板:
 点 [RunModal] 自动加工作流需要的节点。多台电脑各装一部分时:**只增不删,镜像 = 各机并集**,互不干扰。
 想清理:Setup →「管理云端节点」→ 勾选要移除的 → 移除并重部署(带"别的机器用到会失败"二次确认)。
 
+## ComfyUI 版本跟随 + 节点兼容自检
+
+**版本跟随**:部署时自动 `import comfyui_version` 读本机 ComfyUI 版本,云端镜像 clone **同一个 tag**,让"本地能跑的节点云端也能跑"。
+- 本机版本无对应 git tag(Desktop 偶尔跑在两个 tag 之间)→ **取最接近的 tag(平手取更老,不让云端比本地新)+ 部署日志警告**,不中止。
+- 本机升级 ComfyUI 后 → 点 RunModal 会**警告提示重新部署**让云端跟上(非硬拦,本次照常出图)。
+- health 回报 `deployed_comfyui_tag`;改 tag 会重 build clone 层及之后。兜底默认 `v0.22.0`。
+
+**节点兼容自检**:每次部署成功后,自动在云端**同一镜像**(便宜 GPU)里 boot 一次 ComfyUI,解析 ComfyUI 自己打印的 `(IMPORT FAILED)` 标记,逐个报告自定义节点导入成功 / 失败。
+- 失败 = 与当前 ComfyUI 版本不兼容 / 缺依赖 / commit 坏。
+- **只警告不阻断**:结果串进部署日志,坏节点不影响其它工作流;修好(本地换版本 / commit)后重新部署即可。
+- 也可手动跑:`cd modal_app && python -m modal run node_compat_check.py`。
+
 ## Modal 端 endpoint(4 个,私有,自建 key 鉴权)
 
 ```
@@ -236,6 +248,18 @@ Workflows with API nodes need a comfy.org API key (generated at platform.comfy.o
 
 Clicking [RunModal] auto-adds nodes the workflow needs. Across machines that each install a subset: **add-only, image = union**, no cross-deletion.
 To clean up: Setup → "Manage cloud nodes" → check the ones to remove → remove & redeploy (with a "other machines using it will fail" confirmation).
+
+## ComfyUI version follow + node compatibility self-check
+
+**Version follow**: at deploy time it reads your local ComfyUI version (`import comfyui_version`) and clones the **same tag** into the cloud image, so nodes that work locally work in the cloud.
+- No exact git tag for your local version (Desktop sometimes runs between tags) → **use the nearest tag (ties pick the older one, never newer than local) + a deploy-log warning**, not aborted.
+- After you upgrade local ComfyUI → RunModal **warns and suggests a redeploy** to let the cloud catch up (non-blocking; the current run still proceeds).
+- health reports `deployed_comfyui_tag`; changing the tag rebuilds the clone layer onward. Default fallback `v0.22.0`.
+
+**Node compatibility self-check**: after every successful deploy it boots ComfyUI once in the **same cloud image** (on a cheap GPU), parses ComfyUI's own `(IMPORT FAILED)` markers, and reports each custom node's import OK / FAILED.
+- Failed = incompatible with the current ComfyUI version / missing deps / bad commit.
+- **Warn-only, never blocks**: results stream into the deploy log; a broken node doesn't affect other workflows; fix it (bump version / commit locally) and redeploy.
+- Run manually too: `cd modal_app && python -m modal run node_compat_check.py`.
 
 ## Modal endpoints (4, private, self-issued key auth)
 
