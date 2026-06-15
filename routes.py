@@ -131,20 +131,26 @@ def _estimate_workflow_vram(prompt: dict) -> tuple[float, str, int]:
 
 def _pick_gpu_class(prompt: dict, cfg: dict) -> tuple[str, str]:
     """按估算显存在 GPU 档梯子上选档,返回 (gpu_class, reason)。gpu_class ∈ {'cheap','primary','top'}。
-    梯子(成本低→高):cheap(L40S 48G)→ primary(H100 80G)→ top(H200 141G)。
-      1) 升档(正确性,防 OOM):估算 > 主卡容量−余量 → top。不受 auto_downgrade 控制,视频也适用。
-      2) 降档(省钱):auto_downgrade 开 + cheap≠主卡 + 非视频 + 大小已知 + 放得下便宜卡 → cheap。
-      3) 否则 → primary。
+    auto_downgrade 关 = 「H100 固定」模式:一律 primary,不降也不升(>80G 会在前端预警)。
+    auto_downgrade 开 = 「Auto(更省钱)」模式,走梯子(成本低→高 L40S→H100→H200):
+      1) 升档(防 OOM):估算 > 主卡容量−余量 → top(H200)。
+      2) 降档(省钱):cheap≠主卡 + 非视频 + 大小已知 + 放得下便宜卡 → cheap(L40S)。
+      3) 否则 → primary(H100)。
     本地查不到大小(unknown>0)时估算不可信:不升不降,留 primary(稳妥)。"""
+    if not cfg.get("auto_downgrade", True):
+        return "primary", "H100 固定模式"
     cheap_gpu = (cfg.get("cheap_gpu") or "L40S").strip()
     primary_gpu = (cfg.get("default_gpu") or "H100").strip()
     top_gpu = (cfg.get("top_gpu") or "").strip()
     est, category, unknown = _estimate_workflow_vram(prompt)
     primary_vram = _GPU_VRAM_GB.get(primary_gpu, 80)
 
-    # 1) 升档:超过主卡容量(留余量)→ 顶配卡(防 OOM)。需有可信估算(unknown==0)。
+    # 1) 升档:估算超过主卡「裸显存」才升(防 OOM)。⚠ 这里不减 margin ——
+    #    est 已含系数余量(图像×1.15 / 视频×1.3+8),再减 margin 会双重保守:
+    #    例 FLUX.2-dev est≈76G,实际在 H100/A100 80G 上跑得动,不该误升 H200。
+    #    需有可信估算(unknown==0)。
     if (top_gpu and top_gpu != primary_gpu and unknown == 0
-            and est > primary_vram - _CHEAP_MARGIN_GB):
+            and est > primary_vram):
         return "top", f"估算 {est:.1f}G > 主卡 {primary_gpu}({primary_vram}G) → 升档 {top_gpu}"
 
     # 2) 降档:省钱档放得下 → 便宜卡。
@@ -818,6 +824,7 @@ def _setup_routes():
             "modal_volume_name": volume_name,
             "scaledown_window": scaledown,
             "default_gpu": default_gpu,
+            "auto_downgrade": bool(body.get("auto_downgrade", cfg.get("auto_downgrade", True))),
             "modal_token_id": token_id,
             "modal_token_secret": token_secret,
             "bridge_api_key": bridge_key,
