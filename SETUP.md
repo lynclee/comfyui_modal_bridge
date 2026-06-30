@@ -48,19 +48,20 @@ python deploy.py --workspace <你的workspace> --token-id ak-xxx --token-secret 
 7. **CPU / GPU 路由**:工作流无本地模型(纯 API)→ CPU 容器(账单≈0);要 sample → GPU 容器
 8. 提交 Modal → 轮询 → 小文件 base64 / 大文件走 Volume 直连 → 写 `output/modal_results/<job_id>/` → 按来源节点回填:SaveImage 出图、SaveVideo 出视频、**SaveGLB / Preview3D 出 3D 转盘**
 
-## GPU 模式(Auto 省钱 / H100 固定)
+## GPU 模式(Auto 省钱 / H100 固定 / B200 固定)
 
-Modal Setup 里选两种模式之一:
+Modal Setup 里选三种模式之一:
 
 - **Auto(更省钱,默认)**:提交时按工作流估算显存,自动选**最省又够用**的卡:
   - 小图(如 **Z-Image-Turbo**,est ~18–24G)→ **L40S 48G**(最便宜)
   - 常规(如 **FLUX.2-dev**,est ~71–80G)→ **H100/A100-80G**
-  - 真超 80G(大视频 / fp16 大模型叠大 stack)→ **H200 141G**(防 OOM)
-- **H100(固定)**:一律 H100,不降也不升。`>80G` 的工作流会在 RunModal 前显存预警,提示切 Auto。
+  - 真超 80G(大视频 / fp16 大模型叠大 stack)→ **B200 183G**(防 OOM,Blackwell 最强档)
+- **H100(固定)**:一律 H100,不降也不升。`>80G` 的工作流会在 RunModal 前显存预警,提示切 Auto 或 B200。
+- **B200(固定 · 最快最强)**:一律 B200,显存最大(183G)、速度最快。适合大图 / 视频 / 赶时间、或想要全程顶配,代价是**最贵**那档。
 
-四档 worker(CPU / L40S / H100 / H200)**一次部署全部建好**,空闲各自 scale-to-zero —— 没被路由到的档 **0 容器 = 0 成本**,所以多档不额外花钱。切换模式后点「部署」生效(首次升级到本版本也需部署一次)。
+四档 worker(CPU / L40S / H100 / B200)**一次部署全部建好**,空闲各自 scale-to-zero —— 没被路由到的档 **0 容器 = 0 成本**,所以多档不额外花钱。切换模式后点「部署」生效(首次升级到本版本也需部署一次)。
 
-> 显存估算 = 工作流引用的模型文件总大小 × 类别系数(图像 ×1.15;视频 ×1.3 + 多帧激活开销);本地查不到大小的模型按"稳妥"留在 H100,不乱降也不乱升。
+> 显存估算 = 工作流引用的模型文件总大小 × 类别系数(图像 ×1.15;视频 ×1.3 + 多帧激活开销);本地查不到大小的模型按"稳妥"留在主卡,不乱降也不乱升。
 
 ## 图 / 视频 / 3D 输出 + 画板预览
 
@@ -201,19 +202,20 @@ python deploy.py --workspace <your-workspace> --token-id ak-xxx --token-secret a
 7. **CPU / GPU routing**: no local model (pure API) → CPU container (bill ≈ 0); needs sampling → GPU container
 8. Submit Modal → poll → small files base64 / large files via direct Volume → write `output/modal_results/<job_id>/` → fill back per source node: SaveImage for images, SaveVideo for video, **SaveGLB / Preview3D for a 3D turntable**
 
-## GPU mode (Auto = cheaper / H100 = fixed)
+## GPU mode (Auto = cheaper / H100 = fixed / B200 = fastest)
 
-Pick one of two modes in Modal Setup:
+Pick one of three modes in Modal Setup:
 
 - **Auto (cheaper, default)**: on submit, estimate the workflow's VRAM and pick the **cheapest GPU that fits**:
   - small images (e.g. **Z-Image-Turbo**, est ~18–24G) → **L40S 48G** (cheapest)
   - normal (e.g. **FLUX.2-dev**, est ~71–80G) → **H100/A100-80G**
-  - truly over 80G (big video / fp16 model + heavy stack) → **H200 141G** (avoids OOM)
-- **H100 (fixed)**: always H100, no downgrade/escalation. Workflows `>80G` get a VRAM warning before RunModal suggesting you switch to Auto.
+  - truly over 80G (big video / fp16 model + heavy stack) → **B200 183G** (avoids OOM, top Blackwell tier)
+- **H100 (fixed)**: always H100, no downgrade/escalation. Workflows `>80G` get a VRAM warning before RunModal suggesting you switch to Auto or B200.
+- **B200 (fixed · fastest)**: always B200 — biggest VRAM (183G) and fastest. For large images / video / rush jobs, or when you want top-tier throughout; the trade-off is it's the **most expensive** tier.
 
-All four workers (CPU / L40S / H100 / H200) are **deployed at once** and each scales to zero when idle — an un-routed tier is **0 containers = $0**, so extra tiers cost nothing. Click Deploy to apply a mode change (and once when upgrading to this version).
+All four workers (CPU / L40S / H100 / B200) are **deployed at once** and each scales to zero when idle — an un-routed tier is **0 containers = $0**, so extra tiers cost nothing. Click Deploy to apply a mode change (and once when upgrading to this version).
 
-> VRAM estimate = total size of the workflow's referenced model files × a category factor (image ×1.15; video ×1.3 + multi-frame activation overhead). Models whose size can't be found locally stay on H100 ("safe") — no wrong downgrade or escalation.
+> VRAM estimate = total size of the workflow's referenced model files × a category factor (image ×1.15; video ×1.3 + multi-frame activation overhead). Models whose size can't be found locally stay on the primary card ("safe") — no wrong downgrade or escalation.
 
 ## Images / video / 3D output + canvas preview
 

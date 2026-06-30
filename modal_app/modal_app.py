@@ -199,6 +199,7 @@ def _worker_run(workflow: dict, job_id: str, input_images: list | None = None) -
 # 每档带 Modal 原生 fallback(排不到主卡自动降级到链里下一个)。
 _PRIMARY_GPU = os.environ.get("MODAL_BRIDGE_DEFAULT_GPU", "H100")
 _GPU_CHAIN = {
+    "B200":      ["B200", "H200", "H100"], # 183G Blackwell 最强档,排不到降 H200/H100
     "H100":      ["H100", "A100-80GB"],   # 主卡排不到降 A100-80G
     "H200":      ["H200", "H100"],         # 141G 大卡,降级到 H100
     "A100-80GB": ["A100-80GB"],
@@ -212,9 +213,10 @@ _CHEAP_GPU = os.environ.get("MODAL_BRIDGE_CHEAP_GPU", "L40S")
 _CHEAP_GPU_LIST = _GPU_CHAIN.get(_CHEAP_GPU, [_CHEAP_GPU])
 _CHEAP_ENABLED = _CHEAP_GPU != _PRIMARY_GPU
 
-# 顶配档 GPU(默认 H200 141G):估算显存超过主卡的工作流升到这跑,防 OOM(升档 = 正确性兜底)。
+# 顶配档 GPU(默认 B200 183G):估算显存超过主卡的工作流升到这跑,防 OOM(升档 = 正确性兜底)。
+# B200 是 Blackwell 最强档,显存最大、速度最快,大图自动上这张。
 # ⚠ 升档档不向下 fallback(对 >80G 的活退到小卡 = OOM),所以固定单卡列表,宁可排队等也不降级。
-_TOP_GPU = os.environ.get("MODAL_BRIDGE_TOP_GPU", "H200")
+_TOP_GPU = os.environ.get("MODAL_BRIDGE_TOP_GPU", "B200")
 _TOP_GPU_LIST = [_TOP_GPU]
 _TOP_ENABLED = _TOP_GPU != _PRIMARY_GPU
 
@@ -265,7 +267,7 @@ class ComfyWorkerCheap:
         return _worker_run(workflow, job_id, input_images)
 
 
-# 顶配档 worker:估算显存超过主卡的工作流(如 >80G)升到这(默认 H200 141G),防 OOM。
+# 顶配档 worker:估算显存超过主卡的工作流(如 >80G)升到这(默认 B200 183G),防 OOM。
 # 同构,只是 gpu 不同且不向下 fallback;min_containers=0 → 不被路由时 0 容器 = $0。
 @app.cls(gpu=_TOP_GPU_LIST, **_WORKER_KW, **_SNAP_KW)
 @modal.concurrent(max_inputs=1)
@@ -317,7 +319,7 @@ _TIER_WORKERS = {"80g": ComfyWorker, "40g": ComfyWorker}
 _GPU_DISPLAY = "→".join(_GPU_LIST)  # 如 "H100→A100-80GB",进度卡/日志显示真实显卡
 _TIER_GPU_DISPLAY = {"80g": _GPU_DISPLAY, "40g": _GPU_DISPLAY}
 _CHEAP_GPU_DISPLAY = "→".join(_CHEAP_GPU_LIST)  # 省钱档显示(如 "L40S")
-_TOP_GPU_DISPLAY = "→".join(_TOP_GPU_LIST)        # 顶配档显示(如 "H200")
+_TOP_GPU_DISPLAY = "→".join(_TOP_GPU_LIST)        # 顶配档显示(如 "B200")
 
 
 # ============================================================================
@@ -352,7 +354,7 @@ def run_endpoint(payload: dict):
     input_images = payload.get("images")
     # 路由:工作流无本地模型节点(纯 API / 轻节点)= 不需要 GPU → CPU worker(账单≈0);否则 GPU worker。
     # needs_gpu 由后端 /submit 据 extract_required_models 判定后传入(缺省 True,稳妥)。
-    # 四档路由(成本从低到高):无 GPU → CPU;放得下便宜卡 → cheap(L40S);超过主卡 → top(H200);否则 → 主卡。
+    # 四档路由(成本从低到高):无 GPU → CPU;放得下便宜卡 → cheap(L40S);超过主卡 → top(B200);否则 → 主卡。
     # gpu_class 由后端 /submit 据 estimate_vram 判定后传入(缺省 primary,稳妥)。
     needs_gpu = bool(payload.get("needs_gpu", True))
     gpu_class = (payload.get("gpu_class") or "primary").lower()

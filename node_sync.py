@@ -532,7 +532,7 @@ def deploy_env(cfg: dict) -> dict:
     env["MODAL_BRIDGE_COMFYUI_TAG"] = cfg.get("comfyui_tag") or DEFAULT_COMFYUI_TAG  # 云端 ComfyUI 版本(跟随本机)
     env["MODAL_BRIDGE_DEFAULT_GPU"] = cfg.get("default_gpu", "H100")
     env["MODAL_BRIDGE_CHEAP_GPU"] = cfg.get("cheap_gpu", "L40S")  # 省钱档 GPU(自动降档目标)
-    env["MODAL_BRIDGE_TOP_GPU"] = cfg.get("top_gpu", "H200")      # 顶配档 GPU(>主卡显存时自动升档,防 OOM)
+    env["MODAL_BRIDGE_TOP_GPU"] = cfg.get("top_gpu", "B200")      # 顶配档 GPU(>主卡显存时自动升档,防 OOM)
     env["MODAL_BRIDGE_SCALEDOWN"] = str(cfg.get("scaledown_window", 40))
     env["MODAL_BRIDGE_TIMEOUT"] = str(cfg.get("worker_timeout_sec", 1800))  # worker 超时上限(覆盖最慢类别)
     env["MODAL_BRIDGE_SNAPSHOT"] = "1" if cfg.get("enable_snapshot") else "0"  # 内存快照开关(实验)

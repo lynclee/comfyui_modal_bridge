@@ -28,9 +28,10 @@ DEFAULT_CONFIG = {
     # 省钱档:估算显存放得下便宜卡(默认 L40S 48G)且非视频的工作流,自动降到这张卡跑
     # (如 Z-Image-Turbo → L40S,FLUX.2-dev → 仍 H100)。换值需重新部署。
     "cheap_gpu": "L40S",
-    # 顶配档:估算显存超过主卡容量(如 >80G)的工作流自动升到这张卡(默认 H200 141G),防 OOM。
+    # 顶配档:估算显存超过主卡容量(如 >80G)的工作流自动升到这张卡(默认 B200 183G),防 OOM。
+    # B200 是 Blackwell 最强档(显存最大、速度最快),大图自动上这张。
     # 升档是正确性兜底,不受 auto_downgrade 控制;设成与 default_gpu 相同则不启用。换值需重新部署。
-    "top_gpu": "H200",
+    "top_gpu": "B200",
     "auto_downgrade": True,     # 开:按 estimate_vram 自动在 default_gpu / cheap_gpu 间选档(本地路由决策,改它不必重部署)
     "enable_snapshot": True,   # 内存快照(实验):冷启 ~30s→~5s。默认开;不支持的 GPU 档自动退化为普通冷启(不更差)。换值需重新部署
     "user_id": "local-dev",

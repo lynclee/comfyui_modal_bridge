@@ -48,11 +48,12 @@ const I18N = {
   "dlg.secret.ph_saved": { zh: "••••••••(已保存,留空沿用)", en: "•••••••• (saved, blank=reuse)" },
   "dlg.gpu.label":    { zh: "(Auto 按工作流显存自动选卡,更省钱;首次/升级后需部署一次)",
                         en: "(Auto picks the GPU by VRAM to save cost; deploy once after first use/upgrade)" },
-  "dlg.gpu.opt_auto": { zh: "Auto — 更省钱(按显存自动选 L40S/H100/H200)",
-                        en: "Auto — cheaper (auto L40S/H100/H200 by VRAM)" },
+  "dlg.gpu.opt_auto": { zh: "Auto — 更省钱(按显存自动选 L40S/H100/B200)",
+                        en: "Auto — cheaper (auto L40S/H100/B200 by VRAM)" },
   "dlg.gpu.opt_h100": { zh: "H100(固定)", en: "H100 (fixed)" },
-  "dlg.gpu.note":     { zh: "Auto(更省钱):小图走 L40S、常规走 H100、超 80G 自动上 H200,按工作流显存自动选,最省。H100(固定):一律 H100。选择后点「部署」生效。点 RunModal 前会按类别估算显存预警(视频含多帧激活开销)。",
-                        en: "Auto (cheaper): small→L40S, normal→H100, >80G→H200, chosen automatically per workflow VRAM. H100 (fixed): always H100. Click Deploy to apply. Before running, VRAM is estimated per category (video includes multi-frame activations)." },
+  "dlg.gpu.opt_b200": { zh: "B200(固定 · 最快最强)", en: "B200 (fixed · fastest)" },
+  "dlg.gpu.note":     { zh: "Auto(更省钱):小图走 L40S、常规走 H100、超 80G 自动上 B200(183G,最强),按工作流显存自动选,最省。H100(固定):一律 H100。B200(固定):一律 B200,显存最大、速度最快,适合大图/视频/赶时间(最贵)。选择后点「部署」生效。点 RunModal 前会按类别估算显存预警(视频含多帧激活开销)。",
+                        en: "Auto (cheaper): small→L40S, normal→H100, >80G→B200 (183G, top), chosen automatically per workflow VRAM. H100 (fixed): always H100. B200 (fixed): always B200, biggest VRAM & fastest, for large images/video/rush jobs (most expensive). Click Deploy to apply. Before running, VRAM is estimated per category (video includes multi-frame activations)." },
   "vram.warn.title":  { zh: "⚠ 显存可能不够", en: "⚠ VRAM may be tight" },
   "vram.warn.body":   { zh: "预估需 ~{est}GB(模型 {model}GB),超过所选 {gpu}({cap}GB)。可能 offload 变慢甚至 OOM。",
                         en: "Est. ~{est}GB ({model}GB models) exceeds the selected {gpu} ({cap}GB). May offload (slow) or OOM." },
@@ -976,16 +977,16 @@ async function ensureModelsAvailable(prompt, ctx) {
 // 主入口:批量包装
 // =====================================================================
 // GPU 显存表(GB)。键与 Setup 下拉/后端 default_gpu 一致。
-const GPU_VRAM = { "L40S": 48, "A100-80GB": 80, "H100": 80, "H200": 141 };
+const GPU_VRAM = { "L40S": 48, "A100-80GB": 80, "H100": 80, "H200": 141, "B200": 180 };
 
 // 显存预警:点 Modal 前用「模型总显存 ×1.15」对比所选显卡。超了弹确认。
 // 返回 true=继续, false=用户中止(去换显卡)。任何异常都放行 —— 预警是辅助,不该挡正常流程。
 async function vramPreflightOrConfirm(prompt, cfgNow) {
   try {
-    // Auto(更省钱)模式:大工作流会自动升到顶配卡(H200),所以预警上限按顶配卡;
-    // H100 固定模式:上限就是 H100,超了提示用户切到 Auto。
+    // Auto(更省钱)模式:大工作流会自动升到顶配卡(B200),所以预警上限按顶配卡;
+    // 固定模式(H100/B200):上限就是所选主卡,超了提示用户切到 Auto 或更大的卡。
     const auto = cfgNow.auto_downgrade !== false;
-    const gpu = auto ? (cfgNow.top_gpu || "H200") : (cfgNow.default_gpu || "H100");
+    const gpu = auto ? (cfgNow.top_gpu || "B200") : (cfgNow.default_gpu || "H100");
     const cap = GPU_VRAM[gpu];
     if (!cap) return true;
     const r = await api.fetchApi("/modal_bridge/estimate_vram", {
@@ -1433,7 +1434,8 @@ async function openDeployDialog() {
     <label>GPU <span style="color:#9aa;">${t("dlg.gpu.label")}</span></label>
     <select id="mb-dep-gpumode" style="${inputCss}">
       <option value="auto"${(cfg.auto_downgrade!==false)?" selected":""}>${t("dlg.gpu.opt_auto")}</option>
-      <option value="h100"${(cfg.auto_downgrade===false)?" selected":""}>${t("dlg.gpu.opt_h100")}</option>
+      <option value="h100"${(cfg.auto_downgrade===false && (cfg.default_gpu||"H100")!=="B200")?" selected":""}>${t("dlg.gpu.opt_h100")}</option>
+      <option value="b200"${(cfg.auto_downgrade===false && (cfg.default_gpu||"H100")==="B200")?" selected":""}>${t("dlg.gpu.opt_b200")}</option>
     </select>
     <div style="margin:0 0 10px;color:#9aa;font-size:12px;">${t("dlg.gpu.note")}</div>
     <label>comfy.org API Key <span style="color:#9aa;">${t("dlg.comfy.hint")}</span></label>
@@ -1587,12 +1589,14 @@ async function openDeployDialog() {
   };
 
   goBtn.onclick = async () => {
+    const gpuMode = panel.querySelector("#mb-dep-gpumode").value;  // auto | h100 | b200
     const payload = {
       workspace: panel.querySelector("#mb-dep-ws").value.trim(),
       token_id: panel.querySelector("#mb-dep-id").value.trim(),
       token_secret: panel.querySelector("#mb-dep-secret").value.trim(),
-      default_gpu: "H100",  // 主卡固定 H100;省钱/升档由 auto_downgrade 控制
-      auto_downgrade: panel.querySelector("#mb-dep-gpumode").value === "auto",
+      // Auto/H100 固定:主卡 H100(省钱/升档由 auto_downgrade 控制);B200 固定:主卡直接 B200
+      default_gpu: gpuMode === "b200" ? "B200" : "H100",
+      auto_downgrade: gpuMode === "auto",
       comfy_api_key: panel.querySelector("#mb-dep-comfy").value.trim(),
     };
     // token_secret 留空 = 沿用已存的(/config 不再回显它);只有填了才校验格式
