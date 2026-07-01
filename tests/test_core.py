@@ -20,6 +20,7 @@ import model_deps  # noqa: E402
 import contract  # noqa: E402
 import categories  # noqa: E402
 import config  # noqa: E402
+import workflow_check  # noqa: E402
 
 
 # ============================================================================
@@ -354,6 +355,57 @@ def test_generic_ignores_images_and_nonmodel():
     prompt = {"1": {"class_type": "LoadImage", "inputs": {"image": "ref.png"}},
               "2": {"class_type": "CLIPTextEncode", "inputs": {"text": "a cat"}}}
     assert model_deps.extract_generic_filenames(prompt) == set()
+
+
+# ============================================================================
+# workflow_check.find_missing_required_inputs
+# ============================================================================
+def _req_getter(mapping):
+    """把 {class_type: {必填名}} 包成 required_getter;未知类返回 None(跳过)。"""
+    return lambda ct: mapping.get(ct)
+
+
+def test_missing_required_catches_absent_widget():
+    """老图节点缺了新版必填 widget(generate_type)→ 命中。"""
+    prompt = {
+        "2": {"class_type": "TencentImageToModelNode",
+              "inputs": {"model": "3.0", "image": ["1", 0], "face_count": 500000, "seed": 0}},
+    }
+    req = {"TencentImageToModelNode": {"model", "image", "face_count", "generate_type", "seed"}}
+    out = workflow_check.find_missing_required_inputs(prompt, _req_getter(req))
+    assert len(out) == 1
+    assert out[0]["node_id"] == "2"
+    assert out[0]["class_type"] == "TencentImageToModelNode"
+    assert out[0]["missing"] == ["generate_type"]
+
+
+def test_missing_required_none_when_all_present():
+    """必填项都在(widget 值或连线都算已提供)→ 不报。"""
+    prompt = {
+        "2": {"class_type": "TencentImageToModelNode",
+              "inputs": {"model": "3.0", "image": ["1", 0], "face_count": 500000,
+                         "generate_type": "Normal", "seed": 0}},
+    }
+    req = {"TencentImageToModelNode": {"model", "image", "face_count", "generate_type", "seed"}}
+    assert workflow_check.find_missing_required_inputs(prompt, _req_getter(req)) == []
+
+
+def test_missing_required_skips_unknown_class():
+    """拿不到定义的节点(getter 返回 None)→ 跳过,不误报。"""
+    prompt = {"5": {"class_type": "SomeUnknownNode", "inputs": {}}}
+    assert workflow_check.find_missing_required_inputs(prompt, _req_getter({})) == []
+
+
+def test_missing_required_sorted_by_node_id():
+    """多个缺失节点按 node_id 排序返回。"""
+    prompt = {
+        "10": {"class_type": "N", "inputs": {}},
+        "3": {"class_type": "N", "inputs": {}},
+    }
+    req = {"N": {"a"}}
+    out = workflow_check.find_missing_required_inputs(prompt, _req_getter(req))
+    assert [r["node_id"] for r in out] == ["10", "3"]  # 字符串排序,稳定即可
+    assert all(r["missing"] == ["a"] for r in out)
 
 
 # ============================================================================

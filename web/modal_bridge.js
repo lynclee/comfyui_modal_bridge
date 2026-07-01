@@ -61,6 +61,12 @@ const I18N = {
   "vram.warn.video":  { zh: "(视频类:显存还要算多帧激活,估算偏粗,务必留余量)", en: " (video: multi-frame activations add VRAM; estimate is rough, leave headroom)" },
   "vram.warn.run":    { zh: "仍要跑", en: "Run anyway" },
   "vram.warn.switch": { zh: "去 Setup 换显卡", en: "Switch GPU in Setup" },
+  "inputs.warn.title":{ zh: "⚠ 有节点缺必填输入", en: "⚠ Node(s) missing required inputs" },
+  "inputs.warn.body": { zh: "以下节点缺少必填输入。多半是老工作流里的节点在新版本新增了必填项(如内置 API 节点的 generate_type),而老图没带上。建议把这些节点删掉重新拖入、补全后再跑;否则云端很可能报错。",
+                        en: "The nodes below are missing required inputs — usually an old workflow whose nodes gained new required fields in a newer version (e.g. a built-in API node's generate_type). Recreate those nodes and fill the fields before running; otherwise the cloud run will likely fail." },
+  "inputs.warn.node": { zh: "节点", en: "Node" },
+  "inputs.warn.run":  { zh: "仍要提交", en: "Submit anyway" },
+  "inputs.warn.fix":  { zh: "去修改", en: "Go fix" },
   "dlg.comfy.hint":   { zh: "(可选,工作流含 API 节点才需要)", en: "(optional, only if your workflow uses API nodes)" },
   "dlg.comfy.ph":     { zh: "platform.comfy.org 生成的 API key", en: "API key from platform.comfy.org" },
   "dlg.comfy.ph_saved":{ zh: "已保存(留空=沿用)", en: "saved (blank = keep)" },
@@ -1010,6 +1016,29 @@ async function vramPreflightOrConfirm(prompt, cfgNow) {
   } catch (e) { log("vram preflight skipped:", e); return true; }
 }
 
+// 提交前预检:工作流里有节点缺必填输入(常见:老图缺新版节点新增的 widget,如内置 API
+// 节点 generate_type)→ 云端会因缺参数崩,提前弹确认拦住。返回 true=继续 / false=用户去修。
+// 任何异常都放行(预检是辅助,不该挡正常流程)。
+async function requiredInputsPreflight(prompt) {
+  try {
+    const r = await api.fetchApi("/modal_bridge/check_required_inputs", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ prompt }),
+    });
+    const d = await r.json();
+    if (!r.ok || d.error || !Array.isArray(d.missing) || d.missing.length === 0) return true;
+    const lines = d.missing.slice(0, 8).map(
+      (m) => `• ${t("inputs.warn.node")} ${m.node_id} (${m.class_type}): ${m.missing.join(", ")}`
+    ).join("\n");
+    const more = d.missing.length > 8 ? `\n… +${d.missing.length - 8}` : "";
+    return await confirmDialog(
+      t("inputs.warn.title"),
+      t("inputs.warn.body") + "\n\n" + lines + more,
+      t("inputs.warn.run"), t("inputs.warn.fix"),
+    );
+  } catch (e) { log("required-inputs preflight skipped:", e); return true; }
+}
+
 // 轻量 async 确认弹窗,返回 Promise<boolean>(主按钮=true / 次按钮或点遮罩=false)。
 function confirmDialog(title, body, okText, cancelText, opts = {}) {
   const cancelBg = opts.dangerCancel ? "#b91c1c" : "#374151";
@@ -1088,6 +1117,14 @@ async function queueOnModal() {
     if (!okVram) {
       ctx.finish(false, "✕ Cancelled");
       try { openDeployDialog(); } catch (e) {}
+      return;
+    }
+
+    // ⭐ 必填输入预检:节点缺必填 widget(老图缺新版 widget,如 API 节点 generate_type)→ 弹确认。
+    // 放在模型上传之前,别等传完 16G 才发现节点会崩。
+    const okInputs = await requiredInputsPreflight(p.output);
+    if (!okInputs) {
+      ctx.finish(false, "✕ Cancelled");
       return;
     }
 

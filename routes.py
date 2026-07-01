@@ -18,6 +18,7 @@ from . import modal_client
 from . import modal_volume
 from . import model_deps
 from . import node_sync
+from . import workflow_check
 
 
 # folder_paths 是 ComfyUI 全局模块
@@ -553,6 +554,35 @@ def _setup_routes():
         except Exception as e:
             return web.json_response({"error": f"check_models(SDK) failed: {e}"}, status=502)
         return web.json_response(result)
+
+    def _node_required_inputs(class_type: str):
+        """从 ComfyUI 当前加载的节点定义拿必填输入名集合;拿不到返回 None(跳过,不误报)。
+        v3 schema 节点由 ComfyUI 兼容层照样提供经典 INPUT_TYPES()。"""
+        try:
+            import nodes  # ComfyUI 全局
+            cls = nodes.NODE_CLASS_MAPPINGS.get(class_type)
+            if cls is None:
+                return None
+            it = cls.INPUT_TYPES()
+            if not isinstance(it, dict):
+                return None
+            req = it.get("required") or {}
+            return set(req.keys()) if isinstance(req, dict) else None
+        except Exception:
+            return None
+
+    @routes.post("/modal_bridge/check_required_inputs")
+    async def _check_required_inputs(request: web.Request):
+        """提交前预检:按当前本地节点定义,找出 prompt 里「缺必填输入」的节点。
+        body: {prompt}  返回: {missing:[{node_id,class_type,missing:[...]}]}
+        典型拦截:老工作流缺新版节点新增的必填 widget(如 API 节点 generate_type),
+        避免等云端 `execute() missing required argument` 才报错。拿不到定义的节点跳过,不误报。"""
+        body = await request.json()
+        prompt = body.get("prompt")
+        if not isinstance(prompt, dict):
+            return web.json_response({"error": "prompt required"}, status=400)
+        missing = workflow_check.find_missing_required_inputs(prompt, _node_required_inputs)
+        return web.json_response({"missing": missing})
 
     @routes.post("/modal_bridge/estimate_vram")
     async def _estimate_vram(request: web.Request):
