@@ -42,9 +42,9 @@ python deploy.py --workspace <你的workspace> --token-id ak-xxx --token-secret 
 1. 序列化当前工作流
 2. **版本 + 显卡校验**:插件版本与云端不一致、或所选显卡与云端实际在跑的卡不一致 → 拦住并引导重新部署
 3. **API 节点检测**:工作流含 ComfyUI API 节点但没配 comfy.org key → 提交前提示(否则云端会 401)
-4. **custom_node 同步**:工作流用到、云端没有的节点 → 自动加 + 重部署(只这一次,之后秒进)
-5. **显存预检**:模型总显存(按类别估,视频含多帧激活开销)超所选卡 → 弹警告(可仍要跑 / 去换卡)
-6. **必填输入预检**:按当前本地节点定义检查各节点是否缺必填输入(典型:老工作流里的节点在新版新增了必填 widget,如内置 API 节点的 `generate_type`,老图没带上)→ 弹提示(可仍要提交 / 去修),避免等云端 `execute() missing required argument` 才报错。拿不到定义的节点跳过,不误报
+4. **必填输入预检**:按当前本地节点定义检查各节点是否缺必填输入(常见:必填连线没接;或老工作流里的节点在新版新增了必填 widget,如内置 API 节点的 `generate_type`,老图没带上)→ 弹提示(可仍要提交 / 去修),避免等云端 `execute() missing required argument` 才报错。纯本地检查所以放最前,不用先等节点同步重部署;拿不到定义的节点跳过,不误报
+5. **custom_node 同步**:工作流用到、云端没有的节点 → 自动加 + 重部署(只这一次,之后秒进)
+6. **显存预检**:模型总显存(按类别估,视频含多帧激活开销)超所选卡 → 弹警告(可仍要跑 / 去换卡)
 7. **模型同步**:云端 Volume 缺、本地有 → 上传(CAS 去重);云端和本地都没有 → 提示先在本地下好
 8. **CPU / GPU 路由**:工作流无本地模型(纯 API)→ CPU 容器(账单≈0);要 sample → GPU 容器
 9. 提交 Modal → 轮询 → 小文件 base64 / 大文件走 Volume 直连 → 写 `output/modal_results/<job_id>/` → 按来源节点回填:SaveImage 出图、SaveVideo 出视频、**SaveGLB / Preview3D 出 3D 转盘**
@@ -197,9 +197,9 @@ python deploy.py --workspace <your-workspace> --token-id ak-xxx --token-secret a
 1. Serialize the current workflow
 2. **Version + GPU check**: if the plugin version differs from the cloud, or the selected GPU differs from the one actually running → block and guide a redeploy
 3. **API node check**: workflow has ComfyUI API nodes but no comfy.org key configured → warn before submit (otherwise the cloud 401s)
-4. **Node sync**: nodes the workflow uses but the cloud lacks → auto-add + redeploy (one time)
-5. **VRAM preflight**: model VRAM (estimated per category; video includes multi-frame activations) over the selected GPU → warn (run anyway / switch GPU)
-6. **Required-input preflight**: check each node against its current local definition for missing required inputs (typically an old workflow whose node gained a new required widget in a newer version, e.g. a built-in API node's `generate_type`, that the old graph didn't carry) → warn (submit anyway / go fix), instead of failing on the cloud with `execute() missing required argument`. Nodes whose definition can't be read are skipped (no false positives)
+4. **Required-input preflight**: check each node against its current local definition for missing required inputs (commonly a required connection left unwired, or an old workflow whose node gained a new required widget in a newer version, e.g. a built-in API node's `generate_type`, that the old graph didn't carry) → warn (submit anyway / go fix), instead of failing on the cloud with `execute() missing required argument`. Purely local, so it runs first — no waiting for a node-sync redeploy; nodes whose definition can't be read are skipped (no false positives)
+5. **Node sync**: nodes the workflow uses but the cloud lacks → auto-add + redeploy (one time)
+6. **VRAM preflight**: model VRAM (estimated per category; video includes multi-frame activations) over the selected GPU → warn (run anyway / switch GPU)
 7. **Model sync**: missing on Volume but present locally → upload (CAS dedup); missing both places → prompt to download locally first
 8. **CPU / GPU routing**: no local model (pure API) → CPU container (bill ≈ 0); needs sampling → GPU container
 9. Submit Modal → poll → small files base64 / large files via direct Volume → write `output/modal_results/<job_id>/` → fill back per source node: SaveImage for images, SaveVideo for video, **SaveGLB / Preview3D for a 3D turntable**

@@ -62,8 +62,8 @@ const I18N = {
   "vram.warn.run":    { zh: "仍要跑", en: "Run anyway" },
   "vram.warn.switch": { zh: "去 Setup 换显卡", en: "Switch GPU in Setup" },
   "inputs.warn.title":{ zh: "⚠ 有节点缺必填输入", en: "⚠ Node(s) missing required inputs" },
-  "inputs.warn.body": { zh: "以下节点缺少必填输入。多半是老工作流里的节点在新版本新增了必填项(如内置 API 节点的 generate_type),而老图没带上。建议把这些节点删掉重新拖入、补全后再跑;否则云端很可能报错。",
-                        en: "The nodes below are missing required inputs — usually an old workflow whose nodes gained new required fields in a newer version (e.g. a built-in API node's generate_type). Recreate those nodes and fill the fields before running; otherwise the cloud run will likely fail." },
+  "inputs.warn.body": { zh: "以下节点缺少必填输入,直接提交云端多半会报错。常见两种原因:必填的连线没接上;或是老工作流里的节点在新版本新增了必填项(如内置 API 节点的 generate_type),老图没带上——这种把节点删掉重新拖入、补全后再跑。",
+                        en: "The nodes below are missing required inputs; submitting as-is will likely fail on the cloud. Two common causes: a required connection isn't wired up, or an old workflow whose nodes gained new required fields in a newer version (e.g. a built-in API node's generate_type) — for the latter, recreate the node and fill the fields before running." },
   "inputs.warn.node": { zh: "节点", en: "Node" },
   "inputs.warn.run":  { zh: "仍要提交", en: "Submit anyway" },
   "inputs.warn.fix":  { zh: "去修改", en: "Go fix" },
@@ -1102,6 +1102,15 @@ async function queueOnModal() {
       if (!proceed) { ctx.finish(false, "✕ Cancelled"); try { openDeployDialog(); } catch (e) {} return; }
     }
 
+    // ⭐ 必填输入预检:节点缺必填输入(老图缺新版新增的 widget 如 API 节点 generate_type,
+    // 或必填连线没接)→ 弹确认。纯本地检查,放在最前:别等节点同步重部署(3-5 分钟)
+    // 或传完 16G 模型才发现节点会崩。
+    const okInputs = await requiredInputsPreflight(p.output);
+    if (!okInputs) {
+      ctx.finish(false, "✕ Cancelled");
+      return;
+    }
+
     // ⭐ custom_node 自动同步(默认开启,Settings 可关)
     const autoCheckNodes = getSetting("ModalBridge.autoCheckNodes", true);
     if (autoCheckNodes) {
@@ -1117,14 +1126,6 @@ async function queueOnModal() {
     if (!okVram) {
       ctx.finish(false, "✕ Cancelled");
       try { openDeployDialog(); } catch (e) {}
-      return;
-    }
-
-    // ⭐ 必填输入预检:节点缺必填 widget(老图缺新版 widget,如 API 节点 generate_type)→ 弹确认。
-    // 放在模型上传之前,别等传完 16G 才发现节点会崩。
-    const okInputs = await requiredInputsPreflight(p.output);
-    if (!okInputs) {
-      ctx.finish(false, "✕ Cancelled");
       return;
     }
 
