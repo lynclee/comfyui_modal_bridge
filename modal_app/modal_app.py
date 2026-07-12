@@ -26,6 +26,7 @@ from pathlib import Path
 
 import modal
 
+from aigc_delivery import normalize_delivery, public_delivery
 from modal_image import cuda_image
 
 
@@ -155,12 +156,16 @@ def _worker_ensure_alive(self):
     _worker_boot(self, cpu=getattr(self, "_cpu", False))  # 沿用本 worker 的 CPU/GPU 模式
 
 
-def _worker_run(workflow: dict, job_id: str, input_images: list | None = None) -> dict:
+def _worker_run(workflow: dict, job_id: str, input_images: list | None = None,
+                delivery: dict | None = None) -> dict:
+    # delivery:结果交付方式(见 aigc_delivery.normalize_delivery)。desktop = 现状(回本地);
+    # aigc-r2 = 直传 R2 + 回调 AIGC Studio。⚠ delivery 里的 token 是敏感的:不进 job_state、不打日志。
     # call_id 现在存独立 key(见 run_endpoint);等它出现仅为让 cancel 可用,等不到也继续。
     for _ in range(50):  # 最多 ~5s
         if job_state.get(f"{job_id}:call"):
             break
         time.sleep(0.1)
+    mode = (delivery or {}).get("mode", "desktop")
     job_state[job_id] = {**job_state.get(job_id, {}), "status": "running", "started_at": time.time()}
     try:
         # ⚠ 不在这里 free/reload!曾经"每 job 跑前 free+reload"会把 warm 容器显存里的模型卸掉,
@@ -168,7 +173,23 @@ def _worker_run(workflow: dict, job_id: str, input_images: list | None = None) -
         # 正确策略:正常直接跑(模型在显存,秒级);只有验证失败(模型不在列表)时,queue_workflow
         # 内部才按需 free→reload→重试(只有删 Volume/缺模型的极端场景才付这个代价)。
         from _comfy_ws import run_workflow
-        result = run_workflow(workflow=workflow, job_id=job_id, input_images=input_images)
+        # aigc-r2:只「发现」产物不读进内存(materialize=False),下面流式直传 R2。
+        result = run_workflow(workflow=workflow, job_id=job_id, input_images=input_images,
+                              materialize=(mode != "aigc-r2"))
+        if mode == "aigc-r2":
+            # 状态机:running → delivering → completed。出图后直传 R2 + 回调 AIGC Studio;
+            # 全部上传且回调成功才 completed。回调失败但文件已在 R2 → delivery.status =
+            # callback_failed + 保留 manifest,AIGC Studio 轮询 /status 兜底落库(计划 §7)。
+            job_state[job_id] = {**job_state.get(job_id, {}), "status": "delivering"}
+            from aigc_delivery import deliver_outputs
+            dres = deliver_outputs(
+                job_id=job_id, output_refs=result.get("output_refs") or [], delivery=delivery,
+                provider_job_id=str(job_state.get(f"{job_id}:call") or ""))
+            # manifest 只有 r2_key/etag/size 等元数据(无 base64、无 token),job_state 不膨胀。
+            job_state[job_id] = {**job_state.get(job_id, {}), "status": "completed",
+                                 "delivery": {"mode": "aigc-r2", **dres},
+                                 "completed_at": time.time()}
+            return {"delivered": dres["status"], "assets": len(dres["assets"])}
     except Exception as e:
         import traceback
         tb = traceback.format_exc()
@@ -241,8 +262,9 @@ class ComfyWorker:
         _worker_shutdown(self)
 
     @modal.method()
-    def run(self, workflow: dict, job_id: str, input_images: list | None = None) -> dict:
-        return _worker_run(workflow, job_id, input_images)
+    def run(self, workflow: dict, job_id: str, input_images: list | None = None,
+            delivery: dict | None = None) -> dict:
+        return _worker_run(workflow, job_id, input_images, delivery)
 
 
 # 省钱档 worker:估算显存放得下便宜卡(默认 L40S)且非视频的 GPU 工作流路由到这。
@@ -263,8 +285,9 @@ class ComfyWorkerCheap:
         _worker_shutdown(self)
 
     @modal.method()
-    def run(self, workflow: dict, job_id: str, input_images: list | None = None) -> dict:
-        return _worker_run(workflow, job_id, input_images)
+    def run(self, workflow: dict, job_id: str, input_images: list | None = None,
+            delivery: dict | None = None) -> dict:
+        return _worker_run(workflow, job_id, input_images, delivery)
 
 
 # 顶配档 worker:估算显存超过主卡的工作流(如 >80G)升到这(默认 B200 183G),防 OOM。
@@ -285,8 +308,9 @@ class ComfyWorkerTop:
         _worker_shutdown(self)
 
     @modal.method()
-    def run(self, workflow: dict, job_id: str, input_images: list | None = None) -> dict:
-        return _worker_run(workflow, job_id, input_images)
+    def run(self, workflow: dict, job_id: str, input_images: list | None = None,
+            delivery: dict | None = None) -> dict:
+        return _worker_run(workflow, job_id, input_images, delivery)
 
 
 # CPU-only worker:无 GPU 需求的工作流(纯 API / 无本地模型节点)走这,GPU 账单≈0。
@@ -310,8 +334,9 @@ class ComfyWorkerCPU:
         _worker_shutdown(self)
 
     @modal.method()
-    def run(self, workflow: dict, job_id: str, input_images: list | None = None) -> dict:
-        return _worker_run(workflow, job_id, input_images)
+    def run(self, workflow: dict, job_id: str, input_images: list | None = None,
+            delivery: dict | None = None) -> dict:
+        return _worker_run(workflow, job_id, input_images, delivery)
 
 
 # tier 入参保留兼容(前端仍可能传 80g/40g),但 GPU 由部署时的 default_gpu 决定,不再按 tier 分档。
@@ -343,11 +368,18 @@ def _check(key: str):
 @app.function(image=cuda_image, secrets=[bridge_secret], timeout=60)
 @modal.fastapi_endpoint(method="POST", label=f"{APP_NAME}-run")
 def run_endpoint(payload: dict):
-    """提交 workflow。payload: {workflow, tier?, images?, auth_key}"""
+    """提交 workflow。payload: {workflow, tier?, images?, auth_key, delivery?}
+    delivery(可选):{"mode":"desktop"}(缺省,结果回本地)或
+    {"mode":"aigc-r2","job_id":"…","token":"…"}(结果直传 R2 + 回调 AIGC Studio)。"""
     deny = _check(payload.get("auth_key", ""))
     if deny:
         return deny
-    job_id = payload.get("job_id") or str(uuid.uuid4())
+    delivery, derr = normalize_delivery(payload)
+    if derr:
+        return {"error": derr}
+    # aigc-r2 用 AIGC Studio 的任务 UUID 作 job_id,双方同一 id 查 /status;desktop 沿用旧逻辑。
+    job_id = (delivery.get("job_id") if delivery.get("mode") == "aigc-r2" else None) \
+        or payload.get("job_id") or str(uuid.uuid4())
     workflow = payload.get("workflow")
     if not workflow:
         return {"error": "Missing 'workflow' in payload"}
@@ -378,8 +410,10 @@ def run_endpoint(payload: dict):
         gpu_display = _TIER_GPU_DISPLAY[tier]
 
     _sweep_job_state()  # 顺手清理过期/超量的旧 job(防 Dict 无限膨胀)
-    job_state[job_id] = {"status": "queued", "queued_at": time.time(), "gpu": gpu_display, "tier": tier}
-    call = worker().run.spawn(workflow, job_id, input_images)
+    # job_state 只存 delivery 的可外泄形态(mode/job_id),token 绝不落 Dict/日志。
+    job_state[job_id] = {"status": "queued", "queued_at": time.time(), "gpu": gpu_display,
+                         "tier": tier, "delivery": public_delivery(delivery)}
+    call = worker().run.spawn(workflow, job_id, input_images, delivery)
     # ⚠ call_id 存到独立 key,run_endpoint 不再回写 job_state[job_id]。
     # 原因:job_state[job_id] 同时被 worker 容器写(running/failed/completed)。Modal Dict 跨容器
     # 最终一致、无序,run_endpoint spawn 后 merge 回写可能读到 stale 的 queued、把 worker 刚写的

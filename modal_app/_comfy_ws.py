@@ -1,6 +1,7 @@
 """
-ComfyUI 通信(WebSocket 监听 + 图回传)— 简化版
-不上传 R2,直接返回 base64(因为 comfyui_modal_bridge 走 incognito 模式)
+ComfyUI 通信(WebSocket 监听 + 产物回传)
+desktop 交付:小文件 base64、大文件写 Volume 直连取回;aigc-r2 交付只「发现」产物引用,
+由 aigc_delivery 流式直传 R2(见 discover_outputs / materialize_desktop_outputs)。
 """
 import base64
 import json
@@ -19,15 +20,30 @@ COMFY_HOST = "127.0.0.1:8188"
 WS_RECONNECT_ATTEMPTS = 5
 WS_RECONNECT_DELAY_S = 3
 
-# 产物文件扩展名(图 / 视频 / 3D):用于从异构 history 输出里识别"这是个要回传的产物文件"。
+# 产物文件扩展名(图 / 视频 / 3D):用于从异构 history 输出里识别"这是个要回传的产物文件",
+# 并给每个产物打 asset_type(image/video/model3d,aigc-r2 交付的 intake 契约要)。
 # dict 形态({filename,subfolder,type},如 images/gifs/videos)保持原行为、不按扩展名过滤;
 # 只有裸文件名字符串(如 Preview3D 的 result=[文件名, camera_info, bg])才按扩展名筛,
 # 避免把 camera_info 之类非文件串也抓进来。
-_OUTPUT_EXTS = {
-    ".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp",                  # 图
-    ".mp4", ".webm", ".mov", ".mkv", ".avi", ".flv", ".m4v", ".apng",   # 视频 / 动图
-    ".glb", ".gltf", ".obj", ".fbx", ".stl", ".ply", ".splat", ".spz", ".ksplat",  # 3D
-}
+_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}
+_VIDEO_EXTS = {".mp4", ".webm", ".mov", ".mkv", ".avi", ".flv", ".m4v", ".apng"}
+_MODEL3D_EXTS = {".glb", ".gltf", ".obj", ".fbx", ".stl", ".ply", ".splat", ".spz", ".ksplat"}
+_OUTPUT_EXTS = _IMAGE_EXTS | _VIDEO_EXTS | _MODEL3D_EXTS
+
+
+def classify_asset_type(filename: str, out_key: str = "") -> str:
+    """按扩展名归类产物:image / video / model3d。
+    扩展名不认识时用输出键兜底(gifs/videos 这类键都是视频容器),再兜底 image。"""
+    ext = os.path.splitext(filename or "")[1].lower()
+    if ext in _VIDEO_EXTS:
+        return "video"
+    if ext in _MODEL3D_EXTS:
+        return "model3d"
+    if ext in _IMAGE_EXTS:
+        return "image"
+    if out_key in ("gifs", "videos"):
+        return "video"
+    return "image"
 
 # 大于此字节数的产物走 Volume 直连取回(本地 SDK 读),小的仍 base64。0 = 关(全 base64)。
 # 阈值由部署烤进镜像 env(MODAL_BRIDGE_VOLUME_THRESHOLD_MB,默认 8MB)。
@@ -227,12 +243,84 @@ def get_image_data(filename: str, subfolder: str, image_type: str) -> bytes | No
         return None
 
 
-def run_workflow(workflow: dict, job_id: str, input_images: list[dict] | None = None) -> dict:
+def discover_outputs(outputs: dict) -> list[dict]:
+    """从 history 的 outputs 里「发现」所有非 temp 产物 —— 只返回引用,不读文件内容。
+    纯函数(可单测)。每条:{filename, subfolder, type, node_id, key, asset_type}。
+    扫每个输出节点的每个输出键:
+      - dict 形态({filename,...},images/gifs/videos 等):按原样收
+      - 裸文件名字符串(Preview3D 的 result=[文件名,camera_info,bg]):按扩展名筛收
+    每条带来源 node_id(前端按节点回填,多 SaveImage 不串图)+ 输出键。去重。"""
+    refs: list[dict] = []
+    seen = set()
+    for node_id, node_output in (outputs or {}).items():
+        if not isinstance(node_output, dict):
+            continue
+        for out_key, val in node_output.items():
+            if not isinstance(val, list):
+                continue
+            for item in val:
+                if isinstance(item, dict):
+                    filename = item.get("filename")
+                    subfolder = item.get("subfolder", "")
+                    img_type = item.get("type", "output")
+                    if not filename:
+                        continue
+                elif isinstance(item, str):
+                    if os.path.splitext(item)[1].lower() not in _OUTPUT_EXTS:
+                        continue
+                    filename, subfolder, img_type = item, "", "output"
+                else:
+                    continue
+                if img_type == "temp":
+                    continue
+                dkey = (str(node_id), filename, subfolder)
+                if dkey in seen:
+                    continue
+                seen.add(dkey)
+                refs.append({
+                    "filename": filename, "subfolder": subfolder, "type": img_type,
+                    "node_id": str(node_id), "key": out_key,
+                    "asset_type": classify_asset_type(filename, out_key),
+                })
+    return refs
+
+
+def materialize_desktop_outputs(refs: list[dict], job_id: str) -> tuple[list[dict], list[str]]:
+    """desktop 模式的「读取」:逐个产物取内容 → 小的 base64、大的写 Volume(本地 SDK 直连取回)。
+    返回 (images 记录, errors)。"""
+    images: list[dict] = []
+    errors: list[str] = []
+    for ref in refs:
+        image_bytes = get_image_data(ref["filename"], ref["subfolder"], ref["type"])
+        if not image_bytes:
+            errors.append(f"failed to fetch {ref['filename']}")
+            continue
+        rec = {"filename": ref["filename"], "node_id": ref["node_id"], "key": ref["key"]}
+        if _VOL_THRESHOLD and len(image_bytes) > _VOL_THRESHOLD:
+            # 大文件:写进挂载的 Volume(_outputs/<job>/<node>__<fn>)→ 本地 SDK 直连取回,不走 base64。
+            # commit 由 modal_app._worker_run 在跑完后统一做(这里只写挂载点文件)。
+            vp = f"_outputs/{job_id}/{ref['node_id']}__{ref['filename']}"
+            dst = "/comfy-volume/" + vp
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            with open(dst, "wb") as f:
+                f.write(image_bytes)
+            rec["volume_path"] = vp
+        else:
+            rec["data_base64"] = base64.b64encode(image_bytes).decode("utf-8")
+        images.append(rec)
+    return images, errors
+
+
+def run_workflow(workflow: dict, job_id: str, input_images: list[dict] | None = None,
+                 materialize: bool = True) -> dict:
     """
     跑一个 workflow,返回所有产出图 base64。
-    Returns: {images: [{filename, data_base64}], filename, data_base64, errors}
+    Returns: {images: [{filename, data_base64}], filename, data_base64, errors,
+              output_refs: [发现步骤的产物引用(含 asset_type),aigc-r2 交付用]}
       - images: 所有非 temp 输出图(支持多 SaveImage / batch 出多图)
       - filename/data_base64: 第一张(向后兼容老回流路径)
+      - materialize=False(aigc-r2):只「发现」不「读取」,images 留空 —— 产物不进
+        base64/Volume/job_state,由 caller 拿 output_refs 流式直传 R2(大文件不整体进内存)。
     失败时 raise — 由 caller 转 status="failed"
     """
     # 注:boot() 已 wait_comfy_ready 过;这里不再重复等(ComfyUI 若中途崩,下面 ws 连接会快速报错)
@@ -291,56 +379,15 @@ def run_workflow(workflow: dict, job_id: str, input_images: list[dict] | None = 
         if prompt_id not in history:
             raise ValueError(f"Prompt {prompt_id} not in history")
 
-        outputs = history[prompt_id].get("outputs", {})
-        # 收集所有非 temp 产物(图 / 视频 / 3D)。扫每个输出节点的每个输出键:
-        #   - dict 形态({filename,...},images/gifs/videos 等):按原样收
-        #   - 裸文件名字符串(Preview3D 的 result=[文件名,camera_info,bg]):按扩展名筛收
-        # 每条带来源 node_id(前端按节点回填,多 SaveImage 不串图)+ 输出键。去重。
-        images = []
-        seen = set()
-        for node_id, node_output in outputs.items():
-            if not isinstance(node_output, dict):
-                continue
-            for out_key, val in node_output.items():
-                if not isinstance(val, list):
-                    continue
-                for item in val:
-                    if isinstance(item, dict):
-                        filename = item.get("filename")
-                        subfolder = item.get("subfolder", "")
-                        img_type = item.get("type", "output")
-                        if not filename:
-                            continue
-                    elif isinstance(item, str):
-                        if os.path.splitext(item)[1].lower() not in _OUTPUT_EXTS:
-                            continue
-                        filename, subfolder, img_type = item, "", "output"
-                    else:
-                        continue
-                    if img_type == "temp":
-                        continue
-                    dkey = (str(node_id), filename, subfolder)
-                    if dkey in seen:
-                        continue
-                    seen.add(dkey)
-                    image_bytes = get_image_data(filename, subfolder, img_type)
-                    if not image_bytes:
-                        errors.append(f"failed to fetch {filename}")
-                        continue
-                    rec = {"filename": filename, "node_id": str(node_id), "key": out_key}
-                    if _VOL_THRESHOLD and len(image_bytes) > _VOL_THRESHOLD:
-                        # 大文件:写进挂载的 Volume(_outputs/<job>/<node>__<fn>)→ 本地 SDK 直连取回,不走 base64。
-                        # commit 由 modal_app._worker_run 在跑完后统一做(这里只写挂载点文件)。
-                        vp = f"_outputs/{job_id}/{node_id}__{filename}"
-                        dst = "/comfy-volume/" + vp
-                        os.makedirs(os.path.dirname(dst), exist_ok=True)
-                        with open(dst, "wb") as f:
-                            f.write(image_bytes)
-                        rec["volume_path"] = vp
-                    else:
-                        rec["data_base64"] = base64.b64encode(image_bytes).decode("utf-8")
-                    images.append(rec)
-
+        # 拆两步:先「发现」产物引用(不读内容),再按交付模式「读取」。
+        # desktop = materialize(base64/Volume);aigc-r2 由 caller 拿 output_refs 走流式直传 R2。
+        refs = discover_outputs(history[prompt_id].get("outputs", {}))
+        if not refs:
+            raise ValueError(f"No usable output (image/video/3d) in result. errors={errors}")
+        if not materialize:
+            return {"image_url": None, "images": [], "errors": errors, "output_refs": refs}
+        images, mat_errors = materialize_desktop_outputs(refs, job_id)
+        errors.extend(mat_errors)
         if not images:
             raise ValueError(f"No usable output (image/video/3d) in result. errors={errors}")
         return {
@@ -349,6 +396,7 @@ def run_workflow(workflow: dict, job_id: str, input_images: list[dict] | None = 
             "filename": images[0]["filename"],          # 向后兼容
             "data_base64": images[0].get("data_base64"),  # 向后兼容(Volume 项无 base64 → None)
             "errors": errors,
+            "output_refs": refs,
         }
     finally:
         if ws and ws.connected:

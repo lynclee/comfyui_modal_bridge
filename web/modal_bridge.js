@@ -72,6 +72,13 @@ const I18N = {
   "dlg.comfy.ph_saved":{ zh: "已保存(留空=沿用)", en: "saved (blank = keep)" },
   "dlg.comfy.note":   { zh: "⚠ 存进云端 Secret,worker 用它跑 API 节点 —— 账单走你的 comfy.org 额度。",
                         en: "⚠ Stored in the cloud Secret; the worker uses it to run API nodes — billed to your comfy.org credits." },
+  "dlg.aigc.hint":    { zh: "(可选,网站 aigc-r2 交付才需要;本地用完全不用填)",
+                        en: "(optional, only for website aigc-r2 delivery; leave blank for local use)" },
+  "dlg.aigc.url_ph":  { zh: "https://你的站点.vercel.app(留空 = 不启用)", en: "https://your-site.vercel.app (blank = disabled)" },
+  "dlg.aigc.bypass_hint": { zh: "(可选,域名开了 Vercel Protection 才需要)", en: "(optional, only if Vercel Protection is on)" },
+  "dlg.aigc.bypass_ph": { zh: "Vercel Protection Bypass 密钥", en: "Vercel protection bypass secret" },
+  "dlg.aigc.note":    { zh: "⚠ 存进云端 Secret,worker 交付结果时回调这个网站换预签名 R2 上传地址 —— R2 长期密钥永不进 Modal。",
+                        en: "⚠ Stored in the cloud Secret; the worker calls this site for presigned R2 upload URLs — long-term R2 keys never enter Modal." },
   "api.warn.title":   { zh: "⚠ 工作流含 API 节点", en: "⚠ Workflow uses API nodes" },
   "api.warn.body":    { zh: "这个工作流用了 ComfyUI API 节点(Kling/Luma/OpenAI 等),在云端跑需要 comfy.org API key,但你还没配。\n\n现在跑这些 API 节点会 401 失败。\n\n建议先去 Setup 填 comfy.org API key。",
                         en: "This workflow uses ComfyUI API nodes (Kling/Luma/OpenAI, etc.). Running them in the cloud needs a comfy.org API key, which isn't configured.\n\nThose API nodes will fail (401) if you run now.\n\nAdd your comfy.org API key in Setup first." },
@@ -197,7 +204,6 @@ const I18N = {
   "set.poll":         { zh: "查询状态频率", en: "Status polling interval" },
   "set.timeout":      { zh: "前端等出图的最长时间(秒),默认 900=15分钟,和 worker 单任务上限一致——worker 最多跑多久前端就等多久。出图后立刻返回,不会真等满;设大只是给冷启动+大模型留足空间。",
                         en: "Max seconds the frontend waits for a result. Default 900=15min, matching the worker job limit. Returns instantly when done; large values just allow cold start + big models." },
-  "set.incognito":    { zh: "关闭后图会上传到 R2(需要 modal_app R2 凭据)", en: "If off, images upload to R2 (needs modal_app R2 creds)" },
   "set.autosync_models":{ zh: "提交前检查 Modal Volume,工作流要、Volume 没、但本地有的模型自动上传(块级去重,通用大模型秒过)",
                           en: "Before submit, auto-upload models the workflow needs that are missing on the Volume but present locally (block dedup, common big models instant)" },
   "set.autosync_nodes": { zh: "提交前把工作流用到的 custom_node 与本地双向同步到 Modal:缺的加、commit 变的更新、本地已卸载的移除,再重部署",
@@ -1299,13 +1305,6 @@ const SETTINGS = [
     tooltip: t("set.timeout"),
   },
   {
-    id: "ModalBridge.incognito",
-    name: "Modal Bridge: Incognito (return base64, skip R2)",
-    type: "boolean",
-    defaultValue: true,
-    tooltip: t("set.incognito"),
-  },
-  {
     id: "ModalBridge.autoSyncModels",
     name: "Modal Bridge: Auto-sync models (local → Volume)",
     type: "boolean",
@@ -1479,6 +1478,11 @@ async function openDeployDialog() {
     <label>comfy.org API Key <span style="color:#9aa;">${t("dlg.comfy.hint")}</span></label>
     <input id="mb-dep-comfy" type="password" style="${inputCss}" value="" placeholder="${cfg.has_comfy_api_key ? t("dlg.comfy.ph_saved") : t("dlg.comfy.ph")}">
     <div style="margin:0 0 10px;color:#9aa;font-size:12px;">${t("dlg.comfy.note")}</div>
+    <label>AIGC Studio URL <span style="color:#9aa;">${t("dlg.aigc.hint")}</span></label>
+    <input id="mb-dep-aigc-url" type="text" style="${inputCss}" value="${cfg.aigc_studio_base_url || ""}" placeholder="${t("dlg.aigc.url_ph")}">
+    <label>AIGC Bypass Secret <span style="color:#9aa;">${t("dlg.aigc.bypass_hint")}</span></label>
+    <input id="mb-dep-aigc-bypass" type="password" style="${inputCss}" value="" placeholder="${cfg.has_aigc_bypass_secret ? t("dlg.comfy.ph_saved") : t("dlg.aigc.bypass_ph")}">
+    <div style="margin:0 0 10px;color:#9aa;font-size:12px;">${t("dlg.aigc.note")}</div>
     <div style="margin:10px 0;">
       <button id="mb-dep-go" style="padding:8px 18px;background:#2563eb;color:#fff;border:none;border-radius:6px;cursor:pointer;font-weight:600;">${t("dlg.btn.deploy")}</button>
       <button id="mb-dep-test" style="padding:8px 14px;margin-left:8px;background:#374151;color:#ddd;border:none;border-radius:6px;cursor:pointer;">${t("dlg.btn.test")}</button>
@@ -1636,6 +1640,9 @@ async function openDeployDialog() {
       default_gpu: gpuMode === "b200" ? "B200" : "H100",
       auto_downgrade: gpuMode === "auto",
       comfy_api_key: panel.querySelector("#mb-dep-comfy").value.trim(),
+      // AIGC Studio(可选,网站 aigc-r2 交付):URL 明文;bypass 密钥留空 = 沿用已存的
+      aigc_studio_base_url: panel.querySelector("#mb-dep-aigc-url").value.trim(),
+      aigc_bypass_secret: panel.querySelector("#mb-dep-aigc-bypass").value.trim(),
     };
     // token_secret 留空 = 沿用已存的(/config 不再回显它);只有填了才校验格式
     const secretOk = payload.token_secret === "" ? cfg.has_token_secret : payload.token_secret.startsWith("as-");

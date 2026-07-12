@@ -37,7 +37,9 @@ async def submit_job(
         "tier": tier,
         "needs_gpu": bool(needs_gpu),
         "gpu_class": gpu_class,
-        "incognito": bool(cfg.get("incognito", True)),
+        # 本地提交固定 desktop 交付(结果回本地);缺省也是 desktop,显式写上便于排查。
+        # 旧 incognito 字段已删:服务端从未消费,语义由 delivery.mode 取代。
+        "delivery": {"mode": "desktop"},
         "auth_key": _key(cfg),
     }
     if input_images:

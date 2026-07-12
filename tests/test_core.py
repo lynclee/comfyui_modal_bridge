@@ -420,6 +420,18 @@ def test_secret_cmd_includes_comfy_api_key():
     assert not any("COMFY_API_KEY" in a for a in cmd2)
 
 
+def test_secret_cmd_includes_aigc_studio():
+    """aigc-r2 交付配置进 secret;没配则不出现;R2 长期密钥任何情况下都不该出现。"""
+    cmd = node_sync.secret_create_cmd({"modal_app_name": "comfyui-bridge"}, bridge_key="bk-x",
+                                      aigc_base_url="https://studio.example",
+                                      aigc_bypass_secret="byp-1")
+    assert any("AIGC_STUDIO_BASE_URL=https://studio.example" in a for a in cmd)
+    assert any("AIGC_STUDIO_BYPASS_SECRET=byp-1" in a for a in cmd)
+    assert not any("R2_ACCESS_KEY" in a or "R2_SECRET" in a for a in cmd)
+    cmd2 = node_sync.secret_create_cmd({"modal_app_name": "comfyui-bridge"}, bridge_key="bk-x")
+    assert not any("AIGC_STUDIO" in a for a in cmd2)
+
+
 # ============================================================================
 # categories — 工作流类别画像(显存 / 时长按类别)
 # ============================================================================
@@ -582,6 +594,255 @@ def test_local_model_folder_types_includes_standard():
     types = node_sync.local_model_folder_types()
     assert "checkpoints" in types and "loras" in types
     assert "custom_nodes" not in types  # 黑名单
+
+
+# ============================================================================
+# _comfy_ws — 产物「发现」(discover_outputs / classify_asset_type,纯函数)
+# ============================================================================
+def _comfy_ws():
+    """CI 无 requests/websocket 依赖 → 注入空模块桩后 import(只测纯函数,不碰网络)。"""
+    sys.path.insert(0, str(ROOT / "modal_app"))
+    for name in ("requests", "websocket"):
+        if name not in sys.modules:
+            sys.modules[name] = types.ModuleType(name)
+    import _comfy_ws
+    return _comfy_ws
+
+
+def test_classify_asset_type():
+    cw = _comfy_ws()
+    assert cw.classify_asset_type("a.png") == "image"
+    assert cw.classify_asset_type("b.MP4") == "video"
+    assert cw.classify_asset_type("c.glb") == "model3d"
+    assert cw.classify_asset_type("noext", "gifs") == "video"   # 扩展名不认识 → 输出键兜底
+    assert cw.classify_asset_type("noext", "images") == "image"  # 再兜底 image
+
+
+def test_discover_outputs_dict_and_bare_string():
+    """dict 形态照收;裸文件名按扩展名筛(camera_info 等非文件串不收);temp 跳过;去重。"""
+    cw = _comfy_ws()
+    outputs = {
+        "9": {"images": [
+            {"filename": "img.png", "subfolder": "", "type": "output"},
+            {"filename": "img.png", "subfolder": "", "type": "output"},   # 重复 → 去重
+            {"filename": "tmp.png", "subfolder": "", "type": "temp"},     # temp → 跳过
+        ]},
+        "42": {"gifs": [{"filename": "clip.mp4", "subfolder": "v", "type": "output"}]},
+        "7": {"result": ["mesh.glb", "camera_info", "bg"]},               # 裸串:只收 .glb
+    }
+    refs = cw.discover_outputs(outputs)
+    by_file = {r["filename"]: r for r in refs}
+    assert set(by_file) == {"img.png", "clip.mp4", "mesh.glb"}
+    assert by_file["img.png"]["asset_type"] == "image"
+    assert by_file["clip.mp4"]["asset_type"] == "video"
+    assert by_file["clip.mp4"]["subfolder"] == "v" and by_file["clip.mp4"]["node_id"] == "42"
+    assert by_file["mesh.glb"]["asset_type"] == "model3d"
+    assert cw.discover_outputs({}) == []
+
+
+# ============================================================================
+# aigc_delivery — delivery 契约(desktop / aigc-r2)
+# ============================================================================
+def _aigc_delivery():
+    sys.path.insert(0, str(ROOT / "modal_app"))
+    import aigc_delivery
+    return aigc_delivery
+
+
+def test_delivery_default_desktop():
+    """没传 delivery(老客户端)→ 默认 desktop,不报错。"""
+    ad = _aigc_delivery()
+    d, err = ad.normalize_delivery({"workflow": {}})
+    assert err is None and d == {"mode": "desktop"}
+
+
+def test_delivery_desktop_explicit():
+    ad = _aigc_delivery()
+    d, err = ad.normalize_delivery({"delivery": {"mode": "desktop"}})
+    assert err is None and d["mode"] == "desktop"
+
+
+def test_delivery_unsupported_mode_rejected():
+    ad = _aigc_delivery()
+    _, err = ad.normalize_delivery({"delivery": {"mode": "ftp"}})
+    assert err == "unsupported delivery mode"
+    _, err2 = ad.normalize_delivery({"delivery": "aigc-r2"})  # 非 dict 也拒
+    assert err2 is not None
+
+
+def test_delivery_aigc_r2_requires_job_id_and_token():
+    ad = _aigc_delivery()
+    _, e1 = ad.normalize_delivery({"delivery": {"mode": "aigc-r2", "token": "t"}})
+    assert e1 == "aigc-r2 delivery requires 'job_id'"
+    _, e2 = ad.normalize_delivery({"delivery": {"mode": "aigc-r2", "job_id": "j"}})
+    assert e2 == "aigc-r2 delivery requires 'token'"
+    d, e3 = ad.normalize_delivery({"delivery": {"mode": "aigc-r2", "job_id": "j", "token": "t"}})
+    assert e3 is None and d["job_id"] == "j"
+
+
+def test_delivery_public_strips_token():
+    """public_delivery 是唯一进 job_state/日志的形态 —— 必须不含 token。"""
+    ad = _aigc_delivery()
+    pub = ad.public_delivery({"mode": "aigc-r2", "job_id": "j", "token": "SECRET"})
+    assert pub == {"mode": "aigc-r2", "job_id": "j"}
+    assert "token" not in pub
+    assert ad.public_delivery(None) == {"mode": "desktop"}
+
+
+# ============================================================================
+# aigc_delivery — R2 交付引擎(注入假 HTTP,不碰网络;覆盖计划 §6/§7 的重试与恢复矩阵)
+# ============================================================================
+def _delivery_env():
+    """准备可测的 aigc_delivery:配好 base_url、退避 sleep 换成 no-op。"""
+    import os
+    ad = _aigc_delivery()
+    os.environ["AIGC_STUDIO_BASE_URL"] = "https://studio.example"
+    ad._sleep = lambda s: None
+    return ad
+
+
+def _fake_streamer(ref):
+    """假流式落盘:真写个临时小文件(deliver_one 的 finally 会删它)。"""
+    import tempfile
+    fd, p = tempfile.mkstemp(prefix="aigc_test_")
+    import os as _os
+    with _os.fdopen(fd, "wb") as f:
+        f.write(b"x" * 10)
+    return p, 10, "deadbeef"
+
+
+def _ok_intake(body):
+    return 200, {"r2_key": f"aigc/u/j/{body['asset_type']}-{body['position']}.bin",
+                 "put_url": "https://r2/presigned", "asset_type": body["asset_type"],
+                 "content_type": body["content_type"],
+                 "required_headers": {"Content-Type": body["content_type"]}, "expires_in": 300}
+
+
+def test_delivery_happy_path_positions_per_type():
+    """多产物全成功:position 按 asset_type 各自从 0 计(幂等键),complete 只调一次。"""
+    ad = _delivery_env()
+    calls = {"intake": 0, "put": 0, "complete": 0}
+
+    def poster(url, body, headers, timeout):
+        assert body["token"] == "TOK"
+        if url.endswith("asset-intake"):
+            calls["intake"] += 1
+            return _ok_intake(body)
+        calls["complete"] += 1
+        assert len(body["assets"]) == 3 and body["provider_job_id"] == "fc-1"
+        return 200, {"ok": True}
+
+    def putter(put_url, path, headers, timeout):
+        calls["put"] += 1
+        return 200, {"ETag": '"abc"'}
+
+    refs = [{"filename": "a.png", "asset_type": "image"},
+            {"filename": "b.png", "asset_type": "image"},
+            {"filename": "v.mp4", "asset_type": "video"}]
+    res = ad.deliver_outputs("j", refs, {"mode": "aigc-r2", "job_id": "j", "token": "TOK"},
+                             provider_job_id="fc-1",
+                             poster=poster, putter=putter, streamer=_fake_streamer)
+    assert res["status"] == "completed"
+    assert [a["r2_key"] for a in res["assets"]] == [
+        "aigc/u/j/image-0.bin", "aigc/u/j/image-1.bin", "aigc/u/j/video-0.bin"]
+    assert calls == {"intake": 3, "put": 3, "complete": 1}
+    assert all(a["checksum_sha256"] == "deadbeef" and a["size_bytes"] == 10 for a in res["assets"])
+
+
+def test_delivery_put_expiry_reintakes():
+    """PUT 撞预签名过期(403)→ 重新 intake 换新地址再传,最终成功。"""
+    ad = _delivery_env()
+    calls = {"intake": 0, "put": 0}
+
+    def poster(url, body, headers, timeout):
+        if url.endswith("asset-intake"):
+            calls["intake"] += 1
+            return _ok_intake(body)
+        return 200, {"ok": True}
+
+    def putter(put_url, path, headers, timeout):
+        calls["put"] += 1
+        return (403, {}) if calls["put"] == 1 else (200, {"ETag": '"e"'})
+
+    rec = ad.deliver_one("j", "TOK", 0, {"filename": "a.png", "asset_type": "image"},
+                         poster=poster, putter=putter, streamer=_fake_streamer)
+    assert rec["r2_key"] == "aigc/u/j/image-0.bin"
+    assert calls == {"intake": 2, "put": 2}  # 过期那轮多一次 intake(幂等,恒返同一 r2_key)
+
+
+def test_delivery_token_invalid_no_retry():
+    """intake 401(token 失效/任务不属己)→ 不重试,立即 DeliveryError(retryable=False)。"""
+    ad = _delivery_env()
+    calls = {"intake": 0}
+
+    def poster401(url, body, headers, timeout):
+        calls["intake"] += 1
+        return 401, {"error": "bad token"}
+
+    try:
+        ad.deliver_one("j", "TOK", 0, {"filename": "a.png", "asset_type": "image"},
+                       poster=poster401, putter=lambda *a: (200, {}), streamer=_fake_streamer)
+        raise AssertionError("should have raised")
+    except ad.DeliveryError as e:
+        assert e.retryable is False and e.status == 401
+    assert calls["intake"] == 1  # 4xx 一次都不多试
+
+
+def test_delivery_5xx_retries_then_gives_up():
+    """intake 一直 503 → 重试到 INTAKE_TRIES 用尽,DeliveryError(retryable=True)。"""
+    ad = _delivery_env()
+    calls = {"n": 0}
+
+    def poster503(url, body, headers, timeout):
+        calls["n"] += 1
+        return 503, "unavailable"
+
+    try:
+        ad.post_json_with_retry("https://studio.example/api/internal/asset-intake",
+                                {"token": "TOK"}, {}, ad.INTAKE_TRIES, poster=poster503)
+        raise AssertionError("should have raised")
+    except ad.DeliveryError as e:
+        assert e.retryable is True
+    assert calls["n"] == ad.INTAKE_TRIES
+
+
+def test_delivery_callback_failed_keeps_manifest():
+    """文件全部传上 R2 但 job-complete 用尽重试 → 不算失败:status=callback_failed,
+    manifest 完整保留(caller 存 job_state,AIGC Studio 轮询 /status 兜底落库)。"""
+    ad = _delivery_env()
+
+    def poster(url, body, headers, timeout):
+        if url.endswith("asset-intake"):
+            return _ok_intake(body)
+        return 503, "unavailable"
+
+    res = ad.deliver_outputs("j", [{"filename": "a.png", "asset_type": "image"}],
+                             {"mode": "aigc-r2", "job_id": "j", "token": "TOK"},
+                             poster=poster, putter=lambda *a: (200, {"ETag": '"e"'}),
+                             streamer=_fake_streamer)
+    assert res["status"] == "callback_failed"
+    assert len(res["assets"]) == 1 and res["assets"][0]["r2_key"] == "aigc/u/j/image-0.bin"
+
+
+def test_delivery_no_outputs_raises():
+    ad = _delivery_env()
+    try:
+        ad.deliver_outputs("j", [], {"mode": "aigc-r2", "job_id": "j", "token": "TOK"})
+        raise AssertionError("should have raised")
+    except ad.DeliveryError:
+        pass
+
+
+def test_delivery_helpers():
+    """safe_filename 防路径注入;content-type 识别含 3D;错误分类 5xx/网络可重试、4xx 不可。"""
+    ad = _delivery_env()
+    assert ad.safe_filename("../../etc/passwd") == "passwd"
+    assert ad.safe_filename("") == "output.bin"
+    assert ad.detect_content_type("m.glb") == "model/gltf-binary"
+    assert ad.detect_content_type("v.mp4") == "video/mp4"
+    assert ad.detect_content_type("weird.zzz") == "application/octet-stream"
+    assert ad.is_retryable_status(503) and ad.is_retryable_status(None)
+    assert not ad.is_retryable_status(401) and not ad.is_retryable_status(400)
 
 
 # ============================================================================

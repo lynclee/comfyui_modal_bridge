@@ -35,7 +35,6 @@ DEFAULT_CONFIG = {
     "auto_downgrade": True,     # 开:按 estimate_vram 自动在 default_gpu / cheap_gpu 间选档(本地路由决策,改它不必重部署)
     "enable_snapshot": True,   # 内存快照(实验):冷启 ~30s→~5s。默认开;不支持的 GPU 档自动退化为普通冷启(不更差)。换值需重新部署
     "user_id": "local-dev",
-    "incognito": True,         # base64 回流,不上 R2
     "poll_interval_sec": 1.5,
     # worker(Modal)单任务超时上限(秒)。覆盖最慢类别(视频)——见 categories.max_worker_timeout_s()。
     # 是上限不是每任务时长:高上限不拖慢快任务(按实际运行计费)。换值需重新部署生效。
@@ -49,6 +48,14 @@ DEFAULT_CONFIG = {
     # 不再从 HF/civitai 下载——模型都在本地 ComfyUI Desktop 下好。
     "auto_sync_models": True,
     "model_sync_timeout_sec": 3600,  # 上传整批模型的超时(大模型走上行带宽)
+
+    # ── AIGC Studio 交付(可选,网站 aigc-r2 模式;本地 desktop 用户不用管)──
+    # 网站(Vercel)地址:部署时写进 Modal Secret(AIGC_STUDIO_BASE_URL),worker 交付
+    # 结果时调它的 asset-intake / job-complete。留空 = 不启用(desktop 交付完全不受影响)。
+    "aigc_studio_base_url": "",
+    # Vercel Protection 旁路密钥(可选,仅生产域名被保护时需要)。存本地 + Modal Secret,
+    # /config 永不回吐(同 bridge_api_key),页面只显示「已保存」。
+    "aigc_bypass_secret": "",
 
     # ── custom_node 双向同步 ──
     # 提交前对比工作流用到的 custom_node 与 Modal 镜像:缺的加、本地 commit 变了的更新、
