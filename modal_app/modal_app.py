@@ -165,6 +165,7 @@ def _worker_run(workflow: dict, job_id: str, input_images: list | None = None,
         if job_state.get(f"{job_id}:call"):
             break
         time.sleep(0.1)
+    mode = (delivery or {}).get("mode", "desktop")
     job_state[job_id] = {**job_state.get(job_id, {}), "status": "running", "started_at": time.time()}
     try:
         # ⚠ 不在这里 free/reload!曾经"每 job 跑前 free+reload"会把 warm 容器显存里的模型卸掉,
@@ -172,7 +173,23 @@ def _worker_run(workflow: dict, job_id: str, input_images: list | None = None,
         # 正确策略:正常直接跑(模型在显存,秒级);只有验证失败(模型不在列表)时,queue_workflow
         # 内部才按需 free→reload→重试(只有删 Volume/缺模型的极端场景才付这个代价)。
         from _comfy_ws import run_workflow
-        result = run_workflow(workflow=workflow, job_id=job_id, input_images=input_images)
+        # aigc-r2:只「发现」产物不读进内存(materialize=False),下面流式直传 R2。
+        result = run_workflow(workflow=workflow, job_id=job_id, input_images=input_images,
+                              materialize=(mode != "aigc-r2"))
+        if mode == "aigc-r2":
+            # 状态机:running → delivering → completed。出图后直传 R2 + 回调 AIGC Studio;
+            # 全部上传且回调成功才 completed。回调失败但文件已在 R2 → delivery.status =
+            # callback_failed + 保留 manifest,AIGC Studio 轮询 /status 兜底落库(计划 §7)。
+            job_state[job_id] = {**job_state.get(job_id, {}), "status": "delivering"}
+            from aigc_delivery import deliver_outputs
+            dres = deliver_outputs(
+                job_id=job_id, output_refs=result.get("output_refs") or [], delivery=delivery,
+                provider_job_id=str(job_state.get(f"{job_id}:call") or ""))
+            # manifest 只有 r2_key/etag/size 等元数据(无 base64、无 token),job_state 不膨胀。
+            job_state[job_id] = {**job_state.get(job_id, {}), "status": "completed",
+                                 "delivery": {"mode": "aigc-r2", **dres},
+                                 "completed_at": time.time()}
+            return {"delivered": dres["status"], "assets": len(dres["assets"])}
     except Exception as e:
         import traceback
         tb = traceback.format_exc()

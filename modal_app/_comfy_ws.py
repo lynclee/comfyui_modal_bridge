@@ -310,13 +310,16 @@ def materialize_desktop_outputs(refs: list[dict], job_id: str) -> tuple[list[dic
     return images, errors
 
 
-def run_workflow(workflow: dict, job_id: str, input_images: list[dict] | None = None) -> dict:
+def run_workflow(workflow: dict, job_id: str, input_images: list[dict] | None = None,
+                 materialize: bool = True) -> dict:
     """
     跑一个 workflow,返回所有产出图 base64。
     Returns: {images: [{filename, data_base64}], filename, data_base64, errors,
               output_refs: [发现步骤的产物引用(含 asset_type),aigc-r2 交付用]}
       - images: 所有非 temp 输出图(支持多 SaveImage / batch 出多图)
       - filename/data_base64: 第一张(向后兼容老回流路径)
+      - materialize=False(aigc-r2):只「发现」不「读取」,images 留空 —— 产物不进
+        base64/Volume/job_state,由 caller 拿 output_refs 流式直传 R2(大文件不整体进内存)。
     失败时 raise — 由 caller 转 status="failed"
     """
     # 注:boot() 已 wait_comfy_ready 过;这里不再重复等(ComfyUI 若中途崩,下面 ws 连接会快速报错)
@@ -380,6 +383,8 @@ def run_workflow(workflow: dict, job_id: str, input_images: list[dict] | None = 
         refs = discover_outputs(history[prompt_id].get("outputs", {}))
         if not refs:
             raise ValueError(f"No usable output (image/video/3d) in result. errors={errors}")
+        if not materialize:
+            return {"image_url": None, "images": [], "errors": errors, "output_refs": refs}
         images, mat_errors = materialize_desktop_outputs(refs, job_id)
         errors.extend(mat_errors)
         if not images:
