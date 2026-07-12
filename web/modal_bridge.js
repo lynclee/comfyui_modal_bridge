@@ -72,6 +72,8 @@ const I18N = {
   "dlg.comfy.ph_saved":{ zh: "已保存(留空=沿用)", en: "saved (blank = keep)" },
   "dlg.comfy.note":   { zh: "⚠ 存进云端 Secret,worker 用它跑 API 节点 —— 账单走你的 comfy.org 额度。",
                         en: "⚠ Stored in the cloud Secret; the worker uses it to run API nodes — billed to your comfy.org credits." },
+  "dlg.aigc.toggle":  { zh: "AIGC Studio 网站交付(可选,大多数人用不到)",
+                        en: "AIGC Studio website delivery (optional, most users don't need this)" },
   "dlg.aigc.hint":    { zh: "(可选,网站 aigc-r2 交付才需要;本地用完全不用填)",
                         en: "(optional, only for website aigc-r2 delivery; leave blank for local use)" },
   "dlg.aigc.url_ph":  { zh: "https://你的站点.vercel.app(留空 = 不启用)", en: "https://your-site.vercel.app (blank = disabled)" },
@@ -1478,11 +1480,16 @@ async function openDeployDialog() {
     <label>comfy.org API Key <span style="color:#9aa;">${t("dlg.comfy.hint")}</span></label>
     <input id="mb-dep-comfy" type="password" style="${inputCss}" value="" placeholder="${cfg.has_comfy_api_key ? t("dlg.comfy.ph_saved") : t("dlg.comfy.ph")}">
     <div style="margin:0 0 10px;color:#9aa;font-size:12px;">${t("dlg.comfy.note")}</div>
-    <label>AIGC Studio URL <span style="color:#9aa;">${t("dlg.aigc.hint")}</span></label>
-    <input id="mb-dep-aigc-url" type="text" style="${inputCss}" value="${cfg.aigc_studio_base_url || ""}" placeholder="${t("dlg.aigc.url_ph")}">
-    <label>AIGC Bypass Secret <span style="color:#9aa;">${t("dlg.aigc.bypass_hint")}</span></label>
-    <input id="mb-dep-aigc-bypass" type="password" style="${inputCss}" value="" placeholder="${cfg.has_aigc_bypass_secret ? t("dlg.comfy.ph_saved") : t("dlg.aigc.bypass_ph")}">
-    <div style="margin:0 0 10px;color:#9aa;font-size:12px;">${t("dlg.aigc.note")}</div>
+    <div style="margin:2px 0 10px;">
+      <a id="mb-dep-aigc-toggle" href="#" style="color:#6cf;font-size:12px;text-decoration:none;"></a>
+    </div>
+    <div id="mb-dep-aigc-body" style="display:none;">
+      <label>AIGC Studio URL <span style="color:#9aa;">${t("dlg.aigc.hint")}</span></label>
+      <input id="mb-dep-aigc-url" type="text" style="${inputCss}" value="${cfg.aigc_studio_base_url || ""}" placeholder="${t("dlg.aigc.url_ph")}">
+      <label>AIGC Bypass Secret <span style="color:#9aa;">${t("dlg.aigc.bypass_hint")}</span></label>
+      <input id="mb-dep-aigc-bypass" type="password" style="${inputCss}" value="" placeholder="${cfg.has_aigc_bypass_secret ? t("dlg.comfy.ph_saved") : t("dlg.aigc.bypass_ph")}">
+      <div style="margin:0 0 10px;color:#9aa;font-size:12px;">${t("dlg.aigc.note")}</div>
+    </div>
     <div style="margin:10px 0;">
       <button id="mb-dep-go" style="padding:8px 18px;background:#2563eb;color:#fff;border:none;border-radius:6px;cursor:pointer;font-weight:600;">${t("dlg.btn.deploy")}</button>
       <button id="mb-dep-test" style="padding:8px 14px;margin-left:8px;background:#374151;color:#ddd;border:none;border-radius:6px;cursor:pointer;">${t("dlg.btn.test")}</button>
@@ -1522,6 +1529,20 @@ async function openDeployDialog() {
   const testBtn = panel.querySelector("#mb-dep-test");
   const statusEl = panel.querySelector("#mb-dep-status");
   const logEl = panel.querySelector("#mb-dep-log");
+
+  // AIGC Studio 交付配置默认折叠(大多数人用不到);已配置过则自动展开。
+  // 输入框折叠时仍在 DOM 里,提交 payload 照常读取。
+  const aigcToggle = panel.querySelector("#mb-dep-aigc-toggle");
+  const aigcBody = panel.querySelector("#mb-dep-aigc-body");
+  const setAigcOpen = (open) => {
+    aigcBody.style.display = open ? "block" : "none";
+    aigcToggle.textContent = (open ? "▾ " : "▸ ") + t("dlg.aigc.toggle");
+  };
+  setAigcOpen(!!(cfg.aigc_studio_base_url || cfg.has_aigc_bypass_secret));
+  aigcToggle.onclick = (e) => {
+    e.preventDefault();
+    setAigcOpen(aigcBody.style.display === "none");
+  };
 
   // 测试连接:真打一次 Modal /health,查出"app 被删 / endpoint 不通 / key 不对"——
   // 这些光看本地 config 有没有 token 是查不出的(config 字段在不代表云端 app 还活着)。
