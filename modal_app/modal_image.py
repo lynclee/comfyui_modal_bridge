@@ -106,5 +106,6 @@ cuda_image = (
         "MODAL_BRIDGE_SNAPSHOT", "MODAL_BRIDGE_VOLUME_THRESHOLD_MB",
     ) if _os.environ.get(k)})
     .add_local_file(str(_EXTRA_MODEL_PATHS_YAML), "/comfyui/extra_model_paths.yaml")
-    .add_local_python_source("modal_image", "_comfy_ws", "_custom_nodes_data", "comfy_log")
+    .add_local_python_source("modal_image", "_comfy_ws", "_custom_nodes_data", "comfy_log",
+                             "aigc_delivery")
 )

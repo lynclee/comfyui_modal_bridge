@@ -585,6 +585,55 @@ def test_local_model_folder_types_includes_standard():
 
 
 # ============================================================================
+# aigc_delivery — delivery 契约(desktop / aigc-r2)
+# ============================================================================
+def _aigc_delivery():
+    sys.path.insert(0, str(ROOT / "modal_app"))
+    import aigc_delivery
+    return aigc_delivery
+
+
+def test_delivery_default_desktop():
+    """没传 delivery(老客户端)→ 默认 desktop,不报错。"""
+    ad = _aigc_delivery()
+    d, err = ad.normalize_delivery({"workflow": {}})
+    assert err is None and d == {"mode": "desktop"}
+
+
+def test_delivery_desktop_explicit():
+    ad = _aigc_delivery()
+    d, err = ad.normalize_delivery({"delivery": {"mode": "desktop"}})
+    assert err is None and d["mode"] == "desktop"
+
+
+def test_delivery_unsupported_mode_rejected():
+    ad = _aigc_delivery()
+    _, err = ad.normalize_delivery({"delivery": {"mode": "ftp"}})
+    assert err == "unsupported delivery mode"
+    _, err2 = ad.normalize_delivery({"delivery": "aigc-r2"})  # 非 dict 也拒
+    assert err2 is not None
+
+
+def test_delivery_aigc_r2_requires_job_id_and_token():
+    ad = _aigc_delivery()
+    _, e1 = ad.normalize_delivery({"delivery": {"mode": "aigc-r2", "token": "t"}})
+    assert e1 == "aigc-r2 delivery requires 'job_id'"
+    _, e2 = ad.normalize_delivery({"delivery": {"mode": "aigc-r2", "job_id": "j"}})
+    assert e2 == "aigc-r2 delivery requires 'token'"
+    d, e3 = ad.normalize_delivery({"delivery": {"mode": "aigc-r2", "job_id": "j", "token": "t"}})
+    assert e3 is None and d["job_id"] == "j"
+
+
+def test_delivery_public_strips_token():
+    """public_delivery 是唯一进 job_state/日志的形态 —— 必须不含 token。"""
+    ad = _aigc_delivery()
+    pub = ad.public_delivery({"mode": "aigc-r2", "job_id": "j", "token": "SECRET"})
+    assert pub == {"mode": "aigc-r2", "job_id": "j"}
+    assert "token" not in pub
+    assert ad.public_delivery(None) == {"mode": "desktop"}
+
+
+# ============================================================================
 # 无 pytest 时的简易运行器
 # ============================================================================
 if __name__ == "__main__":
