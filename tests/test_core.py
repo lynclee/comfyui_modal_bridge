@@ -585,6 +585,50 @@ def test_local_model_folder_types_includes_standard():
 
 
 # ============================================================================
+# _comfy_ws — 产物「发现」(discover_outputs / classify_asset_type,纯函数)
+# ============================================================================
+def _comfy_ws():
+    """CI 无 requests/websocket 依赖 → 注入空模块桩后 import(只测纯函数,不碰网络)。"""
+    sys.path.insert(0, str(ROOT / "modal_app"))
+    for name in ("requests", "websocket"):
+        if name not in sys.modules:
+            sys.modules[name] = types.ModuleType(name)
+    import _comfy_ws
+    return _comfy_ws
+
+
+def test_classify_asset_type():
+    cw = _comfy_ws()
+    assert cw.classify_asset_type("a.png") == "image"
+    assert cw.classify_asset_type("b.MP4") == "video"
+    assert cw.classify_asset_type("c.glb") == "model3d"
+    assert cw.classify_asset_type("noext", "gifs") == "video"   # 扩展名不认识 → 输出键兜底
+    assert cw.classify_asset_type("noext", "images") == "image"  # 再兜底 image
+
+
+def test_discover_outputs_dict_and_bare_string():
+    """dict 形态照收;裸文件名按扩展名筛(camera_info 等非文件串不收);temp 跳过;去重。"""
+    cw = _comfy_ws()
+    outputs = {
+        "9": {"images": [
+            {"filename": "img.png", "subfolder": "", "type": "output"},
+            {"filename": "img.png", "subfolder": "", "type": "output"},   # 重复 → 去重
+            {"filename": "tmp.png", "subfolder": "", "type": "temp"},     # temp → 跳过
+        ]},
+        "42": {"gifs": [{"filename": "clip.mp4", "subfolder": "v", "type": "output"}]},
+        "7": {"result": ["mesh.glb", "camera_info", "bg"]},               # 裸串:只收 .glb
+    }
+    refs = cw.discover_outputs(outputs)
+    by_file = {r["filename"]: r for r in refs}
+    assert set(by_file) == {"img.png", "clip.mp4", "mesh.glb"}
+    assert by_file["img.png"]["asset_type"] == "image"
+    assert by_file["clip.mp4"]["asset_type"] == "video"
+    assert by_file["clip.mp4"]["subfolder"] == "v" and by_file["clip.mp4"]["node_id"] == "42"
+    assert by_file["mesh.glb"]["asset_type"] == "model3d"
+    assert cw.discover_outputs({}) == []
+
+
+# ============================================================================
 # aigc_delivery — delivery 契约(desktop / aigc-r2)
 # ============================================================================
 def _aigc_delivery():
