@@ -806,7 +806,8 @@ def _setup_routes():
         GUI 一键部署/重新部署:pip 装 modal → 建 secret → modal deploy → 写 config(路径必对)。
         全程在 ComfyUI 进程里,零终端。stream 回传日志,最后 __DEPLOY_DONE__ rc=<code>。
         body: {token_id, token_secret, workspace, hf_token?, civitai_token?,
-               app_name?, volume_name?, default_gpu?, scaledown_window?}
+               app_name?, volume_name?, default_gpu?, scaledown_window?,
+               comfy_api_key?, aigc_studio_base_url?, aigc_bypass_secret?}
         """
         body = await request.json()
         # token_secret 现在不回显到前端(/config 已抹掉),留空 = 沿用已存的;token_id 同理

@@ -824,6 +824,22 @@ def test_delivery_callback_failed_keeps_manifest():
     assert len(res["assets"]) == 1 and res["assets"][0]["r2_key"] == "aigc/u/j/image-0.bin"
 
 
+def test_delivery_complete_accepts_empty_2xx_body():
+    """job-complete 回 204/空 body 的 200 也算成功 —— 不能误判成 callback_failed。"""
+    ad = _delivery_env()
+
+    def poster(url, body, headers, timeout):
+        if url.endswith("asset-intake"):
+            return _ok_intake(body)
+        return 204, ""  # 无 JSON body
+
+    res = ad.deliver_outputs("j", [{"filename": "a.png", "asset_type": "image"}],
+                             {"mode": "aigc-r2", "job_id": "j", "token": "TOK"},
+                             poster=poster, putter=lambda *a: (200, {"ETag": '"e"'}),
+                             streamer=_fake_streamer)
+    assert res["status"] == "completed"
+
+
 def test_delivery_no_outputs_raises():
     ad = _delivery_env()
     try:

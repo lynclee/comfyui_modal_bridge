@@ -203,8 +203,10 @@ def post_json_with_retry(url: str, body: dict, headers: dict, max_tries: int,
     last = "no attempt"
     for attempt in range(max_tries):
         status, resp = poster(url, body, headers, timeout)
-        if status is not None and 200 <= status < 300 and isinstance(resp, dict):
-            return resp
+        if status is not None and 200 <= status < 300:
+            # 2xx 一律算成功:job-complete 完全可能回 204/空 body,不能因为体不是
+            # JSON 就误判成拒绝。需要具体字段的调用方(intake)自己校验缺字段。
+            return resp if isinstance(resp, dict) else {}
         last = f"HTTP {status}: {str(resp)[:300]}"
         if not is_retryable_status(status):
             raise DeliveryError(f"{url.rsplit('/', 1)[-1]} rejected — {last}",
