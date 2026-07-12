@@ -1,6 +1,7 @@
 """
-ComfyUI 通信(WebSocket 监听 + 图回传)— 简化版
-不上传 R2,直接返回 base64(因为 comfyui_modal_bridge 走 incognito 模式)
+ComfyUI 通信(WebSocket 监听 + 产物回传)
+desktop 交付:小文件 base64、大文件写 Volume 直连取回;aigc-r2 交付只「发现」产物引用,
+由 aigc_delivery 流式直传 R2(见 discover_outputs / materialize_desktop_outputs)。
 """
 import base64
 import json

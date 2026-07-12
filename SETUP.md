@@ -121,6 +121,21 @@ https://<ws>--comfyui-bridge-health.modal.run  (GET 健康 + 已装 custom_nodes
 
 模型查/传全走本地 modal SDK,所以不需要 list/check/seed 这些 endpoint。
 
+## 网站交付模式 aigc-r2(可选,给 AIGC Studio 用)
+
+同一套已部署的 Modal App 支持两种**结果交付方式**(`/run` 的 `delivery` 参数):
+
+- `{"mode":"desktop"}`(缺省)—— 现状:结果回本地 ComfyUI(base64 / Volume)。本地用户无感知。
+- `{"mode":"aigc-r2","job_id":"…","token":"…"}` —— 网站(Vercel)调用:出图后 worker
+  **流式直传 Cloudflare R2**(找网站换几分钟有效的预签名 PUT 地址),传完回调网站落库。
+  全程不经过本地 ComfyUI,用户关机也不丢结果;回调失败时 manifest 留在 `/status` 里供网站兜底恢复。
+
+启用方法:[⚙️ Modal Setup] 里填 **AIGC Studio URL**(可选再填 Vercel Protection 的
+Bypass Secret)→ 重新部署。留空 = 不启用,desktop 交付完全不受影响。
+
+安全铁律:R2 长期密钥只在 Vercel,**永不进入 Modal**;任务 token 只在内存里用,
+不写 job_state、不进日志。状态机:`queued → running → delivering → completed`。
+
 ## 文件结构
 
 ```
@@ -275,6 +290,23 @@ https://<ws>--comfyui-bridge-health.modal.run  (GET health + installed custom_no
 ```
 
 Model list/upload all go through the local modal SDK, so no list/check/seed endpoints are needed.
+
+## Website delivery mode aigc-r2 (optional, for AIGC Studio)
+
+The same deployed Modal App supports two **result delivery modes** (the `delivery` field of `/run`):
+
+- `{"mode":"desktop"}` (default) — current behavior: results return to local ComfyUI (base64 / Volume).
+- `{"mode":"aigc-r2","job_id":"…","token":"…"}` — called by the website (Vercel): after generation
+  the worker **streams outputs straight to Cloudflare R2** (using short-lived presigned PUT URLs
+  issued by the site), then calls back to register the assets. Local ComfyUI is never involved;
+  if the callback fails, the manifest stays in `/status` for the site to recover from.
+
+Enable: fill **AIGC Studio URL** (and optionally the Vercel Protection bypass secret) in
+[⚙️ Modal Setup] → redeploy. Leave blank to disable; desktop delivery is unaffected.
+
+Security invariants: long-term R2 keys live only on Vercel and **never enter Modal**; the per-job
+token is used in memory only — never written to job_state or logs. State machine:
+`queued → running → delivering → completed`.
 
 ## File layout
 

@@ -380,9 +380,11 @@ def _setup_routes():
         cfg = dict(cfg_mod.load_config())
         cfg["has_token_secret"] = bool(cfg.get("modal_token_secret"))
         cfg["has_comfy_api_key"] = bool(cfg.get("comfy_api_key"))
+        cfg["has_aigc_bypass_secret"] = bool(cfg.get("aigc_bypass_secret"))
         cfg.pop("modal_token_secret", None)
         cfg.pop("bridge_api_key", None)
         cfg.pop("comfy_api_key", None)  # 账单凭据,不回吐浏览器(同 bridge_api_key)
+        cfg.pop("aigc_bypass_secret", None)  # Vercel 旁路密钥,同上
         return web.json_response(cfg)
 
     @routes.get("/modal_bridge/bridge_key")
@@ -404,9 +406,11 @@ def _setup_routes():
         safe = dict(cur)
         safe["has_token_secret"] = bool(safe.get("modal_token_secret"))
         safe["has_comfy_api_key"] = bool(safe.get("comfy_api_key"))
+        safe["has_aigc_bypass_secret"] = bool(safe.get("aigc_bypass_secret"))
         safe.pop("modal_token_secret", None)
         safe.pop("bridge_api_key", None)
         safe.pop("comfy_api_key", None)
+        safe.pop("aigc_bypass_secret", None)
         return web.json_response(safe)
 
     # -------- 异步提交(返回 job_id,不阻塞)--------
@@ -842,6 +846,14 @@ def _setup_routes():
         civitai_token = (body.get("civitai_token") or "").strip()
         # comfy.org API key(API 节点用):留空 = 沿用已存的(/config 不回显)。持久化进 config,重部署不丢。
         comfy_api_key = (body.get("comfy_api_key") or "").strip() or cfg.get("comfy_api_key", "")
+        # AIGC Studio 交付(可选,网站 aigc-r2 模式)。URL 明文回显、输入框预填现值 →
+        # 传了空串 = 用户清掉了(停用);没传该字段(老前端)才沿用已存。bypass 密钥不回显,
+        # 规则同 comfy_api_key(留空 = 沿用)。都写进 Modal Secret,worker 交付时读。
+        if "aigc_studio_base_url" in body:
+            aigc_base_url = (body.get("aigc_studio_base_url") or "").strip().rstrip("/")
+        else:
+            aigc_base_url = cfg.get("aigc_studio_base_url", "")
+        aigc_bypass = (body.get("aigc_bypass_secret") or "").strip() or cfg.get("aigc_bypass_secret", "")
         endpoint_base = f"https://{workspace}--{app_name}"
         # 私有鉴权 key:已有就复用(不让旧 config 失效),否则新生成
         bridge_key = cfg.get("bridge_api_key") or node_sync.gen_bridge_key()
@@ -866,6 +878,8 @@ def _setup_routes():
             "modal_token_secret": token_secret,
             "bridge_api_key": bridge_key,
             "comfy_api_key": comfy_api_key,
+            "aigc_studio_base_url": aigc_base_url,
+            "aigc_bypass_secret": aigc_bypass,
         })
         env = node_sync.deploy_env(cfg)
         cwd = str(node_sync.MODAL_APP_DIR)
@@ -892,7 +906,8 @@ def _setup_routes():
             # 2) 建 / 更新 secret(放 HF / Civitai token)
             await _emit(resp, "\n== 创建 Modal Secret ==\n")
             rc = await _run_streamed(
-                resp, node_sync.secret_create_cmd(cfg, hf_token, civitai_token, bridge_key, comfy_api_key),
+                resp, node_sync.secret_create_cmd(cfg, hf_token, civitai_token, bridge_key,
+                                                  comfy_api_key, aigc_base_url, aigc_bypass),
                 cwd=cwd, env=env,
             )
             if rc != 0:

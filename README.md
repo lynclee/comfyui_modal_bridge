@@ -36,6 +36,7 @@
 - **节点兼容自检(每次部署)**:部署成功后自动在云端**同镜像**里 boot 一次 ComfyUI,逐个报告自定义节点导入成功 / 失败(失败 = 与该 ComfyUI 版本不兼容 / 缺依赖 / commit 坏)。**只警告不阻断**:坏节点不影响其它工作流。
 - **模型本地 → Volume**:模型在本地 ComfyUI 下好,提交时自动把云端缺的传上去;**块级去重(CAS)让通用大模型秒过**,只有自训练/私有模型才真占上行带宽。不从 HF 下载、不依赖手维护的 registry。
 - **私有鉴权**:endpoint 用自建 `BRIDGE_API_KEY` 校验,只有你的 key 能调用,无 key 一律 401。
+- **两种结果交付(可选 aigc-r2)**:默认 desktop(结果回本地);网站(AIGC Studio)调 `/run` 时可带 `delivery:{"mode":"aigc-r2"}`,出图后 worker **流式直传 Cloudflare R2**(短期预签名地址,R2 长期密钥永不进 Modal)再回调网站落库 —— 同一套部署本地 / 网站共用,网站出图全程不需要本地 ComfyUI 在线。详见 SETUP。
 
 ## 工作流程(点 [RunModal] 之后)
 
@@ -113,6 +114,7 @@ You don't have a big-VRAM GPU locally (Mac / thin laptop / a 4090 that can't fit
 - **Node compatibility self-check (every deploy)**: after a successful deploy it boots ComfyUI once in the **same cloud image** and reports each custom node's import OK / FAILED (failed = incompatible with that ComfyUI version / missing deps / bad commit). **Warn-only, never blocks** — a broken node doesn't affect other workflows.
 - **Local → Volume models**: download models locally; missing ones upload on submit; **block-level dedup (CAS) makes common big models instant** — only custom/private models actually use upstream bandwidth. No HF download, no hand-maintained registry.
 - **Private auth**: endpoints verify a self-issued `BRIDGE_API_KEY`; only your key can call them, missing key always returns 401.
+- **Two delivery modes (optional aigc-r2)**: desktop by default (results return locally); a website (AIGC Studio) may call `/run` with `delivery:{"mode":"aigc-r2"}` — the worker then **streams outputs straight to Cloudflare R2** (short-lived presigned URLs; long-term R2 keys never enter Modal) and calls the site back to register assets. One deployment serves both local and website use; website jobs never need your local ComfyUI online. See SETUP.
 
 ## Flow (after clicking [RunModal])
 

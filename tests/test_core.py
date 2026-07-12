@@ -420,6 +420,18 @@ def test_secret_cmd_includes_comfy_api_key():
     assert not any("COMFY_API_KEY" in a for a in cmd2)
 
 
+def test_secret_cmd_includes_aigc_studio():
+    """aigc-r2 交付配置进 secret;没配则不出现;R2 长期密钥任何情况下都不该出现。"""
+    cmd = node_sync.secret_create_cmd({"modal_app_name": "comfyui-bridge"}, bridge_key="bk-x",
+                                      aigc_base_url="https://studio.example",
+                                      aigc_bypass_secret="byp-1")
+    assert any("AIGC_STUDIO_BASE_URL=https://studio.example" in a for a in cmd)
+    assert any("AIGC_STUDIO_BYPASS_SECRET=byp-1" in a for a in cmd)
+    assert not any("R2_ACCESS_KEY" in a or "R2_SECRET" in a for a in cmd)
+    cmd2 = node_sync.secret_create_cmd({"modal_app_name": "comfyui-bridge"}, bridge_key="bk-x")
+    assert not any("AIGC_STUDIO" in a for a in cmd2)
+
+
 # ============================================================================
 # categories — 工作流类别画像(显存 / 时长按类别)
 # ============================================================================
