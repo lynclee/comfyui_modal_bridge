@@ -156,6 +156,7 @@ comfyui_modal_bridge/
     ├── modal_image.py        镜像 DSL(读 _custom_nodes_data,缺失自愈)
     ├── _custom_nodes_data.py 镜像要装的 custom_nodes 清单(本地状态,.gitignore)
     ├── _comfy_ws.py          容器内跑 ComfyUI + 取图/视频/3D(大文件写 Volume)
+    ├── aigc_delivery.py      aigc-r2 网站交付(契约校验 + 流式直传 R2 + 回调)
     ├── snapshot_bench.py     内存快照隔离 bench(按 GPU 档验证用)
     └── extra_model_paths.yaml Volume 模型路径
 ```
@@ -327,6 +328,7 @@ comfyui_modal_bridge/
     ├── modal_image.py        image DSL (reads _custom_nodes_data, self-heals if absent)
     ├── _custom_nodes_data.py custom_nodes baked into the image (local state, .gitignore)
     ├── _comfy_ws.py          run ComfyUI in-container + fetch images/video/3D (large files to Volume)
+    ├── aigc_delivery.py      aigc-r2 website delivery (contract checks + streamed R2 upload + callback)
     ├── snapshot_bench.py     isolated memory-snapshot bench (verify per GPU tier)
     └── extra_model_paths.yaml Volume model paths
 ```
