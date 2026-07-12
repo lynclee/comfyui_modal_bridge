@@ -690,6 +690,162 @@ def test_delivery_public_strips_token():
 
 
 # ============================================================================
+# aigc_delivery — R2 交付引擎(注入假 HTTP,不碰网络;覆盖计划 §6/§7 的重试与恢复矩阵)
+# ============================================================================
+def _delivery_env():
+    """准备可测的 aigc_delivery:配好 base_url、退避 sleep 换成 no-op。"""
+    import os
+    ad = _aigc_delivery()
+    os.environ["AIGC_STUDIO_BASE_URL"] = "https://studio.example"
+    ad._sleep = lambda s: None
+    return ad
+
+
+def _fake_streamer(ref):
+    """假流式落盘:真写个临时小文件(deliver_one 的 finally 会删它)。"""
+    import tempfile
+    fd, p = tempfile.mkstemp(prefix="aigc_test_")
+    import os as _os
+    with _os.fdopen(fd, "wb") as f:
+        f.write(b"x" * 10)
+    return p, 10, "deadbeef"
+
+
+def _ok_intake(body):
+    return 200, {"r2_key": f"aigc/u/j/{body['asset_type']}-{body['position']}.bin",
+                 "put_url": "https://r2/presigned", "asset_type": body["asset_type"],
+                 "content_type": body["content_type"],
+                 "required_headers": {"Content-Type": body["content_type"]}, "expires_in": 300}
+
+
+def test_delivery_happy_path_positions_per_type():
+    """多产物全成功:position 按 asset_type 各自从 0 计(幂等键),complete 只调一次。"""
+    ad = _delivery_env()
+    calls = {"intake": 0, "put": 0, "complete": 0}
+
+    def poster(url, body, headers, timeout):
+        assert body["token"] == "TOK"
+        if url.endswith("asset-intake"):
+            calls["intake"] += 1
+            return _ok_intake(body)
+        calls["complete"] += 1
+        assert len(body["assets"]) == 3 and body["provider_job_id"] == "fc-1"
+        return 200, {"ok": True}
+
+    def putter(put_url, path, headers, timeout):
+        calls["put"] += 1
+        return 200, {"ETag": '"abc"'}
+
+    refs = [{"filename": "a.png", "asset_type": "image"},
+            {"filename": "b.png", "asset_type": "image"},
+            {"filename": "v.mp4", "asset_type": "video"}]
+    res = ad.deliver_outputs("j", refs, {"mode": "aigc-r2", "job_id": "j", "token": "TOK"},
+                             provider_job_id="fc-1",
+                             poster=poster, putter=putter, streamer=_fake_streamer)
+    assert res["status"] == "completed"
+    assert [a["r2_key"] for a in res["assets"]] == [
+        "aigc/u/j/image-0.bin", "aigc/u/j/image-1.bin", "aigc/u/j/video-0.bin"]
+    assert calls == {"intake": 3, "put": 3, "complete": 1}
+    assert all(a["checksum_sha256"] == "deadbeef" and a["size_bytes"] == 10 for a in res["assets"])
+
+
+def test_delivery_put_expiry_reintakes():
+    """PUT 撞预签名过期(403)→ 重新 intake 换新地址再传,最终成功。"""
+    ad = _delivery_env()
+    calls = {"intake": 0, "put": 0}
+
+    def poster(url, body, headers, timeout):
+        if url.endswith("asset-intake"):
+            calls["intake"] += 1
+            return _ok_intake(body)
+        return 200, {"ok": True}
+
+    def putter(put_url, path, headers, timeout):
+        calls["put"] += 1
+        return (403, {}) if calls["put"] == 1 else (200, {"ETag": '"e"'})
+
+    rec = ad.deliver_one("j", "TOK", 0, {"filename": "a.png", "asset_type": "image"},
+                         poster=poster, putter=putter, streamer=_fake_streamer)
+    assert rec["r2_key"] == "aigc/u/j/image-0.bin"
+    assert calls == {"intake": 2, "put": 2}  # 过期那轮多一次 intake(幂等,恒返同一 r2_key)
+
+
+def test_delivery_token_invalid_no_retry():
+    """intake 401(token 失效/任务不属己)→ 不重试,立即 DeliveryError(retryable=False)。"""
+    ad = _delivery_env()
+    calls = {"intake": 0}
+
+    def poster401(url, body, headers, timeout):
+        calls["intake"] += 1
+        return 401, {"error": "bad token"}
+
+    try:
+        ad.deliver_one("j", "TOK", 0, {"filename": "a.png", "asset_type": "image"},
+                       poster=poster401, putter=lambda *a: (200, {}), streamer=_fake_streamer)
+        raise AssertionError("should have raised")
+    except ad.DeliveryError as e:
+        assert e.retryable is False and e.status == 401
+    assert calls["intake"] == 1  # 4xx 一次都不多试
+
+
+def test_delivery_5xx_retries_then_gives_up():
+    """intake 一直 503 → 重试到 INTAKE_TRIES 用尽,DeliveryError(retryable=True)。"""
+    ad = _delivery_env()
+    calls = {"n": 0}
+
+    def poster503(url, body, headers, timeout):
+        calls["n"] += 1
+        return 503, "unavailable"
+
+    try:
+        ad.post_json_with_retry("https://studio.example/api/internal/asset-intake",
+                                {"token": "TOK"}, {}, ad.INTAKE_TRIES, poster=poster503)
+        raise AssertionError("should have raised")
+    except ad.DeliveryError as e:
+        assert e.retryable is True
+    assert calls["n"] == ad.INTAKE_TRIES
+
+
+def test_delivery_callback_failed_keeps_manifest():
+    """文件全部传上 R2 但 job-complete 用尽重试 → 不算失败:status=callback_failed,
+    manifest 完整保留(caller 存 job_state,AIGC Studio 轮询 /status 兜底落库)。"""
+    ad = _delivery_env()
+
+    def poster(url, body, headers, timeout):
+        if url.endswith("asset-intake"):
+            return _ok_intake(body)
+        return 503, "unavailable"
+
+    res = ad.deliver_outputs("j", [{"filename": "a.png", "asset_type": "image"}],
+                             {"mode": "aigc-r2", "job_id": "j", "token": "TOK"},
+                             poster=poster, putter=lambda *a: (200, {"ETag": '"e"'}),
+                             streamer=_fake_streamer)
+    assert res["status"] == "callback_failed"
+    assert len(res["assets"]) == 1 and res["assets"][0]["r2_key"] == "aigc/u/j/image-0.bin"
+
+
+def test_delivery_no_outputs_raises():
+    ad = _delivery_env()
+    try:
+        ad.deliver_outputs("j", [], {"mode": "aigc-r2", "job_id": "j", "token": "TOK"})
+        raise AssertionError("should have raised")
+    except ad.DeliveryError:
+        pass
+
+
+def test_delivery_helpers():
+    """safe_filename 防路径注入;content-type 识别含 3D;错误分类 5xx/网络可重试、4xx 不可。"""
+    ad = _delivery_env()
+    assert ad.safe_filename("../../etc/passwd") == "passwd"
+    assert ad.safe_filename("") == "output.bin"
+    assert ad.detect_content_type("m.glb") == "model/gltf-binary"
+    assert ad.detect_content_type("v.mp4") == "video/mp4"
+    assert ad.detect_content_type("weird.zzz") == "application/octet-stream"
+    assert ad.is_retryable_status(503) and ad.is_retryable_status(None)
+    assert not ad.is_retryable_status(401) and not ad.is_retryable_status(400)
+
+
+# ============================================================================
 # 无 pytest 时的简易运行器
 # ============================================================================
 if __name__ == "__main__":
