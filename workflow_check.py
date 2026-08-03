@@ -15,6 +15,18 @@ from __future__ import annotations
 from typing import Callable, Optional, Set
 
 
+def _has_autogrow_expansion(name: str, inputs: dict) -> bool:
+    """prompt 里是否存在该必填项的 V3 Autogrow 展开输入(`<name>.<后缀>`)。
+
+    V3 schema 的动态输入组(`io.Autogrow.Input("values", …)`)在 INPUT_TYPES() 里
+    以**模板名**(values)出现在 required,但序列化进 prompt 的是**展开名**
+    (values.a / values.b …),模板名本身永远不会作为 key 出现 —— 裸比对必然误报。
+    内置 ComfyMathExpression / GLSL / post_processing 等一批节点都用这个机制。
+    """
+    prefix = name + "."
+    return any(isinstance(k, str) and k.startswith(prefix) for k in inputs)
+
+
 def find_missing_required_inputs(
     prompt: dict,
     required_getter: Callable[[str], Optional[Set[str]]],
@@ -28,6 +40,8 @@ def find_missing_required_inputs(
     返回:[{"node_id", "class_type", "missing": [必填但 prompt 未提供的输入名]}],
     按 node_id 排序,只含确有缺失的节点。inputs 里已存在的键(无论是 widget 值还是
     [来源节点, 槽位] 的连线)都算「已提供」,只有完全不存在的必填键才算缺。
+    V3 Autogrow 动态输入组按展开名匹配(见 _has_autogrow_expansion);整组一项都没
+    展开时仍按缺失报出(模板 min≥1 时确实缺)。
     """
     out: list[dict] = []
     if not isinstance(prompt, dict):
@@ -44,7 +58,8 @@ def find_missing_required_inputs(
         inputs = node.get("inputs")
         if not isinstance(inputs, dict):
             inputs = {}
-        missing = [k for k in req if k not in inputs]
+        missing = [k for k in req
+                   if k not in inputs and not _has_autogrow_expansion(k, inputs)]
         if missing:
             out.append({
                 "node_id": str(node_id),

@@ -842,7 +842,7 @@ def _setup_routes():
         app_name = (body.get("app_name") or cfg.get("modal_app_name") or "comfyui-bridge").strip()
         volume_name = (body.get("volume_name") or cfg.get("modal_volume_name") or "comfyui-bridge-models").strip()
         default_gpu = (body.get("default_gpu") or cfg.get("default_gpu") or "H100").strip()
-        scaledown = int(body.get("scaledown_window") or cfg.get("scaledown_window") or 40)
+        scaledown = int(body.get("scaledown_window") or cfg.get("scaledown_window") or 12)
         hf_token = (body.get("hf_token") or "").strip()
         civitai_token = (body.get("civitai_token") or "").strip()
         # comfy.org API key(API 节点用):留空 = 沿用已存的(/config 不回显)。持久化进 config,重部署不丢。
@@ -971,6 +971,11 @@ def _setup_routes():
                 result = await modal_client.cancel(session, cfg, job_id)
         except Exception as e:
             return web.json_response({"error": str(e)}, status=502)
+        # 云端取消失败(如 Modal 拒绝该请求)必须原样透出:此时任务仍在跑、仍在计费,
+        # 不能因为 HTTP 200 就当成功 —— 前端据 ok/error 提示用户去 Modal 控制台确认。
+        if isinstance(result, dict) and result.get("error"):
+            print(f"[modal_bridge] cancel job {job_id} FAILED: {result['error']}")
+            return web.json_response({"ok": False, **result})
         print(f"[modal_bridge] cancelled job {job_id}: {result}")
         return web.json_response({"ok": True, **result})
 

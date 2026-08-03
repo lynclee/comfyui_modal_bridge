@@ -22,8 +22,11 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
+      # 固定版本:ruff 0.16.0(2026-07-23)起默认规则集扩大(BLE/S/RUF/I/SIM… 一并启用),
+      # 不 pin 的话既有代码会在某次 ruff 发版后突然报 129 条、CI 无故转红。
+      # 升级此处版本 = 一次独立的告警清理任务,别顺手带过。
       - name: Install ruff
-        run: pip install ruff
+        run: pip install ruff==0.15.22
 
       # 编译全部模块(含 tests 不 import 的 routes / modal_app / _comfy_ws 等):
       # 只编译不执行,无需真实依赖(aiohttp/modal/...),按版本捕获语法错(如 3.9 的 PEP604 坑)。

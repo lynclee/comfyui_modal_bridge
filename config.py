@@ -12,7 +12,9 @@ DEFAULT_CONFIG = {
     "modal_app_name": "comfyui-bridge",
     "modal_workspace": "",                       # 用于拼 endpoint
     "modal_volume_name": "comfyui-bridge-models",  # 重部署(加 custom_node)时要
-    "scaledown_window": 40,                      # 空闲多久回收容器(s);重部署时要
+    "scaledown_window": 12,                      # 空闲多久回收容器(s);重部署时要。
+    # 12s:典型用法是「跑一次、看结果、再调参」,间隔远大于窗口,留久了纯空转计费。
+    # 留 12s 是为了「失败立刻重试」还能复用容器(冷启约 20+s,比窗口贵得多)。
 
     # ── 鉴权(私有 endpoint,deploy.py / GUI 部署自动写)──
     "modal_token_id": "",      # ak-xxx(account token,仅本机 deploy 用)
@@ -38,7 +40,7 @@ DEFAULT_CONFIG = {
     "poll_interval_sec": 1.5,
     # worker(Modal)单任务超时上限(秒)。覆盖最慢类别(视频)——见 categories.max_worker_timeout_s()。
     # 是上限不是每任务时长:高上限不拖慢快任务(按实际运行计费)。换值需重新部署生效。
-    "worker_timeout_sec": 1800,
+    "worker_timeout_sec": 900,
     "output_subfolder": "modal_results",
     # 产物大于此(MB)走 Volume 直连取回(避开 base64/modal.Dict 上限);小的仍 base64。换值需重新部署。
     "volume_threshold_mb": 8,

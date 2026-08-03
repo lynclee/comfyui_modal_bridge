@@ -58,7 +58,7 @@ def main():
     cfg["modal_workspace"] = ws
     cfg["modal_app_name"] = APP_NAME
     cfg.setdefault("modal_volume_name", "comfyui-bridge-models")
-    cfg.setdefault("scaledown_window", 40)
+    cfg.setdefault("scaledown_window", 12)
     if args.token_id:
         cfg["modal_token_id"] = args.token_id
     if args.token_secret:

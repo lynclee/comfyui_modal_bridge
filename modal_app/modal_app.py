@@ -36,10 +36,10 @@ from modal_image import cuda_image
 APP_NAME = os.environ.get("MODAL_BRIDGE_APP_NAME", "comfyui-bridge")
 VOLUME_NAME = os.environ.get("MODAL_BRIDGE_VOLUME", "comfyui-bridge-models")
 SECRET_NAME = os.environ.get("MODAL_BRIDGE_SECRET", "comfyui-bridge-secrets")
-SCALEDOWN = int(os.environ.get("MODAL_BRIDGE_SCALEDOWN", "40"))
+SCALEDOWN = int(os.environ.get("MODAL_BRIDGE_SCALEDOWN", "12"))
 # worker 单任务超时上限(s)。部署时由 config.worker_timeout_sec 决定(覆盖最慢类别,如视频)。
 # ⚠ Modal 的 timeout 是部署期固定的,运行时不可变 —— 换值需重新部署。
-WORKER_TIMEOUT = int(os.environ.get("MODAL_BRIDGE_TIMEOUT", "1800"))
+WORKER_TIMEOUT = int(os.environ.get("MODAL_BRIDGE_TIMEOUT", "900"))
 # 内存快照(可选,默认关):冷启 ~30s→~5s。开关 = config.enable_snapshot → MODAL_BRIDGE_SNAPSHOT。
 # 必须连 GPU 快照一起开(ComfyUI boot 探 CUDA;只 CPU 快照会以 CPU 模式初始化、恢复后切不回卡)。
 # experimental,按 GPU 档需各自 bench;失败兜底见 ComfyWorker.ensure_comfy_alive(退化为普通冷启,不更差)。
@@ -448,9 +448,16 @@ def cancel_endpoint(payload: dict):
     call_id = job_state.get(f"{job_id}:call") or s.get("call_id")  # 新独立 key,兼容旧字段
     if call_id:
         try:
-            modal.FunctionCall.from_id(call_id).cancel(terminate_containers=was_running)
+            # 不传 terminate_containers —— cancel() 自身就会中断执行并把 input 标记 TERMINATED。
+            # 传 True 有两处害:(1)新版 Modal 服务端直接拒绝该请求,而恰恰只有 running 的任务
+            # 才会传 True,结果「正在烧钱的任务反而取消不掉」;(2)强杀容器会让同容器上其它
+            # 并发任务被重新调度 —— 本插件主打多任务并发,不能误伤邻居。
+            modal.FunctionCall.from_id(call_id).cancel()
         except Exception as e:
-            print(f"[bridge] cancel call {call_id}: {e}")
+            # 取消失败绝不能谎报成功:云端还在跑、还在计费,必须让调用方看见。
+            print(f"[bridge] cancel call {call_id} FAILED: {e}")
+            return {"id": job_id, "status": s.get("status") or "unknown",
+                    "error": f"cancel failed: {e}", "was_running": was_running}
     job_state[job_id] = {**s, "status": "cancelled", "completed_at": time.time()}
     return {"id": job_id, "status": "cancelled", "was_running": was_running}
 
