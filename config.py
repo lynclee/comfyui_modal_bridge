@@ -35,12 +35,17 @@ DEFAULT_CONFIG = {
     # 升档是正确性兜底,不受 auto_downgrade 控制;设成与 default_gpu 相同则不启用。换值需重新部署。
     "top_gpu": "B200",
     "auto_downgrade": True,     # 开:按 estimate_vram 自动在 default_gpu / cheap_gpu 间选档(本地路由决策,改它不必重部署)
+    # 关掉云端 ComfyUI 的动态 VRAM(--disable-dynamic-vram),改用估算式模型加载。
+    # 动态 VRAM 开着时权重只常驻一小部分、其余按需从 CPU 搬(日志 "N MB Staged"),
+    # 显存装得下也照搬 —— 云上按秒计费,这段 PCIe 搬运是白付的钱。关掉通常更快,
+    # 代价:显存不够会直接 OOM,没有降速兜底。默认不关,按工作流自行取舍。换值需重新部署。
+    "disable_dynamic_vram": False,
     "enable_snapshot": True,   # 内存快照(实验):冷启 ~30s→~5s。默认开;不支持的 GPU 档自动退化为普通冷启(不更差)。换值需重新部署
     "user_id": "local-dev",
     "poll_interval_sec": 1.5,
     # worker(Modal)单任务超时上限(秒)。覆盖最慢类别(视频)——见 categories.max_worker_timeout_s()。
     # 是上限不是每任务时长:高上限不拖慢快任务(按实际运行计费)。换值需重新部署生效。
-    "worker_timeout_sec": 900,
+    "worker_timeout_sec": 1200,
     "output_subfolder": "modal_results",
     # 产物大于此(MB)走 Volume 直连取回(避开 base64/modal.Dict 上限);小的仍 base64。换值需重新部署。
     "volume_threshold_mb": 8,

@@ -39,11 +39,14 @@ SECRET_NAME = os.environ.get("MODAL_BRIDGE_SECRET", "comfyui-bridge-secrets")
 SCALEDOWN = int(os.environ.get("MODAL_BRIDGE_SCALEDOWN", "12"))
 # worker 单任务超时上限(s)。部署时由 config.worker_timeout_sec 决定(覆盖最慢类别,如视频)。
 # ⚠ Modal 的 timeout 是部署期固定的,运行时不可变 —— 换值需重新部署。
-WORKER_TIMEOUT = int(os.environ.get("MODAL_BRIDGE_TIMEOUT", "900"))
+WORKER_TIMEOUT = int(os.environ.get("MODAL_BRIDGE_TIMEOUT", "1200"))
 # 内存快照(可选,默认关):冷启 ~30s→~5s。开关 = config.enable_snapshot → MODAL_BRIDGE_SNAPSHOT。
 # 必须连 GPU 快照一起开(ComfyUI boot 探 CUDA;只 CPU 快照会以 CPU 模式初始化、恢复后切不回卡)。
 # experimental,按 GPU 档需各自 bench;失败兜底见 ComfyWorker.ensure_comfy_alive(退化为普通冷启,不更差)。
 _SNAPSHOT = os.environ.get("MODAL_BRIDGE_SNAPSHOT", "0") == "1"
+# 关掉云端 ComfyUI 的动态 VRAM(见 _worker_boot)。开关 = config.disable_dynamic_vram。
+# 默认不关:关掉后显存不够会直接 OOM,而非降速兜底 —— 是否划算取决于工作流,交给用户判断。
+_DISABLE_DYNAMIC_VRAM = os.environ.get("MODAL_BRIDGE_DISABLE_DYNAMIC_VRAM", "0") == "1"
 DEPLOYED_VERSION = os.environ.get("MODAL_BRIDGE_VERSION", "unknown")  # 部署时烤进,health 回传
 DEPLOYED_COMFYUI_TAG = os.environ.get("MODAL_BRIDGE_COMFYUI_TAG", "v0.22.0")  # 云端 clone 的 ComfyUI tag
 
@@ -126,11 +129,17 @@ def _worker_boot(self, cpu: bool = False):
         "--extra-model-paths-config", "/comfyui/extra_model_paths.yaml",
     ]
     if cpu:
-        cmd.append("--cpu")
+        cmd.append("--cpu")  # --cpu 本身就会关掉动态 VRAM,不必再叠加下面那个开关
+    elif _DISABLE_DYNAMIC_VRAM:
+        # 动态 VRAM 默认开:权重只常驻一小部分,其余按需从 CPU 搬(日志里的 "N MB Staged" +
+        # "Force pre-loaded ... KB")。显存装得下时这层搬运是白付的 PCIe 时间,而云上按秒计费。
+        # 关掉 = 估算式加载,更快;代价是显存不够时直接 OOM,没有降速兜底。
+        cmd.append("--disable-dynamic-vram")
     self.proc = subprocess.Popen(cmd)
     from _comfy_ws import wait_comfy_ready
     wait_comfy_ready(timeout_s=180)
-    print(f"[bridge] ComfyUI ready ({'CPU' if cpu else 'GPU'})")
+    mode = "CPU" if cpu else ("GPU, dynamic-vram off" if _DISABLE_DYNAMIC_VRAM else "GPU")
+    print(f"[bridge] ComfyUI ready ({mode})")
 
 
 def _worker_shutdown(self):

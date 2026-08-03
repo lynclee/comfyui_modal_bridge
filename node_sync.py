@@ -542,8 +542,12 @@ def deploy_env(cfg: dict) -> dict:
     env["MODAL_BRIDGE_CHEAP_GPU"] = cfg.get("cheap_gpu", "L40S")  # 省钱档 GPU(自动降档目标)
     env["MODAL_BRIDGE_TOP_GPU"] = cfg.get("top_gpu", "B200")      # 顶配档 GPU(>主卡显存时自动升档,防 OOM)
     env["MODAL_BRIDGE_SCALEDOWN"] = str(cfg.get("scaledown_window", 12))
-    env["MODAL_BRIDGE_TIMEOUT"] = str(cfg.get("worker_timeout_sec", 900))  # worker 超时上限(覆盖最慢类别)
+    env["MODAL_BRIDGE_TIMEOUT"] = str(cfg.get("worker_timeout_sec", 1200))  # worker 超时上限(覆盖最慢类别)
     env["MODAL_BRIDGE_SNAPSHOT"] = "1" if cfg.get("enable_snapshot") else "0"  # 内存快照开关(实验)
+    # 关掉云端 ComfyUI 的动态 VRAM(改用估算式加载)。开着时权重只常驻极少一部分、其余按需
+    # 从 CPU 搬,显存够也照搬 —— 在按秒计费的云上等于持续付 PCIe 搬运的钱。关掉更快但显存
+    # 不够会直接 OOM 而非降速兜底,所以默认不关,由用户按工作流自行取舍。
+    env["MODAL_BRIDGE_DISABLE_DYNAMIC_VRAM"] = "1" if cfg.get("disable_dynamic_vram") else "0"
     env["MODAL_BRIDGE_VOLUME_THRESHOLD_MB"] = str(cfg.get("volume_threshold_mb", 8))  # 大产物走 Volume 的阈值
     env["MODAL_BRIDGE_VERSION"] = plugin_version()  # 版本契约:烤进 app,health 回传供前端比对
     if cfg.get("modal_token_id"):

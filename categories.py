@@ -24,8 +24,8 @@ PROFILES = {
             "SaveVideo", "SaveWEBM", "SaveAnimatedWEBP", "SaveAnimatedPNG",
             "VHS_VideoCombine", "CreateVideo",
         },
-        "worker_timeout_s": 900,    # 15 分钟。⚠ 原生画布 + 15s 长度实测约需 14 分钟,余量很薄 ——
-                                    # 想跑满 15s 时长的,把这里和 config.worker_timeout_sec 一起调大。
+        "worker_timeout_s": 1200,   # 20 分钟。原生画布 + 15s 实测:采样 743s、端到端 802s,
+                                    # 而这个预算还要覆盖冷启和产物回传 —— 900s 曾在回传阶段被杀。
         "vram_base_factor": 1.3,
         "vram_overhead_gb": 8.0,    # 多帧激活的粗略额外开销;宁可偏高,目的是 OOM 前预警
     },
