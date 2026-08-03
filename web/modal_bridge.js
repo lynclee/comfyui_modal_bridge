@@ -50,10 +50,11 @@ const I18N = {
                         en: "(Auto picks the GPU by VRAM to save cost; deploy once after first use/upgrade)" },
   "dlg.gpu.opt_auto": { zh: "Auto — 更省钱(按显存自动选 L40S/H100/B200)",
                         en: "Auto — cheaper (auto L40S/H100/B200 by VRAM)" },
-  "dlg.gpu.opt_h100": { zh: "H100(固定)", en: "H100 (fixed)" },
-  "dlg.gpu.opt_b200": { zh: "B200(固定 · 最快最强)", en: "B200 (fixed · fastest)" },
-  "dlg.gpu.note":     { zh: "Auto(更省钱):小图走 L40S、常规走 H100、超 80G 自动上 B200(183G,最强),按工作流显存自动选,最省。H100(固定):一律 H100。B200(固定):一律 B200,显存最大、速度最快,适合大图/视频/赶时间(最贵)。选择后点「部署」生效。点 RunModal 前会按类别估算显存预警(视频含多帧激活开销)。",
-                        en: "Auto (cheaper): small→L40S, normal→H100, >80G→B200 (183G, top), chosen automatically per workflow VRAM. H100 (fixed): always H100. B200 (fixed): always B200, biggest VRAM & fastest, for large images/video/rush jobs (most expensive). Click Deploy to apply. Before running, VRAM is estimated per category (video includes multi-frame activations)." },
+  "dlg.gpu.opt_h100": { zh: "H100(固定 · 80G)", en: "H100 (fixed · 80G)" },
+  "dlg.gpu.opt_h200": { zh: "H200(固定 · 141G · 性价比大显存)", en: "H200 (fixed · 141G · roomy, mid-priced)" },
+  "dlg.gpu.opt_b200": { zh: "B200(固定 · 180G · 最快最强)", en: "B200 (fixed · 180G · fastest)" },
+  "dlg.gpu.note":     { zh: "Auto(更省钱):小图走 L40S、常规走 H100、超主卡显存自动升顶配档,按工作流显存自动选,最省。固定档按显存/价格递增:H100 80G < H200 141G < B200 180G —— 显存不够会退化成频繁 offload(慢几倍),但显存够之后再加大对速度帮助有限,别只盯着最贵那档。选择后点「部署」生效。点 RunModal 前会按类别估算显存预警(视频含多帧激活开销)。",
+                        en: "Auto (cheaper): small→L40S, normal→H100, above the primary card's VRAM it escalates to the top tier, chosen per workflow. Fixed tiers by VRAM/price: H100 80G < H200 141G < B200 180G. Too little VRAM degrades into constant offloading (several times slower), but past the point where it fits, more VRAM buys little speed - don't just pick the priciest. Click Deploy to apply. Before running, VRAM is estimated per category (video includes multi-frame activations)." },
   "vram.warn.title":  { zh: "⚠ 显存可能不够", en: "⚠ VRAM may be tight" },
   "vram.warn.body":   { zh: "预估需 ~{est}GB(模型 {model}GB),超过所选 {gpu}({cap}GB)。可能 offload 变慢甚至 OOM。",
                         en: "Est. ~{est}GB ({model}GB models) exceeds the selected {gpu} ({cap}GB). May offload (slow) or OOM." },
@@ -207,8 +208,8 @@ const I18N = {
   "toast.done_n":     { zh: "✓ {wf} {n} 张完成", en: "✓ {wf} {n} done" },
   "set.batch":        { zh: "一次点击跑几次(自动改 seed)", en: "How many runs per click (auto-reseed)" },
   "set.poll":         { zh: "查询状态频率", en: "Status polling interval" },
-  "set.timeout":      { zh: "前端等出图的最长时间(秒),默认 1800=30分钟,和 worker 单任务上限一致——worker 最多跑多久前端就等多久。出图后立刻返回,不会真等满;设大只是给冷启动+大模型留足空间。⚠ 别设得比 worker 上限小:那样前端会先放弃,而云端还在跑、还在计费(超时后会自动请求取消)。",
-                        en: "Max seconds the frontend waits for a result. Default 1800=30min, matching the worker job limit. Returns instantly when done; large values just allow cold start + big models. Do not set it below the worker limit: the frontend would give up first while the cloud job keeps running and billing (a cancel is requested on timeout)." },
+  "set.timeout":      { zh: "前端等出图的最长时间(秒),默认 900=15分钟,和 worker 单任务上限一致——worker 最多跑多久前端就等多久。出图后立刻返回,不会真等满;设大只是给冷启动+大模型留足空间。⚠ 别设得比 worker 上限小:那样前端会先放弃,而云端还在跑、还在计费(超时后会自动请求取消)。",
+                        en: "Max seconds the frontend waits for a result. Default 900=15min, matching the worker job limit. Returns instantly when done; large values just allow cold start + big models. Do not set it below the worker limit: the frontend would give up first while the cloud job keeps running and billing (a cancel is requested on timeout)." },
   "set.autosync_models":{ zh: "提交前检查 Modal Volume,工作流要、Volume 没、但本地有的模型自动上传(块级去重,通用大模型秒过)",
                           en: "Before submit, auto-upload models the workflow needs that are missing on the Volume but present locally (block dedup, common big models instant)" },
   "set.autosync_nodes": { zh: "提交前把工作流用到的 custom_node 与本地双向同步到 Modal:缺的加、commit 变的更新、本地已卸载的移除,再重部署",
@@ -857,7 +858,7 @@ async function runOnceOnModal(workflowPrompt, outputNodeIds, ctx, submitGuard, b
   ctx.stage("queued", `${batchSuffix}job=${jobId.slice(0, 8)} gpu=${gpu}`, true);
 
   const interval = getSetting("ModalBridge.pollIntervalSec", 1.2) * 1000;
-  const timeoutMs = getSetting("ModalBridge.timeoutSec", 1800) * 1000;  // 兜底值须与上面注册的 defaultValue 一致(见 ModalBridge.timeoutSec)
+  const timeoutMs = getSetting("ModalBridge.timeoutSec", 900) * 1000;  // 兜底值须与上面注册的 defaultValue 一致(见 ModalBridge.timeoutSec)
   const deadline = Date.now() + timeoutMs;
 
   let final = null;
@@ -1334,7 +1335,7 @@ const SETTINGS = [
     // 必须 ≥ worker 超时上限(config.worker_timeout_sec / categories.max_worker_timeout_s)。
     // 小于它 = 前端先放弃,而 worker 还在跑、还在计费 —— 历史上这里是 900 而 worker 是 1800,
     // 正好踩中这个坑(且下方 getSetting 的兜底值写的又是另一个数,三处互不一致)。
-    defaultValue: 1800,
+    defaultValue: 900,
     attrs: { min: 60, max: 21600, step: 60 },
     tooltip: t("set.timeout"),
   },
@@ -1505,7 +1506,8 @@ async function openDeployDialog() {
     <label>GPU <span style="color:#9aa;">${t("dlg.gpu.label")}</span></label>
     <select id="mb-dep-gpumode" style="${inputCss}">
       <option value="auto"${(cfg.auto_downgrade!==false)?" selected":""}>${t("dlg.gpu.opt_auto")}</option>
-      <option value="h100"${(cfg.auto_downgrade===false && (cfg.default_gpu||"H100")!=="B200")?" selected":""}>${t("dlg.gpu.opt_h100")}</option>
+      <option value="h100"${(cfg.auto_downgrade===false && (cfg.default_gpu||"H100")==="H100")?" selected":""}>${t("dlg.gpu.opt_h100")}</option>
+      <option value="h200"${(cfg.auto_downgrade===false && (cfg.default_gpu||"H100")==="H200")?" selected":""}>${t("dlg.gpu.opt_h200")}</option>
       <option value="b200"${(cfg.auto_downgrade===false && (cfg.default_gpu||"H100")==="B200")?" selected":""}>${t("dlg.gpu.opt_b200")}</option>
     </select>
     <div style="margin:0 0 10px;color:#9aa;font-size:12px;">${t("dlg.gpu.note")}</div>
@@ -1684,13 +1686,14 @@ async function openDeployDialog() {
   };
 
   goBtn.onclick = async () => {
-    const gpuMode = panel.querySelector("#mb-dep-gpumode").value;  // auto | h100 | b200
+    const gpuMode = panel.querySelector("#mb-dep-gpumode").value;  // auto | h100 | h200 | b200
     const payload = {
       workspace: panel.querySelector("#mb-dep-ws").value.trim(),
       token_id: panel.querySelector("#mb-dep-id").value.trim(),
       token_secret: panel.querySelector("#mb-dep-secret").value.trim(),
-      // Auto/H100 固定:主卡 H100(省钱/升档由 auto_downgrade 控制);B200 固定:主卡直接 B200
-      default_gpu: gpuMode === "b200" ? "B200" : "H100",
+      // Auto:主卡 H100(省钱降档/升顶配由 auto_downgrade 控制);固定档:主卡就是所选那张。
+      // 卡名须与 modal_app._GPU_CHAIN 的键一致(H200 走 ["H200","H100"] fallback)。
+      default_gpu: { h100: "H100", h200: "H200", b200: "B200" }[gpuMode] || "H100",
       auto_downgrade: gpuMode === "auto",
       comfy_api_key: panel.querySelector("#mb-dep-comfy").value.trim(),
       // AIGC Studio(可选,网站 aigc-r2 交付):URL 明文;bypass 密钥留空 = 沿用已存的

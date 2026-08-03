@@ -39,7 +39,7 @@ SECRET_NAME = os.environ.get("MODAL_BRIDGE_SECRET", "comfyui-bridge-secrets")
 SCALEDOWN = int(os.environ.get("MODAL_BRIDGE_SCALEDOWN", "12"))
 # worker 单任务超时上限(s)。部署时由 config.worker_timeout_sec 决定(覆盖最慢类别,如视频)。
 # ⚠ Modal 的 timeout 是部署期固定的,运行时不可变 —— 换值需重新部署。
-WORKER_TIMEOUT = int(os.environ.get("MODAL_BRIDGE_TIMEOUT", "1800"))
+WORKER_TIMEOUT = int(os.environ.get("MODAL_BRIDGE_TIMEOUT", "900"))
 # 内存快照(可选,默认关):冷启 ~30s→~5s。开关 = config.enable_snapshot → MODAL_BRIDGE_SNAPSHOT。
 # 必须连 GPU 快照一起开(ComfyUI boot 探 CUDA;只 CPU 快照会以 CPU 模式初始化、恢复后切不回卡)。
 # experimental,按 GPU 档需各自 bench;失败兜底见 ComfyWorker.ensure_comfy_alive(退化为普通冷启,不更差)。
