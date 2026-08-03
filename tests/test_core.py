@@ -396,6 +396,38 @@ def test_missing_required_skips_unknown_class():
     assert workflow_check.find_missing_required_inputs(prompt, _req_getter({})) == []
 
 
+def test_missing_required_ignores_autogrow_expanded_inputs():
+    """V3 Autogrow 动态输入组:INPUT_TYPES() 的 required 里是模板名(values),
+    prompt 里却是展开名(values.a / values.b)→ 已接上就不该报缺。
+    真实案例:内置 ComfyMathExpression(comfy_extras/nodes_math.py)。"""
+    prompt = {
+        "105:107": {"class_type": "ComfyMathExpression",
+                    "inputs": {"values.a": ["105:111", 0], "values.b": ["105:120", 0],
+                               "expression": "max(5, round(a * 24))"}},
+    }
+    req = {"ComfyMathExpression": {"expression", "values"}}
+    assert workflow_check.find_missing_required_inputs(prompt, _req_getter(req)) == []
+
+
+def test_missing_required_still_catches_empty_autogrow():
+    """Autogrow 组一个展开项都没有(min=1 要求至少一项)→ 仍要报缺。"""
+    prompt = {"7": {"class_type": "ComfyMathExpression",
+                    "inputs": {"expression": "a + b"}}}
+    req = {"ComfyMathExpression": {"expression", "values"}}
+    out = workflow_check.find_missing_required_inputs(prompt, _req_getter(req))
+    assert len(out) == 1
+    assert out[0]["missing"] == ["values"]
+
+
+def test_missing_required_prefix_match_is_not_substring_match():
+    """前缀豁免必须以 `名字.` 为界,不能被同前缀的无关输入(valuesX)顶掉。"""
+    prompt = {"8": {"class_type": "N", "inputs": {"valuesX": 1, "values_b": 2}}}
+    req = {"N": {"values"}}
+    out = workflow_check.find_missing_required_inputs(prompt, _req_getter(req))
+    assert len(out) == 1
+    assert out[0]["missing"] == ["values"]
+
+
 def test_missing_required_sorted_by_node_id():
     """多个缺失节点按 node_id 排序返回。"""
     prompt = {
