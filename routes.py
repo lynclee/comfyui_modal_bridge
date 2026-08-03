@@ -575,17 +575,33 @@ def _setup_routes():
         except Exception:
             return None
 
+    def _node_is_output(class_type: str):
+        """该节点类是否 OUTPUT_NODE(SaveImage / SaveVideo / PreviewImage …)。
+        用于把预检范围收敛到「输出节点的依赖闭包」—— ComfyUI 只执行这部分
+        (execution.py 从 OUTPUT_NODE 递归 validate_inputs),画布上输出悬空的节点
+        根本不参与执行,不该被预检拦下。拿不到定义返回 None(调用方退回全量检查)。"""
+        try:
+            import nodes  # ComfyUI 全局
+            cls = nodes.NODE_CLASS_MAPPINGS.get(class_type)
+            if cls is None:
+                return None
+            return getattr(cls, "OUTPUT_NODE", False) is True
+        except Exception:
+            return None
+
     @routes.post("/modal_bridge/check_required_inputs")
     async def _check_required_inputs(request: web.Request):
         """提交前预检:按当前本地节点定义,找出 prompt 里「缺必填输入」的节点。
         body: {prompt}  返回: {missing:[{node_id,class_type,missing:[...]}]}
         典型拦截:老工作流缺新版节点新增的必填 widget(如 API 节点 generate_type),
-        避免等云端 `execute() missing required argument` 才报错。拿不到定义的节点跳过,不误报。"""
+        避免等云端 `execute() missing required argument` 才报错。拿不到定义的节点跳过,不误报。
+        只检查输出节点的依赖闭包,与 ComfyUI 的执行范围一致(悬空节点不拦)。"""
         body = await request.json()
         prompt = body.get("prompt")
         if not isinstance(prompt, dict):
             return web.json_response({"error": "prompt required"}, status=400)
-        missing = workflow_check.find_missing_required_inputs(prompt, _node_required_inputs)
+        missing = workflow_check.find_missing_required_inputs(
+            prompt, _node_required_inputs, _node_is_output)
         return web.json_response({"missing": missing})
 
     @routes.post("/modal_bridge/estimate_vram")

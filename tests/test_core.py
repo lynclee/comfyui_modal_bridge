@@ -428,6 +428,70 @@ def test_missing_required_prefix_match_is_not_substring_match():
     assert out[0]["missing"] == ["values"]
 
 
+def _out_getter(output_types):
+    """把 {会被当作 OUTPUT_NODE 的 class_type} 包成 is_output_getter。"""
+    return lambda ct: (ct in output_types) if ct else None
+
+
+def test_missing_required_skips_dangling_node():
+    """输出悬空的节点不参与执行(ComfyUI 只跑 OUTPUT_NODE 的依赖闭包)→ 不该拦。
+    真实案例:画布上顺手拖进来还没接线的 ImageScaleToTotalPixels,云端跑得好好的,
+    预检却报它缺 image。"""
+    prompt = {
+        "92": {"class_type": "SaveVideo", "inputs": {"video": ["91", 0]}},
+        "91": {"class_type": "CreateVideo", "inputs": {"images": ["10", 0]}},
+        "10": {"class_type": "VAEDecode", "inputs": {"samples": ["14", 0], "vae": ["11", 0]}},
+        "14": {"class_type": "SamplerCustomAdvanced", "inputs": {}},
+        "11": {"class_type": "VAELoader", "inputs": {"vae_name": "x.safetensors"}},
+        # 缺 image,但输出没接到任何地方 → ComfyUI 根本不执行它
+        "119": {"class_type": "ImageScaleToTotalPixels",
+                "inputs": {"upscale_method": "lanczos", "megapixels": 1.0}},
+    }
+    req = {"ImageScaleToTotalPixels": {"image", "upscale_method", "megapixels"},
+           "SaveVideo": {"video"}}
+    out = workflow_check.find_missing_required_inputs(
+        prompt, _req_getter(req), _out_getter({"SaveVideo"}))
+    assert out == []
+
+
+def test_missing_required_still_catches_reachable_node():
+    """同样缺 image,但接进了输出链 → 必须照报。"""
+    prompt = {
+        "92": {"class_type": "SaveVideo", "inputs": {"video": ["119", 0]}},
+        "119": {"class_type": "ImageScaleToTotalPixels",
+                "inputs": {"upscale_method": "lanczos", "megapixels": 1.0}},
+    }
+    req = {"ImageScaleToTotalPixels": {"image", "upscale_method", "megapixels"},
+           "SaveVideo": {"video"}}
+    out = workflow_check.find_missing_required_inputs(
+        prompt, _req_getter(req), _out_getter({"SaveVideo"}))
+    assert len(out) == 1
+    assert out[0]["node_id"] == "119"
+    assert out[0]["missing"] == ["image"]
+
+
+def test_missing_required_falls_back_when_no_output_node():
+    """一个 OUTPUT_NODE 都识别不出来(拿不到定义等)→ 退回全量检查,不因优化而漏报。"""
+    prompt = {"119": {"class_type": "ImageScaleToTotalPixels", "inputs": {"megapixels": 1.0}}}
+    req = {"ImageScaleToTotalPixels": {"image", "megapixels"}}
+    out = workflow_check.find_missing_required_inputs(
+        prompt, _req_getter(req), _out_getter(set()))
+    assert len(out) == 1
+    assert out[0]["missing"] == ["image"]
+
+
+def test_reachable_follows_widget_values_safely():
+    """inputs 里的标量 widget 值不能被当成连线(否则遍历会串到不相干的节点)。"""
+    prompt = {
+        "1": {"class_type": "SaveVideo", "inputs": {"video": ["2", 0], "fps": 24}},
+        "2": {"class_type": "CreateVideo", "inputs": {"images": ["3", 0]}},
+        "3": {"class_type": "VAEDecode", "inputs": {}},
+        "24": {"class_type": "Dangling", "inputs": {}},  # id 恰好等于上面的 fps 值
+    }
+    got = workflow_check.reachable_from_outputs(prompt, _out_getter({"SaveVideo"}))
+    assert got == {"1", "2", "3"}          # "24" 不该因为 fps=24 被拉进来
+
+
 def test_missing_required_sorted_by_node_id():
     """多个缺失节点按 node_id 排序返回。"""
     prompt = {
