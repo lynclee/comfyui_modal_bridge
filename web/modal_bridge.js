@@ -207,8 +207,8 @@ const I18N = {
   "toast.done_n":     { zh: "✓ {wf} {n} 张完成", en: "✓ {wf} {n} done" },
   "set.batch":        { zh: "一次点击跑几次(自动改 seed)", en: "How many runs per click (auto-reseed)" },
   "set.poll":         { zh: "查询状态频率", en: "Status polling interval" },
-  "set.timeout":      { zh: "前端等出图的最长时间(秒),默认 900=15分钟,和 worker 单任务上限一致——worker 最多跑多久前端就等多久。出图后立刻返回,不会真等满;设大只是给冷启动+大模型留足空间。",
-                        en: "Max seconds the frontend waits for a result. Default 900=15min, matching the worker job limit. Returns instantly when done; large values just allow cold start + big models." },
+  "set.timeout":      { zh: "前端等出图的最长时间(秒),默认 5400=90分钟,和 worker 单任务上限一致——worker 最多跑多久前端就等多久。出图后立刻返回,不会真等满;设大只是给冷启动+大模型留足空间。⚠ 别设得比 worker 上限小:那样前端会先放弃,而云端还在跑、还在计费(超时后会自动请求取消)。",
+                        en: "Max seconds the frontend waits for a result. Default 5400=90min, matching the worker job limit. Returns instantly when done; large values just allow cold start + big models. Do not set it below the worker limit: the frontend would give up first while the cloud job keeps running and billing (a cancel is requested on timeout)." },
   "set.autosync_models":{ zh: "提交前检查 Modal Volume,工作流要、Volume 没、但本地有的模型自动上传(块级去重,通用大模型秒过)",
                           en: "Before submit, auto-upload models the workflow needs that are missing on the Volume but present locally (block dedup, common big models instant)" },
   "set.autosync_nodes": { zh: "提交前把工作流用到的 custom_node 与本地双向同步到 Modal:缺的加、commit 变的更新、本地已卸载的移除,再重部署",
@@ -857,7 +857,7 @@ async function runOnceOnModal(workflowPrompt, outputNodeIds, ctx, submitGuard, b
   ctx.stage("queued", `${batchSuffix}job=${jobId.slice(0, 8)} gpu=${gpu}`, true);
 
   const interval = getSetting("ModalBridge.pollIntervalSec", 1.2) * 1000;
-  const timeoutMs = getSetting("ModalBridge.timeoutSec", 1800) * 1000;  // 默认 1800s=30min,覆盖最慢类别(视频),与 worker 超时上限一致
+  const timeoutMs = getSetting("ModalBridge.timeoutSec", 5400) * 1000;  // 兜底值须与上面注册的 defaultValue 一致(见 ModalBridge.timeoutSec)
   const deadline = Date.now() + timeoutMs;
 
   let final = null;
@@ -900,8 +900,20 @@ async function runOnceOnModal(workflowPrompt, outputNodeIds, ctx, submitGuard, b
     removeActiveJob(jobId);
   }
   if (!final) {
-    reportJobEvent(jobId, "polling_timed_out", `前端等待超时;Modal 可能仍在跑,图若出会在 output/`);
-    throw new Error(`[job ${jobId}] Polling timed out(前端等待超时;Modal 可能仍在跑,稍后看 output/modal_results/)`);
+    reportJobEvent(jobId, "polling_timed_out", `前端等待超时,已请求取消云端任务`);
+    // 前端停止 poll 之后没有任何人会去 fetch_result,而上面的 finally 已把这个 job 移出
+    // 「未完成 job」恢复列表 —— 也就是说不取消的话:worker 会一路跑到它自己的超时上限
+    // (worker_timeout_sec)为止,全程计费,而跑出来的产物再也取不回来。所以主动取消止损。
+    try {
+      await api.fetchApi("/modal_bridge/cancel", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ job_id: jobId }),
+      });
+    } catch (e) {
+      err("cancel after polling timeout failed", e);
+    }
+    throw new Error(`[job ${jobId}] Polling timed out(前端等待超时,已请求取消云端任务)`);
   }
   if (final.status === "cancelled") {
     reportJobEvent(jobId, "cancelled", "");
@@ -1319,8 +1331,11 @@ const SETTINGS = [
     id: "ModalBridge.timeoutSec",
     name: "Modal Bridge: Timeout (sec)",
     type: "number",
-    defaultValue: 900,
-    attrs: { min: 60, max: 7200, step: 60 },
+    // 必须 ≥ worker 超时上限(config.worker_timeout_sec / categories.max_worker_timeout_s)。
+    // 小于它 = 前端先放弃,而 worker 还在跑、还在计费 —— 历史上这里是 900 而 worker 是 1800,
+    // 正好踩中这个坑(且下方 getSetting 的兜底值写的又是另一个数,三处互不一致)。
+    defaultValue: 5400,
+    attrs: { min: 60, max: 21600, step: 60 },
     tooltip: t("set.timeout"),
   },
   {

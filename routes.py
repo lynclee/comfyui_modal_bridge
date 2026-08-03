@@ -842,7 +842,7 @@ def _setup_routes():
         app_name = (body.get("app_name") or cfg.get("modal_app_name") or "comfyui-bridge").strip()
         volume_name = (body.get("volume_name") or cfg.get("modal_volume_name") or "comfyui-bridge-models").strip()
         default_gpu = (body.get("default_gpu") or cfg.get("default_gpu") or "H100").strip()
-        scaledown = int(body.get("scaledown_window") or cfg.get("scaledown_window") or 40)
+        scaledown = int(body.get("scaledown_window") or cfg.get("scaledown_window") or 12)
         hf_token = (body.get("hf_token") or "").strip()
         civitai_token = (body.get("civitai_token") or "").strip()
         # comfy.org API key(API 节点用):留空 = 沿用已存的(/config 不回显)。持久化进 config,重部署不丢。
