@@ -136,6 +136,9 @@ const I18N = {
   "mdl.downloading":  { zh: "这些模型本地还在下载中,现在传会传成残缺文件:\n\n{list}\n\n建议:等本地下完再点 [☁️ Modal]。\n\n仍然继续提交?(会缺这些模型,大概率失败)",
                         en: "These models are still downloading locally; uploading now would push partial files:\n\n{list}\n\nTip: wait until done, then click [☁️ Modal].\n\nSubmit anyway? (missing these, likely to fail)" },
   "mdl.cancel_dl":    { zh: "Cancelled — 本地模型还在下载中", en: "Cancelled — local models still downloading" },
+  "cancel.failed":    { zh: "⚠ 取消失败 — 云端可能仍在运行", en: "⚠ Cancel failed — job may still be running" },
+  "cancel.failed_msg":{ zh: "取消失败:{msg}\n\n云端任务可能仍在运行并继续计费。请到 Modal 控制台确认,必要时手动停止容器。",
+                        en: "Cancel failed: {msg}\n\nThe cloud job may still be running and billing. Check the Modal dashboard and stop the container manually if needed." },
   "mdl.no_source":    { zh: "下面这些模型 Modal Volume 没有,本地也找不到,无法自动同步:\n\n{list}\n\n解决:先在本地 ComfyUI 里把这些模型下到对应 models/<类型>/ 目录,再跑。\n\n仍然继续提交?(大概率失败)",
                         en: "These models are on neither the Volume nor locally, can't auto-sync:\n\n{list}\n\nFix: download them locally into models/<type>/ first, then run.\n\nSubmit anyway? (likely to fail)" },
   "mdl.cancel_miss":  { zh: "Cancelled — 缺本地模型", en: "Cancelled — missing local models" },
@@ -828,12 +831,26 @@ async function runOnceOnModal(workflowPrompt, outputNodeIds, ctx, submitGuard, b
     // 立即结束卡片(不依赖后续 poll 拿到 cancelled —— 那可能慢或因竞态拿不到)
     removeActiveJob(jobId);
     ctx.finish(false, "✕ Cancelled");
-    // 后台告诉 Modal 取消(不阻塞 UI,失败也无所谓)
-    api.fetchApi("/modal_bridge/cancel", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ job_id: jobId }),
-    }).catch((e) => err("cancel failed", e));
+    // 告诉 Modal 取消。UI 先乐观置为已取消(响应快),但**必须校验结果** ——
+    // 取消失败意味着云端还在跑、还在计费,不能让 "✕ Cancelled" 骗过用户。
+    try {
+      const r = await api.fetchApi("/modal_bridge/cancel", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ job_id: jobId }),
+      });
+      const d = await r.json().catch(() => ({}));
+      if (!r.ok || d.ok === false || d.error) {
+        const msg = d.error || `HTTP ${r.status}`;
+        err("cancel failed", msg);
+        ctx.finish(false, t("cancel.failed"));
+        alert(t("cancel.failed_msg", { msg }));
+      }
+    } catch (e) {
+      err("cancel failed", e);
+      ctx.finish(false, t("cancel.failed"));
+      alert(t("cancel.failed_msg", { msg: String(e) }));
+    }
   });
   log("submitted", jobId, "gpu=" + gpu);
 
