@@ -137,6 +137,8 @@ const I18N = {
   "mdl.downloading":  { zh: "这些模型本地还在下载中,现在传会传成残缺文件:\n\n{list}\n\n建议:等本地下完再点 [☁️ Modal]。\n\n仍然继续提交?(会缺这些模型,大概率失败)",
                         en: "These models are still downloading locally; uploading now would push partial files:\n\n{list}\n\nTip: wait until done, then click [☁️ Modal].\n\nSubmit anyway? (missing these, likely to fail)" },
   "mdl.cancel_dl":    { zh: "Cancelled — 本地模型还在下载中", en: "Cancelled — local models still downloading" },
+  "run.slow":         { zh: "⚠ 已跑 {min} 分钟,快到等待上限了(gpu={gpu}) — 常见原因是显存不足被 offload 拖慢:换更大显存的 GPU 档,或降低分辨率 / 时长 / 帧数",
+                        en: "⚠ {min} min elapsed, approaching the wait limit (gpu={gpu}) — usually VRAM starvation causing offload: pick a larger GPU tier, or lower resolution / duration / frames" },
   "cancel.failed":    { zh: "⚠ 取消失败 — 云端可能仍在运行", en: "⚠ Cancel failed — job may still be running" },
   "cancel.failed_msg":{ zh: "取消失败:{msg}\n\n云端任务可能仍在运行并继续计费。请到 Modal 控制台确认,必要时手动停止容器。",
                         en: "Cancel failed: {msg}\n\nThe cloud job may still be running and billing. Check the Modal dashboard and stop the container manually if needed." },
@@ -860,6 +862,15 @@ async function runOnceOnModal(workflowPrompt, outputNodeIds, ctx, submitGuard, b
   const interval = getSetting("ModalBridge.pollIntervalSec", 1.2) * 1000;
   const timeoutMs = getSetting("ModalBridge.timeoutSec", 1200) * 1000;  // 兜底值须与上面注册的 defaultValue 一致(见 ModalBridge.timeoutSec)
   const deadline = Date.now() + timeoutMs;
+  // 运行时慢速预警。显存不够时 ComfyUI 不报错,而是把权重甩去 CPU 降速硬撑 —— 实测同一
+  // 工作流显存够是 37 s/it、不够是 219 s/it,最后撞 worker 超时、烧满预算却零产出,且全程
+  // 没有任何提示。这里在接近等待上限时提醒一次:不打断(可能工作流本来就重),但让
+  // "异常慢"变得可见,而不是干等到超时才发现。
+  // ⚠ 比例别往低调:健康基线实测 802s 端到端、上限 1200s —— 0.5 会在 600s 触发,每次正常
+  // 任务都弹一次警告(狼来了,反而没人看)。0.75=900s 既躲开健康值,又留 300s 给用户反应。
+  const SLOW_WARN_RATIO = 0.75;
+  const slowWarnAt = Date.now() + timeoutMs * SLOW_WARN_RATIO;
+  let slowWarned = false;
 
   let final = null;
   let lastStatus = "queued";
@@ -891,6 +902,13 @@ async function runOnceOnModal(workflowPrompt, outputNodeIds, ctx, submitGuard, b
         } else if (pData.status === "queued") {
           ctx.stage("queued", `${batchSuffix}Waiting for worker...`, true);
         }
+      }
+      // 慢速预警:只在 running 阶段提示一次,之后不再覆盖(状态变化时上面的分支会自然接管)。
+      if (!slowWarned && lastStatus === "running" && Date.now() > slowWarnAt) {
+        slowWarned = true;
+        const min = Math.round((timeoutMs * SLOW_WARN_RATIO) / 60000);
+        log("slow job", jobId, `still running after ${min}min — possible VRAM starvation`);
+        ctx.stage("running", t("run.slow", { min, gpu }), true);
       }
       if (pData.status === "completed" || pData.status === "failed" || pData.status === "cancelled") {
         final = pData;
