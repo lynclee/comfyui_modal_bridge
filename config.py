@@ -34,7 +34,14 @@ DEFAULT_CONFIG = {
     # B200 是 Blackwell 最强档(显存最大、速度最快),大图自动上这张。
     # 升档是正确性兜底,不受 auto_downgrade 控制;设成与 default_gpu 相同则不启用。换值需重新部署。
     "top_gpu": "B200",
-    "auto_downgrade": True,     # 开:按 estimate_vram 自动在 default_gpu / cheap_gpu 间选档(本地路由决策,改它不必重部署)
+    # GPU 档位:auto | cheap | primary | top。四档 worker(CPU/cheap/primary/top)一次部署
+    # 全建好、空闲各自 scale-to-zero,这里只决定「这次路由到哪一档」——
+    # ⭐ 改它立即生效,不必重新部署(与 default_gpu/cheap_gpu/top_gpu 换卡型不同,那才要重部署)。
+    #   auto    : 按 estimate_vram 自动选(小图降 cheap、超主卡显存升 top)
+    #   cheap   : 固定走 cheap_gpu    primary: 固定走 default_gpu    top: 固定走 top_gpu
+    # 空值 = 旧配置,回落到 auto_downgrade 的语义(见 routes._pick_gpu_class)。
+    "gpu_tier": "auto",
+    "auto_downgrade": True,     # 旧开关(gpu_tier 为空时才用):开=自动选档,关=固定 primary。新配置请用 gpu_tier
     # 关掉云端 ComfyUI 的动态 VRAM(--disable-dynamic-vram),改用估算式模型加载。
     # 动态 VRAM 开着时权重只常驻一小部分、其余按需从 CPU 搬(日志 "N MB Staged"),
     # 显存装得下也照搬 —— 云上按秒计费,这段 PCIe 搬运是白付的钱。关掉通常更快,

@@ -46,15 +46,17 @@ const I18N = {
                         en: "(the segment in your modal.com profile URL, e.g. your-workspace)" },
   "dlg.secret.saved": { zh: ";已保存,留空=沿用", en: "; saved, leave blank to reuse" },
   "dlg.secret.ph_saved": { zh: "••••••••(已保存,留空沿用)", en: "•••••••• (saved, blank=reuse)" },
-  "dlg.gpu.label":    { zh: "(Auto 按工作流显存自动选卡,更省钱;首次/升级后需部署一次)",
-                        en: "(Auto picks the GPU by VRAM to save cost; deploy once after first use/upgrade)" },
-  "dlg.gpu.opt_auto": { zh: "Auto — 更省钱(按显存自动选 L40S/H100/B200)",
-                        en: "Auto — cheaper (auto L40S/H100/B200 by VRAM)" },
-  "dlg.gpu.opt_h100": { zh: "H100(固定 · 80G)", en: "H100 (fixed · 80G)" },
-  "dlg.gpu.opt_h200": { zh: "H200(固定 · 141G · 性价比大显存)", en: "H200 (fixed · 141G · roomy, mid-priced)" },
-  "dlg.gpu.opt_b200": { zh: "B200(固定 · 180G · 最快最强)", en: "B200 (fixed · 180G · fastest)" },
-  "dlg.gpu.note":     { zh: "Auto(更省钱):小图走 L40S、常规走 H100、超主卡显存自动升顶配档,按工作流显存自动选,最省。固定档按显存/价格递增:H100 80G < H200 141G < B200 180G —— 显存不够会退化成频繁 offload(慢几倍),但显存够之后再加大对速度帮助有限,别只盯着最贵那档。选择后点「部署」生效。点 RunModal 前会按类别估算显存预警(视频含多帧激活开销)。",
-                        en: "Auto (cheaper): small→L40S, normal→H100, above the primary card's VRAM it escalates to the top tier, chosen per workflow. Fixed tiers by VRAM/price: H100 80G < H200 141G < B200 180G. Too little VRAM degrades into constant offloading (several times slower), but past the point where it fits, more VRAM buys little speed - don't just pick the priciest. Click Deploy to apply. Before running, VRAM is estimated per category (video includes multi-frame activations)." },
+  "dlg.gpu.label":    { zh: "(选完立即生效,无需部署)",
+                        en: "(takes effect immediately, no deploy needed)" },
+  "dlg.gpu.opt_auto": { zh: "Auto — 按显存自动选档(更省钱)",
+                        en: "Auto — pick the tier by VRAM (cheaper)" },
+  "dlg.gpu.opt_cheap":   { zh: "省钱档 — {gpu}(固定)", en: "Cheap tier — {gpu} (fixed)" },
+  "dlg.gpu.opt_primary": { zh: "标准档 — {gpu}(固定)", en: "Standard tier — {gpu} (fixed)" },
+  "dlg.gpu.opt_top":     { zh: "顶配档 — {gpu}(固定)", en: "Top tier — {gpu} (fixed)" },
+  "dlg.gpu.tier_saved":  { zh: "✓ 已切到「{tier}」— 下次提交即生效,无需部署", en: "✓ switched to \"{tier}\" — effective on next submit, no deploy needed" },
+  "dlg.gpu.tier_failed": { zh: "✗ 切换失败:{msg}", en: "✗ switch failed: {msg}" },
+  "dlg.gpu.note":     { zh: "⚡ 换档立即生效,不用重新部署 —— 四档 worker(CPU/省钱/标准/顶配)是一次部署全建好的,选哪档只是运行时路由,空闲的档 scale-to-zero 不花钱。Auto:小图走省钱档、超主卡显存自动升顶配档(防 OOM),按工作流估算显存自动选。显存不够会退化成频繁 offload(慢几倍且不报错),但显存够之后再加大对速度帮助有限 —— 别只盯着最贵那档。想换某档具体是哪张卡(default_gpu/cheap_gpu/top_gpu),改 config.json 后需要重新部署。",
+                        en: "⚡ Switching tiers takes effect immediately, no redeploy - all four workers (CPU/cheap/standard/top) are created by a single deploy, and picking a tier is pure runtime routing; idle tiers scale to zero and cost nothing. Auto: small jobs go cheap, anything above the primary card's VRAM escalates to the top tier (OOM guard). Too little VRAM silently degrades into constant offloading (several times slower, no error), but past the point where the model fits, more VRAM buys little speed - don't just pick the priciest. Changing which card a tier maps to (default_gpu/cheap_gpu/top_gpu) does require editing config.json and redeploying." },
   "vram.warn.title":  { zh: "⚠ 显存可能不够", en: "⚠ VRAM may be tight" },
   "vram.warn.body":   { zh: "预估需 ~{est}GB(模型 {model}GB),超过所选 {gpu}({cap}GB)。可能 offload 变慢甚至 OOM。",
                         en: "Est. ~{est}GB ({model}GB models) exceeds the selected {gpu} ({cap}GB). May offload (slow) or OOM." },
@@ -1045,10 +1047,16 @@ const GPU_VRAM = { "L40S": 48, "A100-80GB": 80, "H100": 80, "H200": 141, "B200":
 // 返回 true=继续, false=用户中止(去换显卡)。任何异常都放行 —— 预警是辅助,不该挡正常流程。
 async function vramPreflightOrConfirm(prompt, cfgNow) {
   try {
-    // Auto(更省钱)模式:大工作流会自动升到顶配卡(B200),所以预警上限按顶配卡;
-    // 固定模式(H100/B200):上限就是所选主卡,超了提示用户切到 Auto 或更大的卡。
-    const auto = cfgNow.auto_downgrade !== false;
-    const gpu = auto ? (cfgNow.top_gpu || "B200") : (cfgNow.default_gpu || "H100");
+    // 预警上限取「这次实际会跑在哪张卡上」:
+    //   auto  → 大工作流会自动升顶配档,所以按 top_gpu 算;
+    //   固定档 → 就是该档绑定的那张卡,超了提示用户换档或降参数。
+    // 档位判定须与后端 routes.resolve_gpu_tier 一致(gpu_tier 优先,空则回落 auto_downgrade)。
+    const tier = (cfgNow.gpu_tier || "").trim().toLowerCase()
+      || (cfgNow.auto_downgrade === false ? "primary" : "auto");
+    const gpu = tier === "auto" ? (cfgNow.top_gpu || "B200")
+      : tier === "cheap" ? (cfgNow.cheap_gpu || "L40S")
+      : tier === "top" ? (cfgNow.top_gpu || "B200")
+      : (cfgNow.default_gpu || "H100");
     const cap = GPU_VRAM[gpu];
     if (!cap) return true;
     const r = await api.fetchApi("/modal_bridge/estimate_vram", {
@@ -1480,6 +1488,10 @@ async function openDeployDialog() {
   // 版本徽标改成异步填(见对话框末尾 refreshVerBanner):不再在这里 await /version,
   // 否则首次打开要先等云端 /health(冷启动/超时最长 6s),对话框迟迟不出 → 像卡死。
   const ver = { local: "?", deployed: null, match: false, reachable: false };
+  // 生效中的 GPU 档位。判定须与后端 routes.resolve_gpu_tier 一致:
+  // 新配置用 gpu_tier;为空则回落到旧的 auto_downgrade 语义(关 = 固定 primary)。
+  const curTier = (cfg.gpu_tier || "").trim().toLowerCase()
+    || (cfg.auto_downgrade === false ? "primary" : "auto");
 
   const overlay = document.createElement("div");
   deployDialogEl = overlay;
@@ -1522,12 +1534,13 @@ async function openDeployDialog() {
     <label>Token Secret <span style="color:#9aa;">(as-...${cfg.has_token_secret ? t("dlg.secret.saved") : ""})</span></label>
     <input id="mb-dep-secret" type="password" style="${inputCss}" value="" placeholder="${cfg.has_token_secret ? t("dlg.secret.ph_saved") : "as-xxxxxxxx"}">
     <label>GPU <span style="color:#9aa;">${t("dlg.gpu.label")}</span></label>
-    <select id="mb-dep-gpumode" style="${inputCss}">
-      <option value="auto"${(cfg.auto_downgrade!==false)?" selected":""}>${t("dlg.gpu.opt_auto")}</option>
-      <option value="h100"${(cfg.auto_downgrade===false && (cfg.default_gpu||"H100")==="H100")?" selected":""}>${t("dlg.gpu.opt_h100")}</option>
-      <option value="h200"${(cfg.auto_downgrade===false && (cfg.default_gpu||"H100")==="H200")?" selected":""}>${t("dlg.gpu.opt_h200")}</option>
-      <option value="b200"${(cfg.auto_downgrade===false && (cfg.default_gpu||"H100")==="B200")?" selected":""}>${t("dlg.gpu.opt_b200")}</option>
+    <select id="mb-dep-gputier" style="${inputCss}">
+      <option value="auto"${curTier==="auto"?" selected":""}>${t("dlg.gpu.opt_auto")}</option>
+      <option value="cheap"${curTier==="cheap"?" selected":""}>${t("dlg.gpu.opt_cheap", { gpu: cfg.cheap_gpu || "L40S" })}</option>
+      <option value="primary"${curTier==="primary"?" selected":""}>${t("dlg.gpu.opt_primary", { gpu: cfg.default_gpu || "H100" })}</option>
+      <option value="top"${curTier==="top"?" selected":""}>${t("dlg.gpu.opt_top", { gpu: cfg.top_gpu || "B200" })}</option>
     </select>
+    <div id="mb-dep-tiermsg" style="margin:0 0 4px;color:#10b981;font-size:12px;"></div>
     <div style="margin:0 0 10px;color:#9aa;font-size:12px;">${t("dlg.gpu.note")}</div>
     <label>comfy.org API Key <span style="color:#9aa;">${t("dlg.comfy.hint")}</span></label>
     <input id="mb-dep-comfy" type="password" style="${inputCss}" value="" placeholder="${cfg.has_comfy_api_key ? t("dlg.comfy.ph_saved") : t("dlg.comfy.ph")}">
@@ -1703,16 +1716,39 @@ async function openDeployDialog() {
     }
   };
 
+  // GPU 档位:纯运行时路由(四档 worker 已在云端建好),改完存进 config 立即生效 ——
+  // 不用等部署,所以这里独立即时保存,而不是攒到「部署」按钮里。
+  const tierSel = panel.querySelector("#mb-dep-gputier");
+  const tierMsg = panel.querySelector("#mb-dep-tiermsg");
+  tierSel.onchange = async () => {
+    const tier = tierSel.value;
+    try {
+      const r = await api.fetchApi("/modal_bridge/config", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ gpu_tier: tier }),
+      });
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      const label = tierSel.options[tierSel.selectedIndex].textContent.trim();
+      tierMsg.style.color = "#10b981";
+      tierMsg.textContent = t("dlg.gpu.tier_saved", { tier: label });
+      log("gpu tier →", tier);
+    } catch (e) {
+      tierMsg.style.color = "#ef4444";
+      tierMsg.textContent = t("dlg.gpu.tier_failed", { msg: String(e) });
+      err("save gpu tier failed", e);
+    }
+  };
+
   goBtn.onclick = async () => {
-    const gpuMode = panel.querySelector("#mb-dep-gpumode").value;  // auto | h100 | h200 | b200
     const payload = {
       workspace: panel.querySelector("#mb-dep-ws").value.trim(),
       token_id: panel.querySelector("#mb-dep-id").value.trim(),
       token_secret: panel.querySelector("#mb-dep-secret").value.trim(),
-      // Auto:主卡 H100(省钱降档/升顶配由 auto_downgrade 控制);固定档:主卡就是所选那张。
-      // 卡名须与 modal_app._GPU_CHAIN 的键一致(H200 走 ["H200","H100"] fallback)。
-      default_gpu: { h100: "H100", h200: "H200", b200: "B200" }[gpuMode] || "H100",
-      auto_downgrade: gpuMode === "auto",
+      // ⚠ 这里不再写 default_gpu / auto_downgrade —— 档位改走 gpu_tier(运行时路由,上面
+      // 即时保存)。各档具体绑哪张卡由 cheap_gpu / default_gpu / top_gpu 决定,那才是部署期
+      // 固定的(@app.cls 的 gpu= 参数),要换卡型得改 config.json 再部署。
+      gpu_tier: tierSel.value,
       comfy_api_key: panel.querySelector("#mb-dep-comfy").value.trim(),
       // AIGC Studio(可选,网站 aigc-r2 交付):URL 明文;bypass 密钥留空 = 沿用已存的
       aigc_studio_base_url: panel.querySelector("#mb-dep-aigc-url").value.trim(),

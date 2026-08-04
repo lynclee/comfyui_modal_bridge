@@ -130,16 +130,32 @@ def _estimate_workflow_vram(prompt: dict) -> tuple[float, str, int]:
     return est, category, unknown
 
 
+_TIER_GPU_KEY = {"cheap": "cheap_gpu", "primary": "default_gpu", "top": "top_gpu"}
+
+
+def resolve_gpu_tier(cfg: dict) -> str:
+    """config → 生效的 GPU 档位。'auto' 表示按显存自动选,其余为固定档。
+    新配置用 gpu_tier;为空则回落到旧的 auto_downgrade 语义(关=固定 primary)。"""
+    tier = (cfg.get("gpu_tier") or "").strip().lower()
+    if tier in ("auto", "cheap", "primary", "top"):
+        return tier
+    return "auto" if cfg.get("auto_downgrade", True) else "primary"
+
+
 def _pick_gpu_class(prompt: dict, cfg: dict) -> tuple[str, str]:
     """按估算显存在 GPU 档梯子上选档,返回 (gpu_class, reason)。gpu_class ∈ {'cheap','primary','top'}。
-    auto_downgrade 关 = 「H100/B200 固定」模式:一律 primary,不降也不升(>主卡容量会在前端预警)。
-    auto_downgrade 开 = 「Auto(更省钱)」模式,走梯子(成本低→高 L40S→H100→B200):
+
+    gpu_tier 固定某档时直接返回该档 —— 四档 worker 是一次部署全建好的,选哪档纯粹是
+    运行时路由,**换档不必重新部署**(换某档具体是哪张卡才要)。
+    gpu_tier=auto 时走梯子(成本低→高 L40S→H100→B200):
       1) 升档(防 OOM):估算 > 主卡容量 → top(B200 183G)。
       2) 降档(省钱):cheap≠主卡 + 非视频 + 大小已知 + 放得下便宜卡 → cheap(L40S)。
       3) 否则 → primary(H100)。
     本地查不到大小(unknown>0)时估算不可信:不升不降,留 primary(稳妥)。"""
-    if not cfg.get("auto_downgrade", True):
-        return "primary", f"{(cfg.get('default_gpu') or 'H100').strip()} 固定模式"
+    tier = resolve_gpu_tier(cfg)
+    if tier != "auto":
+        gpu_name = (cfg.get(_TIER_GPU_KEY[tier]) or "").strip() or "?"
+        return tier, f"固定 {tier} 档({gpu_name})"
     cheap_gpu = (cfg.get("cheap_gpu") or "L40S").strip()
     primary_gpu = (cfg.get("default_gpu") or "H100").strip()
     top_gpu = (cfg.get("top_gpu") or "").strip()
@@ -888,6 +904,9 @@ def _setup_routes():
             "modal_volume_name": volume_name,
             "scaledown_window": scaledown,
             "default_gpu": default_gpu,
+            # GPU 档位是运行时路由(改它本不必部署,前端切换时已即时存过);这里一并收下,
+            # 只是让「部署」也能兜住一次,避免即时保存失败时前后端看到的档位不一致。
+            "gpu_tier": (body.get("gpu_tier") or cfg.get("gpu_tier") or "auto").strip().lower(),
             "auto_downgrade": bool(body.get("auto_downgrade", cfg.get("auto_downgrade", True))),
             "comfyui_version": comfyui_version,
             "comfyui_tag": comfyui_tag,
