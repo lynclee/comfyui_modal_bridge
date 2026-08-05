@@ -61,8 +61,8 @@ const I18N = {
   "dlg.sage.label":   { zh: "(有损加速;改完要点「部署」才生效)", en: "(lossy speedup; takes effect after Deploy)" },
   "dlg.sage.saved":   { zh: "✓ 已保存 —— 点「部署」后生效(开关烤在镜像 env 里,只重建最后一层,秒级)", en: "✓ saved — takes effect after Deploy (flag baked into image env; only the last layer rebuilds, seconds)" },
   "dlg.sage.failed":  { zh: "✗ 保存失败:{msg}", en: "✗ save failed: {msg}" },
-  "dlg.sage.note":    { zh: "QK 走 INT8 的有损加速,仅标准档 H100 生效;建议同 seed A/B 看片 —— 悬停看详情", en: "Lossy INT8-QK speedup, standard H100 tier only; A/B with a fixed seed — hover for details" },
-  "dlg.sage.note_full":{ zh: "用 SageAttention 换掉默认的 PyTorch SDPA:attention 的 QK 矩阵乘走 INT8(长序列视频里 attention 占单步约七成算力)。论文口径视频模型端到端损失 ~0.2%;但 H3 权重本身已剪枝+INT8,误差叠加建议同 seed A/B 看片(重点看音画同步与高频细节)再常开。仅标准档 H100 生效 —— 省钱/顶配档的卡不匹配编译目标,会自动回退 SDPA,不报错。", en: "Replaces default PyTorch SDPA with SageAttention: QK matmuls in INT8 (attention is ~70% of per-step FLOPs on long video sequences). Papers report ~0.2% end-to-end loss on video models, but H3 weights are already pruned+INT8 - A/B with a fixed seed (watch AV sync & high-freq detail) before leaving it on. Only the standard H100 tier benefits; cheap/top tiers silently fall back to SDPA." },
+  "dlg.sage.note":    { zh: "QK 走 INT8 的有损加速,仅标准档 H100 生效;建议同 seed A/B 对比资产 —— 悬停看详情", en: "Lossy INT8-QK speedup, standard H100 tier only; A/B with a fixed seed — hover for details" },
+  "dlg.sage.note_full":{ zh: "用 SageAttention 换掉默认的 PyTorch SDPA:attention 的 QK 矩阵乘走 INT8(长序列视频里 attention 占单步约七成算力)。论文口径视频模型端到端损失 ~0.2%;但 H3 权重本身已剪枝+INT8,误差叠加建议同 seed A/B 对比资产(视频重点看音画同步与高频细节)再常开。仅标准档 H100 生效 —— 省钱/顶配档的卡不匹配编译目标,会自动回退 SDPA,不报错。", en: "Replaces default PyTorch SDPA with SageAttention: QK matmuls in INT8 (attention is ~70% of per-step FLOPs on long video sequences). Papers report ~0.2% end-to-end loss on video models, but H3 weights are already pruned+INT8 - A/B with a fixed seed (watch AV sync & high-freq detail) before leaving it on. Only the standard H100 tier benefits; cheap/top tiers silently fall back to SDPA." },
   "vram.warn.title":  { zh: "⚠ 显存可能不够", en: "⚠ VRAM may be tight" },
   "vram.warn.body":   { zh: "预估需 ~{est}GB(模型 {model}GB),超过所选 {gpu}({cap}GB)。可能 offload 变慢甚至 OOM。",
                         en: "Est. ~{est}GB ({model}GB models) exceeds the selected {gpu} ({cap}GB). May offload (slow) or OOM." },
@@ -117,7 +117,7 @@ const I18N = {
   "dep.fill_all":     { zh: "请填对 workspace + ak-/as- token", en: "Fill workspace + ak-/as- token" },
   "dep.running":      { zh: "部署中(首次拉镜像约 3-5 分钟,别关窗口)...",
                         en: "Deploying (first image pull ~3-5 min, keep window open)..." },
-  "dep.ok":           { zh: "✓ 部署成功!可以关掉这个窗口去出图了",
+  "dep.ok":           { zh: "✓ 部署成功!可以关掉这个窗口去出资产了",
                         en: "✓ Deployed! Close this window and start generating." },
   "dep.ok.toast":     { zh: "✓ Modal 部署成功", en: "✓ Modal deployed" },
   "dep.fail":         { zh: "✗ 部署失败 rc={rc}(看上面日志)", en: "✗ Deploy failed rc={rc} (see log above)" },
@@ -162,7 +162,7 @@ const I18N = {
   // —— 通知 / 版本契约 / 恢复 ——
   "toast.saved_no_node":{ zh: "图已存到 output/{sf}/(没找到对应输出节点)", en: "Image saved to output/{sf}/ (no matching output node)" },
   "toast.saved_3d":   { zh: "🧊 3D 模型已存到 output/{sf}/", en: "🧊 3D model saved to output/{sf}/" },
-  "toast.bg_done":    { zh: "✓ 后台工作流出图完成,切到该 tab 即显示(也已存 output/{sf}/)",
+  "toast.bg_done":    { zh: "✓ 后台工作流出资产完成,切到该 tab 即显示(也已存 output/{sf}/)",
                         en: "✓ Background workflow done; switch to its tab to view (also saved to output/{sf}/)" },
   "toast.not_deployed":{ zh: "还没部署到 Modal。先点右上角 [⚙️ Modal Setup] 填 token 一键部署(不用开终端)",
                         en: "Not deployed yet. Click [⚙️ Modal Setup] top-right to deploy with your token (no terminal)." },
@@ -190,10 +190,10 @@ const I18N = {
                         en: "GPU changed to {local}, but cloud is deployed on {deployed}; redeploy required." },
   "ver.gpu_mismatch_msg": { zh: "⚠ 显卡不一致:\n  你选的:{local}\n  云端实际在跑:{deployed}\n\nModal 的显卡是部署时固定的,换卡必须重新部署才生效——否则会继续在旧卡 {deployed} 上跑。\n\n点「确定」打开部署窗口重新部署。",
                         en: "⚠ GPU mismatch:\n  Selected: {local}\n  Actually running on cloud: {deployed}\n\nModal's GPU is fixed at deploy time; switching GPU needs a redeploy — otherwise it keeps running on the old {deployed}.\n\nOK to open the deploy dialog to redeploy." },
-  "ver.comfyui_changed_toast":{ zh: "本机 ComfyUI 已升级({local}),云端还是部署时的 {deployed} —— 建议重新部署让云端跟上(不影响本次出图)。",
+  "ver.comfyui_changed_toast":{ zh: "本机 ComfyUI 已升级({local}),云端还是部署时的 {deployed} —— 建议重新部署让云端跟上(不影响本次出资产)。",
                         en: "Local ComfyUI upgraded ({local}); cloud still on {deployed} from last deploy — redeploy to sync (this run still proceeds)." },
   "ver.checking":     { zh: "检查云端中…", en: "Checking cloud…" },
-  "ver.platform_startup":{ zh: "⚠ Modal 平台当前异常(status.modal.com),出图可能失败,等平台恢复",
+  "ver.platform_startup":{ zh: "⚠ Modal 平台当前异常(status.modal.com),出资产可能失败,等平台恢复",
                            en: "⚠ Modal platform is currently degraded (status.modal.com); jobs may fail until it recovers" },
   "ver.platform_toast":{ zh: "⚠ 连不上 Modal,可能是平台故障", en: "⚠ Can't reach Modal — possible platform outage" },
   "ver.platform_msg": { zh: "连不上 Modal 云端(超时)。\n\n这很可能是 Modal 平台故障,不是你的问题——重新部署也会失败。\n\n点「确定」打开 status.modal.com 查看平台状态;若显示故障,等恢复后再试即可。",
@@ -218,7 +218,7 @@ const I18N = {
   "toast.done_n":     { zh: "✓ {wf} {n} 张完成", en: "✓ {wf} {n} done" },
   "set.batch":        { zh: "一次点击跑几次(自动改 seed)", en: "How many runs per click (auto-reseed)" },
   "set.poll":         { zh: "查询状态频率", en: "Status polling interval" },
-  "set.timeout":      { zh: "前端等出图的最长时间(秒),默认 1200=20分钟,和 worker 单任务上限一致——worker 最多跑多久前端就等多久。出图后立刻返回,不会真等满;设大只是给冷启动+大模型留足空间。⚠ 别设得比 worker 上限小:那样前端会先放弃,而云端还在跑、还在计费(超时后会自动请求取消)。",
+  "set.timeout":      { zh: "前端等出资产的最长时间(秒),默认 1200=20分钟,和 worker 单任务上限一致——worker 最多跑多久前端就等多久。出资产后立刻返回,不会真等满;设大只是给冷启动+大模型留足空间。⚠ 别设得比 worker 上限小:那样前端会先放弃,而云端还在跑、还在计费(超时后会自动请求取消)。",
                         en: "Max seconds the frontend waits for a result. Default 1200=20min, matching the worker job limit. Returns instantly when done; large values just allow cold start + big models. Do not set it below the worker limit: the frontend would give up first while the cloud job keeps running and billing (a cancel is requested on timeout)." },
   "set.autosync_models":{ zh: "提交前检查 Modal Volume,工作流要、Volume 没、但本地有的模型自动上传(块级去重,通用大模型秒过)",
                           en: "Before submit, auto-upload models the workflow needs that are missing on the Volume but present locally (block dedup, common big models instant)" },
@@ -428,7 +428,7 @@ function displayInGraph(outputNodeIds, modalOutputs) {
   return placed;
 }
 
-// 后台工作流的出图结果暂存,等用户切回那个 tab 再渲染(ComfyUI 单 graph,后台渲染不了)。
+// 后台工作流的出资产结果暂存,等用户切回那个 tab 再渲染(ComfyUI 单 graph,后台渲染不了)。
 const _pendingResults = new Map();  // wfKey -> {outputNodeIds, outputs}
 let _pendingWatcher = null;
 function storePendingResult(wfKey, outputNodeIds, outputs) {
@@ -605,7 +605,7 @@ const STATUS_PROGRESS = {
   submitting:  [78, 82],
   queued:      [82, 85],
   running:     [85, 96],
-  downloading: [96, 99],   // 出图 base64 回流
+  downloading: [96, 99],   // 出资产 base64 回流
   done:        [100, 100],
   failed:      [100, 100],
 };
@@ -1415,7 +1415,7 @@ function isConfigured(cfg) {
 // 版本契约:本地插件版本 vs 云端部署版本不一致 → 拦截提交、引导重新部署。
 // 返回 true=放行 / false=拦截。version 检查本身出错(网络等)不拦(放行,别误伤)。
 async function checkVersionOrBlock() {
-  // 不弹"检查中"提示(正常云端在时 <1s 返回、直接出图,用户无感;弹了反而烦)。
+  // 不弹"检查中"提示(正常云端在时 <1s 返回、直接出资产,用户无感;弹了反而烦)。
   // 只有连不上/版本不一致才提示(下面)。
   let v;
   try {
@@ -1841,7 +1841,7 @@ function downloadText(filename, text) {
   a.remove(); URL.revokeObjectURL(url);
 }
 
-// 把当前画布工作流导成「自包含单文件 Modal API 客户端」——别人 python xxx.py 就能云端出图,
+// 把当前画布工作流导成「自包含单文件 Modal API 客户端」——别人 python xxx.py 就能云端出资产,
 // 不需要 ComfyUI / 本机 GPU / 作者机器开机(直连已部署的 -run / -status)。纯前端,不碰后端。
 async function exportModalApi() {
   const cfg = await fetchConfig();
@@ -1901,7 +1901,7 @@ async function exportModalApi() {
 """
 ${wfname} — Modal API 单文件客户端(comfyui_modal_bridge 导出)
 
-把这套 ComfyUI 工作流在云端 Modal GPU 上跑、出图存本地。
+把这套 ComfyUI 工作流在云端 Modal GPU 上跑、出资产存本地。
 不需要 ComfyUI、不需要本机 GPU、不用作者的机器开机。
 
 用法:
