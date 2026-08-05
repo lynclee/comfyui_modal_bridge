@@ -57,6 +57,10 @@ const I18N = {
   "dlg.gpu.tier_failed": { zh: "✗ 切换失败:{msg}", en: "✗ switch failed: {msg}" },
   "dlg.gpu.note":     { zh: "⚡ 换档立即生效,不用重新部署 —— 四档 worker(CPU/省钱/标准/顶配)是一次部署全建好的,选哪档只是运行时路由,空闲的档 scale-to-zero 不花钱。Auto:小图走省钱档、超主卡显存自动升顶配档(防 OOM),按工作流估算显存自动选。显存不够会退化成频繁 offload(慢几倍且不报错),但显存够之后再加大对速度帮助有限 —— 别只盯着最贵那档。想换某档具体是哪张卡(default_gpu/cheap_gpu/top_gpu),改 config.json 后需要重新部署。",
                         en: "⚡ Switching tiers takes effect immediately, no redeploy - all four workers (CPU/cheap/standard/top) are created by a single deploy, and picking a tier is pure runtime routing; idle tiers scale to zero and cost nothing. Auto: small jobs go cheap, anything above the primary card's VRAM escalates to the top tier (OOM guard). Too little VRAM silently degrades into constant offloading (several times slower, no error), but past the point where the model fits, more VRAM buys little speed - don't just pick the priciest. Changing which card a tier maps to (default_gpu/cheap_gpu/top_gpu) does require editing config.json and redeploying." },
+  "dlg.sage.label":   { zh: "(有损加速;改完要点「部署」才生效)", en: "(lossy speedup; takes effect after Deploy)" },
+  "dlg.sage.saved":   { zh: "✓ 已保存 —— 点「部署」后生效(开关烤在镜像 env 里,只重建最后一层,秒级)", en: "✓ saved — takes effect after Deploy (flag baked into image env; only the last layer rebuilds, seconds)" },
+  "dlg.sage.failed":  { zh: "✗ 保存失败:{msg}", en: "✗ save failed: {msg}" },
+  "dlg.sage.note":    { zh: "用 SageAttention 换掉默认的 PyTorch SDPA:attention 的 QK 矩阵乘走 INT8(长序列视频里 attention 占单步约七成算力)。论文口径视频模型端到端损失 ~0.2%;但 H3 权重本身已剪枝+INT8,误差叠加建议同 seed A/B 看片(重点看音画同步与高频细节)再常开。仅标准档 H100 生效 —— 省钱/顶配档的卡不匹配编译目标,会自动回退 SDPA,不报错。", en: "Replaces default PyTorch SDPA with SageAttention: QK matmuls in INT8 (attention is ~70% of per-step FLOPs on long video sequences). Papers report ~0.2% end-to-end loss on video models, but H3 weights are already pruned+INT8 - A/B with a fixed seed (watch AV sync & high-freq detail) before leaving it on. Only the standard H100 tier benefits; cheap/top tiers silently fall back to SDPA." },
   "vram.warn.title":  { zh: "⚠ 显存可能不够", en: "⚠ VRAM may be tight" },
   "vram.warn.body":   { zh: "预估需 ~{est}GB(模型 {model}GB),超过所选 {gpu}({cap}GB)。可能 offload 变慢甚至 OOM。",
                         en: "Est. ~{est}GB ({model}GB models) exceeds the selected {gpu} ({cap}GB). May offload (slow) or OOM." },
@@ -1542,6 +1546,12 @@ async function openDeployDialog() {
     </select>
     <div id="mb-dep-tiermsg" style="margin:0 0 4px;color:#10b981;font-size:12px;"></div>
     <div style="margin:0 0 10px;color:#9aa;font-size:12px;">${t("dlg.gpu.note")}</div>
+    <label style="display:flex;align-items:center;gap:8px;cursor:pointer;">
+      <input id="mb-dep-sage" type="checkbox" style="margin:0;"${cfg.use_sage_attention ? " checked" : ""}>
+      SageAttention <span style="color:#9aa;">${t("dlg.sage.label")}</span>
+    </label>
+    <div id="mb-dep-sagemsg" style="margin:0 0 4px;color:#10b981;font-size:12px;"></div>
+    <div style="margin:0 0 10px;color:#9aa;font-size:12px;">${t("dlg.sage.note")}</div>
     <label>comfy.org API Key <span style="color:#9aa;">${t("dlg.comfy.hint")}</span></label>
     <input id="mb-dep-comfy" type="password" style="${inputCss}" value="" placeholder="${cfg.has_comfy_api_key ? t("dlg.comfy.ph_saved") : t("dlg.comfy.ph")}">
     <div style="margin:0 0 10px;color:#9aa;font-size:12px;">${t("dlg.comfy.note")}</div>
@@ -1737,6 +1747,29 @@ async function openDeployDialog() {
       tierMsg.style.color = "#ef4444";
       tierMsg.textContent = t("dlg.gpu.tier_failed", { msg: String(e) });
       err("save gpu tier failed", e);
+    }
+  };
+
+  // SageAttention:和 GPU 档位不同,它不是运行时路由 —— 开关经 deploy_env 烤进镜像 env,
+  // 由 worker 启动参数(--use-sage-attention)消费,所以改完必须点「部署」才生效
+  // (只重建最后的 .env() 层,秒级)。这里即时存 config,部署时 deploy_env 读走。
+  const sageChk = panel.querySelector("#mb-dep-sage");
+  const sageMsg = panel.querySelector("#mb-dep-sagemsg");
+  sageChk.onchange = async () => {
+    try {
+      const r = await api.fetchApi("/modal_bridge/config", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ use_sage_attention: sageChk.checked }),
+      });
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      sageMsg.style.color = "#10b981";
+      sageMsg.textContent = t("dlg.sage.saved");
+      log("sage attention →", sageChk.checked);
+    } catch (e) {
+      sageMsg.style.color = "#ef4444";
+      sageMsg.textContent = t("dlg.sage.failed", { msg: String(e) });
+      err("save sage attention failed", e);
     }
   };
 

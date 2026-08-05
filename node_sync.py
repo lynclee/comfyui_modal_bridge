@@ -548,6 +548,10 @@ def deploy_env(cfg: dict) -> dict:
     # 从 CPU 搬,显存够也照搬 —— 在按秒计费的云上等于持续付 PCIe 搬运的钱。关掉更快但显存
     # 不够会直接 OOM 而非降速兜底,所以默认不关,由用户按工作流自行取舍。
     env["MODAL_BRIDGE_DISABLE_DYNAMIC_VRAM"] = "1" if cfg.get("disable_dynamic_vram") else "0"
+    # 用 SageAttention 替换 ComfyUI 默认的 PyTorch SDPA。attention 在长序列视频模型上占大头
+    # (H3 单步约七成 FLOPs),量化后理论翻倍;代价是 QK 走 INT8 有数值误差,需自行看片验证。
+    # 包在镜像里总是装好,这里只控制启动参数 → 切换不必重编译 kernel。
+    env["MODAL_BRIDGE_SAGE_ATTENTION"] = "1" if cfg.get("use_sage_attention") else "0"
     env["MODAL_BRIDGE_VOLUME_THRESHOLD_MB"] = str(cfg.get("volume_threshold_mb", 8))  # 大产物走 Volume 的阈值
     env["MODAL_BRIDGE_VERSION"] = plugin_version()  # 版本契约:烤进 app,health 回传供前端比对
     if cfg.get("modal_token_id"):

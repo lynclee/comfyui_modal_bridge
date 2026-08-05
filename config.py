@@ -47,6 +47,12 @@ DEFAULT_CONFIG = {
     # 显存装得下也照搬 —— 云上按秒计费,这段 PCIe 搬运是白付的钱。关掉通常更快,
     # 代价:显存不够会直接 OOM,没有降速兜底。默认不关,按工作流自行取舍。换值需重新部署。
     "disable_dynamic_vram": False,
+    # 用 SageAttention 替换 ComfyUI 默认的 PyTorch SDPA(--use-sage-attention)。
+    # attention 在长序列视频模型上占绝大部分算力(H3 单步约七成 FLOPs),量化后理论翻倍。
+    # 代价是 QK 走 INT8 属有损:论文在 CogVideoX 上端到端 ~0.2%(视频那组甚至略优),
+    # 但 H3 是音视频联合生成、权重本身已剪枝+INT8,误差叠加没有先例数据 —— 默认关,
+    # 自己同 seed 跑 A/B 看过片子(重点看音画同步和高频细节)再决定常开。换值需重新部署。
+    "use_sage_attention": False,
     "enable_snapshot": True,   # 内存快照(实验):冷启 ~30s→~5s。默认开;不支持的 GPU 档自动退化为普通冷启(不更差)。换值需重新部署
     "user_id": "local-dev",
     "poll_interval_sec": 1.5,

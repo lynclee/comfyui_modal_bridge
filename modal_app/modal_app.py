@@ -47,6 +47,10 @@ _SNAPSHOT = os.environ.get("MODAL_BRIDGE_SNAPSHOT", "0") == "1"
 # 关掉云端 ComfyUI 的动态 VRAM(见 _worker_boot)。开关 = config.disable_dynamic_vram。
 # 默认不关:关掉后显存不够会直接 OOM,而非降速兜底 —— 是否划算取决于工作流,交给用户判断。
 _DISABLE_DYNAMIC_VRAM = os.environ.get("MODAL_BRIDGE_DISABLE_DYNAMIC_VRAM", "0") == "1"
+# 用 SageAttention 顶替 ComfyUI 默认的 PyTorch SDPA。开关 = config.use_sage_attention。
+# 默认关:QK 走 INT8 是有损的(论文在 CogVideoX 上端到端 ~0.2%,但 H3 是音视频联合生成、
+# 且权重本身已剪枝+INT8,误差叠加没有先例数据),需要自己看片验证后再常开。
+_SAGE_ATTENTION = os.environ.get("MODAL_BRIDGE_SAGE_ATTENTION", "0") == "1"
 DEPLOYED_VERSION = os.environ.get("MODAL_BRIDGE_VERSION", "unknown")  # 部署时烤进,health 回传
 DEPLOYED_COMFYUI_TAG = os.environ.get("MODAL_BRIDGE_COMFYUI_TAG", "v0.22.0")  # 云端 clone 的 ComfyUI tag
 
@@ -135,10 +139,23 @@ def _worker_boot(self, cpu: bool = False):
         # "Force pre-loaded ... KB")。显存装得下时这层搬运是白付的 PCIe 时间,而云上按秒计费。
         # 关掉 = 估算式加载,更快;代价是显存不够时直接 OOM,没有降速兜底。
         cmd.append("--disable-dynamic-vram")
+    if not cpu and _SAGE_ATTENTION:
+        # 顶替默认的 PyTorch SDPA。是否真正生效看 ComfyUI 启动日志里打的是
+        # "Using sage attention" 还是 "Using pytorch attention" —— 包没装上或
+        # import 失败时 ComfyUI 会静默回退到 SDPA,不会报错也不会崩。
+        cmd.append("--use-sage-attention")
     self.proc = subprocess.Popen(cmd)
     from _comfy_ws import wait_comfy_ready
     wait_comfy_ready(timeout_s=180)
-    mode = "CPU" if cpu else ("GPU, dynamic-vram off" if _DISABLE_DYNAMIC_VRAM else "GPU")
+    if cpu:
+        mode = "CPU"
+    else:
+        bits = ["GPU"]
+        if _DISABLE_DYNAMIC_VRAM:
+            bits.append("dynamic-vram off")
+        if _SAGE_ATTENTION:
+            bits.append("sage-attention")
+        mode = ", ".join(bits)
     print(f"[bridge] ComfyUI ready ({mode})")
 
 
