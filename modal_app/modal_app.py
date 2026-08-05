@@ -187,15 +187,28 @@ def _worker_shutdown(self):
         _tv, _tl = "/comfy-volume/.cache/triton", "/root/.cache/triton-local"
         if os.path.isdir(_tl):
             os.makedirs(_tv, exist_ok=True)
+            # 「临时名写入 + rename 发布」:copytree 中断只会留下 .tmp- 垃圾(下面顺手清),
+            # 正式名字的目录要么完整要么不存在 —— 杜绝"半个 hash 目录"被后续容器
+            # 当作已存在而永远跳过修复的卡死态。
+            for junk in [d for d in os.listdir(_tv) if d.startswith(".tmp-")]:
+                shutil.rmtree(os.path.join(_tv, junk), ignore_errors=True)
             have = set(os.listdir(_tv))
             new = [d for d in os.listdir(_tl) if d not in have]
+            done = 0
             for d in new:
                 src = os.path.join(_tl, d)
-                if os.path.isdir(src):
-                    shutil.copytree(src, os.path.join(_tv, d), dirs_exist_ok=True)
-            if new:
+                if not os.path.isdir(src):
+                    continue
+                tmp = os.path.join(_tv, f".tmp-{d}")
+                try:
+                    shutil.copytree(src, tmp)
+                    os.rename(tmp, os.path.join(_tv, d))
+                    done += 1
+                except Exception:
+                    shutil.rmtree(tmp, ignore_errors=True)
+            if done:
                 models_vol.commit()
-                print(f"[bridge] triton cache 回写 {len(new)} 个新条目")
+                print(f"[bridge] triton cache 回写 {done} 个新条目")
     except Exception as e:
         print(f"[bridge] triton cache 回写失败(无害): {e}")
 
