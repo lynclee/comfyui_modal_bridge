@@ -145,6 +145,10 @@ const I18N = {
   "mdl.downloading":  { zh: "这些模型本地还在下载中,现在传会传成残缺文件:\n\n{list}\n\n建议:等本地下完再点 [☁️ Modal]。\n\n仍然继续提交?(会缺这些模型,大概率失败)",
                         en: "These models are still downloading locally; uploading now would push partial files:\n\n{list}\n\nTip: wait until done, then click [☁️ Modal].\n\nSubmit anyway? (missing these, likely to fail)" },
   "mdl.cancel_dl":    { zh: "Cancelled — 本地模型还在下载中", en: "Cancelled — local models still downloading" },
+  "run.progress":     { zh: "{prefix}推理中 {step}/{total} 步 · {sit}s/步 (gpu={gpu})",
+                        en: "{prefix}inference {step}/{total} steps · {sit}s/step (gpu={gpu})" },
+  "run.eta_overrun":  { zh: "⚠ 按当前速度({sit}s/步)预计还需 {eta} 分钟,会超过 {limit} 分钟的 worker 上限被强杀、白付全程费用 —— 建议取消,换更大显存 GPU 档或降低分辨率/时长(显存不足会被静默 offload 拖慢几倍)",
+                        en: "⚠ At {sit}s/step this needs ~{eta} more min and will overrun the {limit}-min worker limit (killed, fully billed, no output) — cancel and use a bigger-VRAM tier or lower res/duration (VRAM starvation silently slows jobs several-fold)" },
   "run.slow":         { zh: "⚠ 已跑 {min} 分钟,快到等待上限了(gpu={gpu}) — 常见原因是显存不足被 offload 拖慢:换更大显存的 GPU 档,或降低分辨率 / 时长 / 帧数",
                         en: "⚠ {min} min elapsed, approaching the wait limit (gpu={gpu}) — usually VRAM starvation causing offload: pick a larger GPU tier, or lower resolution / duration / frames" },
   "cancel.failed":    { zh: "⚠ 取消失败 — 云端可能仍在运行", en: "⚠ Cancel failed — job may still be running" },
@@ -872,13 +876,18 @@ async function runOnceOnModal(workflowPrompt, outputNodeIds, ctx, submitGuard, b
   const deadline = Date.now() + timeoutMs;
   // 运行时慢速预警。显存不够时 ComfyUI 不报错,而是把权重甩去 CPU 降速硬撑 —— 实测同一
   // 工作流显存够是 37 s/it、不够是 219 s/it,最后撞 worker 超时、烧满预算却零产出,且全程
-  // 没有任何提示。这里在接近等待上限时提醒一次:不打断(可能工作流本来就重),但让
-  // "异常慢"变得可见,而不是干等到超时才发现。
-  // ⚠ 比例别往低调:健康基线实测 802s 端到端、上限 1200s —— 0.5 会在 600s 触发,每次正常
-  // 任务都弹一次警告(狼来了,反而没人看)。0.75=900s 既躲开健康值,又留 300s 给用户反应。
-  const SLOW_WARN_RATIO = 0.75;
+  // 没有任何提示。
+  // 判据是「投影」不是「耗时」:worker 每步上报 progress:{step,total,s_it},前端算
+  // 照当前速度跑完(+固定尾巴)会不会撞 worker 超时 —— 会撞才警告(那才值得取消止损),
+  // 不会撞就只显示进度。老的按耗时比例(0.75×上限)方案已废弃:0.9MP 健康任务 ~1100s,
+  // 900s 线必然误报,实际误导过用户把只差 3 分钟完工的任务取消。下面的比例线只剩一个
+  // 用途:对没部署进度上报的老 worker 兜底。
+  // 0.9 只作为「没有进度数据」时的兜底线(老 worker);有进度时走投影式预警,见 poll 循环。
+  const SLOW_WARN_RATIO = 0.9;
   const slowWarnAt = Date.now() + timeoutMs * SLOW_WARN_RATIO;
   let slowWarned = false;
+  let etaWarned = false;    // 投影式预警只弹一次
+  let sawProgress = false;  // 收到过 progress → 永不走老的按耗时兜底
 
   let final = null;
   let lastStatus = "queued";
@@ -911,8 +920,35 @@ async function runOnceOnModal(workflowPrompt, outputNodeIds, ctx, submitGuard, b
           ctx.stage("queued", `${batchSuffix}Waiting for worker...`, true);
         }
       }
-      // 慢速预警:只在 running 阶段提示一次,之后不再覆盖(状态变化时上面的分支会自然接管)。
-      if (!slowWarned && lastStatus === "running" && Date.now() > slowWarnAt) {
+      // ---- 进度显示 + 投影式慢速预警(worker 每步写 progress:{step,total,s_it,elapsed}) ----
+      // 老的「按耗时比例」预警对合法长任务必然误报(0.9MP 健康任务 ~1100s,900s 线上必弹,
+      // 实际误导过用户把只差 3 分钟完工的任务取消)。正确判据:照当前 s/it 跑完会不会撞
+      // worker 超时 —— 会撞才值得取消止损(超时=强杀+全程计费+零产出),不会撞就闭嘴。
+      const prog = pData.progress;
+      if (lastStatus === "running" && prog && prog.step >= 1 && prog.total > 1) {
+        sawProgress = true;
+        if (!etaWarned && prog.s_it && prog.step >= 3) {
+          // TAIL_MS:采样之后的固定尾巴(VAE decode+视频编码+写回,实测 45~124s)留 150s 余量
+          const TAIL_MS = 150000;
+          const remainMs = (prog.total - prog.step) * prog.s_it * 1000;
+          if (Date.now() + remainMs + TAIL_MS > deadline) {
+            etaWarned = true;
+            const eta = Math.ceil(remainMs / 60000);
+            const limit = Math.round(timeoutMs / 60000);
+            log("eta overrun", jobId, `s/it=${prog.s_it} step=${prog.step}/${prog.total} eta=${eta}min`);
+            ctx.stage("running", t("run.eta_overrun", { sit: prog.s_it, eta, limit }), true);
+          }
+        }
+        if (!etaWarned) {
+          ctx.stage("running", t("run.progress", {
+            prefix: batchSuffix, step: prog.step, total: prog.total,
+            sit: prog.s_it != null ? prog.s_it : "?", gpu,
+          }), true);
+        }
+      }
+      // 兜底:老 worker(没部署进度上报)拿不到 progress —— 保留按耗时预警,但阈值提到 0.9
+      // 减少误报(0.75 线被证明打在健康任务身上)。
+      if (!sawProgress && !slowWarned && lastStatus === "running" && Date.now() > slowWarnAt) {
         slowWarned = true;
         const min = Math.round((timeoutMs * SLOW_WARN_RATIO) / 60000);
         log("slow job", jobId, `still running after ${min}min — possible VRAM starvation`);

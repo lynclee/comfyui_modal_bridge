@@ -199,9 +199,37 @@ def _worker_run(workflow: dict, job_id: str, input_images: list | None = None,
         # 正确策略:正常直接跑(模型在显存,秒级);只有验证失败(模型不在列表)时,queue_workflow
         # 内部才按需 free→reload→重试(只有删 Volume/缺模型的极端场景才付这个代价)。
         from _comfy_ws import run_workflow
+
+        # 进度上报:ComfyUI 每步推一次 → 算 s/it 写进 job_state.progress,poll 全量透传到前端。
+        # 前端据此做「投影式慢速预警」(按当前速度是否会撞 worker 超时),替代老的
+        # 按耗时比例预警 —— 后者对 0.9MP 这类合法长任务必然误报(健康任务本来就超 75% 线)。
+        # s/it 的参考点取首个事件(首步含 Triton/sage JIT ~70s,差分计算天然把它排除在外)。
+        # 每步最多写一次 modal.Dict(20~50 次/任务),开销可忽略;写失败静默,不碰任务本体。
+        _t0 = time.time()
+        _prog = {"v": 0, "m": 0, "t_ref": 0.0, "v_ref": 0}
+        def _on_progress(v: int, m: int) -> None:
+            now = time.time()
+            if m <= 1 or v <= 0:
+                return
+            if m != _prog["m"]:          # 新一段进度条(换了节点)→ 重置参考点
+                _prog.update(m=m, v=v, t_ref=now, v_ref=v)
+                return
+            if v <= _prog["v"]:
+                return
+            _prog["v"] = v
+            s_it = ((now - _prog["t_ref"]) / (v - _prog["v_ref"])) if v > _prog["v_ref"] else None
+            try:
+                job_state[job_id] = {**job_state.get(job_id, {}), "progress": {
+                    "step": v, "total": m,
+                    "s_it": round(s_it, 2) if s_it else None,
+                    "elapsed": int(now - _t0),
+                }}
+            except Exception:
+                pass
+
         # aigc-r2:只「发现」产物不读进内存(materialize=False),下面流式直传 R2。
         result = run_workflow(workflow=workflow, job_id=job_id, input_images=input_images,
-                              materialize=(mode != "aigc-r2"))
+                              materialize=(mode != "aigc-r2"), on_progress=_on_progress)
         if mode == "aigc-r2":
             # 状态机:running → delivering → completed。出图后直传 R2 + 回调 AIGC Studio;
             # 全部上传且回调成功才 completed。回调失败但文件已在 R2 → delivery.status =

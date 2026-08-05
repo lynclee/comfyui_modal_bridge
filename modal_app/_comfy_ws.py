@@ -312,7 +312,7 @@ def materialize_desktop_outputs(refs: list[dict], job_id: str) -> tuple[list[dic
 
 
 def run_workflow(workflow: dict, job_id: str, input_images: list[dict] | None = None,
-                 materialize: bool = True) -> dict:
+                 materialize: bool = True, on_progress=None) -> dict:
     """
     跑一个 workflow,返回所有产出图 base64。
     Returns: {images: [{filename, data_base64}], filename, data_base64, errors,
@@ -358,6 +358,14 @@ def run_workflow(workflow: dict, job_id: str, input_images: list[dict] | None = 
                     if data.get("node") is None and data.get("prompt_id") == prompt_id:
                         execution_done = True
                         break
+                elif t == "progress":
+                    # ComfyUI 每完成一步推一条 {value, max}(采样器为主,带进度条的节点都有)。
+                    # 这里保持哑管道:原样上抛,s/it 的计算和限频写状态由 caller 决定。
+                    if on_progress and data.get("prompt_id") == prompt_id:
+                        try:
+                            on_progress(int(data.get("value") or 0), int(data.get("max") or 0))
+                        except Exception:
+                            pass  # 进度上报绝不能影响任务本体
                 elif t == "execution_error":
                     if data.get("prompt_id") == prompt_id:
                         errors.append(
