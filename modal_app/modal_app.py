@@ -134,14 +134,15 @@ def _worker_boot(self, cpu: bool = False):
     #   boot 把 Volume 快照拷到本地 → 运行期 Triton 只碰本地盘(与 reload 彻底解耦)
     #   → shutdown 只回写新增条目 + commit(见 _worker_shutdown)。
     # 缓存按内容 hash 分目录,并发容器编同一 kernel 产物字节相同,合并无一致性风险。
-    import shutil
-    _tv, _tl = "/comfy-volume/.cache/triton", "/root/.cache/triton-local"
-    try:
-        if os.path.isdir(_tv):
-            shutil.copytree(_tv, _tl, dirs_exist_ok=True)
-    except Exception as e:
-        print(f"[bridge] triton cache 预热失败(无害,本容器重编): {e}")
-    os.environ.setdefault("TRITON_CACHE_DIR", _tl)
+    if not cpu:  # CPU 容器不跑 Triton,别白拷几百 MB
+        import shutil
+        _tv, _tl = "/comfy-volume/.cache/triton", "/root/.cache/triton-local"
+        try:
+            if os.path.isdir(_tv):
+                shutil.copytree(_tv, _tl, dirs_exist_ok=True)
+        except Exception as e:
+            print(f"[bridge] triton cache 预热失败(无害,本容器重编): {e}")
+        os.environ.setdefault("TRITON_CACHE_DIR", _tl)
     cmd = [
         "python", "/comfyui/main.py",
         "--listen", "127.0.0.1", "--port", "8188",
@@ -187,11 +188,20 @@ def _worker_shutdown(self):
         _tv, _tl = "/comfy-volume/.cache/triton", "/root/.cache/triton-local"
         if os.path.isdir(_tl):
             os.makedirs(_tv, exist_ok=True)
-            # 「临时名写入 + rename 发布」:copytree 中断只会留下 .tmp- 垃圾(下面顺手清),
-            # 正式名字的目录要么完整要么不存在 —— 杜绝"半个 hash 目录"被后续容器
-            # 当作已存在而永远跳过修复的卡死态。
+            # 「临时名写入 + rename 发布」:copytree 中断只会留下 .tmp- 垃圾,正式名字的
+            # 目录要么完整要么不存在 —— 杜绝"半个 hash 目录"被后续容器当作已存在而
+            # 永远跳过修复的卡死态。
+            # ⚠ 清垃圾必须带年龄门:并发容器可能正在发布自己的 .tmp-(存在窗口仅几秒),
+            # 无差别清理会删掉进行中的拷贝,最坏交错下对方 copytree 无感知地写完剩余
+            # 文件再 rename —— 残缺目录反而被冠上正式名。只清 >1h 的崩溃残留。
+            now = time.time()
             for junk in [d for d in os.listdir(_tv) if d.startswith(".tmp-")]:
-                shutil.rmtree(os.path.join(_tv, junk), ignore_errors=True)
+                p = os.path.join(_tv, junk)
+                try:
+                    if now - os.path.getmtime(p) > 3600:
+                        shutil.rmtree(p, ignore_errors=True)
+                except OSError:
+                    pass
             have = set(os.listdir(_tv))
             new = [d for d in os.listdir(_tl) if d not in have]
             done = 0
