@@ -55,12 +55,14 @@ const I18N = {
   "dlg.gpu.opt_top":     { zh: "顶配档 — {gpu}(固定)", en: "Top tier — {gpu} (fixed)" },
   "dlg.gpu.tier_saved":  { zh: "✓ 已切到「{tier}」— 下次提交即生效,无需部署", en: "✓ switched to \"{tier}\" — effective on next submit, no deploy needed" },
   "dlg.gpu.tier_failed": { zh: "✗ 切换失败:{msg}", en: "✗ switch failed: {msg}" },
-  "dlg.gpu.note":     { zh: "⚡ 换档立即生效,不用重新部署 —— 四档 worker(CPU/省钱/标准/顶配)是一次部署全建好的,选哪档只是运行时路由,空闲的档 scale-to-zero 不花钱。Auto:小图走省钱档、超主卡显存自动升顶配档(防 OOM),按工作流估算显存自动选。显存不够会退化成频繁 offload(慢几倍且不报错),但显存够之后再加大对速度帮助有限 —— 别只盯着最贵那档。想换某档具体是哪张卡(default_gpu/cheap_gpu/top_gpu),改 config.json 后需要重新部署。",
-                        en: "⚡ Switching tiers takes effect immediately, no redeploy - all four workers (CPU/cheap/standard/top) are created by a single deploy, and picking a tier is pure runtime routing; idle tiers scale to zero and cost nothing. Auto: small jobs go cheap, anything above the primary card's VRAM escalates to the top tier (OOM guard). Too little VRAM silently degrades into constant offloading (several times slower, no error), but past the point where the model fits, more VRAM buys little speed - don't just pick the priciest. Changing which card a tier maps to (default_gpu/cheap_gpu/top_gpu) does require editing config.json and redeploying." },
+  "dlg.gpu.note":     { zh: "⚡ 换档立即生效,无需部署;Auto 按显存自动选档 —— 悬停看详情", en: "⚡ Tier switch is instant, no redeploy; Auto picks by VRAM — hover for details" },
+  "dlg.gpu.note_full":{ zh: "四档 worker(CPU/省钱/标准/顶配)是一次部署全建好的,选哪档只是运行时路由,空闲的档 scale-to-zero 不花钱。Auto:小图走省钱档、超主卡显存自动升顶配档(防 OOM),按工作流估算显存自动选。显存不够会退化成频繁 offload(慢几倍且不报错),但显存够之后再加大对速度帮助有限 —— 别只盯着最贵那档。想换某档具体是哪张卡(default_gpu/cheap_gpu/top_gpu),改 config.json 后需要重新部署。",
+                        en: "All four workers (CPU/cheap/standard/top) are created by a single deploy; picking a tier is pure runtime routing and idle tiers scale to zero. Auto: small jobs go cheap, anything above the primary card's VRAM escalates to the top tier (OOM guard). Too little VRAM silently degrades into constant offloading (several times slower, no error), but past the point where the model fits, more VRAM buys little speed. Changing which card a tier maps to (default_gpu/cheap_gpu/top_gpu) requires editing config.json and redeploying." },
   "dlg.sage.label":   { zh: "(有损加速;改完要点「部署」才生效)", en: "(lossy speedup; takes effect after Deploy)" },
   "dlg.sage.saved":   { zh: "✓ 已保存 —— 点「部署」后生效(开关烤在镜像 env 里,只重建最后一层,秒级)", en: "✓ saved — takes effect after Deploy (flag baked into image env; only the last layer rebuilds, seconds)" },
   "dlg.sage.failed":  { zh: "✗ 保存失败:{msg}", en: "✗ save failed: {msg}" },
-  "dlg.sage.note":    { zh: "用 SageAttention 换掉默认的 PyTorch SDPA:attention 的 QK 矩阵乘走 INT8(长序列视频里 attention 占单步约七成算力)。论文口径视频模型端到端损失 ~0.2%;但 H3 权重本身已剪枝+INT8,误差叠加建议同 seed A/B 看片(重点看音画同步与高频细节)再常开。仅标准档 H100 生效 —— 省钱/顶配档的卡不匹配编译目标,会自动回退 SDPA,不报错。", en: "Replaces default PyTorch SDPA with SageAttention: QK matmuls in INT8 (attention is ~70% of per-step FLOPs on long video sequences). Papers report ~0.2% end-to-end loss on video models, but H3 weights are already pruned+INT8 - A/B with a fixed seed (watch AV sync & high-freq detail) before leaving it on. Only the standard H100 tier benefits; cheap/top tiers silently fall back to SDPA." },
+  "dlg.sage.note":    { zh: "QK 走 INT8 的有损加速,仅标准档 H100 生效;建议同 seed A/B 看片 —— 悬停看详情", en: "Lossy INT8-QK speedup, standard H100 tier only; A/B with a fixed seed — hover for details" },
+  "dlg.sage.note_full":{ zh: "用 SageAttention 换掉默认的 PyTorch SDPA:attention 的 QK 矩阵乘走 INT8(长序列视频里 attention 占单步约七成算力)。论文口径视频模型端到端损失 ~0.2%;但 H3 权重本身已剪枝+INT8,误差叠加建议同 seed A/B 看片(重点看音画同步与高频细节)再常开。仅标准档 H100 生效 —— 省钱/顶配档的卡不匹配编译目标,会自动回退 SDPA,不报错。", en: "Replaces default PyTorch SDPA with SageAttention: QK matmuls in INT8 (attention is ~70% of per-step FLOPs on long video sequences). Papers report ~0.2% end-to-end loss on video models, but H3 weights are already pruned+INT8 - A/B with a fixed seed (watch AV sync & high-freq detail) before leaving it on. Only the standard H100 tier benefits; cheap/top tiers silently fall back to SDPA." },
   "vram.warn.title":  { zh: "⚠ 显存可能不够", en: "⚠ VRAM may be tight" },
   "vram.warn.body":   { zh: "预估需 ~{est}GB(模型 {model}GB),超过所选 {gpu}({cap}GB)。可能 offload 变慢甚至 OOM。",
                         en: "Est. ~{est}GB ({model}GB models) exceeds the selected {gpu} ({cap}GB). May offload (slow) or OOM." },
@@ -1523,6 +1525,8 @@ async function openDeployDialog() {
     <div style="font-size:16px;font-weight:600;margin-bottom:4px;">${t("dlg.title")}</div>
     <div id="mb-dep-ver" style="margin-bottom:10px;font-size:12px;padding:6px 10px;border-radius:6px;
          background:#222;border:1px solid #383838;">
+      <a href="https://github.com/lynclee/comfyui_modal_bridge" target="_blank"
+         style="float:right;color:#6cf;text-decoration:none;">GitHub ↗</a>
       ${t("dlg.ver.local")}<b style="color:#eee;">${ver.local}</b>　·
       ${t("dlg.ver.deployed")}<b style="color:${vColor};">${vDeployed}</b>
       <span style="color:${vColor};">${vHint}</span>
@@ -1545,13 +1549,13 @@ async function openDeployDialog() {
       <option value="top"${curTier==="top"?" selected":""}>${t("dlg.gpu.opt_top", { gpu: cfg.top_gpu || "B200" })}</option>
     </select>
     <div id="mb-dep-tiermsg" style="margin:0 0 4px;color:#10b981;font-size:12px;"></div>
-    <div style="margin:0 0 10px;color:#9aa;font-size:12px;">${t("dlg.gpu.note")}</div>
+    <div style="margin:0 0 10px;color:#9aa;font-size:12px;cursor:help;" title="${t("dlg.gpu.note_full")}">${t("dlg.gpu.note")}</div>
     <label style="display:flex;align-items:center;gap:8px;cursor:pointer;">
       <input id="mb-dep-sage" type="checkbox" style="margin:0;"${cfg.use_sage_attention ? " checked" : ""}>
       SageAttention <span style="color:#9aa;">${t("dlg.sage.label")}</span>
     </label>
     <div id="mb-dep-sagemsg" style="margin:0 0 4px;color:#10b981;font-size:12px;"></div>
-    <div style="margin:0 0 10px;color:#9aa;font-size:12px;">${t("dlg.sage.note")}</div>
+    <div style="margin:0 0 10px;color:#9aa;font-size:12px;cursor:help;" title="${t("dlg.sage.note_full")}">${t("dlg.sage.note")}</div>
     <label>comfy.org API Key <span style="color:#9aa;">${t("dlg.comfy.hint")}</span></label>
     <input id="mb-dep-comfy" type="password" style="${inputCss}" value="" placeholder="${cfg.has_comfy_api_key ? t("dlg.comfy.ph_saved") : t("dlg.comfy.ph")}">
     <div style="margin:0 0 10px;color:#9aa;font-size:12px;">${t("dlg.comfy.note")}</div>
