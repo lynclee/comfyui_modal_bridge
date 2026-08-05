@@ -127,12 +127,21 @@ def _worker_boot(self, cpu: bool = False):
     # 避免 CUDA 版 torch 在无驱动机器上自动探测的边角风险。GPU 容器走默认(自动用 CUDA)。
     self._cpu = cpu
     models_vol.reload()  # 启动前同步 Volume(ComfyUI 还没打开文件,不冲突)
-    # Triton JIT 缓存落 Volume:torch 2.13 起 H3 走 Triton 路径,冷容器首步要现场编译
-    # kernel(实测首步 ~95s vs 稳态 ~25s,大头就是它)。缓存默认在容器内(~/.triton),
-    # 销毁即丢 → 每个冷容器重编。指到 Volume 后编译一次全网复用;持久化靠 _worker_shutdown
-    # 的 commit(Volume 语义:不 commit 只在本容器可见)。缓存目录按内容 hash 组织,
-    # 多容器并发写同一 hash 是幂等的,无一致性风险。
-    os.environ.setdefault("TRITON_CACHE_DIR", "/comfy-volume/.cache/triton")
+    # Triton JIT 缓存跨容器复用:torch 2.13 起 H3 走 Triton 路径,冷容器首步要现场编译
+    # kernel(实测首步 ~95s vs 稳态 ~25s,编译占其中 30~70s)。缓存默认在容器内,销毁即丢。
+    # ⚠ 不让 Triton 直接读写 Volume:运行中 _reload_volume_in_worker 的 reload() 会使
+    # Volume 上的打开句柄失效,且 FUSE 读几百个小缓存文件比本地盘慢。所以三段式:
+    #   boot 把 Volume 快照拷到本地 → 运行期 Triton 只碰本地盘(与 reload 彻底解耦)
+    #   → shutdown 只回写新增条目 + commit(见 _worker_shutdown)。
+    # 缓存按内容 hash 分目录,并发容器编同一 kernel 产物字节相同,合并无一致性风险。
+    import shutil
+    _tv, _tl = "/comfy-volume/.cache/triton", "/root/.cache/triton-local"
+    try:
+        if os.path.isdir(_tv):
+            shutil.copytree(_tv, _tl, dirs_exist_ok=True)
+    except Exception as e:
+        print(f"[bridge] triton cache 预热失败(无害,本容器重编): {e}")
+    os.environ.setdefault("TRITON_CACHE_DIR", _tl)
     cmd = [
         "python", "/comfyui/main.py",
         "--listen", "127.0.0.1", "--port", "8188",
@@ -170,12 +179,25 @@ def _worker_shutdown(self):
         self.proc.terminate()
     except Exception:
         pass
-    # 把本容器新编译的 Triton kernel 缓存持久化(见 _worker_boot 的 TRITON_CACHE_DIR)。
-    # scaledown 时才走一次,不在任务路径上;失败无所谓,下个容器重编就是。
+    # 把本容器新编译的 Triton kernel 缓存回写 Volume(见 _worker_boot 的三段式说明)。
+    # 只拷 Volume 里还没有的 hash 目录:避免把从 Volume 拷来的旧条目原样写回去。
+    # scaledown 时才走一次,不在任务路径上;任何一步失败都无害(下个容器重编就是)。
     try:
-        models_vol.commit()
-    except Exception:
-        pass
+        import shutil
+        _tv, _tl = "/comfy-volume/.cache/triton", "/root/.cache/triton-local"
+        if os.path.isdir(_tl):
+            os.makedirs(_tv, exist_ok=True)
+            have = set(os.listdir(_tv))
+            new = [d for d in os.listdir(_tl) if d not in have]
+            for d in new:
+                src = os.path.join(_tl, d)
+                if os.path.isdir(src):
+                    shutil.copytree(src, os.path.join(_tv, d), dirs_exist_ok=True)
+            if new:
+                models_vol.commit()
+                print(f"[bridge] triton cache 回写 {len(new)} 个新条目")
+    except Exception as e:
+        print(f"[bridge] triton cache 回写失败(无害): {e}")
 
 
 def _worker_ensure_alive(self):
