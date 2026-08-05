@@ -253,22 +253,29 @@ def _worker_run(workflow: dict, job_id: str, input_images: list | None = None,
         # s/it 的参考点取首个事件(首步含 Triton/sage JIT ~70s,差分计算天然把它排除在外)。
         # 每步最多写一次 modal.Dict(20~50 次/任务),开销可忽略;写失败静默,不碰任务本体。
         _t0 = time.time()
-        _prog = {"v": 0, "m": 0, "t_ref": 0.0, "v_ref": 0}
+        # s/it 用「最近 ≤5 个步间隔的中位数」而非累计平均:冷容器第 2 步仍带 JIT 残余,
+        # 累计平均会在早期高估一倍(实测第 3 步评估出 ~48 而稳态 24.6),触发误报;
+        # 中位数滚动几步后热身样本自然被洗出窗口。
+        _prog = {"v": 0, "m": 0, "t_last": 0.0, "win": []}
         def _on_progress(v: int, m: int) -> None:
             now = time.time()
             if m <= 1 or v <= 0:
                 return
-            if m != _prog["m"]:          # 新一段进度条(换了节点)→ 重置参考点
-                _prog.update(m=m, v=v, t_ref=now, v_ref=v)
+            if m != _prog["m"]:          # 新一段进度条(换了节点)→ 全部重置
+                _prog.update(m=m, v=v, t_last=now, win=[])
                 return
             if v <= _prog["v"]:
                 return
-            _prog["v"] = v
-            s_it = ((now - _prog["t_ref"]) / (v - _prog["v_ref"])) if v > _prog["v_ref"] else None
+            itv = (now - _prog["t_last"]) / (v - _prog["v"])
+            _prog.update(v=v, t_last=now)
+            _prog["win"] = (_prog["win"] + [itv])[-5:]
+            w = sorted(_prog["win"])
+            s_it = w[len(w) // 2]
             try:
                 job_state[job_id] = {**job_state.get(job_id, {}), "progress": {
                     "step": v, "total": m,
-                    "s_it": round(s_it, 2) if s_it else None,
+                    "s_it": round(s_it, 2),
+                    "n_samples": len(w),      # 前端据此决定预警可信度
                     "elapsed": int(now - _t0),
                 }}
             except Exception:

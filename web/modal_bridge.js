@@ -924,22 +924,30 @@ async function runOnceOnModal(workflowPrompt, outputNodeIds, ctx, submitGuard, b
       // 老的「按耗时比例」预警对合法长任务必然误报(0.9MP 健康任务 ~1100s,900s 线上必弹,
       // 实际误导过用户把只差 3 分钟完工的任务取消)。正确判据:照当前 s/it 跑完会不会撞
       // worker 超时 —— 会撞才值得取消止损(超时=强杀+全程计费+零产出),不会撞就闭嘴。
+      // 预警是「活状态」不是闩锁:每次 poll 重算投影,ETA 跟着最新 s/it 刷新;
+      // 条件解除(热身步被滑动窗口洗出后 s/it 回落)就自动撤回警告、恢复进度显示。
       const prog = pData.progress;
       if (lastStatus === "running" && prog && prog.step >= 1 && prog.total > 1) {
         sawProgress = true;
-        if (!etaWarned && prog.s_it && prog.step >= 3) {
+        let overrun = false;
+        // n_samples>=3:窗口里至少 3 个步间隔,热身样本已被中位数压制,投影才可信
+        if (prog.s_it && (prog.n_samples || 0) >= 3) {
           // TAIL_MS:采样之后的固定尾巴(VAE decode+视频编码+写回,实测 45~124s)留 150s 余量
           const TAIL_MS = 150000;
           const remainMs = (prog.total - prog.step) * prog.s_it * 1000;
           if (Date.now() + remainMs + TAIL_MS > deadline) {
-            etaWarned = true;
+            overrun = true;
             const eta = Math.ceil(remainMs / 60000);
             const limit = Math.round(timeoutMs / 60000);
-            log("eta overrun", jobId, `s/it=${prog.s_it} step=${prog.step}/${prog.total} eta=${eta}min`);
+            if (!etaWarned) {  // 只用于日志去重,不再冻结显示
+              etaWarned = true;
+              log("eta overrun", jobId, `s/it=${prog.s_it} step=${prog.step}/${prog.total} eta=${eta}min`);
+            }
             ctx.stage("running", t("run.eta_overrun", { sit: prog.s_it, eta, limit }), true);
           }
         }
-        if (!etaWarned) {
+        if (!overrun) {
+          if (etaWarned) { etaWarned = false; log("eta overrun cleared", jobId, `s/it=${prog.s_it}`); }
           ctx.stage("running", t("run.progress", {
             prefix: batchSuffix, step: prog.step, total: prog.total,
             sit: prog.s_it != null ? prog.s_it : "?", gpu,
