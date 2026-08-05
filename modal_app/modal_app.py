@@ -127,6 +127,12 @@ def _worker_boot(self, cpu: bool = False):
     # 避免 CUDA 版 torch 在无驱动机器上自动探测的边角风险。GPU 容器走默认(自动用 CUDA)。
     self._cpu = cpu
     models_vol.reload()  # 启动前同步 Volume(ComfyUI 还没打开文件,不冲突)
+    # Triton JIT 缓存落 Volume:torch 2.13 起 H3 走 Triton 路径,冷容器首步要现场编译
+    # kernel(实测首步 ~95s vs 稳态 ~25s,大头就是它)。缓存默认在容器内(~/.triton),
+    # 销毁即丢 → 每个冷容器重编。指到 Volume 后编译一次全网复用;持久化靠 _worker_shutdown
+    # 的 commit(Volume 语义:不 commit 只在本容器可见)。缓存目录按内容 hash 组织,
+    # 多容器并发写同一 hash 是幂等的,无一致性风险。
+    os.environ.setdefault("TRITON_CACHE_DIR", "/comfy-volume/.cache/triton")
     cmd = [
         "python", "/comfyui/main.py",
         "--listen", "127.0.0.1", "--port", "8188",
@@ -162,6 +168,12 @@ def _worker_boot(self, cpu: bool = False):
 def _worker_shutdown(self):
     try:
         self.proc.terminate()
+    except Exception:
+        pass
+    # 把本容器新编译的 Triton kernel 缓存持久化(见 _worker_boot 的 TRITON_CACHE_DIR)。
+    # scaledown 时才走一次,不在任务路径上;失败无所谓,下个容器重编就是。
+    try:
+        models_vol.commit()
     except Exception:
         pass
 
