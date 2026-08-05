@@ -14,7 +14,7 @@
 - 🧩 **custom node 自动同步** — 工作流用到的自定义节点,云端镜像没有就**自动装进镜像并重部署**;多台机器各装一部分时取**并集、互不删**,换机无缝。
 - 🎨 **图 / 视频 / 3D 全支持** — SaveImage / SaveVideo / SaveGLB / Preview3D 的产物都回流本地,并直接回填画板预览(3D 出可转动的网格);大文件(视频 / 网格)自动走 Volume 直连取回,不受 base64 体积限制。
 - 🤖 **API 节点 + 自动省钱** — 工作流含 ComfyUI API 节点(Kling / Luma / Tripo / OpenAI 等)也能跑(Setup 填一次 comfy.org key);**没有本地模型的纯 API 工作流自动路由到 CPU 容器,GPU 账单≈0**。
-- 💰 **按秒计费,空闲归零** — 用你自己的 Modal 账号(注册送 $30/月额度,需绑卡),**不出图不花钱**,闲置自动缩到零。可选「内存快照」把冷启从 ~30s 降到 ~5s。
+- 💰 **按秒计费,空闲归零** — 用你自己的 Modal 账号(注册送 $30/月额度,需绑卡),**不出图不花钱**,闲置自动缩到零。可选 SageAttention 加速把长视频任务端到端压掉约 45%(实测 MiniMax H3 720p·15s 一条约 $0.63)。
 
 ## 它解决什么
 
@@ -31,7 +31,7 @@
 - **提交前必填输入预检**:点 RunModal 时按当前本地节点定义检查各节点是否缺必填输入(常见:必填连线没接;或老工作流里的节点在新版新增了必填 widget,如内置 API 节点的 `generate_type`,老图没带上)→ 提前弹提示(可仍要提交 / 去修),避免等云端 `execute() missing required argument` 才报错;拿不到定义的节点跳过、不误报。
 - **SageAttention 有损加速(可选,默认关)**:Setup 里勾选后点「部署」生效(开关烤在镜像 env,只重建最后一层,秒级)。attention 的 QK 矩阵乘走 INT8 —— 长序列视频里 attention 占单步约七成算力,实测 MiniMax H3 @H100 采样 48.6→24.6 s/it,**端到端约 −45%**,同 seed A/B 画质无可见差异;图像模型(FLUX.2 等)序列短,收益仅个位数且可能引起构图漂移(复现历史产物请关闭)。仅标准档 H100 生效 —— 预编译 wheel 只含 sm_90(本仓库 Release `sage-2.2.0-d1a57a5` 自托管,规避上游 v2.2.0 tag 在 sm90 的静默数值 bug),省钱/顶配档自动回退 SDPA,不报错。
 - **运行卡实时进度 + 投影式慢速预警**:worker 每步上报进度,运行卡实时显示「7/20 步 · 24.6s/步」;预警只在「照当前速度会撞 worker 超时」时出现(ETA 实时刷新,速度恢复自动撤回)—— 显存不足被静默 offload 拖慢的任务早期即可识别止损,健康的长任务不再被误报打扰。
-- **更快冷启(可选)**:Setting 开「内存快照」后,容器冷启从 ~30s 降到 ~5s(experimental,按 GPU 档需自测;CPU worker 用 GA 的 CPU 快照,稳)。
+- **内存快照(实验,默认关)**:实测对 GPU worker **基本无效**——ComfyUI 以子进程运行,Modal 内存快照难以覆盖(实测 7 次容器启动 7 次重建快照、零复用),开着反添 ~5s/次的快照创建开销,故默认已关;CPU worker 的 CPU 快照(GA)不受影响。留作实验开关,等上游支持子进程快照再评估。
 - **多任务并发 & 进度**:多工作流并发各有独立进度卡片(可拖动/取消/关闭);上传带速率 + ETA;job 状态自动清理,不会互相覆盖。
 - **custom_node 自动同步 + 多机友好**:自动加工作流需要的节点并重部署(只这一次);多机取并集、互不删;清理走 Setup 的「管理云端节点」手动勾选。
 - **云端 ComfyUI 版本跟随本机**:部署时自动检测本机 ComfyUI 版本,云端镜像 clone **同一个 tag**(本机版本无对应 tag 时取最接近的,只警告不中止);本机升级后点 RunModal 会提示重新部署让云端跟上 —— 本地能跑的节点云端基本就能跑。
@@ -94,7 +94,7 @@ MIT
 - 🧩 **Custom nodes auto-sync.** Nodes your workflow uses but the cloud lacks are **auto-baked into the image and redeployed**; across machines the image is the **union, never cross-deleted** — switch machines seamlessly.
 - 🎨 **Images / video / 3D — all supported.** Outputs from SaveImage / SaveVideo / SaveGLB / Preview3D flow back locally and render right on the canvas (3D shows a rotatable mesh); large files (video / meshes) are pulled back directly via the Volume, free of the base64 size ceiling.
 - 🤖 **API nodes + auto cost-saving.** Workflows with ComfyUI API nodes (Kling / Luma / Tripo / OpenAI, etc.) run too (enter a comfy.org key once in Setup); **pure-API workflows with no local model auto-route to a CPU container — GPU bill ≈ 0**.
-- 💰 **Per-second billing, scales to zero.** Uses your own Modal account ($30/mo free credit, card required); **you pay nothing when not generating**, idle scales to zero. Optional memory snapshot cuts cold start from ~30s to ~5s.
+- 💰 **Per-second billing, scales to zero.** Uses your own Modal account ($30/mo free credit, card required); **you pay nothing when not generating**, idle scales to zero. Optional SageAttention speedup cuts long video jobs by ~45% end-to-end (measured: MiniMax H3 720p·15s ≈ $0.63/clip).
 
 ## What it solves
 
@@ -111,7 +111,7 @@ You don't have a big-VRAM GPU locally (Mac / thin laptop / a 4090 that can't fit
 - **Submit-time required-input preflight**: on RunModal, each node is checked against its current local definition for missing required inputs (commonly a required connection left unwired, or an old workflow whose node gained a new required widget in a newer version — e.g. a built-in API node's `generate_type` — that the old graph didn't carry) → warn up front (submit anyway / go fix) instead of failing on the cloud with `execute() missing required argument`; nodes whose definition can't be read are skipped (no false positives).
 - **SageAttention lossy speedup (optional, off by default)**: tick it in Setup and hit Deploy (the flag is baked into the image env; only the last layer rebuilds, seconds). QK matmuls run in INT8 — attention is ~70% of per-step FLOPs on long video sequences. Measured on MiniMax H3 @H100: sampling 48.6→24.6 s/it, **~−45% end-to-end**, no visible quality difference in same-seed A/B; image models (FLUX.2 etc.) have short sequences, gains are single-digit and composition may drift (turn it off to reproduce older outputs). Standard H100 tier only — the prebuilt wheel targets sm_90 (self-hosted in this repo's Release `sage-2.2.0-d1a57a5`, avoiding the silent sm90 numerical bug in upstream's v2.2.0 tag); cheap/top tiers silently fall back to SDPA.
 - **Live progress + projection-based slow-job warning**: the worker reports per-step progress; the job card shows "7/20 steps · 24.6s/step" live. The warning appears only when the current pace would overrun the worker timeout (ETA refreshes live, auto-clears on recovery) — VRAM-starved jobs silently degraded by offloading get flagged early, while healthy long jobs are no longer false-alarmed.
-- **Faster cold start (optional)**: enable "Memory snapshot" in Settings to cut container cold start from ~30s to ~5s (experimental, verify per GPU tier; the CPU worker uses the GA CPU snapshot, reliable).
+- **Memory snapshot (experimental, off by default)**: measured to be **mostly ineffective for GPU workers** — ComfyUI runs as a subprocess, which Modal's memory snapshot doesn't cover (measured: 7 container starts, 7 snapshot rebuilds, zero reuse), while adding ~5s of snapshot-creation overhead per boot; hence off by default now. The CPU worker's GA CPU snapshot is unaffected. Kept as an experimental toggle pending upstream subprocess support.
 - **Multi-task concurrency & progress**: each concurrent workflow gets its own progress card (draggable / cancelable / closable); uploads show rate + ETA; job state auto-cleans without clobbering.
 - **Custom-node auto-sync & multi-machine**: auto-adds nodes the workflow needs and redeploys (one time); across machines it's the **union, never cross-deleted**; cleanup is manual via "Manage cloud nodes" in Setup.
 - **Cloud ComfyUI version follows your machine**: at deploy time it detects your local ComfyUI version and clones the **same tag** into the cloud image (no exact tag → nearest one, warn-only); after you upgrade locally, RunModal nudges you to redeploy so the cloud catches up — nodes that work locally work in the cloud.

@@ -53,7 +53,10 @@ DEFAULT_CONFIG = {
     # 但 H3 是音视频联合生成、权重本身已剪枝+INT8,误差叠加没有先例数据 —— 默认关,
     # 自己同 seed 跑 A/B 看过片子(重点看音画同步和高频细节)再决定常开。换值需重新部署。
     "use_sage_attention": False,
-    "enable_snapshot": True,   # 内存快照(实验):冷启 ~30s→~5s。默认开;不支持的 GPU 档自动退化为普通冷启(不更差)。换值需重新部署
+    # 内存快照(实验):实测对 GPU worker 基本无效 —— ComfyUI 是子进程,Modal 快照盖不住
+    # (2026-08-05 实测 7 启动 7 重建 0 复用),开着反添 ~5s/次创建开销,故默认关。
+    # CPU worker 的 CPU 快照不受影响。换值需重新部署。
+    "enable_snapshot": False,
     "user_id": "local-dev",
     "poll_interval_sec": 1.5,
     # worker(Modal)单任务超时上限(秒)。覆盖最慢类别(视频)——见 categories.max_worker_timeout_s()。
