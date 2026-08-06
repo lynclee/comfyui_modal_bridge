@@ -477,6 +477,11 @@ def _setup_routes():
             "job_id": job_id,
             "gpu": gpu,
             "input_image_count": len(input_images),
+            # 前端等待窗自动跟上云端超时用(见 modal_bridge.js poll deadline):
+            # 云端 worker 上限 = 部署时的 cfg.worker_timeout_sec(node_sync 注入 MODAL_BRIDGE_TIMEOUT)。
+            # 若用户改了 cfg 还没重新部署,这里会与云端短暂不一致 —— 偏大无害(worker 先死,
+            # poll 拿到失败态提前结束),偏小则被前端设置项的 max() 兜住。
+            "worker_timeout_sec": int(cfg.get("worker_timeout_sec", 1200)),
         })
 
     # -------- 轮询单次状态(前端高频调用,显示进度)--------

@@ -123,6 +123,20 @@ _WORKER_KW = dict(
 )
 
 
+def _gpu_compute_cap() -> str:
+    """探测容器内 GPU 的 compute capability(如 "9.0"),探测失败返回 ""。
+    故意用 nvidia-smi 而非 import torch:boot wrapper 进程不必为这一个数字付 torch 冷 import 的钱。
+    探测不到时按「非 sm_90」处理 —— sage 是锦上添花,SDPA 永远正确,宁可慢不可炸。"""
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=compute_cap", "--format=csv,noheader"],
+            capture_output=True, text=True, timeout=10,
+        ).stdout.strip().splitlines()
+        return out[0].strip() if out else ""
+    except Exception:
+        return ""
+
+
 def _worker_boot(self, cpu: bool = False):
     # cpu=True:CPU-only 容器(无 GPU)→ 给 ComfyUI 传 --cpu 强制 CPU 模式,根本不碰 CUDA 初始化,
     # 避免 CUDA 版 torch 在无驱动机器上自动探测的边角风险。GPU 容器走默认(自动用 CUDA)。
@@ -144,11 +158,21 @@ def _worker_boot(self, cpu: bool = False):
         # "Force pre-loaded ... KB")。显存装得下时这层搬运是白付的 PCIe 时间,而云上按秒计费。
         # 关掉 = 估算式加载,更快;代价是显存不够时直接 OOM,没有降速兜底。
         cmd.append("--disable-dynamic-vram")
+    sage_on = False
     if not cpu and _SAGE_ATTENTION:
-        # 顶替默认的 PyTorch SDPA。是否真正生效看 ComfyUI 启动日志里打的是
-        # "Using sage attention" 还是 "Using pytorch attention" —— 包没装上或
-        # import 失败时 ComfyUI 会静默回退到 SDPA,不会报错也不会崩。
-        cmd.append("--use-sage-attention")
+        # 只在 wheel 真有 kernel 的架构上开 sage:multiarch wheel 含 sm_89(L40S)+ sm_90a(H100),
+        # 双卡冒烟对 SDPA 余弦 0.9992+(含 H3 真实形状 56×90720×96),见 Release
+        # sage-2.2.0-d1a57a5-multiarch。门控存在的原因:sm89 分支若装的是错架构代码,launch
+        # 失败不报 Python 异常,而是采样时异步 CUDA illegal access 打崩整个 job(2026-08-06
+        # 在 L40S 实测,初版 sm90-only wheel);B200(sm100)则因 dispatch 无分支抛 ValueError
+        # 被 ComfyUI 兜住回退 SDPA —— 有假 kernel 的架构比没分支的更危险,所以白名单制。
+        cap = _gpu_compute_cap()
+        if cap in ("8.9", "9.0"):
+            sage_on = True
+            cmd.append("--use-sage-attention")
+        else:
+            print(f"[bridge] sage-attention skipped: compute_cap={cap or '?'} "
+                  f"(wheel 只有 sm_89/sm_90 kernel) → 回退 PyTorch SDPA")
     self.proc = subprocess.Popen(cmd)
     from _comfy_ws import wait_comfy_ready
     wait_comfy_ready(timeout_s=180)
@@ -158,7 +182,7 @@ def _worker_boot(self, cpu: bool = False):
         bits = ["GPU"]
         if _DISABLE_DYNAMIC_VRAM:
             bits.append("dynamic-vram off")
-        if _SAGE_ATTENTION:
+        if sage_on:
             bits.append("sage-attention")
         mode = ", ".join(bits)
     print(f"[bridge] ComfyUI ready ({mode})")

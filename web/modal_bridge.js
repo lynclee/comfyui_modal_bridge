@@ -872,7 +872,13 @@ async function runOnceOnModal(workflowPrompt, outputNodeIds, ctx, submitGuard, b
   ctx.stage("queued", `${batchSuffix}job=${jobId.slice(0, 8)} gpu=${gpu}`, true);
 
   const interval = getSetting("ModalBridge.pollIntervalSec", 1.2) * 1000;
-  const timeoutMs = getSetting("ModalBridge.timeoutSec", 1200) * 1000;  // 兜底值须与上面注册的 defaultValue 一致(见 ModalBridge.timeoutSec)
+  // 等待窗取「前端设置」与「云端 worker 超时 + 3 分钟尾巴」的较大者 —— 两个旋钮手动同步
+  // 是 bug 温床:历史上 900 vs 1800 踩过一次;2026-08-06 用户把 worker 调到 3600 后前端
+  // 仍按 1200 到点取消,把一单已跑完采样、正在 VAE decode 的任务杀在终点线前。尾巴罩住
+  // decode/编码/取回,与投影式预警的 TAIL_MS 同源。
+  const settingMs = getSetting("ModalBridge.timeoutSec", 1200) * 1000;  // 兜底值须与上面注册的 defaultValue 一致(见 ModalBridge.timeoutSec)
+  const workerMs = sub.worker_timeout_sec ? sub.worker_timeout_sec * 1000 + 180000 : 0;  // 老后端无此字段 → 0,退化为纯设置值
+  const timeoutMs = Math.max(settingMs, workerMs);
   const deadline = Date.now() + timeoutMs;
   // 运行时慢速预警。显存不够时 ComfyUI 不报错,而是把权重甩去 CPU 降速硬撑 —— 实测同一
   // 工作流显存够是 37 s/it、不够是 219 s/it,最后撞 worker 超时、烧满预算却零产出,且全程
@@ -1408,9 +1414,10 @@ const SETTINGS = [
     id: "ModalBridge.timeoutSec",
     name: "Modal Bridge: Timeout (sec)",
     type: "number",
-    // 必须 ≥ worker 超时上限(config.worker_timeout_sec / categories.max_worker_timeout_s)。
-    // 小于它 = 前端先放弃,而 worker 还在跑、还在计费 —— 历史上这里是 900 而 worker 是 1800,
-    // 正好踩中这个坑(且下方 getSetting 的兜底值写的又是另一个数,三处互不一致)。
+    // 实际等待窗 = max(此值, 云端 worker 超时 + 3 分钟)(见 poll deadline 处):后端在提交
+    // 响应里带回 worker_timeout_sec,前端自动跟上,不再要求手动同步两处 —— 历史上 900 vs
+    // 1800、1200 vs 3600 两次都是「前端先放弃取消,worker 还在跑/已跑完」的白烧钱事故。
+    // 此设置现在只用于「想比 worker 上限等得更久」的罕见场景,一般不用动。
     defaultValue: 1200,
     attrs: { min: 60, max: 21600, step: 60 },
     tooltip: t("set.timeout"),

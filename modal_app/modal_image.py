@@ -94,23 +94,23 @@ cuda_image = (
     # 注意它跟 nvcc 两码事:Triton 自带 LLVM 直接出 PTX,不走 nvcc。
     .apt_install("build-essential")
     # SageAttention 装预编译 wheel(本仓库 Release 自托管),不再现场编译:
-    #   - 全网没有可用的 Linux 二进制:官方 thu-ml Releases 零资产、PyPI 只到 1.0.6(纯 Triton)、
-    #     woct0rdho/sdbds 等 fork 全是 win_amd64 —— Linux 生态默认"自己编",所以只能自己发。
-    #   - wheel 由本镜像内实际编译产物重打包而来(bit 级一致),构建配方见 Release 页:
-    #     thu-ml/SageAttention@d1a57a546c3d + nvcc 13.0 + TORCH_CUDA_ARCH_LIST=9.0。
+    #   - 全网没有可用的 Linux 二进制(2026-08-06 复查):官方 thu-ml Releases 零资产、PyPI 只到
+    #     1.0.6(纯 Triton)、woct0rdho 全 win_amd64;有 Linux wheel 的社区仓全是 cp312/torch≤2.12,
+    #     唯一 cp313+cu13 的(snw35)从坏的 v2.2.0 tag 编 —— 只能自己发。
     #   - ⚠ 不能用上游 v2.2.0 tag:它带 PR #218 引入的 sm90 wrapper bug(custom op 写 output
     #     没声明 mutates_args → torch 当纯函数把写入丢弃 → kernel "成功"返回垃圾,H100 上
     #     输出全花且无异常无回退)。上游 issue #288/#320,2025-12-22 起 main 已修,
     #     实测 H100: 48.6 → 24.6 s/it(−49%),画质正常。
-    #   - 只含 sm_90(H100)。L40S/B200 上模块能加载、kernel 启动报 no kernel image →
-    #     ComfyUI try/except 自动回退 pytorch attention,不崩(attention.py:577)。
-    #   - 要重编 wheel(升上游版本/加架构)时的完整踩坑记录 —— nvcc 找 clang(Modal 的
-    #     Python 是 Clang 构建,需 CC/CXX/-ccbin 指 g++)、cusparse.h 头(cuda-libraries-dev,
-    #     且要先 apt-mark unhold)、-lcuda 链接(builder 无驱动,LIBRARY_PATH 指 toolkit 的
-    #     driver stub)—— 见 git 历史 05cd503 前后版本与 Release 说明。
+    #   - multiarch 版含真·双架构:_qattn_sm89=sm_89(L40S/L20/4090)、_qattn_sm90=sm_90a(H100)、
+    #     _fused=双架构。上游 setup.py 所有扩展共享 NVCC_FLAGS(thu-ml#360),单一 ARCH_LIST 会把
+    #     每个 .so 编成同一架构 —— 初版 wheel 的 _qattn_sm89 里全是 sm_90a 代码,L40S 上
+    #     CUDA illegal access(2026-08-06 实测)。构建时需给 setup.py 打「每扩展各自 gencode」补丁,
+    #     配方+双卡冒烟数据见 Release 页;B200(sm100)无 dispatch 分支,Python 异常被 ComfyUI
+    #     兜住回退 SDPA(attention.py:578)。是否传 --use-sage-attention 由 _worker_boot 按
+    #     compute_cap 门控(见 modal_app.py)。
     .pip_install(
         "sageattention @ https://github.com/lynclee/comfyui_modal_bridge/releases/download/"
-        "sage-2.2.0-d1a57a5/sageattention-2.2.0-cp313-cp313-linux_x86_64.whl"
+        "sage-2.2.0-d1a57a5-multiarch/sageattention-2.2.0-cp313-cp313-linux_x86_64.whl"
     )
     .run_commands("cd /comfyui && pip install -r requirements.txt")
     .run_commands(_CLONE_CMD)
