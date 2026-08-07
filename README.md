@@ -39,6 +39,7 @@
 - **模型本地 → Volume**:模型在本地 ComfyUI 下好,提交时自动把云端缺的传上去;**块级去重(CAS)让通用大模型秒过**,只有自训练/私有模型才真占上行带宽。不从 HF 下载、不依赖手维护的 registry。
 - **私有鉴权**:endpoint 用自建 `BRIDGE_API_KEY` 校验,只有你的 key 能调用,无 key 一律 401。
 - **两种结果交付(可选 aigc-r2)**:默认 desktop(结果回本地);网站(AIGC Studio)调 `/run` 时可带 `delivery:{"mode":"aigc-r2"}`,出图后 worker **流式直传 Cloudflare R2**(短期预签名地址,R2 长期密钥永不进 Modal)再回调网站落库 —— 同一套部署本地 / 网站共用,网站出图全程不需要本地 ComfyUI 在线。详见 SETUP。
+- **机器接口:HTTP API + MCP**:UI 用的本地 HTTP API 全部文档化([API.md](API.md)),脚本 / agent 可直接调(提交 → 轮询进度 → 取产物 → 取消,含显存估算与健康检查);附带薄封装 MCP server([mcp_server.py](mcp_server.py),7 个工具,兼容 mcp 1.x/2.x SDK),注册进 Claude Code / Codex 后「云端 GPU 出资产」就是一个标准工具调用。
 
 ## 工作流程(点 [RunModal] 之后)
 
@@ -119,6 +120,7 @@ You don't have a big-VRAM GPU locally (Mac / thin laptop / a 4090 that can't fit
 - **Local → Volume models**: download models locally; missing ones upload on submit; **block-level dedup (CAS) makes common big models instant** — only custom/private models actually use upstream bandwidth. No HF download, no hand-maintained registry.
 - **Private auth**: endpoints verify a self-issued `BRIDGE_API_KEY`; only your key can call them, missing key always returns 401.
 - **Two delivery modes (optional aigc-r2)**: desktop by default (results return locally); a website (AIGC Studio) may call `/run` with `delivery:{"mode":"aigc-r2"}` — the worker then **streams outputs straight to Cloudflare R2** (short-lived presigned URLs; long-term R2 keys never enter Modal) and calls the site back to register assets. One deployment serves both local and website use; website jobs never need your local ComfyUI online. See SETUP.
+- **Machine interface: HTTP API + MCP**: the local HTTP API the UI itself uses is fully documented ([API.md](API.md)) — scripts/agents can drive submit → poll progress → fetch results → cancel, plus VRAM estimation and health checks; a thin MCP server ships alongside ([mcp_server.py](mcp_server.py), 7 tools, compatible with mcp 1.x/2.x SDKs), so once registered in Claude Code / Codex, "generate assets on cloud GPU" becomes a standard tool call.
 
 ## Flow (after clicking [RunModal])
 

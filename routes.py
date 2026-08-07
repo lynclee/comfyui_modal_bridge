@@ -113,19 +113,28 @@ _CHEAP_MARGIN_GB = 6  # 余量:估算 + 激活波动,est_vram 要比便宜卡显
 
 
 def _estimate_workflow_vram(prompt: dict) -> tuple[float, str, int]:
-    """估工作流显存需求(GB)+ 类别 + 本地查不到大小的模型数。供自动选档 / 预警端点复用。"""
+    """估工作流显存需求(GB)+ 类别 + 本地查不到大小的模型数。供自动选档 / 预警端点复用。
+    视频类优先走激活公式(最大模型常驻 + W×H×帧数 激活项,H3 双卡实测校准),
+    工作流里抠不出分辨率/帧数字面量时回退旧的「权重总和×系数」保守公式。"""
     resolver = _local_model_resolver()
-    total_bytes, unknown = 0, 0
+    total_bytes, largest_bytes, unknown = 0, 0, 0
     for m in extract_required_models(prompt):
         p = resolver(m["type"], m["filename"])
         try:
             if p and Path(p).exists():
-                total_bytes += Path(p).stat().st_size
+                sz = Path(p).stat().st_size
+                total_bytes += sz
+                largest_bytes = max(largest_bytes, sz)
             else:
                 unknown += 1
         except OSError:
             unknown += 1
     category = categories.classify(prompt)
+    if category == "video" and largest_bytes:
+        pixels, frames = categories.extract_pixels_frames(prompt)
+        if pixels and frames:
+            est = categories.estimate_vram_video_gb(largest_bytes / (1024 ** 3), pixels, frames)
+            return est, category, unknown
     est = categories.estimate_vram_gb(total_bytes / (1024 ** 3), category)
     return est, category, unknown
 
@@ -638,27 +647,38 @@ def _setup_routes():
             return web.json_response({"error": "prompt required"}, status=400)
         required = extract_required_models(prompt)
         resolver = _local_model_resolver()
-        total_bytes, known, unknown = 0, 0, []
+        total_bytes, largest_bytes, known, unknown = 0, 0, 0, []
         for m in required:
             p = resolver(m["type"], m["filename"])
             try:
                 if p and Path(p).exists():
-                    total_bytes += Path(p).stat().st_size
+                    sz = Path(p).stat().st_size
+                    total_bytes += sz
+                    largest_bytes = max(largest_bytes, sz)
                     known += 1
                 else:
                     unknown.append(f"{m['type']}/{m['filename']}")
             except OSError:
                 unknown.append(f"{m['type']}/{m['filename']}")
-        # 按类别(image/video/…)估显存:视频权重小但多帧激活大,系数+开销见 categories.py。
+        # 按类别估显存。视频优先激活公式(最大模型常驻 + W×H×帧数,实测校准,见 categories.py);
+        # 工作流里抠不出尺寸字面量时回退旧的「权重总和×系数」保守公式(basis 标明用的哪个)。
         category = categories.classify(prompt)
-        model_gb = total_bytes / (1024 ** 3)
+        est, basis = None, "legacy"
+        if category == "video" and largest_bytes:
+            pixels, frames = categories.extract_pixels_frames(prompt)
+            if pixels and frames:
+                est = categories.estimate_vram_video_gb(largest_bytes / (1024 ** 3), pixels, frames)
+                basis = "activation"
+        if est is None:
+            est = categories.estimate_vram_gb(total_bytes / (1024 ** 3), category)
         return web.json_response({
             "total_mb": total_bytes // 1024 // 1024,
             "known_count": known,
             "required_count": len(required),
             "unknown": unknown,
             "category": category,
-            "est_vram_gb": round(categories.estimate_vram_gb(model_gb, category), 1),
+            "est_vram_gb": round(est, 1),
+            "est_basis": basis,
         })
 
     @routes.post("/modal_bridge/sync_models")

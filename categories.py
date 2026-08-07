@@ -60,9 +60,67 @@ def profile(category: str) -> dict:
 
 
 def estimate_vram_gb(model_gb: float, category: str) -> float:
-    """按类别估算显存需求(GB)= 权重×系数 + 固定开销。供显存预警对比所选显卡。"""
+    """按类别估算显存需求(GB)= 权重×系数 + 固定开销。供显存预警对比所选显卡。
+    视频类这是**兜底公式**(从工作流抠不出分辨率×帧数时用):它把 TE/VAE 也算成常驻,
+    对 MiniMax H3 高估约 50%(估 60G vs 实测峰值 38-40G)。抠得出时走 estimate_vram_video_gb。"""
     p = profile(category)
     return model_gb * p["vram_base_factor"] + p["vram_overhead_gb"]
+
+
+# ── 视频显存估算 v2:常驻权重 + 激活(∝ 像素×帧数)──
+# 视频显存的真实结构是「主模型常驻 + 多帧激活」,不是「全部权重 × 系数」:
+# TE 编码完 prompt 即被模型管理换出、VAE 到 decode 才上,采样期只有主扩散模型常驻。
+# 激活与 token 数成正比,token 数 ∝ W×H×帧数(DiT 的 patch 化把空间/时间都线性切)。
+# 锚点(MiniMax H3, H100/L40S 双卡实测一致):1280×736×362帧 = 0.341 G像素帧 →
+# 激活 ≈18GB → 52.8 GB/G像素帧。余量 1.3 使三个实测锚点同时成立:
+# 0.9MP@48G 放行(est 45.4)、1344×768@48G 放行(47.7)、2K@80G 报警(80.5,实测确实 offload)。
+VIDEO_ACT_GB_PER_GPIXFRAME = 52.8
+VIDEO_ACT_MARGIN = 1.3
+VIDEO_FIXED_GB = 2.0  # CUDA context + 显存碎片
+
+
+def estimate_vram_video_gb(largest_model_gb: float, pixels: float, frames: int) -> float:
+    """视频显存估算(GB)= 最大单模型(常驻的主扩散模型)+ 激活项 + 固定开销。"""
+    act = VIDEO_ACT_GB_PER_GPIXFRAME * (pixels * frames) / 1e9
+    return largest_model_gb + act * VIDEO_ACT_MARGIN + VIDEO_FIXED_GB
+
+
+_FRAME_KEYS = ("length", "num_frames", "frames", "video_frames", "frame_count")
+
+
+def extract_pixels_frames(prompt: dict) -> tuple[float, int]:
+    """从 API prompt 抠(像素数 W×H, 帧数)。抠不到返回 (0, 0) → 调用方回退兜底公式。
+    只认**字面量**,不做节点求值:
+      1) 首选某节点同时带 width/height/帧数字面量(H3 的 EmptyMiniMaxH3LatentAV 等),
+         多个取像素×帧数最大者;
+      2) W/H 经连线拿不到时,退而找图里的 megapixels 字面量(ResolutionSelector 类节点)——
+         激活只关心 W×H 乘积,不关心宽高比,MP 值即乘积;帧数取全图最大帧字面量。"""
+    best_px, best_f, best_prod = 0.0, 0, 0.0
+    mp_px, max_f = 0.0, 0
+    for n in (prompt or {}).values():
+        if not isinstance(n, dict):
+            continue
+        ins = n.get("inputs") or {}
+        f = 0
+        for k in _FRAME_KEYS:
+            v = ins.get(k)
+            if isinstance(v, (int, float)) and not isinstance(v, bool) and v >= 5:
+                f = int(v)
+                break
+        if f:
+            max_f = max(max_f, f)
+            w, h = ins.get("width"), ins.get("height")
+            if (isinstance(w, (int, float)) and isinstance(h, (int, float))
+                    and w >= 64 and h >= 64 and w * h * f > best_prod):
+                best_px, best_f, best_prod = float(w * h), f, w * h * f
+        v = ins.get("megapixels")
+        if isinstance(v, (int, float)) and 0.05 <= v <= 16:
+            mp_px = max(mp_px, float(v) * 1e6)
+    if best_prod:
+        return best_px, best_f
+    if mp_px and max_f:
+        return mp_px, max_f
+    return 0.0, 0
 
 
 def worker_timeout_s(category: str) -> int:

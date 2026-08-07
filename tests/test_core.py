@@ -562,6 +562,45 @@ def test_config_default_covers_slowest_category():
     assert config.DEFAULT_CONFIG["worker_timeout_sec"] >= categories.max_worker_timeout_s()
 
 
+def test_extract_pixels_frames_literal_whl():
+    """节点同时带 width/height/length 字面量(H3 的 EmptyMiniMaxH3LatentAV 形态)→ 直接取。"""
+    p = {"1": {"class_type": "EmptyMiniMaxH3LatentAV",
+               "inputs": {"width": 1280, "height": 736, "length": 362}}}
+    px, f = categories.extract_pixels_frames(p)
+    assert px == 1280 * 736 and f == 362
+
+
+def test_extract_pixels_frames_linked_wh_megapixels_fallback():
+    """W/H 是连线(引用列表)拿不到字面量 → 退到图里 megapixels 字面量 ×1e6,帧数取最大帧字面量。"""
+    p = {
+        "1": {"class_type": "ResolutionSelector",
+              "inputs": {"aspect_ratio": "16:9 (Widescreen)", "megapixels": 0.9, "multiple": 32}},
+        "2": {"class_type": "MiniMaxH3ImageToVideo",
+              "inputs": {"width": ["1", 0], "height": ["1", 1], "length": 362}},
+    }
+    px, f = categories.extract_pixels_frames(p)
+    assert px == 0.9e6 and f == 362
+
+
+def test_extract_pixels_frames_none():
+    """全图抠不出尺寸/帧数字面量 → (0, 0),调用方回退兜底公式。"""
+    assert categories.extract_pixels_frames(
+        {"1": {"class_type": "SaveVideo", "inputs": {}}}) == (0.0, 0)
+    assert categories.extract_pixels_frames({}) == (0.0, 0)
+
+
+def test_estimate_vram_video_v2_anchors():
+    """激活公式的三个实测锚点(MiniMax H3,主模型 20GB):
+    0.9MP×362 帧应放行 48G 卡(实测峰值 38-40G 无 offload);2K×362 应对 80G 卡报警(实测 offload)。
+    旧公式对同一工作流估 ~60G,在 48G 卡上纯误报 —— 这组断言防止公式回退。"""
+    e_09 = categories.estimate_vram_video_gb(20.0, 1280 * 736, 362)
+    assert e_09 <= 48.0, e_09                 # 0.9MP 在 L40S/L20 上必须放行
+    e_native = categories.estimate_vram_video_gb(20.0, 1344 * 768, 362)
+    assert e_native <= 48.0, e_native         # 原生画布 1344×768 也应放行
+    e_2k = categories.estimate_vram_video_gb(20.0, 2048 * 1152, 362)
+    assert e_2k > 80.0, e_2k                  # 2K 必须对 80G 卡报警
+
+
 # ============================================================================
 # contract.compute_contract — 版本 / GPU 契约
 # ============================================================================
