@@ -79,6 +79,29 @@ curl -X POST http://127.0.0.1:8000/modal_bridge/submit \
 | `/modal_bridge/bridge_key` | GET | 取回本机 bridge_api_key(显式动作用,如导出脚本) |
 | `/modal_bridge/job_event` | POST | 前端/调用方上报客户端侧结局(`{job_id, event, detail}`)进后端日志留痕 |
 
+## 无 ComfyUI 直连云端(standalone)
+
+本地 ComfyUI 不是必需品——云端 app 本身就是一组独立 REST endpoint(自建 bridge_key 鉴权),
+上面的本地 API 只是它的「全功能前台」。脱离 ComfyUI 的消费/自建方式(0.7.3+):
+
+**云端协议**(`https://<ws>--comfyui-bridge` + `-{label}.modal.run`):
+
+| label | 方法 | 说明 |
+|---|---|---|
+| `-run` | POST | `{workflow, images?, gpu_class?, needs_gpu?, delivery?, auth_key}` → `{id, status, gpu}` |
+| `-status` | GET | `?job_id=&key=` → 状态对象(同上文 poll 的透传源) |
+| `-fetch` | GET | `?job_id=&path=<volume_path>&key=&delete=1` → **流式下载大文件产物**(路径囚笼在该 job 目录;这是外部消费者不需要 modal token 的关键) |
+| `-cancel` | POST | `{job_id, auth_key}` |
+| `-health` | GET | `?key=` → 部署版本/卡型/已装节点 |
+
+**三种消费方式**(都基于 `bridge_client.py`,纯 stdlib 零依赖):
+
+1. **Python 库**:`BridgeClient(endpoint, key)` → `submit / wait / download_outputs`(base64 与 Volume 大文件双路径自动处理,输入图 `pack_input_images` 打包)
+2. **CLI**(`bridge_cli.py`):消费者 `configure → submit --wait`;自建者 `deploy`(复用插件的 env 链路,避开裸 `modal deploy` 陷阱)+ `upload-model`(模型上 Volume)
+3. **MCP cloud 模式**(`mcp_server.py`):设 `MODAL_BRIDGE_ENDPOINT` + `MODAL_BRIDGE_KEY` 即切换,agent 工具面不变
+
+**能力边界**:standalone 只「消费」部署好的能力——模型要先在 Volume(部署者同步过,或 `upload-model` 手动放)、custom_node 要先在镜像(部署者本机同步过);显存档位 `gpu_class` 手选,没有本地估算路由。
+
 ## 给 agent 的注意事项
 
 - **等待窗**:用 submit 返回的 `worker_timeout_sec` + 180s 做轮询 deadline,别硬编码

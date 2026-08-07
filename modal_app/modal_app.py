@@ -524,6 +524,40 @@ def status_endpoint(job_id: str, key: str = ""):
     return {"id": job_id, **s}
 
 
+@app.function(image=cuda_image, volumes={"/comfy-volume": models_vol},
+              secrets=[bridge_secret], timeout=300)
+@modal.fastapi_endpoint(method="GET", label=f"{APP_NAME}-fetch")
+def fetch_endpoint(job_id: str, path: str, key: str = "", delete: int = 0):
+    """独立客户端(bridge_client / CLI / cloud 模式 MCP)取大文件:流式返回 Volume 上该 job 的
+    产物。本地插件不用它(routes 走 modal SDK 直连);它的存在让外部消费者只凭 bridge_key 就能
+    拿到走了 Volume 的视频/网格,不必持有 modal token。
+    path 必须是该 job 某个 images[].volume_path(囚笼:仅限 _outputs/<job_id>/ 内,拒绝逃逸);
+    delete=1 → 响应发送完成后删文件并 commit(与本地 SDK 取回后即删的行为一致)。"""
+    deny = _check(key)
+    if deny:
+        return deny
+    from fastapi.responses import JSONResponse, FileResponse
+    from starlette.background import BackgroundTask
+    prefix = f"_outputs/{job_id}/"
+    if not path.startswith(prefix) or ".." in path or path != os.path.normpath(path):
+        return JSONResponse({"error": "path out of job scope"}, status_code=403)
+    models_vol.reload()  # worker 完成时 commit 过;reload 确保本容器看得到最新文件
+    local = Path("/comfy-volume") / path
+    if not local.is_file():
+        return JSONResponse({"error": f"not found: {path}"}, status_code=404)
+
+    cleanup = None
+    if delete:
+        def _cleanup(p=str(local)):
+            try:
+                os.remove(p)
+                models_vol.commit()
+            except Exception as e:
+                print(f"[bridge] fetch cleanup {p} failed: {e}")
+        cleanup = BackgroundTask(_cleanup)
+    return FileResponse(str(local), filename=Path(path).name, background=cleanup)
+
+
 @app.function(image=cuda_image, secrets=[bridge_secret], timeout=15)
 @modal.fastapi_endpoint(method="POST", label=f"{APP_NAME}-cancel")
 def cancel_endpoint(payload: dict):
@@ -594,5 +628,5 @@ def main():
     print(f"Volume: {VOLUME_NAME}")
     print(f"Secret: {SECRET_NAME}")
     print("Endpoints:")
-    for ep in ["run", "status", "cancel", "health"]:
+    for ep in ["run", "status", "cancel", "health", "fetch"]:
         print(f"  https://<workspace>--{APP_NAME}-{ep}.modal.run")

@@ -589,6 +589,57 @@ def test_extract_pixels_frames_none():
     assert categories.extract_pixels_frames({}) == (0.0, 0)
 
 
+def test_bridge_client_endpoint_validation_and_urls():
+    """独立客户端:endpoint 校验 + URL 拼装约定(与 modal_client._endpoint 同一约定)。"""
+    import bridge_client
+    try:
+        bridge_client.BridgeClient("https://no-dashes.example", "k")
+        assert False, "缺 -- 的 endpoint 应当拒绝"
+    except bridge_client.BridgeError:
+        pass
+    c = bridge_client.BridgeClient("https://ws--comfyui-bridge", "k")
+    assert c._url("run") == "https://ws--comfyui-bridge-run.modal.run"
+    assert c._url("fetch") == "https://ws--comfyui-bridge-fetch.modal.run"
+
+
+def test_bridge_client_pack_input_images(tmp_path):
+    """输入图打包:LoadImage 类节点 → {name, image: data uri};找不到抛错。"""
+    import base64
+    import bridge_client
+    (tmp_path / "a.png").write_bytes(b"\x89PNG-fake")
+    wf = {"1": {"class_type": "LoadImage", "inputs": {"image": "a.png"}},
+          "2": {"class_type": "KSampler", "inputs": {}}}
+    out = bridge_client.BridgeClient.pack_input_images(wf, [str(tmp_path)])
+    assert out[0]["name"] == "a.png"
+    assert out[0]["image"].startswith("data:image/png;base64,")
+    assert base64.b64decode(out[0]["image"].split(",", 1)[1]) == b"\x89PNG-fake"
+    try:
+        bridge_client.BridgeClient.pack_input_images(
+            {"1": {"class_type": "LoadImage", "inputs": {"image": "missing.png"}}}, [str(tmp_path)])
+        assert False, "缺输入图应当抛错"
+    except bridge_client.BridgeError:
+        pass
+
+
+def test_bridge_client_download_outputs_base64(tmp_path):
+    """产物落盘(base64 路径,无网络):写文件 + 重名去重 + 未完成拒绝。"""
+    import base64
+    import bridge_client
+    c = bridge_client.BridgeClient("https://ws--comfyui-bridge", "k")
+    b64 = base64.b64encode(b"vid").decode()
+    state = {"status": "completed", "id": "j1",
+             "images": [{"filename": "out.mp4", "data_base64": b64},
+                        {"filename": "out.mp4", "data_base64": b64}]}
+    outs = c.download_outputs(state, str(tmp_path / "r"))
+    assert [o["filename"] for o in outs] == ["out.mp4", "out_1.mp4"]
+    assert (tmp_path / "r" / "out.mp4").read_bytes() == b"vid"
+    try:
+        c.download_outputs({"status": "running"}, str(tmp_path))
+        assert False
+    except bridge_client.BridgeError:
+        pass
+
+
 def test_estimate_vram_video_v2_anchors():
     """激活公式的三个实测锚点(MiniMax H3,主模型 20GB):
     0.9MP×362 帧应放行 48G 卡(实测峰值 38-40G 无 offload);2K×362 应对 80G 卡报警(实测 offload)。
