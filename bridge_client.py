@@ -172,8 +172,12 @@ class BridgeClient:
         qs = urllib.parse.urlencode({"job_id": job_id, "path": vol_path,
                                      "key": self.key, "delete": int(delete_remote)})
         url = f"{self._url('fetch')}?{qs}"
+        # 先写 .part、校验后原子 rename:delete_remote 时远端边传边清,
+        # 中断若直接写终名会留下"看起来完整"的残缺文件。
+        part = local.with_name(local.name + ".part")
         try:
-            with urllib.request.urlopen(url, timeout=600) as r, open(local, "wb") as f:
+            with urllib.request.urlopen(url, timeout=600) as r, open(part, "wb") as f:
+                expected = int(r.headers.get("Content-Length") or 0)
                 size = 0
                 while True:
                     chunk = r.read(1 << 20)
@@ -181,12 +185,18 @@ class BridgeClient:
                         break
                     f.write(chunk)
                     size += len(chunk)
-                return size
+            if expected and size != expected:
+                raise BridgeError(
+                    f"/fetch 下载不完整: {size}/{expected} bytes({vol_path})")
+            part.replace(local)
+            return size
         except urllib.error.HTTPError as e:
             if e.code == 404:
                 raise BridgeError(
                     f"/fetch 404:{vol_path} 不在 Volume 上(已被取过并删除?)") from None
             raise BridgeError(f"/fetch HTTP {e.code}(云端是 0.7.3+ 吗?老部署没有该端点)") from None
+        finally:
+            part.unlink(missing_ok=True)
 
     # ── 输入图打包(LoadImage 类节点 → data uri,协议与官方插件一致)──
     @staticmethod
@@ -202,6 +212,11 @@ class BridgeClient:
                 if isinstance(n, str) and n not in names:
                     names.append(n)
         for n in names:
+            # 工作流内容不可信:绝对路径 / ".." 会让 Path(d) / n 落到 search_dirs 之外,
+            # 变成任意本地文件读取并上传。子目录相对路径(如 "sub/a.png")合法。
+            pn = Path(n)
+            if pn.is_absolute() or ".." in pn.parts:
+                raise BridgeError(f"输入图路径非法(绝对路径或含 ..): {n}")
             p = next((Path(d) / n for d in search_dirs if (Path(d) / n).is_file()), None)
             if p is None:
                 raise BridgeError(f"输入图找不到: {n}(搜索目录: {search_dirs})")

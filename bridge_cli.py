@@ -172,11 +172,11 @@ def cmd_deploy(args):
     m = re.search(rf"https://[\w\-]+--{re.escape(args.app_name)}-\w+\.modal\.run",
                   "".join(tail_lines))
     if m:
-        base = re.sub(rf"-(run|status|cancel|health|fetch)\.modal\.run$", "", m.group(0))
+        base = re.sub(r"-(run|status|cancel|health|fetch)\.modal\.run$", "", m.group(0))
         _save_cli_cfg({**saved, "endpoint": base, "key": bridge_key,
                        "app_name": args.app_name, "volume": cfg["modal_volume_name"]})
         print(f"\n✓ 部署完成。endpoint + key 已写 {CLI_CFG}")
-        print(f"  下一步:upload-model 把工作流要的模型放上 Volume,然后 submit。")
+        print("  下一步:upload-model 把工作流要的模型放上 Volume,然后 submit。")
     else:
         print("\n✓ 部署完成,但没从输出解析到 endpoint —— 手动 `configure --endpoint …`"
               f"(key: {bridge_key})")
@@ -204,29 +204,53 @@ def main():
         p.add_argument("--endpoint", help="https://<ws>--comfyui-bridge")
         p.add_argument("--key", help="bridge_api_key")
 
-    p = sub.add_parser("health", help="云端健康检查");                       _common(p); p.set_defaults(f=cmd_health)
-    p = sub.add_parser("submit", help="提交工作流(API prompt JSON 文件)");   _common(p)
-    p.add_argument("workflow"); p.add_argument("--gpu-class", default="primary", choices=["primary", "cheap", "top"])
+    p = sub.add_parser("health", help="云端健康检查")
+    _common(p)
+    p.set_defaults(f=cmd_health)
+
+    p = sub.add_parser("submit", help="提交工作流(API prompt JSON 文件)")
+    _common(p)
+    p.add_argument("workflow")
+    p.add_argument("--gpu-class", default="primary", choices=["primary", "cheap", "top"])
     p.add_argument("--wait", action="store_true", help="阻塞到完成并自动取产物")
-    p.add_argument("--out", default="./modal_bridge_outputs"); p.add_argument("--timeout", type=int, default=3600)
+    p.add_argument("--out", default="./modal_bridge_outputs")
+    p.add_argument("--timeout", type=int, default=3600)
     p.add_argument("--input-dir", action="append", help="输入图搜索目录(可多个)")
     p.set_defaults(f=cmd_submit)
-    p = sub.add_parser("status", help="查任务状态");   _common(p); p.add_argument("job_id"); p.set_defaults(f=cmd_status)
-    p = sub.add_parser("fetch", help="取回已完成任务的产物"); _common(p); p.add_argument("job_id")
-    p.add_argument("--out", default="./modal_bridge_outputs"); p.set_defaults(f=cmd_fetch)
-    p = sub.add_parser("cancel", help="取消任务");     _common(p); p.add_argument("job_id"); p.set_defaults(f=cmd_cancel)
-    p = sub.add_parser("configure", help="保存 endpoint/key 到 ~/.modal_bridge/cli.json"); _common(p); p.set_defaults(f=cmd_configure)
+
+    p = sub.add_parser("status", help="查任务状态")
+    _common(p)
+    p.add_argument("job_id")
+    p.set_defaults(f=cmd_status)
+
+    p = sub.add_parser("fetch", help="取回已完成任务的产物")
+    _common(p)
+    p.add_argument("job_id")
+    p.add_argument("--out", default="./modal_bridge_outputs")
+    p.set_defaults(f=cmd_fetch)
+
+    p = sub.add_parser("cancel", help="取消任务")
+    _common(p)
+    p.add_argument("job_id")
+    p.set_defaults(f=cmd_cancel)
+
+    p = sub.add_parser("configure", help="保存 endpoint/key 到 ~/.modal_bridge/cli.json")
+    _common(p)
+    p.set_defaults(f=cmd_configure)
 
     p = sub.add_parser("deploy", help="[自建者] 无 ComfyUI 部署云端 app(需 modal token)")
     p.add_argument("--app-name", default="comfyui-bridge")
     p.add_argument("--comfyui-tag", default="v0.30.2", help="云端 ComfyUI 版本 tag")
-    p.add_argument("--gpu", default="H100"); p.add_argument("--cheap-gpu", default="L40S")
-    p.add_argument("--top-gpu", default="B200"); p.add_argument("--timeout-s", type=int, default=3600)
+    p.add_argument("--gpu", default="H100")
+    p.add_argument("--cheap-gpu", default="L40S")
+    p.add_argument("--top-gpu", default="B200")
+    p.add_argument("--timeout-s", type=int, default=3600)
     p.add_argument("--sage", action="store_true", help="开 SageAttention(H100/L40S 生效,自行看片验证)")
     p.set_defaults(f=cmd_deploy)
 
     p = sub.add_parser("upload-model", help="[自建者] 本地模型上 Volume")
-    p.add_argument("file"); p.add_argument("type", help="ComfyUI 模型目录名,如 diffusion_models")
+    p.add_argument("file")
+    p.add_argument("type", help="ComfyUI 模型目录名,如 diffusion_models")
     p.add_argument("--volume", help="Volume 名(默认部署时的)")
     p.set_defaults(f=cmd_upload_model)
 

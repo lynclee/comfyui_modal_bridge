@@ -621,6 +621,28 @@ def test_bridge_client_pack_input_images(tmp_path):
         pass
 
 
+def test_bridge_client_pack_input_images_rejects_escape(tmp_path):
+    """工作流不可信:绝对路径 / .. 逃逸必须拒绝;子目录相对路径合法。"""
+    import bridge_client
+    (tmp_path / "secret.txt").write_bytes(b"leak")
+    (tmp_path / "in" / "sub").mkdir(parents=True)
+    (tmp_path / "in" / "sub" / "b.png").write_bytes(b"ok")
+    for evil in (str(tmp_path / "secret.txt"),          # 绝对路径
+                 "../secret.txt",                        # 上跳
+                 "sub/../../secret.txt"):                # 藏在中段的上跳
+        try:
+            bridge_client.BridgeClient.pack_input_images(
+                {"1": {"class_type": "LoadImage", "inputs": {"image": evil}}},
+                [str(tmp_path / "in")])
+            assert False, f"应当拒绝: {evil}"
+        except bridge_client.BridgeError as e:
+            assert "非法" in str(e), f"逃逸路径要报'非法'而不是'找不到': {evil} -> {e}"
+    out = bridge_client.BridgeClient.pack_input_images(
+        {"1": {"class_type": "LoadImage", "inputs": {"image": "sub/b.png"}}},
+        [str(tmp_path / "in")])
+    assert out[0]["name"] == "sub/b.png"
+
+
 def test_bridge_client_download_outputs_base64(tmp_path):
     """产物落盘(base64 路径,无网络):写文件 + 重名去重 + 未完成拒绝。"""
     import base64
@@ -1051,11 +1073,19 @@ def test_delivery_helpers():
 # 无 pytest 时的简易运行器
 # ============================================================================
 if __name__ == "__main__":
+    import inspect
+    import tempfile
+
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     passed = failed = 0
     for fn in fns:
         try:
-            fn()
+            # 极简 fixture:签名带 tmp_path 的给一个独立临时目录(与 pytest 语义对齐)
+            if "tmp_path" in inspect.signature(fn).parameters:
+                with tempfile.TemporaryDirectory() as td:
+                    fn(Path(td))
+            else:
+                fn()
             print(f"  ✓ {fn.__name__}")
             passed += 1
         except AssertionError as e:
