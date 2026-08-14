@@ -1,87 +1,6 @@
 # comfyui_modal_bridge
 
-> 中文 | [English](#english)
-
-**ComfyUI Desktop 插件:一键把当前工作流推到你自己的 Modal Serverless GPU 上跑,图 / 视频 / 3D 回流本地画板。** 本地不用好显卡、不用开终端、不用搭云端 ComfyUI —— 装上、填一次 token、点一下,就跑。
-
-> Registry: `comfyui_modal_bridge`(publisher `lynclee`)· 在 ComfyUI Manager 搜 **Modal Bridge** 即可安装。
-
-## ✨ 核心优势
-
-- 🖥️ **不挑机器,本地零显卡要求** — Mac、轻薄本、核显本都行。FLUX.2 这种吃显存的大模型,**算力全在云端 GPU**(Auto 模式按显存自动选 L40S/H100/B200,省钱),本地只负责发起工作流、收图。本地再弱也能跑 flux2,不用为了跑图换电脑。
-- ⚡ **多任务并发** — 多个工作流可同时提交、同时跑,各有独立进度卡片(可拖动 / 取消 / 关闭),互不阻塞、互不覆盖。
-- 🚀 **全自动部署,零终端** — GUI 填一次 Modal token,后端自动 `pip install modal`、建密钥、`modal deploy`、写配置。全程不碰命令行,首次拉镜像约 3-5 分钟,之后秒进。
-- 🧩 **custom node 自动同步** — 工作流用到的自定义节点,云端镜像没有就**自动装进镜像并重部署**;多台机器各装一部分时取**并集、互不删**,换机无缝。
-- 🎨 **图 / 视频 / 3D 全支持** — SaveImage / SaveVideo / SaveGLB / Preview3D 的产物都回流本地,并直接回填画板预览(3D 出可转动的网格);大文件(视频 / 网格)自动走 Volume 直连取回,不受 base64 体积限制。
-- 🤖 **API 节点 + 自动省钱** — 工作流含 ComfyUI API 节点(Kling / Luma / Tripo / OpenAI 等)也能跑(Setup 填一次 comfy.org key);**没有本地模型的纯 API 工作流自动路由到 CPU 容器,GPU 账单≈0**。
-- 💰 **按秒计费,空闲归零** — 用你自己的 Modal 账号(注册送 $30/月额度,需绑卡),**不出图不花钱**,闲置自动缩到零。可选 SageAttention 加速把长视频任务端到端压掉约 45%(实测 MiniMax H3 720p·15s 一条约 $0.63)。
-
-## 它解决什么
-
-本地没有大显存 GPU(Mac / 轻薄本 / 4090 显存不够跑 flux2),又不想自己搭一套云端 ComfyUI、不想折腾 Docker 和命令行。装上这个插件,点一下 **RunModal**,当前工作流就在你自己 Modal 账号的 GPU 上跑完,图回到本地 SaveImage 节点。
-
-## 关键特性(细节)
-
-- **零终端部署**:点 `⚙️ Modal Setup` 填 Modal token → 后端自动 `pip install modal`、建 Secret、`modal deploy`、写配置并验证 health。
-- **不挑本地机器**:本地只做序列化 + 上传 + 收图,**不跑推理**,所以对本地显卡/显存无要求;Mac / Windows / Linux 一致(子进程串流部署日志,绕开 Windows 事件循环坑)。
-- **GPU 分四档 + 换档免部署**:Modal Setup 里选 **Auto(按显存自动选,更省钱)**、**省钱档**(默认 L40S)、**标准档**(默认 H100)或 **顶配档**(默认 B200)。四档 worker(CPU / 省钱 / 标准 / 顶配)**一次部署全部建好**、空闲各自 scale-to-zero(**没被路由到的档 0 成本**),所以**换档只是运行时路由 —— 选完下次提交即生效,不用重新部署**(只有换某档具体绑哪张卡才需要重部署)。Auto 会按工作流估算显存自动选最省又够用的档:小图(如 **Z-Image-Turbo**)走省钱档、常规(如 **FLUX.2-dev**)走标准档、真超主卡显存才升顶配档(防 OOM)。⚠ **显存不够不会报错,只会静默退化成频繁 offload(慢几倍)直到撞超时** —— 跑得异常久时进度卡片会提示往这个方向查;反过来,显存够了之后再加大对速度帮助有限(实测同一工作流 B200 比 H100 快 13.5%、单价却贵 58%),**别只盯着最贵那档**。点 RunModal 前还会按类别估算显存预警(视频含多帧激活)。
-- **图 / 视频 / 3D 输出 + 画板预览**:扫工作流所有输出节点收产物 —— SaveImage/SaveVideo 出图、视频,**SaveGLB / Preview3D 出 3D 网格并在画板内渲染转盘**(按来源节点回填,多输出不串台);大文件(视频 / 网格 >8MB)走 **Volume 直连取回**,绕开 base64/Dict 体积上限,小文件仍 base64。
-- **CPU / GPU 自动路由**:提交时判断工作流要不要 GPU(有没有引用本地模型)—— **纯 API / 无模型的轻工作流自动落 CPU 容器(账单≈0)**,要 sample 的才上 GPU。
-- **ComfyUI API 节点**:工作流含 API 节点(Kling/Luma/Tripo/OpenAI…)时,Setup 填的 comfy.org API key 经云端 Secret 注入鉴权;前端检测到 API 节点但没配 key 会提前提示(账单走你的 comfy.org 额度)。
-- **提交前必填输入预检**:点 RunModal 时按当前本地节点定义检查各节点是否缺必填输入(常见:必填连线没接;或老工作流里的节点在新版新增了必填 widget,如内置 API 节点的 `generate_type`,老图没带上)→ 提前弹提示(可仍要提交 / 去修),避免等云端 `execute() missing required argument` 才报错;拿不到定义的节点跳过、不误报。
-- **SageAttention 有损加速(可选,默认关)**:Setup 里勾选后点「部署」生效(开关烤在镜像 env,只重建最后一层,秒级)。attention 的 QK 矩阵乘走 INT8 —— 长序列视频里 attention 占单步约七成算力,实测 MiniMax H3 @H100 采样 48.6→24.6 s/it,**端到端约 −45%**,同 seed A/B 画质无可见差异;图像模型(FLUX.2 等)序列短,收益仅个位数且可能引起构图漂移(复现历史产物请关闭)。标准档 H100 与省钱档 L40S 都生效(实测 L40S:88→50.6 s/it 约 −43%,单条成本与 H100+sage 几乎打平、墙钟约 2.2 倍)—— 预编译**双架构** wheel(sm_89+sm_90,本仓库 Release `sage-2.2.0-d1a57a5-multiarch` 自托管,规避上游 v2.2.0 tag 的静默数值 bug);顶配档 B200(sm_100)自动回退 SDPA,不报错。
-- **运行卡实时进度 + 投影式慢速预警**:worker 每步上报进度,运行卡实时显示「7/20 步 · 24.6s/步」;预警只在「照当前速度会撞 worker 超时」时出现(ETA 实时刷新,速度恢复自动撤回)—— 显存不足被静默 offload 拖慢的任务早期即可识别止损,健康的长任务不再被误报打扰。
-- **内存快照(实验,默认关)**:实测对 GPU worker **基本无效**——ComfyUI 以子进程运行,Modal 内存快照难以覆盖(实测 7 次容器启动 7 次重建快照、零复用),开着反添 ~5s/次的快照创建开销,故默认已关;CPU worker 的 CPU 快照(GA)不受影响。留作实验开关,等上游支持子进程快照再评估。
-- **多任务并发 & 进度**:多工作流并发各有独立进度卡片(可拖动/取消/关闭);上传带速率 + ETA;job 状态自动清理,不会互相覆盖。
-- **custom_node 自动同步 + 多机友好**:自动加工作流需要的节点并重部署(只这一次);多机取并集、互不删;清理走 Setup 的「管理云端节点」手动勾选。
-- **云端 ComfyUI 版本跟随本机**:部署时自动检测本机 ComfyUI 版本,云端镜像 clone **同一个 tag**(本机版本无对应 tag 时取最接近的,只警告不中止);本机升级后点 RunModal 会提示重新部署让云端跟上 —— 本地能跑的节点云端基本就能跑。
-- **节点兼容自检(每次部署)**:部署成功后自动在云端**同镜像**里 boot 一次 ComfyUI,逐个报告自定义节点导入成功 / 失败(失败 = 与该 ComfyUI 版本不兼容 / 缺依赖 / commit 坏)。**只警告不阻断**:坏节点不影响其它工作流。
-- **模型本地 → Volume**:模型在本地 ComfyUI 下好,提交时自动把云端缺的传上去;**块级去重(CAS)让通用大模型秒过**,只有自训练/私有模型才真占上行带宽。不从 HF 下载、不依赖手维护的 registry。
-- **私有鉴权**:endpoint 用自建 `BRIDGE_API_KEY` 校验,只有你的 key 能调用,无 key 一律 401。
-- **两种结果交付(可选 aigc-r2)**:默认 desktop(结果回本地);网站(AIGC Studio)调 `/run` 时可带 `delivery:{"mode":"aigc-r2"}`,出图后 worker **流式直传 Cloudflare R2**(短期预签名地址,R2 长期密钥永不进 Modal)再回调网站落库 —— 同一套部署本地 / 网站共用,网站出图全程不需要本地 ComfyUI 在线。详见 SETUP。
-- **机器接口:HTTP API + MCP + 独立 CLI(可完全脱离 ComfyUI)**:UI 用的本地 HTTP API 全部文档化([API.md](API.md));MCP server([mcp_server.py](mcp_server.py))注册进 Claude Code / Codex 后「云端 GPU 出资产」就是标准工具调用——**local 模式**走本地插件(全功能),**cloud 模式**设 endpoint + bridge_key 直连云端、**不需要 ComfyUI 在跑**。配套零依赖客户端库([bridge_client.py](bridge_client.py))与独立 CLI([bridge_cli.py](bridge_cli.py)):协作者拿 endpoint+key 即可 `submit --wait` 出片;自建者 clone 仓库后 `deploy` + `upload-model` 从零起云端,全程无 ComfyUI。大文件经云端 `/fetch` 端点流式取回,外部消费者不需要 modal token。
-
-## 工作流程(点 [RunModal] 之后)
-
-```
-ComfyUI Desktop(本地,不挑机器)
-  │ graphToPrompt() 序列化当前工作流
-  ▼
-custom_node 同步   工作流用到、云端镜像没有的节点 → 自动加 + 重部署(只这一次)
-  ▼
-模型同步          工作流要的模型,云端 Volume 没、本地有 → 用 modal SDK 直传 Volume
-  │              (CAS 块级去重:网上通用大模型秒过)
-  ▼
-路由             无本地模型(纯 API)→ CPU 容器;要 sample → GPU 容器
-  ▼
-提交 Modal /run → 轮询 → 小文件 base64 / 大文件走 Volume 直连 → 写 output/modal_results/<job_id>/
-  ▼
-按来源节点回填画板:SaveImage 出图、SaveVideo 出视频、SaveGLB / Preview3D 出 3D 转盘
-```
-
-## 安装
-
-- **方式一(推荐)**:ComfyUI Manager → Custom Nodes Manager → 搜 `Modal Bridge` → 安装 → 重启。
-- **方式二**:`git clone https://github.com/lynclee/comfyui_modal_bridge` 到 `ComfyUI/custom_nodes/`,重启。
-
-装好后点右上角 `⚙️ Modal Setup`,填 Workspace / Token 部署。详见 [SETUP.md](./SETUP.md)。
-
-## 安全
-
-- `config.json`(含 token)和 `secrets.toml` 在 `.gitignore` 里,**绝不进仓库**。
-- Modal endpoint 私有,自建 key 鉴权,无 key 一律 401。
-
-## License
-
-MIT
-
----
-
-<a name="english"></a>
-
-# comfyui_modal_bridge (English)
-
-> [中文](#comfyui_modal_bridge) | English
+> English | [中文](#chinese)
 
 **A ComfyUI Desktop plugin: push the current workflow to your own Modal Serverless GPU with one click; images / video / 3D flow back to your local canvas.** No good GPU locally, no terminal, no self-hosted cloud ComfyUI — install, enter a token once, click, done.
 
@@ -151,6 +70,87 @@ After install, click `⚙️ Modal Setup`, enter Workspace / Token to deploy. Se
 
 - `config.json` (contains tokens) and `secrets.toml` are in `.gitignore` — **never committed**.
 - Modal endpoints are private with self-issued key auth; missing key always returns 401.
+
+## License
+
+MIT
+
+---
+
+<a name="chinese"></a>
+
+# comfyui_modal_bridge(中文)
+
+> [English](#comfyui_modal_bridge) | 中文
+
+**ComfyUI Desktop 插件:一键把当前工作流推到你自己的 Modal Serverless GPU 上跑,图 / 视频 / 3D 回流本地画板。** 本地不用好显卡、不用开终端、不用搭云端 ComfyUI —— 装上、填一次 token、点一下,就跑。
+
+> Registry: `comfyui_modal_bridge`(publisher `lynclee`)· 在 ComfyUI Manager 搜 **Modal Bridge** 即可安装。
+
+## ✨ 核心优势
+
+- 🖥️ **不挑机器,本地零显卡要求** — Mac、轻薄本、核显本都行。FLUX.2 这种吃显存的大模型,**算力全在云端 GPU**(Auto 模式按显存自动选 L40S/H100/B200,省钱),本地只负责发起工作流、收图。本地再弱也能跑 flux2,不用为了跑图换电脑。
+- ⚡ **多任务并发** — 多个工作流可同时提交、同时跑,各有独立进度卡片(可拖动 / 取消 / 关闭),互不阻塞、互不覆盖。
+- 🚀 **全自动部署,零终端** — GUI 填一次 Modal token,后端自动 `pip install modal`、建密钥、`modal deploy`、写配置。全程不碰命令行,首次拉镜像约 3-5 分钟,之后秒进。
+- 🧩 **custom node 自动同步** — 工作流用到的自定义节点,云端镜像没有就**自动装进镜像并重部署**;多台机器各装一部分时取**并集、互不删**,换机无缝。
+- 🎨 **图 / 视频 / 3D 全支持** — SaveImage / SaveVideo / SaveGLB / Preview3D 的产物都回流本地,并直接回填画板预览(3D 出可转动的网格);大文件(视频 / 网格)自动走 Volume 直连取回,不受 base64 体积限制。
+- 🤖 **API 节点 + 自动省钱** — 工作流含 ComfyUI API 节点(Kling / Luma / Tripo / OpenAI 等)也能跑(Setup 填一次 comfy.org key);**没有本地模型的纯 API 工作流自动路由到 CPU 容器,GPU 账单≈0**。
+- 💰 **按秒计费,空闲归零** — 用你自己的 Modal 账号(注册送 $30/月额度,需绑卡),**不出图不花钱**,闲置自动缩到零。可选 SageAttention 加速把长视频任务端到端压掉约 45%(实测 MiniMax H3 720p·15s 一条约 $0.63)。
+
+## 它解决什么
+
+本地没有大显存 GPU(Mac / 轻薄本 / 4090 显存不够跑 flux2),又不想自己搭一套云端 ComfyUI、不想折腾 Docker 和命令行。装上这个插件,点一下 **RunModal**,当前工作流就在你自己 Modal 账号的 GPU 上跑完,图回到本地 SaveImage 节点。
+
+## 关键特性(细节)
+
+- **零终端部署**:点 `⚙️ Modal Setup` 填 Modal token → 后端自动 `pip install modal`、建 Secret、`modal deploy`、写配置并验证 health。
+- **不挑本地机器**:本地只做序列化 + 上传 + 收图,**不跑推理**,所以对本地显卡/显存无要求;Mac / Windows / Linux 一致(子进程串流部署日志,绕开 Windows 事件循环坑)。
+- **GPU 分四档 + 换档免部署**:Modal Setup 里选 **Auto(按显存自动选,更省钱)**、**省钱档**(默认 L40S)、**标准档**(默认 H100)或 **顶配档**(默认 B200)。四档 worker(CPU / 省钱 / 标准 / 顶配)**一次部署全部建好**、空闲各自 scale-to-zero(**没被路由到的档 0 成本**),所以**换档只是运行时路由 —— 选完下次提交即生效,不用重新部署**(只有换某档具体绑哪张卡才需要重部署)。Auto 会按工作流估算显存自动选最省又够用的档:小图(如 **Z-Image-Turbo**)走省钱档、常规(如 **FLUX.2-dev**)走标准档、真超主卡显存才升顶配档(防 OOM)。⚠ **显存不够不会报错,只会静默退化成频繁 offload(慢几倍)直到撞超时** —— 跑得异常久时进度卡片会提示往这个方向查;反过来,显存够了之后再加大对速度帮助有限(实测同一工作流 B200 比 H100 快 13.5%、单价却贵 58%),**别只盯着最贵那档**。点 RunModal 前还会按类别估算显存预警(视频含多帧激活)。
+- **图 / 视频 / 3D 输出 + 画板预览**:扫工作流所有输出节点收产物 —— SaveImage/SaveVideo 出图、视频,**SaveGLB / Preview3D 出 3D 网格并在画板内渲染转盘**(按来源节点回填,多输出不串台);大文件(视频 / 网格 >8MB)走 **Volume 直连取回**,绕开 base64/Dict 体积上限,小文件仍 base64。
+- **CPU / GPU 自动路由**:提交时判断工作流要不要 GPU(有没有引用本地模型)—— **纯 API / 无模型的轻工作流自动落 CPU 容器(账单≈0)**,要 sample 的才上 GPU。
+- **ComfyUI API 节点**:工作流含 API 节点(Kling/Luma/Tripo/OpenAI…)时,Setup 填的 comfy.org API key 经云端 Secret 注入鉴权;前端检测到 API 节点但没配 key 会提前提示(账单走你的 comfy.org 额度)。
+- **提交前必填输入预检**:点 RunModal 时按当前本地节点定义检查各节点是否缺必填输入(常见:必填连线没接;或老工作流里的节点在新版新增了必填 widget,如内置 API 节点的 `generate_type`,老图没带上)→ 提前弹提示(可仍要提交 / 去修),避免等云端 `execute() missing required argument` 才报错;拿不到定义的节点跳过、不误报。
+- **SageAttention 有损加速(可选,默认关)**:Setup 里勾选后点「部署」生效(开关烤在镜像 env,只重建最后一层,秒级)。attention 的 QK 矩阵乘走 INT8 —— 长序列视频里 attention 占单步约七成算力,实测 MiniMax H3 @H100 采样 48.6→24.6 s/it,**端到端约 −45%**,同 seed A/B 画质无可见差异;图像模型(FLUX.2 等)序列短,收益仅个位数且可能引起构图漂移(复现历史产物请关闭)。标准档 H100 与省钱档 L40S 都生效(实测 L40S:88→50.6 s/it 约 −43%,单条成本与 H100+sage 几乎打平、墙钟约 2.2 倍)—— 预编译**双架构** wheel(sm_89+sm_90,本仓库 Release `sage-2.2.0-d1a57a5-multiarch` 自托管,规避上游 v2.2.0 tag 的静默数值 bug);顶配档 B200(sm_100)自动回退 SDPA,不报错。
+- **运行卡实时进度 + 投影式慢速预警**:worker 每步上报进度,运行卡实时显示「7/20 步 · 24.6s/步」;预警只在「照当前速度会撞 worker 超时」时出现(ETA 实时刷新,速度恢复自动撤回)—— 显存不足被静默 offload 拖慢的任务早期即可识别止损,健康的长任务不再被误报打扰。
+- **内存快照(实验,默认关)**:实测对 GPU worker **基本无效**——ComfyUI 以子进程运行,Modal 内存快照难以覆盖(实测 7 次容器启动 7 次重建快照、零复用),开着反添 ~5s/次的快照创建开销,故默认已关;CPU worker 的 CPU 快照(GA)不受影响。留作实验开关,等上游支持子进程快照再评估。
+- **多任务并发 & 进度**:多工作流并发各有独立进度卡片(可拖动/取消/关闭);上传带速率 + ETA;job 状态自动清理,不会互相覆盖。
+- **custom_node 自动同步 + 多机友好**:自动加工作流需要的节点并重部署(只这一次);多机取并集、互不删;清理走 Setup 的「管理云端节点」手动勾选。
+- **云端 ComfyUI 版本跟随本机**:部署时自动检测本机 ComfyUI 版本,云端镜像 clone **同一个 tag**(本机版本无对应 tag 时取最接近的,只警告不中止);本机升级后点 RunModal 会提示重新部署让云端跟上 —— 本地能跑的节点云端基本就能跑。
+- **节点兼容自检(每次部署)**:部署成功后自动在云端**同镜像**里 boot 一次 ComfyUI,逐个报告自定义节点导入成功 / 失败(失败 = 与该 ComfyUI 版本不兼容 / 缺依赖 / commit 坏)。**只警告不阻断**:坏节点不影响其它工作流。
+- **模型本地 → Volume**:模型在本地 ComfyUI 下好,提交时自动把云端缺的传上去;**块级去重(CAS)让通用大模型秒过**,只有自训练/私有模型才真占上行带宽。不从 HF 下载、不依赖手维护的 registry。
+- **私有鉴权**:endpoint 用自建 `BRIDGE_API_KEY` 校验,只有你的 key 能调用,无 key 一律 401。
+- **两种结果交付(可选 aigc-r2)**:默认 desktop(结果回本地);网站(AIGC Studio)调 `/run` 时可带 `delivery:{"mode":"aigc-r2"}`,出图后 worker **流式直传 Cloudflare R2**(短期预签名地址,R2 长期密钥永不进 Modal)再回调网站落库 —— 同一套部署本地 / 网站共用,网站出图全程不需要本地 ComfyUI 在线。详见 SETUP。
+- **机器接口:HTTP API + MCP + 独立 CLI(可完全脱离 ComfyUI)**:UI 用的本地 HTTP API 全部文档化([API.md](API.md));MCP server([mcp_server.py](mcp_server.py))注册进 Claude Code / Codex 后「云端 GPU 出资产」就是标准工具调用——**local 模式**走本地插件(全功能),**cloud 模式**设 endpoint + bridge_key 直连云端、**不需要 ComfyUI 在跑**。配套零依赖客户端库([bridge_client.py](bridge_client.py))与独立 CLI([bridge_cli.py](bridge_cli.py)):协作者拿 endpoint+key 即可 `submit --wait` 出片;自建者 clone 仓库后 `deploy` + `upload-model` 从零起云端,全程无 ComfyUI。大文件经云端 `/fetch` 端点流式取回,外部消费者不需要 modal token。
+
+## 工作流程(点 [RunModal] 之后)
+
+```
+ComfyUI Desktop(本地,不挑机器)
+  │ graphToPrompt() 序列化当前工作流
+  ▼
+custom_node 同步   工作流用到、云端镜像没有的节点 → 自动加 + 重部署(只这一次)
+  ▼
+模型同步          工作流要的模型,云端 Volume 没、本地有 → 用 modal SDK 直传 Volume
+  │              (CAS 块级去重:网上通用大模型秒过)
+  ▼
+路由             无本地模型(纯 API)→ CPU 容器;要 sample → GPU 容器
+  ▼
+提交 Modal /run → 轮询 → 小文件 base64 / 大文件走 Volume 直连 → 写 output/modal_results/<job_id>/
+  ▼
+按来源节点回填画板:SaveImage 出图、SaveVideo 出视频、SaveGLB / Preview3D 出 3D 转盘
+```
+
+## 安装
+
+- **方式一(推荐)**:ComfyUI Manager → Custom Nodes Manager → 搜 `Modal Bridge` → 安装 → 重启。
+- **方式二**:`git clone https://github.com/lynclee/comfyui_modal_bridge` 到 `ComfyUI/custom_nodes/`,重启。
+
+装好后点右上角 `⚙️ Modal Setup`,填 Workspace / Token 部署。详见 [SETUP.md](./SETUP.md)。
+
+## 安全
+
+- `config.json`(含 token)和 `secrets.toml` 在 `.gitignore` 里,**绝不进仓库**。
+- Modal endpoint 私有,自建 key 鉴权,无 key 一律 401。
 
 ## License
 
