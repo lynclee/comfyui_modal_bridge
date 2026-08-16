@@ -285,24 +285,40 @@ def _pyproject_repo_url(path: Path) -> str | None:
     return _sanitize_repo_url(best[1]) if best else None
 
 
+def commit_on_remote(path: Path, commit: str) -> bool:
+    """本地 HEAD 是否已推到远端 —— 云端只会 `git clone <url> && git checkout <commit>`,
+    没推的 commit 在云端根本不存在,checkout 失败会让**整个镜像 build 崩掉**(连带其它节点)。
+    判定用 `git branch -r --contains`:任一远端分支包含该 commit 即算可达。
+    ⚠ 读的是本地缓存的 remote-tracking 引用,不联网 —— 刚 push 但没 fetch 的情况会误判为
+    未推送(方向安全:宁可多问一句,不可让部署炸)。取不到结论时返回 True(不误伤)。"""
+    out = _git(["branch", "-r", "--contains", commit], path)
+    if out is None:
+        return True  # 没有远端跟踪信息 / git 报错 → 不做判断
+    return bool(out.strip())
+
+
 def folder_git_info(folder: str) -> dict:
     """读本地 custom_nodes/<folder> 的可克隆地址 + commit。
     主路径读 .git(remote.origin.url + HEAD commit);CNR / Registry / 压缩包装的节点
     没有 .git,则兜底读 pyproject.toml 的仓库地址(commit 留空 = 跟随默认分支 HEAD)。
-    has_git 在此表示「解析得到可克隆 url」(未必真有本地 .git)。"""
+    has_git 在此表示「解析得到可克隆 url」(未必真有本地 .git)。
+    额外回 pushed:False 表示本地 commit 没推到远端(云端 checkout 必失败)。"""
     path = _comfyui_root() / "custom_nodes" / folder
-    if not path.exists():
-        return {"folder": folder, "has_git": False, "url": None, "commit": None}
+    if not path.is_dir():
+        # 注意用 is_dir:单文件节点(custom_nodes/foo.py)不是可 clone 的仓库,
+        # 走 exists() 会让后面的 git 调用在非目录 cwd 上报错,白跑一圈。
+        return {"folder": folder, "has_git": False, "url": None, "commit": None, "pushed": True}
     url = _git(["config", "--get", "remote.origin.url"], path)
     commit = _git(["rev-parse", "HEAD"], path)
     if url and commit:
         return {"folder": folder, "has_git": True,
-                "url": _normalize_git_url(url), "commit": commit}
+                "url": _normalize_git_url(url), "commit": commit,
+                "pushed": commit_on_remote(path, commit)}
     repo = _pyproject_repo_url(path)
     if repo:
         return {"folder": folder, "has_git": True,
-                "url": _normalize_git_url(repo), "commit": ""}
-    return {"folder": folder, "has_git": False, "url": None, "commit": None}
+                "url": _normalize_git_url(repo), "commit": "", "pushed": True}
+    return {"folder": folder, "has_git": False, "url": None, "commit": None, "pushed": True}
 
 
 def _class_source_folder(class_type: str) -> str | None | bool:
@@ -368,8 +384,10 @@ def plan_node_sync(prompt: dict, baked: list[dict] | None = None,
                    allow_prune: bool = False) -> dict:
     """
     节点同步规划:让 Modal 镜像装上工作流需要的 custom_node。
-      - add:   工作流用到、本地有 git、baked 还没有的 → 加
+      - add:   工作流用到、本地有 git(且已推送)、baked 还没有的 → 加进镜像
       - update: baked 有、但本地 commit 跟 baked 不一致的 → 按本地 commit 更新
+      - local_pack: 无 git remote(自写节点)或本地 commit 未推送 → 走 Volume 打包通道,
+                    **不需要重新部署**(worker 启动时解压,见 local_nodes.py)
       - prune: baked 有、但本地 custom_nodes 没有的 → 候选移除
 
     ⚠ 多机场景:不同电脑各装一部分节点,"本地没有"≠"全局不需要"。所以默认
@@ -395,27 +413,39 @@ def plan_node_sync(prompt: dict, baked: list[dict] | None = None,
     baked_by_name = {n.get("name"): dict(n) for n in baked if n.get("name")}
     info = analyze_workflow(prompt)
 
-    add, update, missing_no_git = [], [], []
+    add, update, local_pack, missing_no_git = [], [], [], []
     ok_baked = 0
-    # 1) 工作流用到的 custom_node:加 / 更新
+    # 1) 工作流用到的 custom_node:加 / 更新 / 走本地打包通道
     for folder, class_types in info["by_folder"].items():
         git = folder_git_info(folder)
         if folder in baked_by_name:
             ok_baked += 1
             local_commit = (git.get("commit") or "").strip()
             baked_commit = (baked_by_name[folder].get("commit") or "").strip()
-            if git["has_git"] and local_commit and local_commit != baked_commit:
+            # 未推送的 commit 不能写进清单:云端 checkout 不到 → 镜像 build 崩。
+            # 保持 baked 里那个旧 commit(云端还能 clone 到),差异交给前端提示。
+            if git["has_git"] and git.get("pushed", True) and local_commit \
+                    and local_commit != baked_commit:
                 update.append({"folder": folder, "url": git["url"],
                                "old_commit": baked_commit, "commit": local_commit})
                 baked_by_name[folder] = {"name": folder, "url": git["url"], "commit": local_commit}
             continue
-        if git["has_git"]:
+        if git["has_git"] and git.get("pushed", True):
             add.append({"folder": folder, "class_types": sorted(class_types),
                         "url": git["url"], "commit": git.get("commit") or ""})
             baked_by_name[folder] = {"name": folder, "url": git["url"],
                                      "commit": git.get("commit") or ""}
+        elif folder_exists_locally(folder):
+            # 自写节点(无 git remote)、或有 remote 但本轮改动没推 —— 走本地打包通道:
+            # 打包传 Volume,worker 启动时解压。不需要重 build 镜像(见 local_nodes.py)。
+            local_pack.append({
+                "folder": folder, "class_types": sorted(class_types),
+                "reason": "unpushed" if git["has_git"] else "no_git",
+            })
         else:
-            missing_no_git.append({"folder": folder, "class_types": sorted(class_types)})
+            # 目录都不在(单文件节点 custom_nodes/foo.py,或路径解析异常)→ 真的补不了
+            missing_no_git.append({"folder": folder, "class_types": sorted(class_types),
+                                   "reason": "not_a_directory"})
 
     # 2) baked 里、本地没有的 → prune 候选。默认不真删(多机并集,见 docstring),
     #    只在 allow_prune 时才从 new_baked 移除(手动清理面板用)。
@@ -439,12 +469,16 @@ def plan_node_sync(prompt: dict, baked: list[dict] | None = None,
             new_baked.append(entry)
             seen.add(nm)
 
-    # 自动同步只看 add/update(prune 默认不执行 → 不该触发部署);allow_prune 时 prune 也算
+    # 自动同步只看 add/update(prune 默认不执行 → 不该触发部署);allow_prune 时 prune 也算。
+    # ⚠ local_pack 刻意**不**触发部署:本地节点走 Volume 运行时挂载,重传 zip 即生效,
+    #   这正是这条通道相对 git 路线的核心优势(省掉 3-5 分钟重 build)。
     needs_deploy = bool(add or update or (prune and allow_prune))
     return {
         "add": add,
         "update": update,
         "prune": prune,
+        "local_pack": local_pack,
+        "needs_local_upload": bool(local_pack),
         "missing_no_git": missing_no_git,
         "unresolved": info["unresolved"],
         "ok_builtin": len(info["builtin"]),

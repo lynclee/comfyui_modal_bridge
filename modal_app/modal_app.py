@@ -142,6 +142,13 @@ def _worker_boot(self, cpu: bool = False):
     # 避免 CUDA 版 torch 在无驱动机器上自动探测的边角风险。GPU 容器走默认(自动用 CUDA)。
     self._cpu = cpu
     models_vol.reload()  # 启动前同步 Volume(ComfyUI 还没打开文件,不冲突)
+    # 本地自写节点(没有 git remote、传不上 GitHub 的那些)从 Volume 解压进 custom_nodes/。
+    # 必须在 ComfyUI 起来之前做 —— 它只在启动时扫一次 custom_nodes。失败不阻断启动。
+    try:
+        from _local_nodes_boot import extract_all
+        extract_all()
+    except Exception as e:
+        print(f"[bridge] ⚠ 本地节点装载跳过: {e}")
     # ⚠ 别再做「Triton JIT 缓存落 Volume」:2026-08-06 实测过并回退(git 历史 9fb8efc→此提交)。
     # 全历史逐单对比证明冷容器首步的慢(25~95s 波动)来自**宿主机 Volume 冷缓存**的权重
     # 流式 stall(无缓存的冷容器首步同样只有 25.8s,铁证),Triton 编译本身仅几秒;

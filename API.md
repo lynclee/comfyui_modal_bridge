@@ -57,7 +57,7 @@ curl -X POST http://127.0.0.1:8000/modal_bridge/submit \
 | `/modal_bridge/estimate_vram` | POST | `{prompt}` | 返回 `{est_vram_gb, est_basis, category, total_mb, unknown[]}`。视频类在能从工作流抠出 分辨率×帧数 字面量时走激活公式(`est_basis:"activation"`,实测校准),否则回退权重×系数(`"legacy"`,偏保守) |
 | `/modal_bridge/check_required_inputs` | POST | `{prompt}` | 找出缺必填输入的节点(老工作流 × 新节点定义),`{missing:[{node_id, class_type, missing[]}]}` |
 | `/modal_bridge/check_models` | POST | `{prompt}` | 对比工作流所需模型 vs 云端 Volume,返回缺失清单 |
-| `/modal_bridge/check_nodes` | POST | `{prompt}` | 对比工作流 custom_node vs 云端镜像清单 |
+| `/modal_bridge/check_nodes` | POST | `{prompt}` | 对比工作流 custom_node vs 云端镜像清单。分流:`add`/`update`(有 git 且已推送 → 进镜像,要重部署)、`local_pack`(自写节点或 commit 未推送 → 走 Volume 打包通道,**不用重部署**)、`missing_no_git`(本地连目录都没有 → 补不了) |
 
 ## 同步与部署(耗时操作,内部有互斥锁)
 
@@ -65,6 +65,9 @@ curl -X POST http://127.0.0.1:8000/modal_bridge/submit \
 |---|---|---|
 | `/modal_bridge/sync_models` | POST | 本地模型 → Modal Volume(SDK batch_upload,CAS 去重) |
 | `/modal_bridge/sync_nodes` | POST | custom_node 清单同步 + 触发重新部署 |
+| `/modal_bridge/sync_local_nodes` | POST | `{folders:[...]}` → 自写节点(无 git remote / commit 未推送)打包传 Volume。**不重建镜像**,worker 启动时解压;内容指纹去重,没改就跳过 |
+| `/modal_bridge/list_local_nodes` | GET | Volume 上现存的本地节点包名单 |
+| `/modal_bridge/remove_local_node` | POST | `{folder}` → 从 Volume 删掉某个本地节点包 |
 | `/modal_bridge/deploy` | POST | 重新部署云端 app(drain 语义:在跑的任务在旧版本上跑完) |
 | `/modal_bridge/list_nodes` | GET | 云端镜像当前的 custom_node 清单 |
 

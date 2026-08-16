@@ -125,8 +125,12 @@ const I18N = {
   "nodes.redeploying":{ zh: "重部署中(约 1-3 分钟,别关窗口)...", en: "Redeploying (~1-3 min, keep window open)..." },
   // —— 节点同步 ——
   "node.scan":        { zh: "扫描工作流 custom nodes...", en: "Scanning workflow custom nodes..." },
-  "node.nogit":       { zh: "这些 custom_node 没有 git 信息,无法自动补:\n{list}",
-                        en: "These custom_nodes have no git info, cannot auto-add:\n{list}" },
+  "node.nogit":       { zh: "这些 custom_node 在本地找不到目录,无法自动补(单文件节点?):\n{list}",
+                        en: "No local directory for these custom_nodes, cannot auto-add (single-file node?):\n{list}" },
+  "node.local_pack":  { zh: "打包 {n} 个本地节点上传(不需重新部署)...",
+                        en: "Packing {n} local node(s) for upload (no redeploy needed)..." },
+  "node.local_fail":  { zh: "本地节点上传失败,云端可能缺这些节点。仍然提交?(很可能失败)",
+                        en: "Local node upload failed; the cloud may be missing them. Submit anyway? (likely to fail)" },
   "node.ok":          { zh: "nodes ok ({baked} custom + {builtin} builtin)", en: "nodes ok ({baked} custom + {builtin} builtin)" },
   "node.confirm_skip":{ zh: "部分 custom_node 无法自动补,仍然提交?(很可能失败)",
                         en: "Some custom_nodes can't be auto-added. Submit anyway? (likely to fail)" },
@@ -515,6 +519,25 @@ async function syncNodes(plan, ctx) {
   return rc === 0;
 }
 
+// 本地自写节点 → 打包上传 Volume(不重建镜像:worker 启动时解压)。返回是否成功
+async function syncLocalNodes(localPack, ctx) {
+  const folders = localPack.map((p) => p.folder);
+  try {
+    const rc = await streamPost(
+      "/modal_bridge/sync_local_nodes",
+      { folders },
+      (line) => {
+        log("local-node:", line);
+        ctx.stage("uploading", line.length > 72 ? line.slice(0, 72) + "…" : line, false);
+      },
+    );
+    return rc === 0;
+  } catch (e) {
+    log("sync_local_nodes failed:", e);
+    return false;
+  }
+}
+
 // submit 前调:custom_node 与本地双向同步(加/改/删)。返回 true=可继续 / false=用户取消
 async function ensureNodesAvailable(prompt, ctx) {
   ctx.stage("nodes", t("node.scan"));
@@ -526,19 +549,29 @@ async function ensureNodesAvailable(prompt, ctx) {
     return true; // 检查本身失败不阻塞提交
   }
 
-  const { add = [], update = [], prune = [], missing_no_git = [], unresolved = [], source } = plan;
+  const { add = [], update = [], prune = [], local_pack = [], missing_no_git = [],
+          unresolved = [], source } = plan;
   if (unresolved.length) log("unresolved class_types (本地也没装):", unresolved);
 
+  // ⚠ missing_no_git = 云端补不了、任务上去必失败。**必须在任何分支之前拦**:
+  //   历史上这个确认只写在 !needs_deploy 分支里,于是"还要重部署"的路径反而不拦 ——
+  //   用户白等 3-5 分钟部署,再眼看云端因为缺节点报错。风险一样,不该因路径而异。
   if (missing_no_git.length) {
     const list = missing_no_git.map((m) => `  ${m.folder} (${m.class_types.join(", ")})`).join("\n");
     notify(t("node.nogit", { list }), "warn");
+    if (!confirm(t("node.confirm_skip"))) return false;
+  }
+
+  // 本地自写节点(无 git remote / commit 未推送)→ 打包传 Volume,worker 启动时解压。
+  // 放在部署之前:即使同一批还要重部署,本地节点也已经在 Volume 上,一次提交全齐。
+  if (local_pack.length) {
+    ctx.stage("nodes", t("node.local_pack", { n: local_pack.length }), false);
+    const ok = await syncLocalNodes(local_pack, ctx);
+    if (!ok && !confirm(t("node.local_fail"))) return false;
   }
 
   if (!plan.needs_deploy) {
     ctx.stage("nodes", t("node.ok", { baked: plan.ok_baked, builtin: plan.ok_builtin }));
-    if (missing_no_git.length) {
-      return confirm(t("node.confirm_skip"));
-    }
     return true;
   }
 

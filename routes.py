@@ -14,6 +14,7 @@ from aiohttp import web
 from . import categories
 from . import config as cfg_mod
 from . import contract
+from . import local_nodes
 from . import modal_client
 from . import modal_volume
 from . import model_deps
@@ -740,6 +741,92 @@ def _setup_routes():
         await _emit(resp, "\n__DEPLOY_DONE__ rc=0\n")
         await resp.write_eof()
         return resp
+
+    @routes.post("/modal_bridge/sync_local_nodes")
+    async def _sync_local_nodes(request: web.Request):
+        """
+        本地自写 custom_node(无 git remote / commit 未推送)打包上传 Volume。stream 回传进度。
+        worker 启动时会解压进 /comfyui/custom_nodes/ —— **不需要重新部署镜像**。
+        body: {folders: ["my_node", ...]}  (前端从 check_nodes 的 local_pack 拿)
+        最后一行: __DEPLOY_DONE__ rc=<code>
+        """
+        body = await request.json()
+        folders = body.get("folders")
+        if not isinstance(folders, list) or not folders:
+            return web.json_response({"error": "folders (non-empty list) required"}, status=400)
+
+        cfg = cfg_mod.load_config()
+        resp = web.StreamResponse(
+            status=200,
+            headers={"Content-Type": "text/plain; charset=utf-8", "Cache-Control": "no-cache"},
+        )
+        await resp.prepare(request)
+
+        if not modal_volume.modal_importable():
+            await _emit(resp, "✗ 本地没装 modal,无法上传\n\n__DEPLOY_DONE__ rc=1\n")
+            await resp.write_eof()
+            return resp
+
+        root = Path(node_sync._comfyui_root()) / "custom_nodes"
+        await _emit(resp, f"== 打包上传 {len(folders)} 个本地节点到 Volume ==\n")
+        await _emit(resp, "== 这条通道不重建镜像:worker 启动时从 Volume 解压,改完重传即生效 ==\n\n")
+
+        def do_upload(emit):
+            plan = local_nodes.plan_local_uploads(cfg, folders, root)
+            for f in plan["uptodate"]:
+                emit(f"  = {f} 云端已是最新,跳过\n")
+            for f in plan["failed"]:
+                emit(f"  ✗ {f['folder']}: {f['error']}\n")
+            todo = [u["folder"] for u in plan["upload"]]
+            if not todo:
+                return {"uploaded": [], "failed": plan["failed"]}
+            for u in plan["upload"]:
+                emit(f"  ↑ {u['folder']}({u['files']} 个文件,~{u['raw_mb']} MB)\n")
+            r = local_nodes.upload_local_nodes(cfg, todo, root)
+            r["failed"] = plan["failed"] + r.get("failed", [])
+            return r
+
+        if _UPLOAD_LOCK.locked():
+            await _emit(resp, "== 另有上传进行中,排队等待…\n\n")
+        try:
+            async with _UPLOAD_LOCK:
+                result = await _run_blocking_streamed(resp, do_upload)
+        except Exception as e:
+            import traceback
+            tb = traceback.format_exc()
+            print(f"[modal_bridge] sync_local_nodes 失败: {e}\n{tb}")
+            await _emit(resp, f"\n✗ 上传失败: {e}\n{tb[-800:]}\n\n__DEPLOY_DONE__ rc=1\n")
+            await resp.write_eof()
+            return resp
+
+        for u in result.get("uploaded", []):
+            await _emit(resp, f"  ✓ {u['folder']} ({u['zip_kb']} KB, {u['files']} files)\n")
+        failed = result.get("failed", [])
+        rc = 1 if failed and not result.get("uploaded") else 0
+        await _emit(resp, f"\n== {'✓' if rc == 0 else '⚠'} 本地节点同步完成:"
+                          f"{len(result.get('uploaded', []))} 个上传,{len(failed)} 个失败 ==\n")
+        await _emit(resp, f"\n__DEPLOY_DONE__ rc={rc}\n")
+        await resp.write_eof()
+        return resp
+
+    @routes.get("/modal_bridge/list_local_nodes")
+    async def _list_local_nodes(request: web.Request):
+        """Volume 上现有的本地节点包名单(「管理云端节点」面板用)。返回 {ok, nodes:[name]}"""
+        cfg = cfg_mod.load_config()
+        if not modal_volume.modal_importable():
+            return web.json_response({"ok": False, "nodes": [], "error": "modal 未安装"})
+        return web.json_response({"ok": True, "nodes": local_nodes.list_volume_local_nodes(cfg)})
+
+    @routes.post("/modal_bridge/remove_local_node")
+    async def _remove_local_node(request: web.Request):
+        """从 Volume 删掉某个本地节点包。body: {folder}"""
+        body = await request.json()
+        folder = (body.get("folder") or "").strip()
+        if not folder or "/" in folder or ".." in folder:
+            return web.json_response({"error": "folder 非法"}, status=400)
+        cfg = cfg_mod.load_config()
+        local_nodes.remove_volume_local_node(cfg, folder)
+        return web.json_response({"ok": True, "removed": folder})
 
     # -------- custom_node 双向同步 --------
 

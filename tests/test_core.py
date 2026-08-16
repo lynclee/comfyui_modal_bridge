@@ -119,16 +119,33 @@ def test_plan_noop_when_in_sync():
         _restore()
 
 
-def test_plan_missing_no_git():
-    """工作流用到、baked 没有、本地也没 git 信息 → 进 missing_no_git,不算 add。"""
+def test_plan_no_git_goes_local_pack():
+    """无 git 信息但目录在本地 → 走本地打包通道(local_pack),不算 add、不触发部署。
+    (0.7.5 前这里判 missing_no_git「补不了」;现在有 Volume 打包通道,能补了。)"""
     _stub_analyze({"weird-node": ["W1"]})
     _stub_env({"weird-node": {"has_git": False, "url": None, "commit": None}},
               exists_set={"weird-node"})
     try:
         p = node_sync.plan_node_sync({}, baked=[])
         assert p["add"] == []
-        assert [x["folder"] for x in p["missing_no_git"]] == ["weird-node"]
-        # 没 git 信息进不了 new_baked,也不该触发部署
+        assert [x["folder"] for x in p["local_pack"]] == ["weird-node"]
+        assert p["missing_no_git"] == []
+        assert p["needs_deploy"] is False, "本地通道是运行时挂载,不该重 build 镜像"
+        assert p["needs_local_upload"] is True
+    finally:
+        _restore()
+
+
+def test_plan_missing_no_git_only_when_not_a_dir():
+    """目录都不在(单文件节点 / 解析异常)→ 才是真的补不了,进 missing_no_git。"""
+    _stub_analyze({"single_file.py": ["S1"]})
+    _stub_env({"single_file.py": {"has_git": False, "url": None, "commit": None}},
+              exists_set=set())  # folder_exists_locally → False
+    try:
+        p = node_sync.plan_node_sync({}, baked=[])
+        assert p["local_pack"] == []
+        assert [x["folder"] for x in p["missing_no_git"]] == ["single_file.py"]
+        assert p["missing_no_git"][0]["reason"] == "not_a_directory"
         assert p["needs_deploy"] is False
     finally:
         _restore()
@@ -641,6 +658,102 @@ def test_bridge_client_pack_input_images_rejects_escape(tmp_path):
         {"1": {"class_type": "LoadImage", "inputs": {"image": "sub/b.png"}}},
         [str(tmp_path / "in")])
     assert out[0]["name"] == "sub/b.png"
+
+
+def test_local_nodes_skip_rules():
+    """打包排除规则:代码留下,.git/缓存/权重/素材剔除。"""
+    import local_nodes as ln
+    for keep in ("__init__.py", "nodes/my.py", "requirements.txt", "web/ui.js", "README.md"):
+        assert not ln.should_skip(keep), f"不该排除: {keep}"
+    for drop in (".git/config", "__pycache__/x.pyc", "a/__pycache__/b.py", "x.pyc",
+                 ".DS_Store", "model.safetensors", "w/ckpt.pt", "node_modules/x/y.js",
+                 "demo.mp4", "venv/lib/x.py"):
+        assert ln.should_skip(drop), f"应当排除: {drop}"
+
+
+def test_local_nodes_pack_and_digest(tmp_path):
+    """打包:内容一致 → 指纹一致;改一个字节 → 指纹变;排除项不进包;超限抛错。"""
+    import io
+    import zipfile
+    import local_nodes as ln
+    d = tmp_path / "my_node"
+    (d / "__pycache__").mkdir(parents=True)
+    (d / "__init__.py").write_text("NODE_CLASS_MAPPINGS={}")
+    (d / "helper.py").write_text("x = 1")
+    (d / "__pycache__" / "c.pyc").write_bytes(b"junk")
+    (d / "big.safetensors").write_bytes(b"0" * 1000)
+
+    blob, digest, count, raw = ln.pack_node_dir(d)
+    assert count == 2, "只该打包两个 .py"
+    names = set(zipfile.ZipFile(io.BytesIO(blob)).namelist())
+    assert names == {"__init__.py", "helper.py"}
+    assert raw < 100, "权重/缓存不该计入体积"
+
+    blob2, digest2, _, _ = ln.pack_node_dir(d)
+    assert digest2 == digest and blob2 == blob, "同内容必须打出一致的包与指纹(幂等重传)"
+    (d / "helper.py").write_text("x = 2")
+    assert ln.pack_node_dir(d)[1] != digest, "内容变了指纹必须变"
+
+    ln.MAX_PACK_BYTES, keep = 10, ln.MAX_PACK_BYTES
+    try:
+        ln.pack_node_dir(d)
+        assert False, "超限应抛错"
+    except ValueError as e:
+        assert "上限" in str(e)
+    finally:
+        ln.MAX_PACK_BYTES = keep
+
+
+def test_local_nodes_zip_slip_guard():
+    """云端解压的路径囚笼:绝对路径 / .. 穿越必须被挡在目标目录外。"""
+    sys.path.insert(0, str(ROOT / "modal_app"))
+    import _local_nodes_boot as boot
+    dest = Path("/comfyui/custom_nodes/my_node")
+    ok, bad = boot.safe_members(
+        ["__init__.py", "sub/a.py",
+         "../../../etc/passwd", "/etc/shadow", "sub/../../out.py", "a/../b.py"], dest)
+    assert ok == ["__init__.py", "sub/a.py", "a/../b.py"] or "a/../b.py" in bad
+    for evil in ("../../../etc/passwd", "/etc/shadow", "sub/../../out.py"):
+        assert evil in bad, f"必须拦截: {evil}"
+    for good in ("__init__.py", "sub/a.py"):
+        assert good in ok, f"正常条目不该被拦: {good}"
+
+
+def test_plan_node_sync_routes_local_and_unpushed(tmp_path, monkeypatch=None):
+    """分流:有 git 且已推 → add(重部署);无 git / 未推送 → local_pack(不重部署)。"""
+    import node_sync as ns
+    root = tmp_path
+    (root / "custom_nodes" / "gitnode").mkdir(parents=True)
+    (root / "custom_nodes" / "mynode").mkdir(parents=True)
+    orig_root, orig_info = ns._comfyui_root, ns.folder_git_info
+    ns._comfyui_root = lambda: root
+    ns.folder_git_info = lambda f: {
+        "gitnode": {"folder": f, "has_git": True, "url": "https://github.com/a/b",
+                    "commit": "c" * 40, "pushed": True},
+        "mynode": {"folder": f, "has_git": False, "url": None, "commit": None, "pushed": True},
+        "unpushed": {"folder": f, "has_git": True, "url": "https://github.com/a/b",
+                     "commit": "d" * 40, "pushed": False},
+    }[f]
+    try:
+        ns.analyze_workflow = lambda p: {
+            "builtin": [], "unresolved": [],
+            "by_folder": {"gitnode": ["G"], "mynode": ["M"]}}
+        plan = ns.plan_node_sync({}, baked=[])
+        assert [a["folder"] for a in plan["add"]] == ["gitnode"]
+        assert [p["folder"] for p in plan["local_pack"]] == ["mynode"]
+        assert plan["local_pack"][0]["reason"] == "no_git"
+        assert plan["needs_deploy"] is True and plan["needs_local_upload"] is True
+
+        # 未推送的 commit 绝不能进清单 —— 云端 checkout 不到会让整个镜像 build 崩
+        (root / "custom_nodes" / "unpushed").mkdir()
+        ns.analyze_workflow = lambda p: {
+            "builtin": [], "unresolved": [], "by_folder": {"unpushed": ["U"]}}
+        plan2 = ns.plan_node_sync({}, baked=[])
+        assert plan2["add"] == [], "未推送的不该走 git 路线"
+        assert plan2["local_pack"][0]["reason"] == "unpushed"
+        assert plan2["needs_deploy"] is False, "本地通道不该触发重新部署"
+    finally:
+        ns._comfyui_root, ns.folder_git_info = orig_root, orig_info
 
 
 def test_bridge_client_download_outputs_base64(tmp_path):
