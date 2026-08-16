@@ -198,7 +198,7 @@ def plan_local_uploads(cfg: dict, folders: list[str], root: Path) -> dict:
                 continue
             digest = compute_digest(files)
             if remote.get(folder) == digest:
-                uptodate.append(folder)
+                uptodate.append({"folder": folder, "digest": digest})
             else:
                 upload.append({"folder": folder, "digest": digest,
                                "files": len(files), "raw_mb": max(1, total // 1024 // 1024)})
@@ -228,7 +228,11 @@ def upload_local_nodes(cfg: dict, folders: list[str], root: Path, on_progress=No
         for folder, blob, digest, count, _raw in packs:
             batch.put_file(io.BytesIO(blob), f"{VOLUME_PREFIX}/{folder}.zip")
             batch.put_file(io.BytesIO(digest.encode()), f"{VOLUME_PREFIX}/{folder}.digest")
-            uploaded.append({"folder": folder, "zip_kb": max(1, len(blob) // 1024), "files": count})
+            # 回传实际上传的那个 digest:提交时必须声明「Volume 上真实存在的版本」,
+            # 而不是提交那一刻重新扫目录算出来的(编辑器在两步之间保存一下就对不上了,
+            # 结果是声明了一个云端根本没有的版本 → worker 永远刷新不到 → 任务失败)。
+            uploaded.append({"folder": folder, "zip_kb": max(1, len(blob) // 1024),
+                             "files": count, "digest": digest})
     if on_progress:
         on_progress({"phase": "end", "count": len(uploaded)})
     return {"uploaded": uploaded, "failed": failed}
@@ -248,8 +252,25 @@ def list_volume_local_nodes(cfg: dict) -> list[str]:
         return []
 
 
-def remove_volume_local_node(cfg: dict, folder: str) -> None:
-    """从 Volume 删掉某个本地节点包(zip + digest)。失败忽略。"""
-    mv = _mv()
+def remove_volume_local_node(cfg: dict, folder: str) -> dict:
+    """从 Volume 删掉某个本地节点包(zip + digest)。
+    ⚠ 返回真实结果,不吞异常:modal_volume.remove_volume_path 是 best-effort(内部吞异常),
+      直接用它会让「Modal 不可用 / 删除失败」也显示成 ✓ —— 用户以为清掉了,下次冷启动
+      那个包还在,又被解压回去。所以这里自己调 SDK 并如实回报。
+    返回 {ok, removed: [path], errors: [{path, error}]}"""
+    removed, errors = [], []
+    try:
+        vol = _mv().get_volume(cfg)
+    except Exception as e:
+        return {"ok": False, "removed": [], "errors": [{"path": folder, "error": str(e)}]}
     for suffix in (".zip", ".digest"):
-        mv.remove_volume_path(cfg, f"{VOLUME_PREFIX}/{folder}{suffix}")
+        path = f"{VOLUME_PREFIX}/{folder}{suffix}"
+        try:
+            vol.remove_file(path, recursive=False)
+            removed.append(path)
+        except Exception as e:
+            # 文件本来就不存在算成功(幂等):目标状态「Volume 上没有它」已经达成
+            if "not found" in str(e).lower() or "no such" in str(e).lower():
+                continue
+            errors.append({"path": path, "error": str(e)})
+    return {"ok": not errors, "removed": removed, "errors": errors}

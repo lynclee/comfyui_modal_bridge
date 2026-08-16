@@ -792,6 +792,55 @@ def test_local_nodes_needs_refresh(tmp_path):
         boot.DEST_DIR = orig
 
 
+def test_cloud_stale_reason_matrix():
+    """云端那份是不是旧的 —— 四条分支各一例(纯函数)。
+    dirty 优先级最高:HEAD 没变但文件改了,云端按 commit clone 永远拿不到这些改动。"""
+    f = node_sync._cloud_stale_reason
+    same = "a" * 40
+    assert f({"has_git": True, "pushed": True, "dirty": False}, same, same) is None
+    assert f({"has_git": True, "pushed": True, "dirty": True}, same, same) == "dirty"
+    assert f({"has_git": True, "pushed": True, "dirty": False}, "b" * 40, same) == "commit"
+    assert f({"has_git": True, "pushed": False, "dirty": False}, "b" * 40, same) == "unpushed"
+    assert f({"has_git": False, "pushed": True, "dirty": False}, "", same) == "no_git"
+    # .git 丢了但 baked 里还留着旧记录 → 无从校验,按可能不一致处理(而不是默认「一致」)
+    assert f({"has_git": True, "pushed": True, "dirty": False}, "", same) == "no_git"
+
+
+def test_plan_baked_node_dirty_worktree():
+    """已烤进镜像、HEAD 与 baked 相同、但工作树有未提交改动 → 必须进 local_pack。
+    这是自写/调试节点最常见的状态(改一行试一下,不会先 commit),
+    漏掉它 = 用户改完节点跑一遍、结果和没改一样,且没有任何提示。"""
+    same = "s" * 40
+    _stub_analyze({"baked-node": ["B1"]})
+    _stub_env({"baked-node": {"has_git": True, "url": "https://github.com/a/b",
+                              "commit": same, "pushed": True, "dirty": True}},
+              exists_set={"baked-node"})
+    try:
+        baked = [{"name": "baked-node", "url": "https://github.com/a/b", "commit": same}]
+        p = node_sync.plan_node_sync({}, baked=baked)
+        assert p["update"] == []
+        assert [x["folder"] for x in p["local_pack"]] == ["baked-node"]
+        assert p["local_pack"][0]["reason"] == "dirty"
+        assert p["needs_local_upload"] is True and p["needs_deploy"] is False
+    finally:
+        _restore()
+
+
+def test_plan_dirty_new_node_not_git_route():
+    """还没进镜像、有 git 也推过、但工作树是脏的 → 不能走 git 路线(云端 clone 到的是干净版),
+    必须走本地打包通道。"""
+    _stub_analyze({"newnode": ["N1"]})
+    _stub_env({"newnode": {"has_git": True, "url": "https://github.com/a/b",
+                           "commit": "c" * 40, "pushed": True, "dirty": True}},
+              exists_set={"newnode"})
+    try:
+        p = node_sync.plan_node_sync({}, baked=[])
+        assert p["add"] == [], "脏工作树不该走 git 路线"
+        assert [x["folder"] for x in p["local_pack"]] == ["newnode"]
+    finally:
+        _restore()
+
+
 def test_plan_baked_node_with_unpushed_changes():
     """已烤进镜像的节点,本地改动没推 → 必须进 local_pack 盖掉旧版,
     绝不能静默 continue(那样云端跑旧代码,用户改完毫无变化且无任何线索)。"""

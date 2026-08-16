@@ -195,11 +195,26 @@ def _worker_boot(self, cpu: bool = False):
     print(f"[bridge] ComfyUI ready ({mode})")
 
 
-def _worker_shutdown(self):
+def _worker_shutdown(self, wait_s: float = 20.0):
+    """停掉 ComfyUI 子进程,并**等它真的退出**。
+    ⚠ 只 terminate() 不 wait() 会有端口竞争:SIGTERM 是异步的,旧进程可能还占着 8188,
+      紧接着起的新进程 bind 失败;更坏的是 wait_comfy_ready 可能探到正在退出的旧进程、
+      判定 ready,随后任务打向一个已经关掉的服务。所以这里必须等干净再返回。"""
+    proc = getattr(self, "proc", None)
+    if proc is None:
+        return
     try:
-        self.proc.terminate()
+        proc.terminate()
     except Exception:
         pass
+    try:
+        proc.wait(timeout=wait_s)
+    except Exception:
+        try:
+            proc.kill()          # 赖着不走就硬杀
+            proc.wait(timeout=10)
+        except Exception:
+            pass
 
 
 def _worker_ensure_alive(self):
@@ -228,20 +243,25 @@ def _refresh_local_nodes_if_stale(self, expected: dict | None) -> bool:
     返回是否真的重装过。"""
     if not expected:
         return False
-    try:
-        from _local_nodes_boot import extract_all, needs_refresh
-        if not needs_refresh(expected):
-            return False
-        stale = needs_refresh(expected)
-        print(f"[bridge] 暖容器的本地节点已过期 {stale} → reload + 重装 + 重启 ComfyUI")
-        models_vol.reload()   # 别处 commit 的 Volume 变更,运行中容器必须 reload 才看得到
-        extract_all()
-        _worker_shutdown(self)
-        _worker_boot(self, cpu=getattr(self, "_cpu", False))  # 节点代码变了必须重 import
-        return True
-    except Exception as e:
-        print(f"[bridge] ⚠ 本地节点刷新失败(按现状继续跑): {e}")
+    from _local_nodes_boot import extract_all, needs_refresh
+    stale = needs_refresh(expected)
+    if not stale:
         return False
+    print(f"[bridge] 暖容器的本地节点已过期 {stale} → reload + 重装 + 重启 ComfyUI")
+    models_vol.reload()   # 别处 commit 的 Volume 变更,运行中容器必须 reload 才看得到
+    extract_all()
+    # ⚠ 复核,别只当提示:extract_all 对坏包 / 解压失败 / marker 写失败都是「打日志继续」,
+    #   Volume 上的包也可能压根不是这一版(上传失败/最终一致性没追上)。不复核就会
+    #   **静默跑旧节点代码** —— 用户改完节点跑一遍,结果和没改一样,零线索。宁可让任务明确失败。
+    still = needs_refresh(expected)
+    if still:
+        raise RuntimeError(
+            f"本地节点版本对不上,拒绝用旧代码跑: {still}。"
+            f"云端拿到的不是本次提交声明的那版(上传没成功?包损坏?)——请重试提交;"
+            f"仍不行就在「管理云端节点」里删掉这些包再跑一次。")
+    _worker_shutdown(self)
+    _worker_boot(self, cpu=getattr(self, "_cpu", False))  # 节点代码变了必须重 import
+    return True
 
 
 def _worker_run(workflow: dict, job_id: str, input_images: list | None = None,
@@ -387,7 +407,14 @@ class ComfyWorker:
     @modal.method()
     def run(self, workflow: dict, job_id: str, input_images: list | None = None,
             delivery: dict | None = None, local_nodes: dict | None = None) -> dict:
-        _refresh_local_nodes_if_stale(self, local_nodes)  # 暖容器可能装着上一版自写节点
+        # 暖容器可能装着上一版自写节点。刷不到期望版本会抛错 —— 必须写进 job_state,
+        # 否则前端只看到 queued 一直转(spawn 的异常传不回轮询侧)。
+        try:
+            _refresh_local_nodes_if_stale(self, local_nodes)
+        except Exception as e:
+            job_state[job_id] = {**job_state.get(job_id, {}), "status": "failed",
+                                 "error": str(e), "completed_at": time.time()}
+            raise
         return _worker_run(workflow, job_id, input_images, delivery)
 
 
@@ -411,7 +438,14 @@ class ComfyWorkerCheap:
     @modal.method()
     def run(self, workflow: dict, job_id: str, input_images: list | None = None,
             delivery: dict | None = None, local_nodes: dict | None = None) -> dict:
-        _refresh_local_nodes_if_stale(self, local_nodes)  # 暖容器可能装着上一版自写节点
+        # 暖容器可能装着上一版自写节点。刷不到期望版本会抛错 —— 必须写进 job_state,
+        # 否则前端只看到 queued 一直转(spawn 的异常传不回轮询侧)。
+        try:
+            _refresh_local_nodes_if_stale(self, local_nodes)
+        except Exception as e:
+            job_state[job_id] = {**job_state.get(job_id, {}), "status": "failed",
+                                 "error": str(e), "completed_at": time.time()}
+            raise
         return _worker_run(workflow, job_id, input_images, delivery)
 
 
@@ -435,7 +469,14 @@ class ComfyWorkerTop:
     @modal.method()
     def run(self, workflow: dict, job_id: str, input_images: list | None = None,
             delivery: dict | None = None, local_nodes: dict | None = None) -> dict:
-        _refresh_local_nodes_if_stale(self, local_nodes)  # 暖容器可能装着上一版自写节点
+        # 暖容器可能装着上一版自写节点。刷不到期望版本会抛错 —— 必须写进 job_state,
+        # 否则前端只看到 queued 一直转(spawn 的异常传不回轮询侧)。
+        try:
+            _refresh_local_nodes_if_stale(self, local_nodes)
+        except Exception as e:
+            job_state[job_id] = {**job_state.get(job_id, {}), "status": "failed",
+                                 "error": str(e), "completed_at": time.time()}
+            raise
         return _worker_run(workflow, job_id, input_images, delivery)
 
 
@@ -462,7 +503,14 @@ class ComfyWorkerCPU:
     @modal.method()
     def run(self, workflow: dict, job_id: str, input_images: list | None = None,
             delivery: dict | None = None, local_nodes: dict | None = None) -> dict:
-        _refresh_local_nodes_if_stale(self, local_nodes)  # 暖容器可能装着上一版自写节点
+        # 暖容器可能装着上一版自写节点。刷不到期望版本会抛错 —— 必须写进 job_state,
+        # 否则前端只看到 queued 一直转(spawn 的异常传不回轮询侧)。
+        try:
+            _refresh_local_nodes_if_stale(self, local_nodes)
+        except Exception as e:
+            job_state[job_id] = {**job_state.get(job_id, {}), "status": "failed",
+                                 "error": str(e), "completed_at": time.time()}
+            raise
         return _worker_run(workflow, job_id, input_images, delivery)
 
 

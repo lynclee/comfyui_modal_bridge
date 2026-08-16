@@ -297,6 +297,15 @@ def commit_on_remote(path: Path, commit: str) -> bool:
     return bool(out.strip())
 
 
+def worktree_dirty(path: Path) -> bool:
+    """工作树有未提交改动(含未跟踪文件)。
+    这是自写 / 调试节点**最常见**的状态:改一行试一下,谁会先 commit 再 push?
+    而云端只按 commit clone —— HEAD 没变但文件变了,镜像里跑的还是旧代码,
+    且改前改后结果一模一样、毫无线索。所以 dirty 必须当成「本地版本 ≠ 云端版本」。"""
+    out = _git(["status", "--porcelain"], path)
+    return bool(out and out.strip())
+
+
 def folder_git_info(folder: str) -> dict:
     """读本地 custom_nodes/<folder> 的可克隆地址 + commit。
     主路径读 .git(remote.origin.url + HEAD commit);CNR / Registry / 压缩包装的节点
@@ -313,12 +322,15 @@ def folder_git_info(folder: str) -> dict:
     if url and commit:
         return {"folder": folder, "has_git": True,
                 "url": _normalize_git_url(url), "commit": commit,
-                "pushed": commit_on_remote(path, commit)}
+                "pushed": commit_on_remote(path, commit),
+                "dirty": worktree_dirty(path)}
     repo = _pyproject_repo_url(path)
     if repo:
         return {"folder": folder, "has_git": True,
-                "url": _normalize_git_url(repo), "commit": "", "pushed": True}
-    return {"folder": folder, "has_git": False, "url": None, "commit": None, "pushed": True}
+                "url": _normalize_git_url(repo), "commit": "", "pushed": True,
+                "dirty": worktree_dirty(path)}
+    return {"folder": folder, "has_git": False, "url": None, "commit": None,
+            "pushed": True, "dirty": False}
 
 
 def _class_source_folder(class_type: str) -> str | None | bool:
@@ -380,6 +392,24 @@ def folder_exists_locally(folder: str) -> bool:
     return (_comfyui_root() / "custom_nodes" / folder).is_dir()
 
 
+def _cloud_stale_reason(git: dict, local_commit: str, baked_commit: str) -> str | None:
+    """已烤进镜像的节点:云端那份跟本地比是不是旧的?返回原因,None = 一致无需动作。
+      "dirty"    工作树有未提交改动 —— 云端按 commit clone,拿不到这些改动
+      "unpushed" commit 变了但没推 —— 云端 clone 不到这个 commit
+      "no_git"   拿不到 git 依据(.git 丢了/不是仓库)—— 无从判断,只能按「可能不一致」处理
+      "commit"   干净且已推、commit 与镜像不同 —— 走 git 路线更新即可
+    纯函数,单测覆盖四条分支。"""
+    if git.get("dirty"):
+        return "dirty"
+    if not git.get("has_git") or not local_commit:
+        # 没有 git 可比:镜像里那份是历史某次同步进去的,现在无从校验 → 保守当作可能不一致。
+        # (老实说这条大多命中"用户把 .git 删了"的自写节点,正是本地打包通道的目标场景。)
+        return "no_git"
+    if local_commit == baked_commit:
+        return None
+    return "commit" if git.get("pushed", True) else "unpushed"
+
+
 def plan_node_sync(prompt: dict, baked: list[dict] | None = None,
                    allow_prune: bool = False) -> dict:
     """
@@ -422,19 +452,23 @@ def plan_node_sync(prompt: dict, baked: list[dict] | None = None,
             ok_baked += 1
             local_commit = (git.get("commit") or "").strip()
             baked_commit = (baked_by_name[folder].get("commit") or "").strip()
-            if git["has_git"] and git.get("pushed", True) and local_commit \
-                    and local_commit != baked_commit:
+            reason = _cloud_stale_reason(git, local_commit, baked_commit)
+            if reason is None:
+                pass                                   # 云端那份就是本地这份,什么都不用做
+            elif reason == "commit":
+                # 干净、已推、commit 变了 → 走 git 路线更新镜像
                 update.append({"folder": folder, "url": git["url"],
                                "old_commit": baked_commit, "commit": local_commit})
                 baked_by_name[folder] = {"name": folder, "url": git["url"], "commit": local_commit}
-            elif local_commit and local_commit != baked_commit and folder_exists_locally(folder):
-                # 已烤进镜像、但本地改动没推(或丢了 remote):走本地打包通道盖掉镜像里那份。
-                # ⚠ 这里绝不能只是 continue —— 那样云端会**静默跑旧代码**,比部署报错更难查
-                #   (用户改完节点点运行,结果和改之前一样,毫无线索)。
+            elif folder_exists_locally(folder):
+                # dirty / 未推送 / 没有 git 可依据 —— 云端 clone 不到这一版,
+                # 走本地打包通道盖掉镜像里那份。
+                # ⚠ 绝不能默默跳过:那样云端**静默跑旧代码**,比部署报错难查得多
+                #   (用户改完节点点运行,结果和改之前一模一样,毫无线索)。
                 local_pack.append({"folder": folder, "class_types": sorted(class_types),
-                                   "reason": "unpushed" if git["has_git"] else "no_git"})
+                                   "reason": reason})
             continue
-        if git["has_git"] and git.get("pushed", True):
+        if git["has_git"] and git.get("pushed", True) and not git.get("dirty"):
             add.append({"folder": folder, "class_types": sorted(class_types),
                         "url": git["url"], "commit": git.get("commit") or ""})
             baked_by_name[folder] = {"name": folder, "url": git["url"],

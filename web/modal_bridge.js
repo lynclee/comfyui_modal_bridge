@@ -215,6 +215,8 @@ const I18N = {
   "mn.installed":     { zh: "镜像实装 {n} 个(来源:{src})", en: "{n} installed on image (source: {src})" },
   "mn.nogit_tag":     { zh: "(本地无 git 信息)", en: "(no local git info)" },
   "mn.local_tag":     { zh: "(本地包,Volume)", en: "(local pack, Volume)" },
+  "mn.local_rm_fail": { zh: "✗ 这些本地包没能删掉(下次冷启动仍会装上): {list}",
+                        en: "✗ Failed to remove these local packs (they will load again on next cold start): {list}" },
   "mn.load_fail":     { zh: "✗ 加载失败:{e}", en: "✗ Load failed: {e}" },
   "mn.none_checked":  { zh: "没勾选任何节点", en: "Nothing selected" },
   "mn.confirm":       { zh: "确定从云端镜像移除这 {n} 个节点并重部署?\n\n{list}\n\n⚠ 别的电脑若用到这些节点会失败,需要时重新加。",
@@ -535,6 +537,13 @@ async function syncLocalNodes(localPack, ctx) {
       "/modal_bridge/sync_local_nodes",
       { folders },
       (line) => {
+        // 后端回传「Volume 上真实存在的版本」→ 挂到 ctx,提交时原样带上。
+        // 不在提交时重新扫目录:那期间编辑器保存一下,声明的版本云端就不存在了。
+        const m = line.match(/^__LOCAL_DIGESTS__ (.+)$/);
+        if (m) {
+          try { ctx._localDigests = JSON.parse(m[1]); } catch (e) { log("digest parse:", e); }
+          return;
+        }
         log("local-node:", line);
         ctx.stage("uploading", line.length > 72 ? line.slice(0, 72) + "…" : line, false);
       },
@@ -868,7 +877,12 @@ async function runOnceOnModal(workflowPrompt, outputNodeIds, ctx, submitGuard, b
   const subRes = await api.fetchApi("/modal_bridge/submit", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ prompt: workflowPrompt, tier: getVramTier(workflowPrompt) }),
+    body: JSON.stringify({
+      prompt: workflowPrompt, tier: getVramTier(workflowPrompt),
+      // 本次同步实际放上 Volume 的自写节点版本(见 syncLocalNodes)。worker 据此校验,
+      // 对不上宁可让任务失败也不用旧代码跑 —— 静默出旧结果是最难查的失效。
+      local_nodes: ctx._localDigests || undefined,
+    }),
   });
   const sub = await subRes.json();
   if (!subRes.ok || !sub.ok) {
@@ -1818,12 +1832,21 @@ async function openDeployDialog() {
     nodesLogEl.style.display = "block";
     nodesLogEl.textContent = "";
     try {
+      // 删除结果必须核验:后端删不掉却报成功的话,用户以为清掉了,下次冷启动它又被解压回去
+      const localFailed = [];
       for (const n of localChecked) {
-        await api.fetchApi("/modal_bridge/remove_local_node", {
-          method: "POST", headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ folder: n.name }),
-        });
-        nodesLogEl.textContent += `✓ 已从 Volume 移除本地节点包: ${n.name}\n`;
+        try {
+          const rr = await api.fetchApi("/modal_bridge/remove_local_node", {
+            method: "POST", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ folder: n.name }),
+          });
+          const rj = await rr.json().catch(() => ({}));
+          if (!rr.ok || !rj.ok) throw new Error(rj.error || (rj.errors || []).map((x) => x.error).join("; ") || `HTTP ${rr.status}`);
+          nodesLogEl.textContent += `✓ 已从 Volume 移除本地节点包: ${n.name}\n`;
+        } catch (e) {
+          localFailed.push(n.name);
+          nodesLogEl.textContent += `✗ ${n.name} 移除失败: ${e.message || e}\n`;
+        }
       }
       // 只勾了本地包 → 无需重部署,直接收工
       const rc = bakedChecked.length === 0 ? 0 : await streamPost("/modal_bridge/sync_nodes", {
@@ -1831,11 +1854,15 @@ async function openDeployDialog() {
         summary: { add: 0, update: 0, prune: bakedChecked.length },
       }, (line) => { nodesLogEl.textContent += line + "\n"; nodesLogEl.scrollTop = nodesLogEl.scrollHeight; });
       const keep = keepBaked;
-      if (rc === 0) {
+      if (rc === 0 && !localFailed.length) {
         nodesStatusEl.textContent = t("mn.removed", { n: checked.length, keep: keep.length });
         nodesStatusEl.style.color = "#34d399";
         notify(t("mn.removed_toast", { n: checked.length }), "success");
         nodesLoadBtn.onclick();  // 刷新列表
+      } else if (localFailed.length) {
+        nodesStatusEl.textContent = t("mn.local_rm_fail", { list: localFailed.join(", ") });
+        nodesStatusEl.style.color = "#f87171";
+        nodesLoadBtn.onclick();  // 部分成功也刷新,让面板反映真实状态
       } else {
         nodesStatusEl.textContent = t("mn.redeploy_fail", { rc });
         nodesStatusEl.style.color = "#f87171";

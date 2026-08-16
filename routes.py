@@ -471,15 +471,18 @@ def _setup_routes():
 
         # 自写节点的期望版本随任务发过去:解压只发生在容器启动时,暖容器可能装着上一版
         # (改完节点立刻重跑最容易撞上)→ worker 据此 reload+重装+重启,不会静默出旧结果。
-        local_digests = {}
-        try:
-            plan = node_sync.plan_node_sync(prompt)
-            folders = [p["folder"] for p in plan.get("local_pack", [])]
-            if folders:
-                local_digests = local_nodes.expected_digests(
-                    folders, Path(node_sync._comfyui_root()) / "custom_nodes")
-        except Exception as e:
-            print(f"[modal_bridge] 本地节点指纹计算跳过: {e}")
+        # 优先用调用方带来的(前端刚同步完、由 sync_local_nodes 回传的**Volume 真实版本**);
+        # 没带才现算 —— 现算的风险是同步与提交之间文件又变了,声明一个云端不存在的版本。
+        local_digests = body.get("local_nodes") if isinstance(body.get("local_nodes"), dict) else None
+        if local_digests is None:
+            try:
+                plan = node_sync.plan_node_sync(prompt)
+                folders = [p["folder"] for p in plan.get("local_pack", [])]
+                if folders:
+                    local_digests = local_nodes.expected_digests(
+                        folders, Path(node_sync._comfyui_root()) / "custom_nodes")
+            except Exception as e:
+                print(f"[modal_bridge] 本地节点指纹计算跳过: {e}")
 
         try:
             async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=60)) as session:
@@ -793,17 +796,22 @@ def _setup_routes():
 
         def do_upload(emit):
             plan = local_nodes.plan_local_uploads(cfg, folders, root)
-            for f in plan["uptodate"]:
-                emit(f"  = {f} 云端已是最新,跳过\n")
+            # digests:本次提交应当声明的版本 = Volume 上真实存在的那版
+            # (已最新的取现存 digest,新传的取实际打进包的那个 —— 都不是提交时再扫一次目录)
+            digests = {u["folder"]: u["digest"] for u in plan["uptodate"]}
+            for u in plan["uptodate"]:
+                emit(f"  = {u['folder']} 云端已是最新,跳过\n")
             for f in plan["failed"]:
                 emit(f"  ✗ {f['folder']}: {f['error']}\n")
             todo = [u["folder"] for u in plan["upload"]]
             if not todo:
-                return {"uploaded": [], "failed": plan["failed"]}
+                return {"uploaded": [], "failed": plan["failed"], "digests": digests}
             for u in plan["upload"]:
                 emit(f"  ↑ {u['folder']}({u['files']} 个文件,~{u['raw_mb']} MB)\n")
             r = local_nodes.upload_local_nodes(cfg, todo, root)
             r["failed"] = plan["failed"] + r.get("failed", [])
+            digests.update({u["folder"]: u["digest"] for u in r.get("uploaded", [])})
+            r["digests"] = digests
             return r
 
         if _UPLOAD_LOCK.locked():
@@ -829,6 +837,10 @@ def _setup_routes():
             await _emit(resp, f"  ✗ {f['folder']}: {f['error']}\n")
         await _emit(resp, f"\n== {'✓' if rc == 0 else '⚠'} 本地节点同步完成:"
                           f"{len(result.get('uploaded', []))} 个上传,{len(failed)} 个失败 ==\n")
+        # 回传「Volume 上真实存在的版本」,前端原样带进 submit —— 避免提交时重新扫目录
+        # (编辑器在同步与提交之间保存一下,就会声明一个云端根本没有的版本)。
+        import json as _json
+        await _emit(resp, f"__LOCAL_DIGESTS__ {_json.dumps(result.get('digests') or {})}\n")
         await _emit(resp, f"\n__DEPLOY_DONE__ rc={rc}\n")
         await resp.write_eof()
         return resp
@@ -849,8 +861,12 @@ def _setup_routes():
         if not folder or "/" in folder or ".." in folder:
             return web.json_response({"error": "folder 非法"}, status=400)
         cfg = cfg_mod.load_config()
-        local_nodes.remove_volume_local_node(cfg, folder)
-        return web.json_response({"ok": True, "removed": folder})
+        if not modal_volume.modal_importable():
+            return web.json_response({"ok": False, "error": "modal 未安装,无法操作 Volume"},
+                                     status=503)
+        r = local_nodes.remove_volume_local_node(cfg, folder)
+        return web.json_response({**r, "folder": folder},
+                                 status=200 if r["ok"] else 502)
 
     # -------- custom_node 双向同步 --------
 
