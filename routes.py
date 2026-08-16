@@ -477,10 +477,16 @@ def _setup_routes():
         if local_digests is None:
             try:
                 plan = node_sync.plan_node_sync(prompt)
+                # 没走前端预检的调用方也必须声明 baked 期望,否则历史本地覆盖包会在暖容器里
+                # 永久存活。digest 与 sentinel 共用一个 map,worker 能统一做版本闸门。
+                local_digests = {
+                    folder: local_nodes.BAKED_SENTINEL
+                    for folder in plan.get("expect_baked", [])
+                }
                 folders = [p["folder"] for p in plan.get("local_pack", [])]
                 if folders:
-                    local_digests = local_nodes.expected_digests(
-                        folders, Path(node_sync._comfyui_root()) / "custom_nodes")
+                    local_digests.update(local_nodes.expected_digests(
+                        folders, Path(node_sync._comfyui_root()) / "custom_nodes"))
             except Exception as e:
                 print(f"[modal_bridge] 本地节点指纹计算跳过: {e}")
 
@@ -837,10 +843,11 @@ def _setup_routes():
             await _emit(resp, f"  ✗ {f['folder']}: {f['error']}\n")
         await _emit(resp, f"\n== {'✓' if rc == 0 else '⚠'} 本地节点同步完成:"
                           f"{len(result.get('uploaded', []))} 个上传,{len(failed)} 个失败 ==\n")
-        # 回传「Volume 上真实存在的版本」,前端原样带进 submit —— 避免提交时重新扫目录
-        # (编辑器在同步与提交之间保存一下,就会声明一个云端根本没有的版本)。
-        import json as _json
-        await _emit(resp, f"__LOCAL_DIGESTS__ {_json.dumps(result.get('digests') or {})}\n")
+        # 只有全部成功才给可提交的版本契约。失败时发空/部分 map 会让前端漏掉失败节点,
+        # 暖容器反而可能继续跑它的旧版本。
+        if rc == 0:
+            import json as _json
+            await _emit(resp, f"__LOCAL_DIGESTS__ {_json.dumps(result.get('digests') or {})}\n")
         await _emit(resp, f"\n__DEPLOY_DONE__ rc={rc}\n")
         await resp.write_eof()
         return resp
@@ -927,6 +934,10 @@ def _setup_routes():
             print(f"[modal_bridge] check_nodes: /health 不可达,回退本地清单 ({e})")
 
         result = node_sync.plan_node_sync(prompt, baked=baked)
+        # 只对 Volume 中实际存在的旧覆盖包发删除请求；expect_baked 仍保留全部应跑镜像版
+        # 的节点,用于修复已解压旧包的暖容器以及列表查询暂时失败的情况。
+        volume_local = set(local_nodes.list_volume_local_nodes(cfg))
+        result["local_remove"] = sorted(set(result.get("expect_baked", [])) & volume_local)
         result["ok"] = True
         result["source"] = source
         return web.json_response(result)

@@ -11,6 +11,7 @@ _local_nodes_boot.py — worker 启动时把 Volume 上的「本地自写节点�
 一个 ../../ 就能写到 /comfyui 之外。这里逐条校验规范化后的目标路径仍在目标目录内。
 """
 import os
+import shutil
 import subprocess
 import sys
 import zipfile
@@ -18,6 +19,10 @@ from pathlib import Path
 
 VOL_DIR = Path("/comfy-volume/_local_nodes")
 DEST_DIR = Path("/comfyui/custom_nodes")
+# 本地包覆盖同名 baked 节点前,把镜像版留在容器临时目录。这样包从 Volume 删除后,
+# 已经启动的暖容器也能恢复 baked,不必继续运行内存/磁盘里的旧覆盖版。
+BACKUP_DIR = Path("/tmp/modal-bridge-baked-nodes")
+BAKED_SENTINEL = "__modal_bridge_baked__"
 
 
 def safe_members(names: list[str], dest: Path) -> tuple[list[str], list[str]]:
@@ -74,7 +79,48 @@ def current_digests() -> dict:
 def needs_refresh(expected: dict) -> list[str]:
     """提交方声明的指纹 vs 容器内实际的 → 哪些节点过期了(纯函数,可单测)。"""
     cur = current_digests()
-    return sorted(f for f, d in (expected or {}).items() if d and cur.get(f) != d)
+    stale = []
+    for folder, digest in (expected or {}).items():
+        if digest == BAKED_SENTINEL:
+            # 声明 baked 时,容器里仍有本地 digest marker 就说明旧覆盖尚未退场。
+            if folder in cur:
+                stale.append(folder)
+        elif digest and cur.get(folder) != digest:
+            stale.append(folder)
+    return sorted(stale)
+
+
+def _remember_baked(target: Path, folder: str) -> None:
+    """首次用本地包覆盖镜像目录前保存 baked 副本；后续重复解压不覆盖这份基线。"""
+    backup = BACKUP_DIR / folder
+    if backup.exists() or not target.is_dir() or (target / ".mb_local_digest").exists():
+        return
+    BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(target, backup)
+
+
+def restore_baked(folders: list[str]) -> list[str]:
+    """撤销指定节点的本地覆盖。
+
+    同名 baked 目录存在备份时恢复它；纯本地节点没有备份,则删除已解压目录。
+    已经是 baked(无 marker 且无备份)时幂等跳过。
+    """
+    restored = []
+    for folder in folders or []:
+        if not folder or "/" in folder or "\\" in folder or ".." in folder:
+            raise ValueError(f"非法节点名: {folder!r}")
+        target = DEST_DIR / folder
+        backup = BACKUP_DIR / folder
+        marker = target / ".mb_local_digest"
+        if backup.is_dir():
+            if target.exists():
+                shutil.rmtree(target)
+            shutil.copytree(backup, target)
+            restored.append(folder)
+        elif marker.exists():
+            shutil.rmtree(target)
+            restored.append(folder)
+    return restored
 
 
 def extract_all() -> list[str]:
@@ -100,7 +146,7 @@ def extract_all() -> list[str]:
                 # 已存在(镜像里 clone 过同名节点)先清掉,保证跑的就是刚传上来的这份
                 if target.exists():
                     print(f"[bridge] local-node {folder}: 覆盖镜像内同名目录")
-                    import shutil
+                    _remember_baked(target, folder)
                     shutil.rmtree(target, ignore_errors=True)
                 target.mkdir(parents=True, exist_ok=True)
                 for n in ok:

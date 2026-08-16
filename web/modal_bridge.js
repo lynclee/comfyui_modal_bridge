@@ -129,8 +129,12 @@ const I18N = {
                         en: "No local directory for these custom_nodes, cannot auto-add (single-file node?):\n{list}" },
   "node.local_pack":  { zh: "打包 {n} 个本地节点上传(不需重新部署)...",
                         en: "Packing {n} local node(s) for upload (no redeploy needed)..." },
-  "node.local_fail":  { zh: "本地节点上传失败,云端可能缺这些节点。仍然提交?(很可能失败)",
-                        en: "Local node upload failed; the cloud may be missing them. Submit anyway? (likely to fail)" },
+  "node.local_fail":  { zh: "本地节点上传失败,已停止提交,避免云端静默运行旧版本。请修复上面的上传错误后重试。",
+                        en: "Local node upload failed. Submission was stopped to prevent the cloud from silently running stale code. Fix the upload error above and retry." },
+  "node.local_rm_fail": { zh: "旧的本地节点覆盖包清理失败: {list}",
+                          en: "Failed to remove stale local-node override(s): {list}" },
+  "node.local_cleaning": { zh: "清理旧的本地节点覆盖: {folder}",
+                            en: "Removing stale local-node override: {folder}" },
   "node.ok":          { zh: "nodes ok ({baked} custom + {builtin} builtin)", en: "nodes ok ({baked} custom + {builtin} builtin)" },
   "node.confirm_skip":{ zh: "部分 custom_node 无法自动补,仍然提交?(很可能失败)",
                         en: "Some custom_nodes can't be auto-added. Submit anyway? (likely to fail)" },
@@ -529,9 +533,12 @@ function escHtml(s) {
     (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 }
 
+const LOCAL_NODE_BAKED_SENTINEL = "__modal_bridge_baked__";
+
 // 本地自写节点 → 打包上传 Volume(不重建镜像:worker 启动时解压)。返回是否成功
 async function syncLocalNodes(localPack, ctx) {
   const folders = localPack.map((p) => p.folder);
+  let syncedDigests = null;
   try {
     const rc = await streamPost(
       "/modal_bridge/sync_local_nodes",
@@ -541,18 +548,46 @@ async function syncLocalNodes(localPack, ctx) {
         // 不在提交时重新扫目录:那期间编辑器保存一下,声明的版本云端就不存在了。
         const m = line.match(/^__LOCAL_DIGESTS__ (.+)$/);
         if (m) {
-          try { ctx._localDigests = JSON.parse(m[1]); } catch (e) { log("digest parse:", e); }
+          try { syncedDigests = JSON.parse(m[1]); } catch (e) { log("digest parse:", e); }
           return;
         }
         log("local-node:", line);
         ctx.stage("uploading", line.length > 72 ? line.slice(0, 72) + "…" : line, false);
       },
     );
-    return rc === 0;
+    if (rc !== 0 || !syncedDigests || folders.some((f) => !syncedDigests[f])) return false;
+    ctx._localDigests = { ...(ctx._localDigests || {}), ...syncedDigests };
+    return true;
   } catch (e) {
     log("sync_local_nodes failed:", e);
     return false;
   }
+}
+
+// 清掉 Volume 上不再需要的覆盖包。
+// ⚠ 失败**不阻断提交**:正确性由随任务下发的 baked sentinel 保证(worker 会把暖容器里的
+//   覆盖目录恢复成镜像版),清理只是省掉冷容器"解压→再恢复"那一趟开销。为一个纯优化
+//   动作让用户提交不了,代价倒挂。失败只提示,让用户知道下次冷启动会多花十几秒。
+async function removeLocalOverrides(folders, ctx) {
+  const failed = [];
+  for (const folder of folders || []) {
+    ctx.stage("nodes", t("node.local_cleaning", { folder }), false);
+    try {
+      const r = await api.fetchApi("/modal_bridge/remove_local_node", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ folder }),
+      });
+      const d = await r.json().catch(() => ({}));
+      if (!r.ok || !d.ok) {
+        throw new Error(d.error || (d.errors || []).map((x) => x.error).join("; ") || `HTTP ${r.status}`);
+      }
+    } catch (e) {
+      log("remove_local_node failed:", folder, e);
+      failed.push(`${folder}: ${e.message || e}`);
+    }
+  }
+  if (failed.length) notify(t("node.local_rm_fail", { list: failed.join(", ") }), "warn");
 }
 
 // submit 前调:custom_node 与本地双向同步(加/改/删)。返回 true=可继续 / false=用户取消
@@ -566,8 +601,8 @@ async function ensureNodesAvailable(prompt, ctx) {
     return true; // 检查本身失败不阻塞提交
   }
 
-  const { add = [], update = [], prune = [], local_pack = [], missing_no_git = [],
-          unresolved = [], source } = plan;
+  const { add = [], update = [], prune = [], local_pack = [], local_remove = [],
+          expect_baked = [], missing_no_git = [], unresolved = [], source } = plan;
   if (unresolved.length) log("unresolved class_types (本地也没装):", unresolved);
 
   // ⚠ missing_no_git = 云端补不了、任务上去必失败。**必须在任何分支之前拦**:
@@ -584,38 +619,40 @@ async function ensureNodesAvailable(prompt, ctx) {
   if (local_pack.length) {
     ctx.stage("nodes", t("node.local_pack", { n: local_pack.length }), false);
     const ok = await syncLocalNodes(local_pack, ctx);
-    if (!ok && !confirm(t("node.local_fail"))) return false;
+    if (!ok) throw new Error(t("node.local_fail"));
   }
 
-  if (!plan.needs_deploy) {
-    ctx.stage("nodes", t("node.ok", { baked: plan.ok_baked, builtin: plan.ok_builtin }));
-    return true;
+  if (plan.needs_deploy) {
+    // 组装确认文案(只加 / 改,不删 —— 多机并集,删走 Setup 的「管理云端节点」手动做)
+    const parts = [];
+    if (add.length) {
+      parts.push(t("node.add_head") + "\n" + add.map((m) =>
+        `   • ${m.folder} (${t("node.nodes_n", { n: m.class_types.length })})` + (m.commit ? ` @ ${m.commit.slice(0, 8)}` : "")
+      ).join("\n"));
+    }
+    if (update.length) {
+      parts.push(t("node.upd_head") + "\n" + update.map((m) =>
+        `   • ${m.folder}  ${(m.old_commit || "—").slice(0, 8)} → ${m.commit.slice(0, 8)}`
+      ).join("\n"));
+    }
+    const msg = t("node.sync_title", { src: source, parts: parts.join("\n\n") });
+    const shouldDeploy = confirm(msg);
+    if (!shouldDeploy && !confirm(t("node.skip_confirm"))) return false;
+    if (shouldDeploy) {
+      ctx.stage("deploying", t("node.redeploy"), false);
+      ctx.bar(STATUS_PROGRESS.deploying[0]);
+      const ok = await syncNodes(plan, ctx);
+      if (!ok) throw new Error(t("node.deploy_fail"));
+      ctx.stage("deploying", t("node.updated"), false);
+    }
   }
 
-  // 组装确认文案(只加 / 改,不删 —— 多机并集,删走 Setup 的「管理云端节点」手动做)
-  const parts = [];
-  if (add.length) {
-    parts.push(t("node.add_head") + "\n" + add.map((m) =>
-      `   • ${m.folder} (${t("node.nodes_n", { n: m.class_types.length })})` + (m.commit ? ` @ ${m.commit.slice(0, 8)}` : "")
-    ).join("\n"));
-  }
-  if (update.length) {
-    parts.push(t("node.upd_head") + "\n" + update.map((m) =>
-      `   • ${m.folder}  ${(m.old_commit || "—").slice(0, 8)} → ${m.commit.slice(0, 8)}`
-    ).join("\n"));
-  }
-  const msg = t("node.sync_title", { src: source, parts: parts.join("\n\n") });
-  if (!confirm(msg)) {
-    return confirm(t("node.skip_confirm"));
-  }
-
-  ctx.stage("deploying", t("node.redeploy"), false);
-  ctx.bar(STATUS_PROGRESS.deploying[0]);
-  const ok = await syncNodes(plan, ctx);
-  if (!ok) {
-    throw new Error(t("node.deploy_fail"));
-  }
-  ctx.stage("deploying", t("node.updated"), false);
+  // 清掉 Volume 上不再需要的覆盖包；同时无论包是否还列得出来,都把 baked sentinel
+  // 随任务发给 worker,用于恢复已经解压/导入旧代码的暖容器。
+  await removeLocalOverrides(local_remove, ctx);
+  ctx._localDigests = { ...(ctx._localDigests || {}) };
+  for (const folder of expect_baked) ctx._localDigests[folder] = LOCAL_NODE_BAKED_SENTINEL;
+  ctx.stage("nodes", t("node.ok", { baked: plan.ok_baked, builtin: plan.ok_builtin }));
   return true;
 }
 
@@ -2215,4 +2252,3 @@ app.registerExtension({
     recoverPendingJob();
   },
 });
-

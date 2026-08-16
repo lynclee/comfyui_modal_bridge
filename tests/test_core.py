@@ -7,6 +7,7 @@
 只测不碰真实环境的纯逻辑;对依赖 ComfyUI(`import nodes`)/ 文件系统 / Modal 的点,用桩替换。
 """
 import sys
+import subprocess
 import types
 from pathlib import Path
 
@@ -56,6 +57,7 @@ def test_plan_add_missing_node():
         assert len(p["add"]) == 1 and p["add"][0]["folder"] == "ComfyUI-KJNodes"
         assert p["update"] == [] and p["prune"] == []
         assert p["needs_deploy"] is True
+        assert p["expect_baked"] == ["ComfyUI-KJNodes"]
         names = [n["name"] for n in p["new_baked"]]
         assert names == ["ComfyUI-KJNodes"]
     finally:
@@ -74,6 +76,7 @@ def test_plan_update_on_commit_change():
         assert p["add"] == [] and p["prune"] == []
         assert p["new_baked"][0]["commit"] == "NEW"
         assert p["needs_deploy"] is True
+        assert p["expect_baked"] == ["rgthree-comfy"]
     finally:
         _restore()
 
@@ -115,6 +118,7 @@ def test_plan_noop_when_in_sync():
         assert p["add"] == [] and p["update"] == [] and p["prune"] == []
         assert p["needs_deploy"] is False
         assert p["ok_baked"] == 1
+        assert p["expect_baked"] == ["ComfyUI_essentials"]
     finally:
         _restore()
 
@@ -704,6 +708,30 @@ def test_local_nodes_pack_and_digest(tmp_path):
         ln.MAX_PACK_BYTES = keep
 
 
+def test_local_nodes_pack_reads_each_source_once(tmp_path):
+    """digest 和 zip 必须使用同一次读取的 bytes,避免编辑器保存造成包/指纹分裂。
+    ⚠ 手动 patch + finally 还原,不用 pytest 的 monkeypatch —— CI 跑的是本文件自带的
+      裸 runner(python tests/test_core.py),它只供给 tmp_path,没有 monkeypatch。"""
+    import local_nodes as ln
+    d = tmp_path / "one-read"
+    d.mkdir()
+    src = d / "node.py"
+    src.write_text("x = 1")
+    original = Path.read_bytes
+    reads = {}
+
+    def tracked(path):
+        reads[path] = reads.get(path, 0) + 1
+        return original(path)
+
+    Path.read_bytes = tracked
+    try:
+        ln.pack_node_dir(d)
+    finally:
+        Path.read_bytes = original
+    assert reads[src] == 1, f"每个源文件应只读一次,实际 {reads.get(src)} 次"
+
+
 def test_local_nodes_zip_slip_guard():
     """云端解压的路径囚笼:绝对路径 / .. 穿越必须被挡在目标目录外。"""
     sys.path.insert(0, str(ROOT / "modal_app"))
@@ -787,9 +815,57 @@ def test_local_nodes_needs_refresh(tmp_path):
         assert boot.needs_refresh({"a": "aaa", "b": "bbb"}) == []        # 都最新
         assert boot.needs_refresh({"a": "NEW", "b": "bbb"}) == ["a"]      # a 改过
         assert boot.needs_refresh({"c": "ccc"}) == ["c"]                  # 容器里根本没装
+        assert boot.needs_refresh({"a": boot.BAKED_SENTINEL}) == ["a"]    # 要 baked,却仍是本地覆盖
         assert boot.needs_refresh({}) == [] and boot.needs_refresh(None) == []
     finally:
         boot.DEST_DIR = orig
+
+
+def test_local_nodes_restore_baked_and_remove_local_only(tmp_path):
+    """本地覆盖退场:同名镜像节点恢复备份,纯本地节点则删除目录。"""
+    sys.path.insert(0, str(ROOT / "modal_app"))
+    import _local_nodes_boot as boot
+    dest = tmp_path / "custom_nodes"
+    backup = tmp_path / "backups"
+    baked = dest / "baked-node"
+    baked.mkdir(parents=True)
+    (baked / "node.py").write_text("baked")
+    orig_dest, orig_backup = boot.DEST_DIR, boot.BACKUP_DIR
+    boot.DEST_DIR, boot.BACKUP_DIR = dest, backup
+    try:
+        boot._remember_baked(baked, "baked-node")
+        (baked / "node.py").write_text("local")
+        (baked / ".mb_local_digest").write_text("d")
+        local_only = dest / "local-only"
+        local_only.mkdir()
+        (local_only / ".mb_local_digest").write_text("x")
+        assert boot.restore_baked(["baked-node", "local-only"]) == ["baked-node", "local-only"]
+        assert (baked / "node.py").read_text() == "baked"
+        assert not (baked / ".mb_local_digest").exists()
+        assert not local_only.exists()
+    finally:
+        boot.DEST_DIR, boot.BACKUP_DIR = orig_dest, orig_backup
+
+
+def test_folder_git_info_does_not_inherit_comfyui_parent_repo(tmp_path):
+    """无 .git 节点不能向上继承 ComfyUI 主仓库的 remote/HEAD。"""
+    root = tmp_path / "ComfyUI"
+    node = root / "custom_nodes" / "plain-node"
+    node.mkdir(parents=True)
+    subprocess.run(["git", "init", "-q", str(root)], check=True)
+    subprocess.run(["git", "-C", str(root), "remote", "add", "origin",
+                    "https://github.com/comfyanonymous/ComfyUI.git"], check=True)
+    (node / "pyproject.toml").write_text(
+        '[project.urls]\nRepository = "https://github.com/acme/plain-node"\n')
+    original = node_sync._comfyui_root
+    node_sync._comfyui_root = lambda: root
+    try:
+        info = node_sync.folder_git_info("plain-node")
+        assert info["url"] == "https://github.com/acme/plain-node"
+        assert info["commit"] == ""
+        assert info["dirty"] is False
+    finally:
+        node_sync._comfyui_root = original
 
 
 def test_cloud_stale_reason_matrix():
@@ -822,6 +898,7 @@ def test_plan_baked_node_dirty_worktree():
         assert [x["folder"] for x in p["local_pack"]] == ["baked-node"]
         assert p["local_pack"][0]["reason"] == "dirty"
         assert p["needs_local_upload"] is True and p["needs_deploy"] is False
+        assert p["expect_baked"] == []
     finally:
         _restore()
 

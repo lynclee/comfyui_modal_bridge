@@ -303,7 +303,25 @@ def worktree_dirty(path: Path) -> bool:
     而云端只按 commit clone —— HEAD 没变但文件变了,镜像里跑的还是旧代码,
     且改前改后结果一模一样、毫无线索。所以 dirty 必须当成「本地版本 ≠ 云端版本」。"""
     out = _git(["status", "--porcelain"], path)
-    return bool(out and out.strip())
+    # 已确认是该节点自己的 repo 后,status 仍失败时按 dirty 处理:方向安全,最多多传一次包;
+    # 反过来当 clean 会把本地改动静默丢掉。
+    return out is None or bool(out.strip())
+
+
+def _is_own_git_repo(path: Path) -> bool:
+    """path 本身是不是一个 git worktree 根。
+
+    Git 在子目录执行时会一路向父目录找 `.git`。ComfyUI 通常自身就是 git clone,
+    因此不能仅在 custom_nodes/foo 里跑 `git rev-parse HEAD`:一个完全无 git 的自写节点
+    会误继承 ComfyUI 的 remote/HEAD,最后把 ComfyUI 仓库当作该节点部署。
+    """
+    top = _git(["rev-parse", "--show-toplevel"], path)
+    if not top:
+        return False
+    try:
+        return Path(top).resolve() == Path(path).resolve()
+    except OSError:
+        return False
 
 
 def folder_git_info(folder: str) -> dict:
@@ -317,18 +335,21 @@ def folder_git_info(folder: str) -> dict:
         # 注意用 is_dir:单文件节点(custom_nodes/foo.py)不是可 clone 的仓库,
         # 走 exists() 会让后面的 git 调用在非目录 cwd 上报错,白跑一圈。
         return {"folder": folder, "has_git": False, "url": None, "commit": None, "pushed": True}
-    url = _git(["config", "--get", "remote.origin.url"], path)
-    commit = _git(["rev-parse", "HEAD"], path)
-    if url and commit:
-        return {"folder": folder, "has_git": True,
-                "url": _normalize_git_url(url), "commit": commit,
-                "pushed": commit_on_remote(path, commit),
-                "dirty": worktree_dirty(path)}
+    if _is_own_git_repo(path):
+        url = _git(["config", "--get", "remote.origin.url"], path)
+        commit = _git(["rev-parse", "HEAD"], path)
+        if url and commit:
+            return {"folder": folder, "has_git": True,
+                    "url": _normalize_git_url(url), "commit": commit,
+                    "pushed": commit_on_remote(path, commit),
+                    "dirty": worktree_dirty(path)}
     repo = _pyproject_repo_url(path)
     if repo:
         return {"folder": folder, "has_git": True,
                 "url": _normalize_git_url(repo), "commit": "", "pushed": True,
-                "dirty": worktree_dirty(path)}
+                # pyproject 只提供源码地址,这个目录本身并不是 git worktree；不能跑 git status,
+                # 否则会再次向上命中 ComfyUI 主仓库。
+                "dirty": False}
     return {"folder": folder, "has_git": False, "url": None, "commit": None,
             "pushed": True, "dirty": False}
 
@@ -430,6 +451,7 @@ def plan_node_sync(prompt: dict, baked: list[dict] | None = None,
       {
         "add": [{folder, class_types, url, commit}],
         "update": [{folder, url, old_commit, commit}],
+        "expect_baked": [folder...],                  # 本次任务明确应运行镜像版
         "prune": [{name}],
         "missing_no_git": [{folder, class_types}],  # 工作流要、baked 没、本地也没 git → 补不了
         "unresolved": [class_type...],              # 本地都没装(打字错/没装)
@@ -443,7 +465,7 @@ def plan_node_sync(prompt: dict, baked: list[dict] | None = None,
     baked_by_name = {n.get("name"): dict(n) for n in baked if n.get("name")}
     info = analyze_workflow(prompt)
 
-    add, update, local_pack, missing_no_git = [], [], [], []
+    add, update, local_pack, missing_no_git, expect_baked = [], [], [], [], []
     ok_baked = 0
     # 1) 工作流用到的 custom_node:加 / 更新 / 走本地打包通道
     for folder, class_types in info["by_folder"].items():
@@ -454,12 +476,15 @@ def plan_node_sync(prompt: dict, baked: list[dict] | None = None,
             baked_commit = (baked_by_name[folder].get("commit") or "").strip()
             reason = _cloud_stale_reason(git, local_commit, baked_commit)
             if reason is None:
-                pass                                   # 云端那份就是本地这份,什么都不用做
+                # 这次应跑镜像版。若历史上曾上传过 dirty/local 覆盖包,它必须退场;
+                # expect_baked 还会随任务发给暖容器,让已解压/已 import 的旧覆盖恢复成 baked。
+                expect_baked.append(folder)
             elif reason == "commit":
                 # 干净、已推、commit 变了 → 走 git 路线更新镜像
                 update.append({"folder": folder, "url": git["url"],
                                "old_commit": baked_commit, "commit": local_commit})
                 baked_by_name[folder] = {"name": folder, "url": git["url"], "commit": local_commit}
+                expect_baked.append(folder)
             elif folder_exists_locally(folder):
                 # dirty / 未推送 / 没有 git 可依据 —— 云端 clone 不到这一版,
                 # 走本地打包通道盖掉镜像里那份。
@@ -473,6 +498,7 @@ def plan_node_sync(prompt: dict, baked: list[dict] | None = None,
                         "url": git["url"], "commit": git.get("commit") or ""})
             baked_by_name[folder] = {"name": folder, "url": git["url"],
                                      "commit": git.get("commit") or ""}
+            expect_baked.append(folder)
         elif folder_exists_locally(folder):
             # 自写节点(无 git remote)、或有 remote 但本轮改动没推 —— 走本地打包通道:
             # 打包传 Volume,worker 启动时解压。不需要重 build 镜像(见 local_nodes.py)。
@@ -516,6 +542,9 @@ def plan_node_sync(prompt: dict, baked: list[dict] | None = None,
         "update": update,
         "prune": prune,
         "local_pack": local_pack,
+        # 本次工作流里明确应运行镜像版的节点。local backend 会据此清理 Volume 旧覆盖包,
+        # worker 也会用 sentinel 恢复已启动暖容器里的 baked 目录。
+        "expect_baked": sorted(set(expect_baked)),
         "needs_local_upload": bool(local_pack),
         "missing_no_git": missing_no_git,
         "unresolved": info["unresolved"],

@@ -137,18 +137,19 @@ def _gpu_compute_cap() -> str:
         return ""
 
 
-def _worker_boot(self, cpu: bool = False):
+def _worker_boot(self, cpu: bool = False, load_local_nodes: bool = True):
     # cpu=True:CPU-only 容器(无 GPU)→ 给 ComfyUI 传 --cpu 强制 CPU 模式,根本不碰 CUDA 初始化,
     # 避免 CUDA 版 torch 在无驱动机器上自动探测的边角风险。GPU 容器走默认(自动用 CUDA)。
     self._cpu = cpu
     models_vol.reload()  # 启动前同步 Volume(ComfyUI 还没打开文件,不冲突)
     # 本地自写节点(没有 git remote、传不上 GitHub 的那些)从 Volume 解压进 custom_nodes/。
     # 必须在 ComfyUI 起来之前做 —— 它只在启动时扫一次 custom_nodes。失败不阻断启动。
-    try:
-        from _local_nodes_boot import extract_all
-        extract_all()
-    except Exception as e:
-        print(f"[bridge] ⚠ 本地节点装载跳过: {e}")
+    if load_local_nodes:
+        try:
+            from _local_nodes_boot import extract_all
+            extract_all()
+        except Exception as e:
+            print(f"[bridge] ⚠ 本地节点装载跳过: {e}")
     # ⚠ 别再做「Triton JIT 缓存落 Volume」:2026-08-06 实测过并回退(git 历史 9fb8efc→此提交)。
     # 全历史逐单对比证明冷容器首步的慢(25~95s 波动)来自**宿主机 Volume 冷缓存**的权重
     # 流式 stall(无缓存的冷容器首步同样只有 25.8s,铁证),Triton 编译本身仅几秒;
@@ -203,18 +204,23 @@ def _worker_shutdown(self, wait_s: float = 20.0):
     proc = getattr(self, "proc", None)
     if proc is None:
         return
+    if proc.poll() is not None:
+        return
     try:
         proc.terminate()
-    except Exception:
-        pass
+    except ProcessLookupError:
+        return
+    except Exception as e:
+        raise RuntimeError(f"无法终止旧 ComfyUI 进程: {e}") from e
     try:
         proc.wait(timeout=wait_s)
-    except Exception:
+    except subprocess.TimeoutExpired:
         try:
             proc.kill()          # 赖着不走就硬杀
             proc.wait(timeout=10)
-        except Exception:
-            pass
+        except Exception as e:
+            # 不能确认旧进程已退出就绝不能在同一端口启动新的；否则 readiness 可能误命中旧进程。
+            raise RuntimeError(f"旧 ComfyUI 进程未能退出: {e}") from e
 
 
 def _worker_ensure_alive(self):
@@ -243,13 +249,16 @@ def _refresh_local_nodes_if_stale(self, expected: dict | None) -> bool:
     返回是否真的重装过。"""
     if not expected:
         return False
-    from _local_nodes_boot import extract_all, needs_refresh
+    from _local_nodes_boot import BAKED_SENTINEL, extract_all, needs_refresh, restore_baked
     stale = needs_refresh(expected)
     if not stale:
         return False
     print(f"[bridge] 暖容器的本地节点已过期 {stale} → reload + 重装 + 重启 ComfyUI")
     models_vol.reload()   # 别处 commit 的 Volume 变更,运行中容器必须 reload 才看得到
     extract_all()
+    # Volume 里可能仍留有历史覆盖包(清理失败/多机最终一致性),所以先统一解压,
+    # 再按本次任务声明把应跑 baked 的目录恢复。纯本地节点无备份时会删除覆盖目录。
+    restore_baked([f for f, d in expected.items() if d == BAKED_SENTINEL])
     # ⚠ 复核,别只当提示:extract_all 对坏包 / 解压失败 / marker 写失败都是「打日志继续」,
     #   Volume 上的包也可能压根不是这一版(上传失败/最终一致性没追上)。不复核就会
     #   **静默跑旧节点代码** —— 用户改完节点跑一遍,结果和没改一样,零线索。宁可让任务明确失败。
@@ -260,7 +269,9 @@ def _refresh_local_nodes_if_stale(self, expected: dict | None) -> bool:
             f"云端拿到的不是本次提交声明的那版(上传没成功?包损坏?)——请重试提交;"
             f"仍不行就在「管理云端节点」里删掉这些包再跑一次。")
     _worker_shutdown(self)
-    _worker_boot(self, cpu=getattr(self, "_cpu", False))  # 节点代码变了必须重 import
+    # 上面已经 reload + 解压 + 复核过。这里若再让 boot 解压一次,另一台机器恰好上传新包
+    # 就会在复核之后偷换版本；解压失败也会被 boot 的冷启动容错吞掉。因此只重启进程。
+    _worker_boot(self, cpu=getattr(self, "_cpu", False), load_local_nodes=False)
     return True
 
 

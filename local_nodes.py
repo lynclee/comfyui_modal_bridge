@@ -23,6 +23,9 @@ import zipfile
 from pathlib import Path
 
 VOLUME_PREFIX = "_local_nodes"
+# 随任务传给 worker 的特殊期望值:该节点必须使用镜像 baked 版本,不能继续使用曾经
+# 从 Volume 解压的本地覆盖包。worker 侧有同名常量(两个运行环境不能直接互相 import)。
+BAKED_SENTINEL = "__modal_bridge_baked__"
 
 
 def _mv():
@@ -134,16 +137,28 @@ def pack_node_dir(path: Path) -> tuple[bytes, str, int, int]:
             f"{path.name}: 打包内容 {total // 1024 // 1024}MB 超上限 "
             f"{MAX_PACK_BYTES // 1024 // 1024}MB —— 节点目录里通常是误放了模型/素材,"
             f"模型请放 ComfyUI models/ 走模型同步")
-    digest = compute_digest(files)
+    # 文件只读一次,同一份 bytes 同时参与 digest 和 zip。旧实现先 compute_digest() 读一遍、
+    # 写 zip 又读一遍;编辑器恰好在两次读取间保存时,`.digest` 描述的就不是包内内容。
+    h = hashlib.sha256()
+    actual_total = 0
     buf = io.BytesIO()
     # ZIP_DEFLATED + 固定时间戳:同样内容打出字节一致的包,便于比对与幂等重传
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as z:
         for rel, p, _size in files:
+            data = p.read_bytes()
+            actual_total += len(data)
+            if actual_total > MAX_PACK_BYTES:
+                raise ValueError(
+                    f"{path.name}: 打包内容在读取时增长到超过 "
+                    f"{MAX_PACK_BYTES // 1024 // 1024}MB 上限")
+            h.update(rel.encode("utf-8"))
+            h.update(str(len(data)).encode())
+            h.update(data)
             info = zipfile.ZipInfo(rel, date_time=(1980, 1, 1, 0, 0, 0))
             info.compress_type = zipfile.ZIP_DEFLATED
             info.external_attr = 0o644 << 16
-            z.writestr(info, p.read_bytes())
-    return buf.getvalue(), digest, len(files), total
+            z.writestr(info, data)
+    return buf.getvalue(), h.hexdigest(), len(files), actual_total
 
 
 # ============================================================================
@@ -235,10 +250,34 @@ def upload_local_nodes(cfg: dict, folders: list[str], root: Path, on_progress=No
                              "files": count, "digest": digest})
     if on_progress:
         on_progress({"phase": "end", "count": len(uploaded)})
+    invalidate_list_cache()   # Volume 上的名单变了
     return {"uploaded": uploaded, "failed": failed}
 
 
-def list_volume_local_nodes(cfg: dict) -> list[str]:
+_LIST_CACHE = {"t": 0.0, "v": []}
+_LIST_TTL = 60.0
+
+
+def invalidate_list_cache() -> None:
+    """本进程改动过 Volume 上的包(上传/删除)→ 立刻失效缓存。"""
+    _LIST_CACHE["t"] = 0.0
+
+
+def list_volume_local_nodes(cfg: dict, max_age: float = _LIST_TTL) -> list[str]:
+    """带 TTL 缓存的版本。check_nodes 每次提交都调它,而实测一次 Volume listdir
+    要 0.8~2.4s —— 那个端点的契约是「全本地解析、瞬时」,不能为它加一次网络往返
+    (点 RunModal 后的静默等待会被用户读成卡死)。名单只在本机上传/删除时变,
+    那两处会主动失效缓存;别的机器传的包最多晚 60s 才可见,而漏掉的后果仅是
+    少清一个残留包 —— 正确性由 worker 侧的 baked sentinel 兜底,不依赖这份名单。"""
+    import time
+    if max_age > 0 and (time.time() - _LIST_CACHE["t"]) < max_age:
+        return list(_LIST_CACHE["v"])
+    v = _list_volume_local_nodes_uncached(cfg)
+    _LIST_CACHE.update(t=time.time(), v=list(v))
+    return v
+
+
+def _list_volume_local_nodes_uncached(cfg: dict) -> list[str]:
     """Volume 上现有的本地节点包名单(供「管理云端节点」展示 / 清理)。"""
     try:
         vol = _mv().get_volume(cfg)
@@ -273,4 +312,5 @@ def remove_volume_local_node(cfg: dict, folder: str) -> dict:
             if "not found" in str(e).lower() or "no such" in str(e).lower():
                 continue
             errors.append({"path": path, "error": str(e)})
+    invalidate_list_cache()   # Volume 上的名单变了
     return {"ok": not errors, "removed": removed, "errors": errors}
