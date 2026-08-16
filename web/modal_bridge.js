@@ -214,6 +214,7 @@ const I18N = {
   "mn.empty":         { zh: "镜像里没有 custom_node", en: "No custom_nodes on the image" },
   "mn.installed":     { zh: "镜像实装 {n} 个(来源:{src})", en: "{n} installed on image (source: {src})" },
   "mn.nogit_tag":     { zh: "(本地无 git 信息)", en: "(no local git info)" },
+  "mn.local_tag":     { zh: "(本地包,Volume)", en: "(local pack, Volume)" },
   "mn.load_fail":     { zh: "✗ 加载失败:{e}", en: "✗ Load failed: {e}" },
   "mn.none_checked":  { zh: "没勾选任何节点", en: "Nothing selected" },
   "mn.confirm":       { zh: "确定从云端镜像移除这 {n} 个节点并重部署?\n\n{list}\n\n⚠ 别的电脑若用到这些节点会失败,需要时重新加。",
@@ -517,6 +518,13 @@ async function syncNodes(plan, ctx) {
     },
   );
   return rc === 0;
+}
+
+// 节点名来自本地文件夹名 / Volume 上的包名 —— 进 innerHTML 前必须转义
+// (`custom_nodes/<img onerror=…>` 这种目录名是合法的,不转义就是自家面板上的 XSS)
+function escHtml(s) {
+  return String(s ?? "").replace(/[&<>"']/g,
+    (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 }
 
 // 本地自写节点 → 打包上传 Volume(不重建镜像:worker 启动时解压)。返回是否成功
@@ -1755,7 +1763,17 @@ async function openDeployDialog() {
     try {
       const r = await api.fetchApi("/modal_bridge/list_nodes");
       const d = await r.json();
-      loadedNodes = d.nodes || [];
+      // 镜像里 clone 的节点(/health 枚举)+ Volume 上的本地包 —— 后者不在镜像文件系统里,
+      // 只列 /health 会让自写节点在这个面板上「不存在」,既看不到也删不掉。
+      let localPkgs = [];
+      try {
+        const lr = await api.fetchApi("/modal_bridge/list_local_nodes");
+        localPkgs = (await lr.json()).nodes || [];
+      } catch (e) { log("list_local_nodes failed:", e); }
+      loadedNodes = [
+        ...(d.nodes || []).map((n) => ({ ...n, kind: "baked" })),
+        ...localPkgs.map((name) => ({ name, kind: "local" })),
+      ];
       if (!loadedNodes.length) {
         nodesListEl.innerHTML = `<div style="color:#9aa;font-size:12px;">${t("mn.empty")}</div>`;
         nodesPruneBtn.style.display = "none";
@@ -1763,8 +1781,10 @@ async function openDeployDialog() {
         nodesListEl.innerHTML = loadedNodes.map((n, i) =>
           `<label style="display:flex;align-items:center;gap:8px;padding:3px 0;font-size:12px;cursor:pointer;">
              <input type="checkbox" class="mb-node-cb" data-i="${i}">
-             <span>${n.name}</span>
-             ${n.in_local_baked ? "" : `<span style="color:#fbbf24;font-size:10px;">${t("mn.nogit_tag")}</span>`}
+             <span>${escHtml(n.name)}</span>
+             ${n.kind === "local"
+               ? `<span style="color:#60a5fa;font-size:10px;">${t("mn.local_tag")}</span>`
+               : (n.in_local_baked ? "" : `<span style="color:#fbbf24;font-size:10px;">${t("mn.nogit_tag")}</span>`)}
            </label>`).join("");
         nodesPruneBtn.style.display = "inline-block";
       }
@@ -1782,10 +1802,15 @@ async function openDeployDialog() {
     const checked = [...panel.querySelectorAll(".mb-node-cb:checked")]
       .map((cb) => loadedNodes[parseInt(cb.dataset.i, 10)]);
     if (!checked.length) { nodesStatusEl.textContent = t("mn.none_checked"); return; }
-    const removeNames = new Set(checked.map((n) => n.name));
-    const keep = loadedNodes.filter((n) => !removeNames.has(n.name));
     const list = checked.map((n) => "  • " + n.name).join("\n");
     if (!confirm(t("mn.confirm", { n: checked.length, list }))) return;
+
+    // 两类节点删法不同:镜像里 clone 的要改清单 + 重部署;Volume 上的本地包直接删文件即可
+    // (下次容器启动就不会解压它了),不必为此重 build 一次镜像。
+    const localChecked = checked.filter((n) => n.kind === "local");
+    const bakedChecked = checked.filter((n) => n.kind !== "local");
+    const keepBaked = loadedNodes.filter(
+      (n) => n.kind !== "local" && !bakedChecked.some((c) => c.name === n.name));
 
     nodesPruneBtn.disabled = true;
     nodesStatusEl.textContent = t("nodes.redeploying");
@@ -1793,10 +1818,19 @@ async function openDeployDialog() {
     nodesLogEl.style.display = "block";
     nodesLogEl.textContent = "";
     try {
-      const rc = await streamPost("/modal_bridge/sync_nodes", {
-        new_baked: keep.map((n) => ({ name: n.name, url: n.url, commit: n.commit })),
-        summary: { add: 0, update: 0, prune: checked.length },
+      for (const n of localChecked) {
+        await api.fetchApi("/modal_bridge/remove_local_node", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ folder: n.name }),
+        });
+        nodesLogEl.textContent += `✓ 已从 Volume 移除本地节点包: ${n.name}\n`;
+      }
+      // 只勾了本地包 → 无需重部署,直接收工
+      const rc = bakedChecked.length === 0 ? 0 : await streamPost("/modal_bridge/sync_nodes", {
+        new_baked: keepBaked.map((n) => ({ name: n.name, url: n.url, commit: n.commit })),
+        summary: { add: 0, update: 0, prune: bakedChecked.length },
       }, (line) => { nodesLogEl.textContent += line + "\n"; nodesLogEl.scrollTop = nodesLogEl.scrollHeight; });
+      const keep = keepBaked;
       if (rc === 0) {
         nodesStatusEl.textContent = t("mn.removed", { n: checked.length, keep: keep.length });
         nodesStatusEl.style.color = "#34d399";

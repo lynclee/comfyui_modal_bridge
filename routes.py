@@ -469,12 +469,24 @@ def _setup_routes():
             sizes = sum(len(im["image"]) for im in input_images)
             print(f"[modal_bridge] uploading {len(input_images)} input image(s), ~{sizes//1024} KB total")
 
+        # 自写节点的期望版本随任务发过去:解压只发生在容器启动时,暖容器可能装着上一版
+        # (改完节点立刻重跑最容易撞上)→ worker 据此 reload+重装+重启,不会静默出旧结果。
+        local_digests = {}
+        try:
+            plan = node_sync.plan_node_sync(prompt)
+            folders = [p["folder"] for p in plan.get("local_pack", [])]
+            if folders:
+                local_digests = local_nodes.expected_digests(
+                    folders, Path(node_sync._comfyui_root()) / "custom_nodes")
+        except Exception as e:
+            print(f"[modal_bridge] 本地节点指纹计算跳过: {e}")
+
         try:
             async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=60)) as session:
                 submit_result = await modal_client.submit_job(
                     session, cfg, workflow=prompt,
                     input_images=input_images or None, tier=tier, needs_gpu=needs_gpu,
-                    gpu_class=gpu_class,
+                    gpu_class=gpu_class, local_nodes=local_digests or None,
                 )
         except Exception as e:
             return web.json_response({"error": str(e)}, status=502)
@@ -754,6 +766,14 @@ def _setup_routes():
         folders = body.get("folders")
         if not isinstance(folders, list) or not folders:
             return web.json_response({"error": "folders (non-empty list) required"}, status=400)
+        # 入口即校验:本地 API 无鉴权(同机信任),但 folders 直接参与路径拼接 ——
+        # 越界的名字必须在这里挡住,别指望下游。local_nodes.safe_folder 还会再囚一次(纵深)。
+        bad = [f for f in folders
+               if not isinstance(f, str) or not f.strip()
+               or "/" in f or "\\" in f or f.strip() in (".", "..")]
+        if bad:
+            return web.json_response({"error": f"folders 含非法项(须为单个目录名): {bad[:3]}"},
+                                     status=400)
 
         cfg = cfg_mod.load_config()
         resp = web.StreamResponse(
@@ -802,7 +822,11 @@ def _setup_routes():
         for u in result.get("uploaded", []):
             await _emit(resp, f"  ✓ {u['folder']} ({u['zip_kb']} KB, {u['files']} files)\n")
         failed = result.get("failed", [])
-        rc = 1 if failed and not result.get("uploaded") else 0
+        # ⚠ 任何一个失败都算失败(不是"全失败才算"):工作流要的每个节点都是必需品,
+        #   少一个云端就跑不起来。rc=0 会让前端当作全成功直接提交 → 白跑一趟云端。
+        rc = 1 if failed else 0
+        for f in failed:
+            await _emit(resp, f"  ✗ {f['folder']}: {f['error']}\n")
         await _emit(resp, f"\n== {'✓' if rc == 0 else '⚠'} 本地节点同步完成:"
                           f"{len(result.get('uploaded', []))} 个上传,{len(failed)} 个失败 ==\n")
         await _emit(resp, f"\n__DEPLOY_DONE__ rc={rc}\n")

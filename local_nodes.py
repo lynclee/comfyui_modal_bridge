@@ -53,6 +53,22 @@ _SKIP_SUFFIXES = {
 _SKIP_NAMES = {".DS_Store", "Thumbs.db", ".gitignore", ".gitattributes"}
 
 
+def safe_folder(root: Path, folder: str) -> Path:
+    """把「节点文件夹名」解析成 root 下的真实路径,越界即抛错。
+    folder 来自 HTTP body(本地 API 无鉴权,同机任意进程/网页都能打)——不能直接 root / folder:
+    `../x` 会跑出 custom_nodes,把用户任意目录打包上传。要求单段名 + resolve 后仍在 root 内。"""
+    name = (folder or "").strip()
+    if not name or name in (".", "..") or "/" in name or "\\" in name:
+        raise ValueError(f"非法节点名(必须是 custom_nodes 下的单个目录名): {folder!r}")
+    root_res = Path(root).resolve()
+    target = (root_res / name).resolve()
+    try:
+        target.relative_to(root_res)
+    except ValueError:
+        raise ValueError(f"节点路径越界: {folder!r}") from None
+    return target
+
+
 def should_skip(rel_path: str) -> bool:
     """相对路径是否应排除(纯函数)。rel_path 用 / 分隔。"""
     parts = [p for p in rel_path.replace("\\", "/").split("/") if p]
@@ -133,6 +149,20 @@ def pack_node_dir(path: Path) -> tuple[bytes, str, int, int]:
 # ============================================================================
 # Volume 侧(需要 modal SDK,由 routes 调用)
 # ============================================================================
+def expected_digests(folders: list[str], root: Path) -> dict:
+    """本次提交期望云端跑的那版指纹 {folder: digest}(纯本地算,不查 Volume)。
+    随 /run 一起发给 worker —— 暖容器据此发现自己装的是旧版并自我纠偏。"""
+    out = {}
+    for folder in folders or []:
+        try:
+            files, _ = scan_node_dir(safe_folder(root, folder))
+            if files:
+                out[folder] = compute_digest(files)
+        except Exception:
+            pass
+    return out
+
+
 def volume_digests(cfg: dict, folders: list[str]) -> dict:
     """读 Volume 上已存的 <folder>.digest → {folder: digest}。读不到的不出现在结果里。"""
     out = {}
@@ -160,8 +190,8 @@ def plan_local_uploads(cfg: dict, folders: list[str], root: Path) -> dict:
     remote = volume_digests(cfg, folders)
     upload, uptodate, failed = [], [], []
     for folder in folders:
-        path = Path(root) / folder
         try:
+            path = safe_folder(root, folder)
             files, total = scan_node_dir(path)
             if not files:
                 failed.append({"folder": folder, "error": "目录为空或全被排除"})
@@ -183,7 +213,7 @@ def upload_local_nodes(cfg: dict, folders: list[str], root: Path, on_progress=No
     packs = []
     for folder in folders:
         try:
-            blob, digest, count, raw = pack_node_dir(Path(root) / folder)
+            blob, digest, count, raw = pack_node_dir(safe_folder(root, folder))
             packs.append((folder, blob, digest, count, raw))
         except Exception as e:
             failed.append({"folder": folder, "error": str(e)})

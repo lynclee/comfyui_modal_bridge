@@ -756,6 +756,60 @@ def test_plan_node_sync_routes_local_and_unpushed(tmp_path, monkeypatch=None):
         ns._comfyui_root, ns.folder_git_info = orig_root, orig_info
 
 
+def test_local_nodes_safe_folder(tmp_path):
+    """入口路径囚笼:folders 来自 HTTP body,`../x` 必须挡住,不能打包 custom_nodes 之外的东西。"""
+    import local_nodes as ln
+    root = tmp_path / "custom_nodes"
+    (root / "good").mkdir(parents=True)
+    (tmp_path / "secret").mkdir()
+    assert ln.safe_folder(root, "good") == (root / "good").resolve()
+    for evil in ("../secret", "..", ".", "", "a/b", "/etc", "..\\x"):
+        try:
+            ln.safe_folder(root, evil)
+            assert False, f"应当拒绝: {evil!r}"
+        except ValueError:
+            pass
+
+
+def test_local_nodes_needs_refresh(tmp_path):
+    """暖容器纠偏判定:容器内指纹 ≠ 提交方期望 → 该节点要重装。"""
+    sys.path.insert(0, str(ROOT / "modal_app"))
+    import _local_nodes_boot as boot
+    dest = tmp_path / "custom_nodes"
+    (dest / "a").mkdir(parents=True)
+    (dest / "b").mkdir()
+    (dest / "a" / ".mb_local_digest").write_text("aaa")
+    (dest / "b" / ".mb_local_digest").write_text("bbb")
+    orig = boot.DEST_DIR
+    boot.DEST_DIR = dest
+    try:
+        assert boot.current_digests() == {"a": "aaa", "b": "bbb"}
+        assert boot.needs_refresh({"a": "aaa", "b": "bbb"}) == []        # 都最新
+        assert boot.needs_refresh({"a": "NEW", "b": "bbb"}) == ["a"]      # a 改过
+        assert boot.needs_refresh({"c": "ccc"}) == ["c"]                  # 容器里根本没装
+        assert boot.needs_refresh({}) == [] and boot.needs_refresh(None) == []
+    finally:
+        boot.DEST_DIR = orig
+
+
+def test_plan_baked_node_with_unpushed_changes():
+    """已烤进镜像的节点,本地改动没推 → 必须进 local_pack 盖掉旧版,
+    绝不能静默 continue(那样云端跑旧代码,用户改完毫无变化且无任何线索)。"""
+    _stub_analyze({"baked-node": ["B1"]})
+    _stub_env({"baked-node": {"has_git": True, "url": "https://github.com/a/b",
+                              "commit": "n" * 40, "pushed": False}},
+              exists_set={"baked-node"})
+    try:
+        baked = [{"name": "baked-node", "url": "https://github.com/a/b", "commit": "o" * 40}]
+        p = node_sync.plan_node_sync({}, baked=baked)
+        assert p["update"] == [], "未推送的 commit 不该进清单(云端 checkout 不到会崩 build)"
+        assert [x["folder"] for x in p["local_pack"]] == ["baked-node"]
+        assert p["needs_local_upload"] is True
+        assert p["needs_deploy"] is False
+    finally:
+        _restore()
+
+
 def test_bridge_client_download_outputs_base64(tmp_path):
     """产物落盘(base64 路径,无网络):写文件 + 重名去重 + 未完成拒绝。"""
     import base64

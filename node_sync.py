@@ -422,13 +422,17 @@ def plan_node_sync(prompt: dict, baked: list[dict] | None = None,
             ok_baked += 1
             local_commit = (git.get("commit") or "").strip()
             baked_commit = (baked_by_name[folder].get("commit") or "").strip()
-            # 未推送的 commit 不能写进清单:云端 checkout 不到 → 镜像 build 崩。
-            # 保持 baked 里那个旧 commit(云端还能 clone 到),差异交给前端提示。
             if git["has_git"] and git.get("pushed", True) and local_commit \
                     and local_commit != baked_commit:
                 update.append({"folder": folder, "url": git["url"],
                                "old_commit": baked_commit, "commit": local_commit})
                 baked_by_name[folder] = {"name": folder, "url": git["url"], "commit": local_commit}
+            elif local_commit and local_commit != baked_commit and folder_exists_locally(folder):
+                # 已烤进镜像、但本地改动没推(或丢了 remote):走本地打包通道盖掉镜像里那份。
+                # ⚠ 这里绝不能只是 continue —— 那样云端会**静默跑旧代码**,比部署报错更难查
+                #   (用户改完节点点运行,结果和改之前一样,毫无线索)。
+                local_pack.append({"folder": folder, "class_types": sorted(class_types),
+                                   "reason": "unpushed" if git["has_git"] else "no_git"})
             continue
         if git["has_git"] and git.get("pushed", True):
             add.append({"folder": folder, "class_types": sorted(class_types),

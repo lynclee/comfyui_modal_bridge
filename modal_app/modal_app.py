@@ -218,6 +218,32 @@ def _worker_ensure_alive(self):
     _worker_boot(self, cpu=getattr(self, "_cpu", False))  # 沿用本 worker 的 CPU/GPU 模式
 
 
+def _refresh_local_nodes_if_stale(self, expected: dict | None) -> bool:
+    """暖容器纠偏:本地节点是运行时从 Volume 解压的,而 @modal.enter 只在容器**启动**时跑一次。
+    改完节点重传后若命中暖容器,跑的还是上一版代码 —— 静默出旧结果,是最难查的一类失效。
+    提交方带上期望指纹,这里比对容器实际装的那版,不一致就 reload Volume + 重解压 + 重启 ComfyUI。
+
+    ⚠ 只在 expected 非空(即这个 job 真的用了本地节点)时才做:reload 有 IO 开销,重启更是
+      把显存里的模型也丢了。常规任务 expected 为空 → 整段跳过,warm 复用完全不受影响。
+    返回是否真的重装过。"""
+    if not expected:
+        return False
+    try:
+        from _local_nodes_boot import extract_all, needs_refresh
+        if not needs_refresh(expected):
+            return False
+        stale = needs_refresh(expected)
+        print(f"[bridge] 暖容器的本地节点已过期 {stale} → reload + 重装 + 重启 ComfyUI")
+        models_vol.reload()   # 别处 commit 的 Volume 变更,运行中容器必须 reload 才看得到
+        extract_all()
+        _worker_shutdown(self)
+        _worker_boot(self, cpu=getattr(self, "_cpu", False))  # 节点代码变了必须重 import
+        return True
+    except Exception as e:
+        print(f"[bridge] ⚠ 本地节点刷新失败(按现状继续跑): {e}")
+        return False
+
+
 def _worker_run(workflow: dict, job_id: str, input_images: list | None = None,
                 delivery: dict | None = None) -> dict:
     # delivery:结果交付方式(见 aigc_delivery.normalize_delivery)。desktop = 现状(回本地);
@@ -360,7 +386,8 @@ class ComfyWorker:
 
     @modal.method()
     def run(self, workflow: dict, job_id: str, input_images: list | None = None,
-            delivery: dict | None = None) -> dict:
+            delivery: dict | None = None, local_nodes: dict | None = None) -> dict:
+        _refresh_local_nodes_if_stale(self, local_nodes)  # 暖容器可能装着上一版自写节点
         return _worker_run(workflow, job_id, input_images, delivery)
 
 
@@ -383,7 +410,8 @@ class ComfyWorkerCheap:
 
     @modal.method()
     def run(self, workflow: dict, job_id: str, input_images: list | None = None,
-            delivery: dict | None = None) -> dict:
+            delivery: dict | None = None, local_nodes: dict | None = None) -> dict:
+        _refresh_local_nodes_if_stale(self, local_nodes)  # 暖容器可能装着上一版自写节点
         return _worker_run(workflow, job_id, input_images, delivery)
 
 
@@ -406,7 +434,8 @@ class ComfyWorkerTop:
 
     @modal.method()
     def run(self, workflow: dict, job_id: str, input_images: list | None = None,
-            delivery: dict | None = None) -> dict:
+            delivery: dict | None = None, local_nodes: dict | None = None) -> dict:
+        _refresh_local_nodes_if_stale(self, local_nodes)  # 暖容器可能装着上一版自写节点
         return _worker_run(workflow, job_id, input_images, delivery)
 
 
@@ -432,7 +461,8 @@ class ComfyWorkerCPU:
 
     @modal.method()
     def run(self, workflow: dict, job_id: str, input_images: list | None = None,
-            delivery: dict | None = None) -> dict:
+            delivery: dict | None = None, local_nodes: dict | None = None) -> dict:
+        _refresh_local_nodes_if_stale(self, local_nodes)  # 暖容器可能装着上一版自写节点
         return _worker_run(workflow, job_id, input_images, delivery)
 
 
@@ -510,7 +540,10 @@ def run_endpoint(payload: dict):
     # job_state 只存 delivery 的可外泄形态(mode/job_id),token 绝不落 Dict/日志。
     job_state[job_id] = {"status": "queued", "queued_at": time.time(), "gpu": gpu_display,
                          "tier": tier, "delivery": public_delivery(delivery)}
-    call = worker().run.spawn(workflow, job_id, input_images, delivery)
+    # local_nodes: {folder: digest} —— 本次工作流用到的自写节点及其期望版本。
+    # 暖容器可能装着上一版,worker 侧据此判断要不要 reload+重装+重启(见 _refresh_local_nodes_if_stale)。
+    local_nodes = payload.get("local_nodes") if isinstance(payload.get("local_nodes"), dict) else None
+    call = worker().run.spawn(workflow, job_id, input_images, delivery, local_nodes)
     # ⚠ call_id 存到独立 key,run_endpoint 不再回写 job_state[job_id]。
     # 原因:job_state[job_id] 同时被 worker 容器写(running/failed/completed)。Modal Dict 跨容器
     # 最终一致、无序,run_endpoint spawn 后 merge 回写可能读到 stale 的 queued、把 worker 刚写的

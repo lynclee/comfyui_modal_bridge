@@ -57,6 +57,26 @@ def _install_requirements(node_dir: Path) -> None:
         print(f"[bridge] ⚠ {node_dir.name} 依赖安装异常: {e}")
 
 
+def current_digests() -> dict:
+    """容器内**当前已解压**的那批包的指纹({folder: digest})。
+    解压时把 Volume 上的 .digest 落一份到目标目录内,重启也不会丢(目录还在)。"""
+    out = {}
+    if not DEST_DIR.is_dir():
+        return out
+    for marker in DEST_DIR.glob("*/.mb_local_digest"):
+        try:
+            out[marker.parent.name] = marker.read_text(encoding="utf-8").strip()
+        except Exception:
+            pass
+    return out
+
+
+def needs_refresh(expected: dict) -> list[str]:
+    """提交方声明的指纹 vs 容器内实际的 → 哪些节点过期了(纯函数,可单测)。"""
+    cur = current_digests()
+    return sorted(f for f, d in (expected or {}).items() if d and cur.get(f) != d)
+
+
 def extract_all() -> list[str]:
     """解压 Volume 上所有本地节点包。返回成功装上的 folder 名单。
     整个流程对异常宽容:本地节点是增量能力,坏一个不该阻断 worker 启动。"""
@@ -85,6 +105,14 @@ def extract_all() -> list[str]:
                 target.mkdir(parents=True, exist_ok=True)
                 for n in ok:
                     z.extract(n, target)
+            # 落一份指纹在节点目录里:暖容器据此判断自己装的是不是最新那版(见 needs_refresh)
+            dg = zp.with_suffix(".digest")
+            if dg.is_file():
+                try:
+                    (target / ".mb_local_digest").write_text(
+                        dg.read_text(encoding="utf-8").strip(), encoding="utf-8")
+                except Exception:
+                    pass
             _install_requirements(target)
             installed.append(folder)
             print(f"[bridge] local-node ✓ {folder} ({len(ok)} files)")

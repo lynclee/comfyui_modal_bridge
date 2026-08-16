@@ -25,6 +25,7 @@ async def submit_job(
     tier: str = "40g",
     needs_gpu: bool = True,
     gpu_class: str = "primary",
+    local_nodes: Optional[dict] = None,
     max_retries: int = 1,
 ) -> dict:
     """POST /run,带鉴权,自动重试 1 次。
@@ -44,6 +45,10 @@ async def submit_job(
     }
     if input_images:
         payload["images"] = input_images
+    if local_nodes:
+        # {folder: digest} —— 自写节点的期望版本。暖容器若装着旧版会据此自我纠偏
+        # (解压发生在容器启动时,而暖容器不会重新启动)。
+        payload["local_nodes"] = local_nodes
 
     headers = {"Content-Type": "application/json"}
     last_err: Optional[Exception] = None
