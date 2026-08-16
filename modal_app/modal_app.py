@@ -70,6 +70,18 @@ job_state = modal.Dict.from_name(f"{APP_NAME}-jobs", create_if_missing=True)
 # 策略:终态(completed/failed/cancelled)条目超过 JOB_TTL_S 就删;再按数量上限兜底。
 JOB_TTL_S = int(os.environ.get("MODAL_BRIDGE_JOB_TTL", "3600"))   # 终态保留 1 小时(够客户端取回)
 JOB_MAX = int(os.environ.get("MODAL_BRIDGE_JOB_MAX", "200"))       # 最多保留多少条
+_VOL_GC_PER_SWEEP = 10  # 一次 sweep 最多删多少个 Volume 上的 _outputs/<job> 目录(见 _drop)
+
+
+# `<job_id>:call` 的占位值:run_endpoint 在 spawn *之前* 写它,拿到真实 call_id 再覆盖。
+# 目的是让这段窗口对 cancel 可见(见 run_endpoint / cancel_endpoint 的注释)。
+_CALL_PENDING = "pending"
+
+
+def _call_id(job_id: str) -> str:
+    """取真实 call_id;还在占位(spawn 中)或没有则返回空串。"""
+    cid = job_state.get(f"{job_id}:call")
+    return "" if not cid or cid == _CALL_PENDING else str(cid)
 
 
 def _sweep_job_state():
@@ -86,12 +98,29 @@ def _sweep_job_state():
             continue
         if s.get("status") in terminal:
             finished.append((jid, s.get("completed_at") or 0))
+    vol_gc_budget = _VOL_GC_PER_SWEEP
+
     def _drop(jid):
+        nonlocal vol_gc_budget
         for k in (jid, f"{jid}:call"):  # 连带删独立的 call_id key,不留孤儿
             try:
                 del job_state[k]
             except Exception:
                 pass
+        # 顺带清 Volume 上的 _outputs/<job_id>/:成功取回会即删(见 modal_volume.download_volume_file
+        # 和 fetch_endpoint 的 delete=1),但**失败/取消/客户端放弃**的大文件以前永久留在 Volume 上,
+        # 谁也不会去删。job_state 条目都过期了,产物更没人要。
+        # 限量:一次 sweep 最多删这么多个,避免某次提交撞上大批过期 job 时被一串 RPC 拖慢。
+        if vol_gc_budget <= 0:
+            return
+        vol_gc_budget -= 1
+        try:
+            models_vol.remove_file(f"_outputs/{jid}", recursive=True)
+        except FileNotFoundError:
+            pass  # 目录不存在是常态(产物已取回 / 本来就是小文件走 base64)
+        except Exception as e:
+            # 别的异常要出声:静默失败 = GC 从来没生效过,而日志上看不出来
+            print(f"[bridge] ⚠ Volume GC _outputs/{jid} 失败: {type(e).__name__}: {e}")
     # 1) 过期删
     for jid, done_at in finished:
         if done_at and now - done_at > JOB_TTL_S:
@@ -280,8 +309,9 @@ def _worker_run(workflow: dict, job_id: str, input_images: list | None = None,
     # delivery:结果交付方式(见 aigc_delivery.normalize_delivery)。desktop = 现状(回本地);
     # aigc-r2 = 直传 R2 + 回调 AIGC Studio。⚠ delivery 里的 token 是敏感的:不进 job_state、不打日志。
     # call_id 现在存独立 key(见 run_endpoint);等它出现仅为让 cancel 可用,等不到也继续。
+    # ⚠ 等的是**真实** call_id:run_endpoint 会先写占位值,认占位就等于没等。
     for _ in range(50):  # 最多 ~5s
-        if job_state.get(f"{job_id}:call"):
+        if _call_id(job_id):
             break
         time.sleep(0.1)
     mode = (delivery or {}).get("mode", "desktop")
@@ -338,7 +368,7 @@ def _worker_run(workflow: dict, job_id: str, input_images: list | None = None,
             from aigc_delivery import deliver_outputs
             dres = deliver_outputs(
                 job_id=job_id, output_refs=result.get("output_refs") or [], delivery=delivery,
-                provider_job_id=str(job_state.get(f"{job_id}:call") or ""))
+                provider_job_id=_call_id(job_id))
             # manifest 只有 r2_key/etag/size 等元数据(无 base64、无 token),job_state 不膨胀。
             job_state[job_id] = {**job_state.get(job_id, {}), "status": "completed",
                                  "delivery": {"mode": "aigc-r2", **dres},
@@ -374,7 +404,7 @@ def _worker_run(workflow: dict, job_id: str, input_images: list | None = None,
 # 每档带 Modal 原生 fallback(排不到主卡自动降级到链里下一个)。
 _PRIMARY_GPU = os.environ.get("MODAL_BRIDGE_DEFAULT_GPU", "H100")
 _GPU_CHAIN = {
-    "B200":      ["B200", "H200", "H100"], # 183G Blackwell 最强档,排不到降 H200/H100
+    "B200":      ["B200", "H200", "H100"], # 180G Blackwell 最强档,排不到降 H200/H100
     "H100":      ["H100", "A100-80GB"],   # 主卡排不到降 A100-80G
     "H200":      ["H200", "H100"],         # 141G 大卡,降级到 H100
     "A100-80GB": ["A100-80GB"],
@@ -388,7 +418,7 @@ _CHEAP_GPU = os.environ.get("MODAL_BRIDGE_CHEAP_GPU", "L40S")
 _CHEAP_GPU_LIST = _GPU_CHAIN.get(_CHEAP_GPU, [_CHEAP_GPU])
 _CHEAP_ENABLED = _CHEAP_GPU != _PRIMARY_GPU
 
-# 顶配档 GPU(默认 B200 183G):估算显存超过主卡的工作流升到这跑,防 OOM(升档 = 正确性兜底)。
+# 顶配档 GPU(默认 B200 180G):估算显存超过主卡的工作流升到这跑,防 OOM(升档 = 正确性兜底)。
 # B200 是 Blackwell 最强档,显存最大、速度最快,大图自动上这张。
 # ⚠ 升档档不向下 fallback(对 >80G 的活退到小卡 = OOM),所以固定单卡列表,宁可排队等也不降级。
 _TOP_GPU = os.environ.get("MODAL_BRIDGE_TOP_GPU", "B200")
@@ -460,7 +490,7 @@ class ComfyWorkerCheap:
         return _worker_run(workflow, job_id, input_images, delivery)
 
 
-# 顶配档 worker:估算显存超过主卡的工作流(如 >80G)升到这(默认 B200 183G),防 OOM。
+# 顶配档 worker:估算显存超过主卡的工作流(如 >80G)升到这(默认 B200 180G),防 OOM。
 # 同构,只是 gpu 不同且不向下 fallback;min_containers=0 → 不被路由时 0 容器 = $0。
 @app.cls(gpu=_TOP_GPU_LIST, **_WORKER_KW, **_SNAP_KW)
 @modal.concurrent(max_inputs=1)
@@ -551,7 +581,12 @@ def _check(key: str):
 # REST endpoints(4 个)
 # ============================================================================
 
-@app.function(image=cuda_image, secrets=[bridge_secret], timeout=60)
+# ⚠ 这里挂 Volume 不是为了读写挂载点,是为了让 models_vol 在这个容器里被 hydrate ——
+# _sweep_job_state 要调 models_vol.remove_file() 清 _outputs/,没被引用的全局 Volume 对象
+# 在容器内可能未初始化,那样 GC 会永远静默失败(而日志上看不出来)。挂载本身是 lazy 的,
+# 不读文件就没有实际开销。
+@app.function(image=cuda_image, secrets=[bridge_secret], timeout=60,
+              volumes={"/comfy-volume": models_vol})
 @modal.fastapi_endpoint(method="POST", label=f"{APP_NAME}-run")
 def run_endpoint(payload: dict):
     """提交 workflow。payload: {workflow, tier?, images?, auth_key, delivery?}
@@ -595,14 +630,38 @@ def run_endpoint(payload: dict):
         worker = _TIER_WORKERS[tier]
         gpu_display = _TIER_GPU_DISPLAY[tier]
 
+    # 幂等:客户端带自己的 job_id 重试时(/run 对 502/504/超时会重试),这个 id 可能已经
+    # spawn 过了 —— 响应丢在网关不代表任务没跑。非终态就直接回现状,绝不二次 spawn:
+    # 那会开出第二个同样的 GPU 任务,双跑双计费,而调用方只看得到后一个。
+    # 终态(completed/failed/cancelled)则放行 —— 那是用户有意重跑同一个 id。
+    prior = job_state.get(job_id)
+    if isinstance(prior, dict) and prior.get("status") in ("queued", "running", "delivering"):
+        print(f"[bridge] /run duplicate job_id {job_id} (status={prior['status']}) — 不重复 spawn")
+        return {"id": job_id, "status": prior["status"],
+                "gpu": prior.get("gpu") or gpu_display, "duplicate": True}
+
     _sweep_job_state()  # 顺手清理过期/超量的旧 job(防 Dict 无限膨胀)
     # job_state 只存 delivery 的可外泄形态(mode/job_id),token 绝不落 Dict/日志。
     job_state[job_id] = {"status": "queued", "queued_at": time.time(), "gpu": gpu_display,
                          "tier": tier, "delivery": public_delivery(delivery)}
+    # ⚠ spawn 之前先占位 :call —— spawn 到写 call_id 之间有个毫秒级窗口,而用户点取消
+    # 恰恰常在刚提交那几秒。窗口里到达的 cancel 以前找不到 call_id,只会把状态标成
+    # cancelled 就返回成功,函数照跑照计费(谎报成功,违反本文件的 cancel 铁律)。
+    # 占位后 cancel 能看出"正在提交中",短暂等真实 id(见 cancel_endpoint)。
+    job_state[f"{job_id}:call"] = _CALL_PENDING
     # local_nodes: {folder: digest} —— 本次工作流用到的自写节点及其期望版本。
     # 暖容器可能装着上一版,worker 侧据此判断要不要 reload+重装+重启(见 _refresh_local_nodes_if_stale)。
     local_nodes = payload.get("local_nodes") if isinstance(payload.get("local_nodes"), dict) else None
-    call = worker().run.spawn(workflow, job_id, input_images, delivery, local_nodes)
+    try:
+        call = worker().run.spawn(workflow, job_id, input_images, delivery, local_nodes)
+    except Exception:
+        try:
+            del job_state[f"{job_id}:call"]   # 占位不能留成孤儿,否则 cancel 会一直等
+        except Exception:
+            pass
+        job_state[job_id] = {**(job_state.get(job_id) or {}), "status": "failed",
+                             "error": "spawn failed", "completed_at": time.time()}
+        raise
     # ⚠ call_id 存到独立 key,run_endpoint 不再回写 job_state[job_id]。
     # 原因:job_state[job_id] 同时被 worker 容器写(running/failed/completed)。Modal Dict 跨容器
     # 最终一致、无序,run_endpoint spawn 后 merge 回写可能读到 stale 的 queued、把 worker 刚写的
@@ -668,7 +727,19 @@ def cancel_endpoint(payload: dict):
         return {"error": "Missing 'job_id'"}
     s = job_state.get(job_id) or {}
     was_running = s.get("status") == "running"
-    call_id = job_state.get(f"{job_id}:call") or s.get("call_id")  # 新独立 key,兼容旧字段
+    call_id = _call_id(job_id) or s.get("call_id")  # 新独立 key,兼容旧字段
+    # 占位状态 = run_endpoint 正在 spawn,真实 call_id 还没写回来。这时既不能当"没有 call_id"
+    # 直接标 cancelled(函数马上就要开始跑,谎报成功),也不该让用户白等 —— 短暂轮询一下。
+    if not call_id and job_state.get(f"{job_id}:call") == _CALL_PENDING:
+        for _ in range(20):   # 最多 ~2s
+            time.sleep(0.1)
+            call_id = _call_id(job_id)
+            if call_id:
+                break
+        if not call_id:
+            return {"id": job_id, "status": s.get("status") or "queued",
+                    "error": "任务正在提交中,还拿不到句柄 —— 稍等一两秒再点取消",
+                    "was_running": was_running}
     if call_id:
         try:
             # 不传 terminate_containers —— cancel() 自身就会中断执行并把 input 标记 TERMINATED。
@@ -681,7 +752,10 @@ def cancel_endpoint(payload: dict):
             print(f"[bridge] cancel call {call_id} FAILED: {e}")
             return {"id": job_id, "status": s.get("status") or "unknown",
                     "error": f"cancel failed: {e}", "was_running": was_running}
-    job_state[job_id] = {**s, "status": "cancelled", "completed_at": time.time()}
+    # ⚠ 重新读一次再 merge:上面等占位 call_id 可能花了两秒,worker 在这期间会把状态写成
+    # running(带 started_at/progress)。拿函数开头那份快照回写,等于把 worker 写的东西冲掉。
+    job_state[job_id] = {**(job_state.get(job_id) or s), "status": "cancelled",
+                         "completed_at": time.time()}
     return {"id": job_id, "status": "cancelled", "was_running": was_running}
 
 

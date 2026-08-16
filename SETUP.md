@@ -56,9 +56,9 @@ Modal Setup 里选三种模式之一:
 - **Auto(更省钱,默认)**:提交时按工作流估算显存,自动选**最省又够用**的卡:
   - 小图(如 **Z-Image-Turbo**,est ~18–24G)→ **L40S 48G**(最便宜)
   - 常规(如 **FLUX.2-dev**,est ~71–80G)→ **H100/A100-80G**
-  - 真超 80G(大视频 / fp16 大模型叠大 stack)→ **B200 183G**(防 OOM,Blackwell 最强档)
+  - 真超 80G(大视频 / fp16 大模型叠大 stack)→ **B200 180G**(防 OOM,Blackwell 最强档)
 - **H100(固定)**:一律 H100,不降也不升。`>80G` 的工作流会在 RunModal 前显存预警,提示切 Auto 或 B200。
-- **B200(固定 · 最快最强)**:一律 B200,显存最大(183G)、速度最快。适合大图 / 视频 / 赶时间、或想要全程顶配,代价是**最贵**那档。
+- **B200(固定 · 最快最强)**:一律 B200,显存最大(180G)、速度最快。适合大图 / 视频 / 赶时间、或想要全程顶配,代价是**最贵**那档。
 
 四档 worker(CPU / L40S / H100 / B200)**一次部署全部建好**,空闲各自 scale-to-zero —— 没被路由到的档 **0 容器 = 0 成本**,所以多档不额外花钱。切换模式后点「部署」生效(首次升级到本版本也需部署一次)。
 
@@ -227,9 +227,9 @@ Pick one of three modes in Modal Setup:
 - **Auto (cheaper, default)**: on submit, estimate the workflow's VRAM and pick the **cheapest GPU that fits**:
   - small images (e.g. **Z-Image-Turbo**, est ~18–24G) → **L40S 48G** (cheapest)
   - normal (e.g. **FLUX.2-dev**, est ~71–80G) → **H100/A100-80G**
-  - truly over 80G (big video / fp16 model + heavy stack) → **B200 183G** (avoids OOM, top Blackwell tier)
+  - truly over 80G (big video / fp16 model + heavy stack) → **B200 180G** (avoids OOM, top Blackwell tier)
 - **H100 (fixed)**: always H100, no downgrade/escalation. Workflows `>80G` get a VRAM warning before RunModal suggesting you switch to Auto or B200.
-- **B200 (fixed · fastest)**: always B200 — biggest VRAM (183G) and fastest. For large images / video / rush jobs, or when you want top-tier throughout; the trade-off is it's the **most expensive** tier.
+- **B200 (fixed · fastest)**: always B200 — biggest VRAM (180G) and fastest. For large images / video / rush jobs, or when you want top-tier throughout; the trade-off is it's the **most expensive** tier.
 
 All four workers (CPU / L40S / H100 / B200) are **deployed at once** and each scales to zero when idle — an un-routed tier is **0 containers = $0**, so extra tiers cost nothing. Click Deploy to apply a mode change (and once when upgrading to this version).
 

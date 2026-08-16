@@ -550,6 +550,54 @@ def test_secret_cmd_includes_aigc_studio():
 
 
 # ============================================================================
+# node_sync.redact_cmd — 命令行回显打码(部署面板会把命令流给浏览器)
+# ============================================================================
+def test_redact_cmd_masks_credentials():
+    """secret create 的 argv 里是明文凭据,回显必须打码 —— 用户复制部署日志求助就泄漏了。"""
+    cmd = node_sync.secret_create_cmd(
+        {"modal_app_name": "comfyui-bridge"}, hf_token="hf_SECRETVALUE123",
+        civitai_token="civ_abcdef", bridge_key="bk-0123456789abcdef",
+        comfy_api_key="comfy-XYZ", aigc_base_url="https://studio.example",
+        aigc_bypass_secret="byp-topsecret")
+    out = node_sync.redact_cmd(cmd)
+    # 凭据原文一个都不许出现
+    for leak in ("hf_SECRETVALUE123", "civ_abcdef", "bk-0123456789abcdef",
+                 "comfy-XYZ", "byp-topsecret"):
+        assert leak not in out, f"泄漏了 {leak}: {out}"
+    # key 名要留着(不然日志失去排查价值),够长的露前 4 位 + 长度
+    assert "BRIDGE_API_KEY=bk-0***(len=19)" in out
+    assert "HF_TOKEN=hf_S***(len=17)" in out
+    # 短值一位都不露(8 位的东西露 4 位等于露一半)
+    assert "COMFY_API_KEY_COMFY_ORG=***(len=9)" in out
+    assert "CIVITAI_TOKEN=***(len=10)" in out
+    # 非凭据项保持明文:URL 是排查部署问题的关键信息,打码反而添乱
+    assert "AIGC_STUDIO_BASE_URL=https://studio.example" in out
+    # 命令本体不受影响
+    assert "secret" in out and "create" in out
+
+
+def test_redact_cmd_leaves_plain_args():
+    """普通命令(deploy)没有 KEY=VALUE,应原样输出;命中敏感词则宁滥勿缺。"""
+    assert node_sync.redact_cmd(node_sync.deploy_command()).endswith("deploy modal_app.py")
+    assert node_sync.redact_cmd(["a", "MODE=fast", "TOKEN="]) == "a MODE=fast TOKEN=(empty)"
+    # 名字里带 SECRET 就打码,哪怕它其实不是密钥 —— 漏打一个才是事故
+    assert node_sync.redact_cmd(["NOT_SECRET=1"]) == "NOT_SECRET=***(len=1)"
+
+
+# ============================================================================
+# contract.is_safe_job_id — job_id 拼本地路径前的白名单
+# ============================================================================
+def test_is_safe_job_id():
+    """job_id 会拼进 output/<subfolder>/<job_id>/,路径穿越必须挡住。"""
+    import uuid
+    assert contract.is_safe_job_id(str(uuid.uuid4()))       # 云端真实形态
+    assert contract.is_safe_job_id("job_1.2-3")
+    for evil in ("../../x", "..", "a/b", "a\\b", "", "x" * 65, None, 123,
+                 "a\x00b", "a b", "a/../b"):
+        assert not contract.is_safe_job_id(evil), f"必须拒绝: {evil!r}"
+
+
+# ============================================================================
 # categories — 工作流类别画像(显存 / 时长按类别)
 # ============================================================================
 def test_classify_video_by_savevideo():
@@ -1139,6 +1187,61 @@ def test_discover_outputs_dict_and_bare_string():
     assert by_file["clip.mp4"]["subfolder"] == "v" and by_file["clip.mp4"]["node_id"] == "42"
     assert by_file["mesh.glb"]["asset_type"] == "model3d"
     assert cw.discover_outputs({}) == []
+
+
+def _with_history(cw, payload):
+    """临时替换 _comfy_ws.get_history(不用 monkeypatch —— CI 跑的是裸 runner,不是 pytest)。"""
+    original = cw.get_history
+
+    class _Ctx:
+        def __enter__(self):
+            cw.get_history = lambda pid: payload() if callable(payload) else payload
+        def __exit__(self, *a):
+            cw.get_history = original
+    return _Ctx()
+
+
+def test_history_settled_completed():
+    """WS 丢了完成事件时的兜底:history 说跑完了就该收尾(否则主循环空转到 worker 超时)。"""
+    cw = _comfy_ws()
+    with _with_history(cw, {"p1": {"status": {"status_str": "success", "completed": True},
+                                   "outputs": {"9": {}}}}):
+        assert cw._history_settled("p1") == (True, [])
+
+
+def test_history_settled_error_carries_message():
+    """history 报错 → 已终结 + 带错误,让 caller 走正常报错路径而不是"没有完成"。"""
+    cw = _comfy_ws()
+    msgs = [["execution_start", {}],
+            ["execution_error", {"node_id": "7", "node_type": "KSampler",
+                                 "exception_message": "OOM"}]]
+    with _with_history(cw, {"p1": {"status": {"status_str": "error", "completed": False,
+                                              "messages": msgs}}}):
+        done, errs = cw._history_settled("p1")
+    assert done and len(errs) == 1
+    assert "KSampler" in errs[0] and "OOM" in errs[0]
+
+
+def test_history_settled_not_done_and_never_fakes():
+    """还没跑完 / 查不到 / 查炸了 —— 一律「未终结」。兜底绝不能制造假终态。"""
+    cw = _comfy_ws()
+    with _with_history(cw, {}):                                   # prompt 还不在 history
+        assert cw._history_settled("p1") == (False, [])
+    with _with_history(cw, {"p1": {"status": {"completed": False}}}):
+        assert cw._history_settled("p1") == (False, [])
+    def _boom(pid=None):
+        raise RuntimeError("connection refused")
+    with _with_history(cw, _boom):                                # 查询本身失败
+        assert cw._history_settled("p1") == (False, [])
+
+
+def test_history_settled_legacy_no_status_field():
+    """老版 ComfyUI 的 history 没有 status 字段:有 outputs 才算跑完。"""
+    cw = _comfy_ws()
+    with _with_history(cw, {"p1": {"outputs": {"9": {"images": []}}}}):
+        assert cw._history_settled("p1") == (True, [])
+    with _with_history(cw, {"p1": {"outputs": {}}}):
+        assert cw._history_settled("p1") == (False, [])
 
 
 # ============================================================================

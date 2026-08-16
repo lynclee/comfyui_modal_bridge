@@ -929,7 +929,11 @@ async function runOnceOnModal(workflowPrompt, outputNodeIds, ctx, submitGuard, b
   const jobId = sub.job_id;
   const gpu = sub.gpu;
   let cancelled = false;  // 点取消后置位:poll 循环据此立即退出,卡片不等后续 poll
-  addActiveJob({ jobId, gpu, wfName: ctx.wfName, startedAt: Date.now() });
+  // workerTimeoutSec 一起存:刷新页面后 recoverPendingJob 靠它判断"这个 job 还值不值得恢复",
+  // 否则它只能用硬编码值(历史上是 1200),用户把 worker 调到 3600 后,恢复逻辑会把还在
+  // 正常跑的任务当过期丢掉 —— 和 poll deadline 那次踩的是同一个坑(两个旋钮手动同步)。
+  addActiveJob({ jobId, gpu, wfName: ctx.wfName, startedAt: Date.now(),
+                 workerTimeoutSec: sub.worker_timeout_sec || null });
   // 这张卡的取消只取消这个 job(各 job 互不影响)
   ctx.setCancel(jobId, async () => {
     if (!confirm(`Cancel Modal job ${jobId.slice(0, 8)}?`)) return;
@@ -1422,8 +1426,14 @@ async function refreshRunReady() {
 async function recoverPendingJob() {
   let pending = loadLS(LS_KEYS.activeJob);
   pending = Array.isArray(pending) ? pending : (pending ? [pending] : []);
-  // 丢弃过期的(>20min),其余各自恢复(并行,每个一张卡)
-  const fresh = pending.filter((j) => j?.jobId && (Date.now() - j.startedAt) / 1000 <= 1200);
+  // 丢弃过期的,其余各自恢复(并行,每个一张卡)。过期线跟提交时那条一致:
+  // max(前端设置, 云端 worker 上限 + 3 分钟尾巴),老条目没存 workerTimeoutSec 则退化为纯设置值。
+  const settingSec = getSetting("ModalBridge.timeoutSec", 1200);
+  const fresh = pending.filter((j) => {
+    if (!j?.jobId) return false;
+    const maxAgeSec = Math.max(settingSec, j.workerTimeoutSec ? j.workerTimeoutSec + 180 : 0);
+    return (Date.now() - j.startedAt) / 1000 <= maxAgeSec;
+  });
   saveLS(LS_KEYS.activeJob, fresh);
   for (const j of fresh) recoverOne(j);
 }

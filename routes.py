@@ -158,7 +158,7 @@ def _pick_gpu_class(prompt: dict, cfg: dict) -> tuple[str, str]:
     gpu_tier 固定某档时直接返回该档 —— 四档 worker 是一次部署全建好的,选哪档纯粹是
     运行时路由,**换档不必重新部署**(换某档具体是哪张卡才要)。
     gpu_tier=auto 时走梯子(成本低→高 L40S→H100→B200):
-      1) 升档(防 OOM):估算 > 主卡容量 → top(B200 183G)。
+      1) 升档(防 OOM):估算 > 主卡容量 → top(B200 180G)。
       2) 降档(省钱):cheap≠主卡 + 非视频 + 大小已知 + 放得下便宜卡 → cheap(L40S)。
       3) 否则 → primary(H100)。
     本地查不到大小(unknown>0)时估算不可信:不升不降,留 primary(稳妥)。"""
@@ -211,9 +211,27 @@ async def _write_results(final: dict, job_id: str, subfolder: str, cfg: dict) ->
     """把 Modal 返回的产物写到 output/<subfolder>/<job_id>/,返回 outputs 列表。
     每个产物二选一:小文件 data_base64(解码落盘);大文件 volume_path(从 Volume 直连下载落盘)。
     否则回退单图 data_base64 / image_url。写失败 raise(由调用方转 502)。"""
-    out_dir = _output_dir() / subfolder / job_id
+    # 囚笼:job_id / subfolder 都参与拼路径,必须确认结果仍在 output/ 内。
+    # filename 早就做了 basename 防逃逸,job_id 这条以前是漏的(它来自 HTTP body,
+    # {"job_id": "../../x"} 就能写到 output 之外)。入口有正则,这里再兜一层:
+    # 本地 API 无鉴权(设计如此,同机任意进程都能打),单点校验不够。
+    out_root = _output_dir().resolve()
+    out_dir = (out_root / subfolder / job_id).resolve()
+    try:
+        out_dir.relative_to(out_root)
+    except ValueError:
+        raise ValueError(f"unsafe output path: subfolder={subfolder!r} job_id={job_id!r}")
     out_dir.mkdir(parents=True, exist_ok=True)
     outputs, seen = [], set()
+
+    def _atomic_write(dst: Path, data: bytes) -> int:
+        """先写 .part 再 rename —— 半截文件不能以正式名出现在 output/ 里。
+        ComfyUI 的画廊/前端会直接读这个目录,写到一半被读到就是一张坏图;
+        Volume 下载那条路径(bridge_client / modal_volume)早就是 .part+rename 了,这边补齐。"""
+        tmp = dst.with_suffix(dst.suffix + ".part")
+        tmp.write_bytes(data)
+        tmp.replace(dst)
+        return len(data)
 
     def _dedup(fn: str) -> str:
         if fn not in seen:
@@ -241,9 +259,7 @@ async def _write_results(final: dict, job_id: str, subfolder: str, cfg: dict) ->
                     raise RuntimeError(f"volume download {vp} failed: {e}")
                 await asyncio.to_thread(modal_volume.remove_volume_path, cfg, vp)
             else:
-                data = base64.b64decode(b64)
-                local.write_bytes(data)
-                size = len(data)
+                size = _atomic_write(local, base64.b64decode(b64))
             outputs.append({"filename": fn, "subfolder": f"{subfolder}/{job_id}",
                             "type": "output", "size_bytes": size,
                             "node_id": img.get("node_id"),  # 来源节点 → 前端按节点回填
@@ -255,19 +271,18 @@ async def _write_results(final: dict, job_id: str, subfolder: str, cfg: dict) ->
     b64 = final.get("data_base64")
     image_url = final.get("image_url")
     if b64:
-        data = base64.b64decode(b64)
-        (out_dir / fn).write_bytes(data)
+        size = _atomic_write(out_dir / fn, base64.b64decode(b64))
         outputs.append({"filename": fn, "subfolder": f"{subfolder}/{job_id}",
-                        "type": "output", "size_bytes": len(data)})
+                        "type": "output", "size_bytes": size})
     elif image_url:
         async with aiohttp.ClientSession() as s:
             async with s.get(image_url) as r:
                 if r.status >= 400:
                     raise RuntimeError(f"download {image_url} failed: {r.status}")
                 data = await r.read()
-        (out_dir / fn).write_bytes(data)
+        size = _atomic_write(out_dir / fn, data)
         outputs.append({"filename": fn, "subfolder": f"{subfolder}/{job_id}",
-                        "type": "output", "size_bytes": len(data), "source_url": image_url})
+                        "type": "output", "size_bytes": size, "source_url": image_url})
     return outputs
 
 
@@ -316,7 +331,8 @@ async def _run_streamed(resp: web.StreamResponse, cmd: list[str], cwd: str, env:
     """跑一个命令,stdout/stderr 实时流式回前端,返回 returncode(找不到可执行文件返回 127)。
     用线程 + subprocess.Popen(不走 asyncio 子进程)——避免 Windows 上事件循环不支持
     子进程(SelectorEventLoop → NotImplementedError)的坑,Mac/Linux/Win 一致。"""
-    await _emit(resp, f"$ {' '.join(cmd)}\n")
+    # ⚠ 用 redact_cmd 而不是 ' '.join —— secret create 的 argv 里是明文凭据,见 node_sync.redact_cmd
+    await _emit(resp, f"$ {node_sync.redact_cmd(cmd)}\n")
 
     def work(emit):
         try:
@@ -347,14 +363,17 @@ _UPLOAD_LOCK = asyncio.Lock()
 # 打同一个 app 也会冲突。整段(写文件 + deploy)包进同一把锁。
 _DEPLOY_LOCK = asyncio.Lock()
 
-# poll 记日志用:job_id → 上次见到的 status(只在变化时打日志,避免高频 poll 刷屏)
+# poll 记日志用:job_id → 上次见到的 status(只在变化时打日志,避免高频 poll 刷屏)。
+# 走到终态会 pop,但**没走到终态就没人再 poll 的**(关 tab / 断网)会留下来,而 ComfyUI 是
+# 长跑进程。条目很小,cap 一下就够,不值得为它上 TTL。
 _LAST_POLL_STATUS: dict = {}
+_LAST_POLL_MAX = 500
 
 
 async def _run_blocking_streamed(resp: web.StreamResponse, fn):
     """在线程里跑一个阻塞函数 fn(emit),emit(line) 线程安全地把日志流式写回 resp。
     返回 fn 的返回值。用于 Volume 上传这种阻塞 + 想要实时进度的场景。"""
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()  # get_event_loop 在运行中的循环里已 deprecated
     q: asyncio.Queue = asyncio.Queue()
 
     def emit(line: str):
@@ -534,6 +553,9 @@ def _setup_routes():
         # 这样即使前端超时/放弃,ComfyUI 日志里也能看到 job 走到了哪一步、为何失败。
         st = data.get("status") if isinstance(data, dict) else None
         if st and _LAST_POLL_STATUS.get(job_id) != st:
+            if len(_LAST_POLL_STATUS) >= _LAST_POLL_MAX:
+                for _old in list(_LAST_POLL_STATUS)[: _LAST_POLL_MAX // 5]:  # dict 有序,删最早的一批
+                    _LAST_POLL_STATUS.pop(_old, None)
             _LAST_POLL_STATUS[job_id] = st
             if st == "failed":
                 print(f"[modal_bridge] ⚠ job {job_id} FAILED: {(data.get('error') or '')[:300]}")
@@ -566,6 +588,8 @@ def _setup_routes():
         final = body.get("modal_state")  # 前端 poll 拿到的最终状态对象
         if not job_id or not isinstance(final, dict):
             return web.json_response({"error": "job_id + modal_state required"}, status=400)
+        if not contract.is_safe_job_id(job_id):   # 见 contract.is_safe_job_id 的注释
+            return web.json_response({"error": "bad job_id"}, status=400)
 
         cfg = cfg_mod.load_config()
         subfolder = cfg.get("output_subfolder", "modal_results")
@@ -1056,7 +1080,7 @@ def _setup_routes():
 
         # ComfyUI 版本跟随本机:检测本机版本 → 解析云端 clone tag(无对应取最接近,只警告不中止)
         comfyui_version = node_sync.detect_local_comfyui_version()
-        _tags = await asyncio.get_event_loop().run_in_executor(None, node_sync.list_comfyui_tags)
+        _tags = await asyncio.to_thread(node_sync.list_comfyui_tags)
         comfyui_tag, _tag_note = node_sync.resolve_comfyui_tag(comfyui_version, _tags)
 
         # 合并出完整 config(用于 deploy_env + 最终落盘)

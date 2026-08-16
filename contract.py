@@ -1,9 +1,27 @@
 """
-contract.py — 版本 / GPU 契约的纯计算(无副作用,可单测)。
+contract.py — routes.py 的纯计算(无副作用,可单测)。
 
-routes.py 的 /version 路由调用 compute_contract。抽成纯函数是为了能单测、防回归
-(契约逻辑直接决定前端会不会拦截 RunModal、逼用户重新部署)。
+routes.py 本身 import 不进测试(相对导入 + 依赖 ComfyUI 的 folder_paths),所以它那些
+「决定行为对错」的判断都抽到这里:版本/GPU 契约(compute_contract,直接决定前端会不会
+拦截 RunModal)、外部输入的合法性(is_safe_job_id)。
 """
+import re
+
+# job_id 会拼进本地落盘路径(output/<subfolder>/<job_id>/)。云端产生的 id 是 uuid4
+# 或 AIGC Studio 的任务 UUID,都在这个字符集内;别的一律拒。
+_SAFE_JOB_ID = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
+
+
+def is_safe_job_id(job_id) -> bool:
+    """job_id 能不能安全地拼进文件路径。
+
+    ⚠ /fetch_result 的 job_id 直接来自 HTTP body,而本地 API 无鉴权(设计如此,同机任意
+    进程都能打)。filename 一直有 basename 防逃逸,job_id 以前没有 —— {"job_id": "../../x"}
+    就能把 base64 内容写到 output 目录之外。插件对 folders / path / blend_path 都做了囚笼,
+    这里是漏的那个。"""
+    return (isinstance(job_id, str)
+            and bool(_SAFE_JOB_ID.match(job_id))
+            and ".." not in job_id)
 
 
 def compute_contract(local, deployed, reachable, local_gpu, deployed_gpu,

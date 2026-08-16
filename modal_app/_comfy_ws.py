@@ -19,6 +19,9 @@ import websocket
 COMFY_HOST = "127.0.0.1:8188"
 WS_RECONNECT_ATTEMPTS = 5
 WS_RECONNECT_DELAY_S = 3
+# WS 静默这么久就查一次 /history 兜底(见 _history_settled)。60s 远长于任何正常消息间隔,
+# 又远短于 worker 超时,探测开销(一次本地 HTTP)可忽略。
+WS_IDLE_PROBE_S = 60
 
 # 产物文件扩展名(图 / 视频 / 3D):用于从异构 history 输出里识别"这是个要回传的产物文件",
 # 并给每个产物打 asset_type(image/video/model3d,aigc-r2 交付的 intake 契约要)。
@@ -91,6 +94,45 @@ def _attempt_ws_reconnect(ws_url, max_attempts, delay_s, initial_error):
             if i < max_attempts - 1:
                 time.sleep(delay_s)
     raise websocket.WebSocketConnectionClosedException(f"reconnect failed: {last_err}")
+
+
+def _history_settled(prompt_id: str) -> tuple[bool, list[str]]:
+    """查 /history 判断这个 prompt 是否已经终结(跑完或跑挂),返回 (已终结, 错误列表)。
+
+    ⚠ 为什么需要这个:ComfyUI 的 WS 是广播且不重放 —— 断线窗口里推的 `executing:node=None`
+    完成事件永远补不回来。而主循环的退出条件只有「收到完成/错误事件」,没有超时分支
+    (recv 超时是 continue)。于是丢一次完成事件 = 循环空转到 Modal function timeout 才被杀:
+    烧满 worker_timeout 的钱、零产出、报一个跟真实原因无关的错。history 是 ComfyUI 的权威
+    终态,拿它兜底。
+
+    这里故意不加「主循环绝对超时」:那会引入第二个与 worker_timeout_sec 手动同步的旋钮
+    (前端 timeoutSec 已经因此踩过坑),而空转的根因是丢事件,堵住它就够;真正的绝对上限
+    由 Modal function timeout 承担。
+
+    查不到 / 查失败一律返回 (False, []) —— 兜底绝不能制造假终态。"""
+    try:
+        h = get_history(prompt_id).get(prompt_id)
+    except Exception as e:
+        print(f"[bridge] history probe failed: {e}")
+        return False, []
+    if not isinstance(h, dict):
+        return False, []
+    st = h.get("status") if isinstance(h.get("status"), dict) else None
+    if st is None:
+        # 老版 ComfyUI 没有 status 字段:有 outputs 就算跑完
+        return (True, []) if h.get("outputs") else (False, [])
+    if st.get("status_str") == "error":
+        detail = ""
+        for m in st.get("messages") or []:
+            if isinstance(m, (list, tuple)) and len(m) >= 2 and m[0] == "execution_error":
+                d = m[1] if isinstance(m[1], dict) else {}
+                detail = (f"Node {d.get('node_id')} ({d.get('node_type')}): "
+                          f"{d.get('exception_message')}")
+                break
+        return True, [f"(from history) {detail or str(st.get('messages'))[:200]}"]
+    if st.get("completed"):
+        return True, []
+    return False, []
 
 
 def upload_images(images: list[dict]) -> dict:
@@ -346,9 +388,23 @@ def run_workflow(workflow: dict, job_id: str, input_images: list[dict] | None = 
         print(f"[bridge] queued workflow {prompt_id}")
 
         execution_done = False
+        last_msg_at = time.time()   # 最近一次收到 WS 消息的时刻(静默探测用)
+
+        def _settle_from_history(why: str) -> bool:
+            """查 history,已终结则把结果写进闭包变量并返回 True(由 caller break)。"""
+            nonlocal execution_done
+            done, herrs = _history_settled(prompt_id)
+            if not done:
+                return False
+            print(f"[bridge] {why} → history 显示已终结{'(有错误)' if herrs else ''},收尾")
+            execution_done = not herrs
+            errors.extend(herrs)
+            return True
+
         while True:
             try:
                 out = ws.recv()
+                last_msg_at = time.time()
                 if not isinstance(out, str):
                     continue
                 msg = json.loads(out)
@@ -374,9 +430,19 @@ def run_workflow(workflow: dict, job_id: str, input_images: list[dict] | None = 
                         )
                         break
             except websocket.WebSocketTimeoutException:
+                # 静默超过阈值 → 查 history 兜底(可能完成事件在某次抖动里丢了)
+                if time.time() - last_msg_at >= WS_IDLE_PROBE_S:
+                    last_msg_at = time.time()
+                    if _settle_from_history(f"WS 静默 {WS_IDLE_PROBE_S}s"):
+                        break
                 continue
             except websocket.WebSocketConnectionClosedException as e:
                 ws = _attempt_ws_reconnect(ws_url, WS_RECONNECT_ATTEMPTS, WS_RECONNECT_DELAY_S, e)
+                # ⚠ 断线窗口里推的完成事件不会重发,重连后必须立刻对一次 history,
+                # 否则这个 job 会一直等一条永远不会再来的消息。
+                if _settle_from_history("WS 重连"):
+                    break
+                last_msg_at = time.time()
             except json.JSONDecodeError:
                 continue
 

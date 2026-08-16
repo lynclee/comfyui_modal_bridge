@@ -9,6 +9,8 @@ clone + 装依赖这两层。
 模型不进镜像 — Volume 挂到 /comfy-volume/models/
 """
 import os as _os
+from shlex import quote as _q
+
 import modal
 from pathlib import Path
 
@@ -40,11 +42,14 @@ if not _EXTRA_MODEL_PATHS_YAML.exists():
 
 
 def _clone_one(n: dict) -> str:
-    """生成单个 custom_node 的 clone(+ 可选 checkout)命令。"""
-    base = f"git clone {n['url']} /comfyui/custom_nodes/{n['name']}"
+    """生成单个 custom_node 的 clone(+ 可选 checkout)命令。
+    ⚠ url / name / commit 都插值进 shell,必须 quote:节点文件夹名含空格(Windows 用户常见)
+    或 url 带 shell 元字符会让整个镜像 build 崩,报错还很难和"哪个节点"对上号。"""
+    path = _q(f"/comfyui/custom_nodes/{n['name']}")
+    base = f"git clone {_q(n['url'])} {path}"
     commit = (n.get("commit") or "").strip()
     if commit:
-        return f"{base} && cd /comfyui/custom_nodes/{n['name']} && git checkout {commit}"
+        return f"{base} && cd {path} && git checkout {_q(commit)}"
     return base
 
 
@@ -53,13 +58,17 @@ _CLONE_CMD = " && ".join([
     *[_clone_one(n) for n in CUSTOM_NODES],
 ])
 
+
+def _install_reqs_one(n: dict) -> str:
+    req = _q(f"/comfyui/custom_nodes/{n['name']}/requirements.txt")
+    return (f"if [ -f {req} ]; then pip install -r {req}; "
+            f"else echo {_q('no requirements for ' + n['name'])}; fi")
+
+
 # ⚠ 空清单(全新安装 / 没同步过节点)时 join 出空串 → .run_commands("") 会生成空 RUN,
 # Modal 直接拒绝("the 'RUN' Dockerfile command is not supported")。所以空时兜底成一个 no-op。
 _INSTALL_REQS_CMD = " && ".join(
-    f"if [ -f /comfyui/custom_nodes/{n['name']}/requirements.txt ]; then "
-    f"pip install -r /comfyui/custom_nodes/{n['name']}/requirements.txt; "
-    f"else echo 'no requirements for {n['name']}'; fi"
-    for n in CUSTOM_NODES
+    _install_reqs_one(n) for n in CUSTOM_NODES
 ) or "echo 'no custom_nodes — skip requirements'"
 
 # ⚠ cuda_image 不止 modal_app.py 用 —— snapshot_bench.py / node_compat_check.py 两个旁路

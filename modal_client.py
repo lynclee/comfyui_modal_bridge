@@ -2,6 +2,7 @@
 modal_client.py — 调用 Modal endpoint(私有 endpoint,自建鉴权:GET 走 ?key=,POST 走 body auth_key)
 """
 import asyncio
+import uuid
 from typing import Optional
 
 import aiohttp
@@ -42,6 +43,11 @@ async def submit_job(
         # 旧 incognito 字段已删:服务端从未消费,语义由 delivery.mode 取代。
         "delivery": {"mode": "desktop"},
         "auth_key": _key(cfg),
+        # 幂等键:客户端定 job_id,下面的重试循环用同一个。
+        # 不带的话服务端每次 uuid4 新建,而 502/504/超时的那一次 spawn 可能其实已经成功
+        # (只是响应丢在网关)—— 重试就等于再开一个同样的 GPU 任务,双跑双计费,
+        # 前端只拿得到第二个 id,第一个在后台烧到跑完谁也不知道。
+        "job_id": str(uuid.uuid4()),
     }
     if input_images:
         payload["images"] = input_images
@@ -83,12 +89,23 @@ async def submit_job(
 
 
 async def health(session, cfg) -> dict:
+    """健康检查。⚠ 必须查 HTTP 状态码:401 的 body 也是合法 JSON({"error": ...}),
+    以前无脑 return 会让 /modal_bridge/health 把它包成 {"ok": True, "modal": {"error": ...}},
+    key 错了用户看到的却是"健康检查通过"—— 最误导的一类假阳性。"""
     url = _endpoint(cfg["modal_endpoint_base"], "health")
     last = None
     for attempt in range(3):
         try:
             async with session.get(url, params={"key": _key(cfg)},
                                    timeout=aiohttp.ClientTimeout(total=10)) as r:
+                if r.status == 401:
+                    # 重试无意义,直接抛(RuntimeError 不在下面的 except 里,会冒到调用方)
+                    raise RuntimeError("Modal /health 401 — bridge key 不对/缺失。"
+                                       "点 [Modal Setup] 重新部署会刷新 key")
+                if r.status >= 400:
+                    last = RuntimeError(f"Modal /health {r.status}: {(await r.text())[:200]}")
+                    await asyncio.sleep(1.0)
+                    continue
                 return await r.json(content_type=None)
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
             last = e

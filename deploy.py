@@ -30,7 +30,8 @@ APP_NAME = "comfyui-bridge"
 
 
 def run(cmd, **kw):
-    print(f"$ {' '.join(cmd)}")
+    # 凭据打码后再回显(secret create 的 argv 里是明文 token,见 node_sync.redact_cmd)
+    print(f"$ {node_sync.redact_cmd(cmd)}")
     return subprocess.run(cmd, **kw).returncode
 
 

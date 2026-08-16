@@ -603,6 +603,36 @@ def node_compat_check_command() -> list[str]:
     return [sys.executable, "-m", "modal", "run", "node_compat_check.py"]
 
 
+# 命令行里长这样的 KEY=VALUE,VALUE 属于凭据,回显必须打码。
+# 只匹配 key 名里的这几个词,别的(如 AIGC_STUDIO_BASE_URL)保持明文 —— 排查问题要看得见。
+_SECRETISH = ("KEY", "TOKEN", "SECRET", "PASSWORD", "CREDENTIAL")
+_KV_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)=(.*)$", re.S)
+
+
+def redact_cmd(cmd: list[str]) -> str:
+    """把命令行拼成可回显的字符串,凭据打码。
+
+    ⚠ secret_create_cmd 把 BRIDGE_API_KEY / HF_TOKEN / CIVITAI_TOKEN 等**明文写在 argv 里**
+    (modal secret create 的调用形式就是这样)。部署面板会把命令行流式回显给浏览器,
+    用户复制这段日志求助 = 全套凭据外泄。插件其它地方对密钥都很小心(/config 抹 secret、
+    delivery token 不落 job_state),这条是最宽的口子。
+    保留 key 名和长度,够长的再露前 4 位(hf_ / bk- 这类前缀对排查有用)—— 够判断
+    "是不是贴错了/贴空了",又不足以复用。短值一位都不露:8 位的东西露 4 位等于露一半。
+    key 名命中即打码,宁滥勿缺:多打一个的代价是日志少看一个值,漏一个是事故。"""
+    parts = []
+    for a in cmd:
+        m = _KV_RE.match(a)
+        if m and any(w in m.group(1).upper() for w in _SECRETISH):
+            k, v = m.group(1), m.group(2)
+            if not v:
+                parts.append(f"{k}=(empty)")
+            else:
+                parts.append(f"{k}={v[:4] if len(v) >= 12 else ''}***(len={len(v)})")
+        else:
+            parts.append(a)
+    return " ".join(parts)
+
+
 def secret_create_cmd(cfg: dict, hf_token: str = "", civitai_token: str = "",
                       bridge_key: str = "", comfy_api_key: str = "",
                       aigc_base_url: str = "", aigc_bypass_secret: str = "") -> list[str]:

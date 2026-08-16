@@ -22,6 +22,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from pathlib import Path
 
 
@@ -87,8 +88,10 @@ class BridgeClient:
                    "user_id": "bridge-client"}
         if input_images:
             payload["images"] = input_images
-        if job_id:
-            payload["job_id"] = job_id
+        # 幂等键:客户端定 job_id,重试用同一个 —— _req 对 502/503/504 和网络错会重试,
+        # 而 spawn 可能在第一次就已经成功(响应丢在网关)。不带 id 的话服务端每次新建 uuid,
+        # 重试 = 再开一个一模一样的 GPU 任务,双跑双计费,调用方只看得到第二个。
+        payload["job_id"] = job_id or str(uuid.uuid4())
         d = self._post("run", payload)
         if "error" in d:
             raise BridgeError(f"/run: {d['error']}")
