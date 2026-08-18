@@ -1465,6 +1465,70 @@ def test_delivery_helpers():
     assert not ad.is_retryable_status(401) and not ad.is_retryable_status(400)
 
 
+def test_local_nodes_orphan_zip_marks_unknown_digest(tmp_path):
+    """残包(有 .zip 无 .digest)解压后必须留下"未知版本"痕迹。
+
+    这是一条完整的静默错误链:Volume 上删 zip 失败、digest 却删成功 → 冷容器照样解压出
+    旧本地代码,但因为没有 .digest 而不写 marker → needs_refresh 看不到 marker,把容器
+    判成「已经是 baked」→ 早该退场的旧覆盖版一直跑下去,日志全绿、无人察觉。"""
+    sys.path.insert(0, str(ROOT / "modal_app"))
+    import _local_nodes_boot as boot
+    import zipfile
+    vol, dest = tmp_path / "_local_nodes", tmp_path / "custom_nodes"
+    vol.mkdir(parents=True)
+    dest.mkdir(parents=True)
+    with zipfile.ZipFile(vol / "mynode.zip", "w") as z:
+        z.writestr("__init__.py", "# 旧的本地代码")
+    # 故意不写 mynode.digest —— 这就是残包
+    orig_vol, orig_dest = boot.VOL_DIR, boot.DEST_DIR
+    boot.VOL_DIR, boot.DEST_DIR = vol, dest
+    try:
+        assert boot.extract_all() == ["mynode"]
+        marker = dest / "mynode" / ".mb_local_digest"
+        assert marker.exists(), "残包解压后必须留 marker,否则会被误判成 baked"
+        assert marker.read_text(encoding="utf-8").strip() == boot.UNKNOWN_DIGEST
+        # 两条路都得能自愈:声明 baked → 判定该退场;声明具体指纹 → 判定要重装。
+        assert boot.needs_refresh({"mynode": boot.BAKED_SENTINEL}) == ["mynode"]
+        assert boot.needs_refresh({"mynode": "realdigest"}) == ["mynode"]
+    finally:
+        boot.VOL_DIR, boot.DEST_DIR = orig_vol, orig_dest
+
+
+def test_remove_local_node_keeps_digest_when_zip_delete_fails():
+    """zip 没删掉就必须停手,不能接着删 digest —— 那正是上一条测试里那种残包的来源。"""
+    import local_nodes as ln
+    calls = []
+
+    class _Vol:
+        def remove_file(self, path, recursive=False):
+            calls.append(path)
+            if path.endswith(".zip"):
+                raise RuntimeError("boom: volume unavailable")
+
+    orig = ln._mv
+    ln._mv = lambda: types.SimpleNamespace(get_volume=lambda cfg: _Vol())
+    try:
+        res = ln.remove_volume_local_node({}, "mynode")
+    finally:
+        ln._mv = orig
+    assert res["ok"] is False, "删除失败必须如实回报"
+    assert any(c.endswith(".zip") for c in calls)
+    assert not any(c.endswith(".digest") for c in calls), \
+        f"zip 删失败后不该再动 digest,实际调用: {calls}"
+
+
+def test_job_id_rule_identical_local_and_cloud():
+    """job_id 白名单在本地(contract)和云端(modal_app)各有一份 —— 云端不能 import
+    contract,那个模块不在镜像的 add_local_python_source 名单里。两份必须逐字一致:
+    规则漂移 = 一边挡住的脏 id 另一边照单全收,而这个 id 会被拿去 remove_file(recursive)。"""
+    import re
+    pat = re.compile(r"_SAFE_JOB_ID = re\.compile\((r?['\"].*?['\"])\)")
+    a = pat.search((ROOT / "modal_app" / "modal_app.py").read_text(encoding="utf-8"))
+    b = pat.search((ROOT / "contract.py").read_text(encoding="utf-8"))
+    assert a and b, "云端与本地都应有 _SAFE_JOB_ID 定义"
+    assert a.group(1) == b.group(1), f"规则漂移: 云端 {a.group(1)} vs 本地 {b.group(1)}"
+
+
 # ============================================================================
 # 无 pytest 时的简易运行器
 # ============================================================================

@@ -180,8 +180,11 @@ const I18N = {
                         en: "Not deployed yet. Click [⚙️ Modal Setup] top-right to deploy with your token (no terminal)." },
   "toast.fail":       { zh: "✗ {wf} 失败:{msg}", en: "✗ {wf} failed: {msg}" },
   "toast.recovered":  { zh: "✓ {wf} 恢复完成 → output/{sf}/", en: "✓ {wf} recovered → output/{sf}/" },
-  "toast.still":      { zh: "Job {id} 仍在 {status};重新点 [☁️ Modal] 监控", en: "Job {id} still {status}; click [☁️ Modal] again to monitor" },
-  "stage.still":      { zh: "still {status};重新点 [☁️ Modal] 监控", en: "still {status}; click [☁️ Modal] again" },
+  "stage.recovering": { zh: "恢复中 · {status}(job {id})", en: "recovering · {status} (job {id})" },
+  "stage.recover_p":  { zh: "恢复中 · {step}/{total} 步 · {sit}s/it", en: "recovering · step {step}/{total} · {sit}s/it" },
+  "toast.recover_to": { zh: "⚠ Job {id} 恢复等待超时,已请求取消云端任务", en: "⚠ Job {id} recovery timed out; cancel requested" },
+  "cancel.noop":      { zh: "取消没赶上 —— 云端已跑完(费用已产生),正在取回结果",
+                        en: "Too late to cancel — the job already finished (already billed); fetching the result" },
   "ver.unreach_toast":{ zh: "云端连不上(app 可能没部署/被删)。点 [⚙️ Modal Setup] 重新部署",
                         en: "Cloud unreachable (app maybe undeployed/deleted). Click [⚙️ Modal Setup] to redeploy." },
   "ver.mismatch_toast":{ zh: "插件版本 {local} 与云端部署的 {deployed} 不一致,需重新部署。",
@@ -905,6 +908,54 @@ function removeActiveJob(jobId) {
   saveLS(LS_KEYS.activeJob, a.filter((x) => x.jobId !== jobId));
 }
 
+// 请求取消云端任务并**校验结果**。主流程和刷新恢复共用一份 —— 两处行为必须一致,
+// 否则会出现"恢复的卡片点了取消其实没取消"这种只在某条路径上成立的谎报。
+// 取消失败 = 云端还在跑还在计费,必须弹到用户面前;取消没赶上(cancel_noop)= 产物已生成
+// 且已计费,直接取回落盘,别因为点过取消就把付过钱的东西丢掉。
+async function requestCancel(jobId, ctx, wfName = null) {
+  let d;
+  try {
+    const r = await api.fetchApi("/modal_bridge/cancel", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ job_id: jobId }),
+    });
+    d = await r.json().catch(() => ({}));
+    if (!r.ok || d.ok === false || d.error) {
+      const msg = d.error || `HTTP ${r.status}`;
+      err("cancel failed", msg);
+      if (ctx) ctx.finish(false, t("cancel.failed"));
+      alert(t("cancel.failed_msg", { msg }));
+      return false;
+    }
+  } catch (e) {
+    err("cancel failed", e);
+    if (ctx) ctx.finish(false, t("cancel.failed"));
+    alert(t("cancel.failed_msg", { msg: String(e) }));
+    return false;
+  }
+  if (d.cancel_noop && d.status === "completed") {
+    notify(t("cancel.noop"), "warn");
+    try {
+      const fr = await api.fetchApi("/modal_bridge/fetch_result", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ job_id: jobId, modal_state: d }),
+      });
+      const fd = await fr.json();
+      if (fd.ok) {
+        const sf = fd.outputs?.[0]?.subfolder || "modal_results";
+        // 卡片此刻停在乐观的 "✕ Cancelled" 上,但结果其实拿到了 —— 改成如实的。
+        if (ctx) ctx.finish(true, "✓ Done (cancel too late)");
+        notify(t("toast.recovered", { wf: wfName ? "「" + wfName + "」" : "", sf }), "success");
+      } else {
+        err("cancel_noop fetch failed", fd);
+      }
+    } catch (e) { err("cancel_noop fetch failed", e); }
+  }
+  return d;
+}
+
 async function runOnceOnModal(workflowPrompt, outputNodeIds, ctx, submitGuard, batchInfo = null) {
   // batchInfo: {current, total}
   const batchSuffix = batchInfo ? `[${batchInfo.current}/${batchInfo.total}] ` : "";
@@ -944,24 +995,7 @@ async function runOnceOnModal(workflowPrompt, outputNodeIds, ctx, submitGuard, b
     ctx.finish(false, "✕ Cancelled");
     // 告诉 Modal 取消。UI 先乐观置为已取消(响应快),但**必须校验结果** ——
     // 取消失败意味着云端还在跑、还在计费,不能让 "✕ Cancelled" 骗过用户。
-    try {
-      const r = await api.fetchApi("/modal_bridge/cancel", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ job_id: jobId }),
-      });
-      const d = await r.json().catch(() => ({}));
-      if (!r.ok || d.ok === false || d.error) {
-        const msg = d.error || `HTTP ${r.status}`;
-        err("cancel failed", msg);
-        ctx.finish(false, t("cancel.failed"));
-        alert(t("cancel.failed_msg", { msg }));
-      }
-    } catch (e) {
-      err("cancel failed", e);
-      ctx.finish(false, t("cancel.failed"));
-      alert(t("cancel.failed_msg", { msg: String(e) }));
-    }
+    await requestCancel(jobId, ctx, ctx.wfName);
   });
   log("submitted", jobId, "gpu=" + gpu);
 
@@ -1077,15 +1111,10 @@ async function runOnceOnModal(workflowPrompt, outputNodeIds, ctx, submitGuard, b
     // 前端停止 poll 之后没有任何人会去 fetch_result,而上面的 finally 已把这个 job 移出
     // 「未完成 job」恢复列表 —— 也就是说不取消的话:worker 会一路跑到它自己的超时上限
     // (worker_timeout_sec)为止,全程计费,而跑出来的产物再也取不回来。所以主动取消止损。
-    try {
-      await api.fetchApi("/modal_bridge/cancel", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ job_id: jobId }),
-      });
-    } catch (e) {
-      err("cancel after polling timeout failed", e);
-    }
+    // 走共享的 requestCancel:取消失败会弹到用户面前(以前只 err 到 console),
+    // 且如果超时那一刻云端恰好跑完(cancel_noop),产物会被取回落盘而不是白丢。
+    // 仍然 throw —— 这条路径上工作流回填已经不可能了,如实报超时,产物在 output/ 里。
+    await requestCancel(jobId, null, ctx.wfName);
     throw new Error(`[job ${jobId}] Polling timed out(前端等待超时,已请求取消云端任务)`);
   }
   if (final.status === "cancelled") {
@@ -1429,50 +1458,110 @@ async function recoverPendingJob() {
   // 丢弃过期的,其余各自恢复(并行,每个一张卡)。过期线跟提交时那条一致:
   // max(前端设置, 云端 worker 上限 + 3 分钟尾巴),老条目没存 workerTimeoutSec 则退化为纯设置值。
   const settingSec = getSetting("ModalBridge.timeoutSec", 1200);
-  const fresh = pending.filter((j) => {
-    if (!j?.jobId) return false;
+  const fresh = [];
+  for (const j of pending) {
+    if (!j?.jobId) continue;
     const maxAgeSec = Math.max(settingSec, j.workerTimeoutSec ? j.workerTimeoutSec + 180 : 0);
-    return (Date.now() - j.startedAt) / 1000 <= maxAgeSec;
-  });
-  saveLS(LS_KEYS.activeJob, fresh);
-  for (const j of fresh) recoverOne(j);
+    if ((Date.now() - j.startedAt) / 1000 <= maxAgeSec) fresh.push([j, maxAgeSec]);
+  }
+  saveLS(LS_KEYS.activeJob, fresh.map(([j]) => j));
+  for (const [j, maxAgeSec] of fresh) recoverOne(j, maxAgeSec);
 }
 
-async function recoverOne(pending) {
-  log("recovering pending job:", pending.jobId);
+// 刷新页面后接管一个还没终结的 job:**一直轮询到它真的终结**。
+// ⚠ 这里以前只 poll 一次:还在 queued/running 就结束卡片、并在 finally 里
+// removeActiveJob —— 任务继续在云端跑到底、继续计费,而前端把它从恢复名单里删了,
+// 再没有任何人会来取结果。产物就这么烂在 Volume 上直到 TTL 被 GC。
+// 网络抖动那条路更糟:catch 完同样删记录,一次瞬时失败 = 永久失联。
+async function recoverOne(pending, maxAgeSec) {
+  const jobId = pending.jobId;
+  const short = jobId.slice(0, 8);
+  log("recovering pending job:", jobId);
   const ctx = newProgress("queued", pending.wfName || null);
-  ctx.stage("queued", `recover job=${pending.jobId.slice(0, 8)}`);
+  ctx.stage("queued", `recover job=${short}`, true);
+
+  let cancelled = false;
+  ctx.setCancel(jobId, async () => {
+    if (!confirm(`Cancel Modal job ${short}?`)) return;
+    cancelled = true;
+    removeActiveJob(jobId);
+    ctx.finish(false, "✕ Cancelled");
+    await requestCancel(jobId, ctx, pending.wfName);
+  });
+
+  // 截止线从**任务原本的提交时刻**算,不是从"现在" —— 否则刷一次页面就等于给它续一个
+  // 完整的超时窗口,一个早该被止损的任务靠反复刷新可以无限续命。与 recoverPendingJob
+  // 过滤过期条目用的是同一个 maxAgeSec,两处不会各算各的。
+  const deadline = (pending.startedAt || Date.now()) + maxAgeSec * 1000;
+  const interval = getSetting("ModalBridge.pollIntervalSec", 1.2) * 1000;
+
+  let final = null;
+  while (Date.now() < deadline) {
+    if (cancelled) return;
+    let pData;
+    try {
+      const pRes = await api.fetchApi(`/modal_bridge/poll?job_id=${encodeURIComponent(jobId)}`);
+      pData = await pRes.json();
+    } catch (e) {
+      // 临时网络错误只能重试,绝不能借机结束这张卡(见函数头注释)。
+      log("recover poll error (will retry)", e);
+      await sleep(interval);
+      continue;
+    }
+    if (pData.status === "completed" || pData.status === "failed" || pData.status === "cancelled") {
+      final = pData;
+      break;
+    }
+    if (pData.status === "running" || pData.status === "queued") {
+      const p = pData.progress;
+      ctx.stage(pData.status,
+        (p && p.step >= 1 && p.total > 1)
+          ? t("stage.recover_p", { step: p.step, total: p.total, sit: (p.s_it || 0).toFixed(1) })
+          : t("stage.recovering", { id: short, status: pData.status }),
+        true);
+    }
+    // 没有 status 的响应(纯接口错误)按临时错误处理,与主 poll 循环一致:落到这里重试。
+    await sleep(interval);
+  }
+  if (cancelled) return;
+
+  if (!final) {
+    // 到截止线仍未终结:和主流程一样主动取消止损 —— 这之后再没有人会 poll 它,
+    // 不取消的话 worker 会一路跑到自己的上限,全程计费而产物取不回。
+    removeActiveJob(jobId);
+    ctx.finish(false, "✗ recover timeout");
+    notify(t("toast.recover_to", { id: short }), "warn");
+    await requestCancel(jobId, ctx, pending.wfName);
+    return;
+  }
+  if (final.status !== "completed") {
+    removeActiveJob(jobId);
+    ctx.finish(false, `✗ ${final.status}`, final.error || null);
+    return;
+  }
+
+  ctx.stage("downloading", "Fetching result of recovered job...", false);
   try {
-    const pRes = await api.fetchApi(`/modal_bridge/poll?job_id=${encodeURIComponent(pending.jobId)}`);
-    const pData = await pRes.json();
-    if (pData.status === "completed") {
-      ctx.stage("downloading", "Fetching result of recovered job...");
-      const fr = await api.fetchApi("/modal_bridge/fetch_result", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ job_id: pending.jobId, modal_state: pData }),
-      });
-      const fd = await fr.json();
-      // 恢复时画板多半已不是当时的工作流 → 不强行回填,提示存盘路径
-      if (fd.ok) {
-        const sf = fd.outputs?.[0]?.subfolder || "modal_results";
-        ctx.finish(true, "✓ Recovered");
-        notify(t("toast.recovered", { wf: pending.wfName ? "「" + pending.wfName + "」" : "", sf }), "success");
-      } else {
-        ctx.finish(false, "✗ Recover fetch failed", JSON.stringify(fd));
-      }
-    } else if (pData.status === "running" || pData.status === "queued") {
-      ctx.stage(pData.status, t("stage.still", { status: pData.status }));
-      notify(t("toast.still", { id: pending.jobId.slice(0, 8), status: pData.status }), "warn");
-      ctx.finish(true, `· ${pData.status}`);
+    const fr = await api.fetchApi("/modal_bridge/fetch_result", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ job_id: jobId, modal_state: final }),
+    });
+    const fd = await fr.json();
+    // 恢复时画板多半已不是当时的工作流 → 不强行回填,提示存盘路径
+    if (fd.ok) {
+      removeActiveJob(jobId);
+      const sf = fd.outputs?.[0]?.subfolder || "modal_results";
+      ctx.finish(true, "✓ Recovered");
+      notify(t("toast.recovered", { wf: pending.wfName ? "「" + pending.wfName + "」" : "", sf }), "success");
     } else {
-      ctx.finish(false, `✗ ${pData.status}`);
+      // ⚠ 取回失败**不删**恢复记录:任务已 completed、产物还在云端,下次刷新还能再试。
+      // 到 maxAgeSec 会被 recoverPendingJob 自动滤掉,不会无限残留。
+      ctx.finish(false, "✗ Recover fetch failed", JSON.stringify(fd));
     }
   } catch (e) {
-    err("recover failed", e);
-    ctx.finish(false, "✗ recover error");
-  } finally {
-    removeActiveJob(pending.jobId);
+    err("recover fetch failed", e);
+    ctx.finish(false, "✗ Recover fetch error", String(e));
   }
 }
 

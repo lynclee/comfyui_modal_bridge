@@ -312,5 +312,12 @@ def remove_volume_local_node(cfg: dict, folder: str) -> dict:
             if "not found" in str(e).lower() or "no such" in str(e).lower():
                 continue
             errors.append({"path": path, "error": str(e)})
+            # ⚠ zip 没删掉就必须停手,绝不能接着删 digest —— 那会在 Volume 上留下
+            # 「有 zip 无 digest」的残包。冷容器照样解压它(跑的是旧本地代码),却因为
+            # 没有 digest 而不写 .mb_local_digest;needs_refresh 看不到 marker,
+            # 就把这个容器判成「已经是 baked」→ 静默运行早该退场的旧覆盖版,日志全绿。
+            # 保持两个文件同进同退:这次全留着,下次重试还能干净地再删一遍。
+            if suffix == ".zip":
+                break
     invalidate_list_cache()   # Volume 上的名单变了
     return {"ok": not errors, "removed": removed, "errors": errors}

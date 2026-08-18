@@ -19,6 +19,7 @@ batch_upload)直接传到 Volume(CAS 去重,通用模型秒过)。Volume 查询�
 - Modal Volume  `comfyui-bridge-models`(自动创建,本地脚本往里传模型)
 """
 import os
+import re
 import subprocess
 import time
 import uuid
@@ -77,6 +78,21 @@ _VOL_GC_PER_SWEEP = 10  # 一次 sweep 最多删多少个 Volume 上的 _outputs
 # 目的是让这段窗口对 cancel 可见(见 run_endpoint / cancel_endpoint 的注释)。
 _CALL_PENDING = "pending"
 
+# job_id 会拼进 Volume 路径(_outputs/<job_id>/),并被 _sweep_job_state 用
+# remove_file(recursive=True) 递归删除 —— 一个 "../../" 就能写到、删到 Volume 任意位置。
+# /run 有 bridge_key 鉴权,但 job_id 由调用方(desktop / AIGC Studio 的任务 UUID)自带,
+# 鉴权只证明"是我们的客户端",不证明"这个 id 干净"。
+# ⚠ 刻意内联而不 import contract.is_safe_job_id:contract 不在镜像的
+# add_local_python_source 名单里,容器内根本没有这个模块(和 modal_image.py 内联
+# 目录哈希是同一个理由)。两处规则必须保持一致,改一边记得改另一边。
+_SAFE_JOB_ID = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
+
+
+def _safe_job_id(job_id) -> bool:
+    return (isinstance(job_id, str)
+            and bool(_SAFE_JOB_ID.match(job_id))
+            and ".." not in job_id)
+
 
 def _call_id(job_id: str) -> str:
     """取真实 call_id;还在占位(spawn 中)或没有则返回空串。"""
@@ -111,7 +127,9 @@ def _sweep_job_state():
         # 和 fetch_endpoint 的 delete=1),但**失败/取消/客户端放弃**的大文件以前永久留在 Volume 上,
         # 谁也不会去删。job_state 条目都过期了,产物更没人要。
         # 限量:一次 sweep 最多删这么多个,避免某次提交撞上大批过期 job 时被一串 RPC 拖慢。
-        if vol_gc_budget <= 0:
+        # 二道闸:/run 已经挡住脏 id,但 Dict 里可能还留着旧版本写入的条目 ——
+        # 这行是 recursive 删除,宁可漏删一个孤儿目录,也不能拿不可信的 id 去删 Volume。
+        if vol_gc_budget <= 0 or not _safe_job_id(jid):
             return
         vol_gc_budget -= 1
         try:
@@ -601,6 +619,10 @@ def run_endpoint(payload: dict):
     # aigc-r2 用 AIGC Studio 的任务 UUID 作 job_id,双方同一 id 查 /status;desktop 沿用旧逻辑。
     job_id = (delivery.get("job_id") if delivery.get("mode") == "aigc-r2" else None) \
         or payload.get("job_id") or str(uuid.uuid4())
+    # 先消毒再用:下面所有分支(job_state key / spawn 参数 / Volume 路径)都吃这个值。
+    if not _safe_job_id(job_id):
+        return {"error": f"invalid job_id: {str(job_id)[:64]!r} "
+                         f"(只允许 [A-Za-z0-9_.-],最长 64)"}
     workflow = payload.get("workflow")
     if not workflow:
         return {"error": "Missing 'workflow' in payload"}
@@ -631,24 +653,39 @@ def run_endpoint(payload: dict):
         gpu_display = _TIER_GPU_DISPLAY[tier]
 
     # 幂等:客户端带自己的 job_id 重试时(/run 对 502/504/超时会重试),这个 id 可能已经
-    # spawn 过了 —— 响应丢在网关不代表任务没跑。非终态就直接回现状,绝不二次 spawn:
-    # 那会开出第二个同样的 GPU 任务,双跑双计费,而调用方只看得到后一个。
-    # 终态(completed/failed/cancelled)则放行 —— 那是用户有意重跑同一个 id。
+    # spawn 过了 —— 响应丢在网关不代表任务没跑。
+    rerun = bool(payload.get("rerun"))
     prior = job_state.get(job_id)
-    if isinstance(prior, dict) and prior.get("status") in ("queued", "running", "delivering"):
-        print(f"[bridge] /run duplicate job_id {job_id} (status={prior['status']}) — 不重复 spawn")
-        return {"id": job_id, "status": prior["status"],
+    prior_status = prior.get("status") if isinstance(prior, dict) else None
+    # (a) 非终态:一律不再 spawn,连 rerun 也不给绕 —— 那会开出第二个同样的 GPU 任务,
+    #     双跑双计费,而调用方只看得到后一个。要重跑得先取消。
+    # (b) 终态:默认同样回现状。以前这里放行,理由是"用户有意重跑同一个 id",但客户端
+    #     那 60s 超时窗内任务完全可能已经跑完或失败(冷启才 ~23s),那次重试就变成静默重跑,
+    #     白付一次 GPU 钱还覆盖掉第一次的产物。真要重跑必须显式 rerun=1。
+    if prior_status in ("queued", "running", "delivering") or (prior_status and not rerun):
+        print(f"[bridge] /run duplicate job_id {job_id} (status={prior_status}) — 不重复 spawn")
+        # ⚠ 只回字段子集,别 **prior:终态条目里带着 images(小产物是 base64),
+        # 整个塞进 /run 的响应等于把一份产物白传一遍。要完整状态走 /status。
+        return {"id": job_id, "status": prior_status,
                 "gpu": prior.get("gpu") or gpu_display, "duplicate": True}
 
     _sweep_job_state()  # 顺手清理过期/超量的旧 job(防 Dict 无限膨胀)
+    # ⚠ 先原子占位 :call,再写 job_state —— 两点都不能反过来:
+    # 1) 原子:get→put 之间有窗口,两个并发的同 id 请求会各读到"不存在"、各 spawn 一次。
+    #    put(skip_if_exists=True) 返回 False 就是"别人抢先占了",直接回现状。
+    # 2) 顺序:cancel 靠 :call 存在与否判断"是否正在提交中"。先写 job_state 的话,
+    #    中间窗口里 cancel 看到 status=queued 却查不到 :call,会直接标 cancelled 返回成功,
+    #    而函数下一毫秒就开始跑 —— 谎报成功,违反本文件的 cancel 铁律。
+    if rerun:
+        job_state[f"{job_id}:call"] = _CALL_PENDING
+    elif not job_state.put(f"{job_id}:call", _CALL_PENDING, skip_if_exists=True):
+        cur = job_state.get(job_id) if isinstance(job_state.get(job_id), dict) else {}
+        print(f"[bridge] /run 并发同 job_id {job_id} — 已有请求在提交中,不重复 spawn")
+        return {"id": job_id, "status": cur.get("status") or "queued",
+                "gpu": cur.get("gpu") or gpu_display, "duplicate": True}
     # job_state 只存 delivery 的可外泄形态(mode/job_id),token 绝不落 Dict/日志。
     job_state[job_id] = {"status": "queued", "queued_at": time.time(), "gpu": gpu_display,
                          "tier": tier, "delivery": public_delivery(delivery)}
-    # ⚠ spawn 之前先占位 :call —— spawn 到写 call_id 之间有个毫秒级窗口,而用户点取消
-    # 恰恰常在刚提交那几秒。窗口里到达的 cancel 以前找不到 call_id,只会把状态标成
-    # cancelled 就返回成功,函数照跑照计费(谎报成功,违反本文件的 cancel 铁律)。
-    # 占位后 cancel 能看出"正在提交中",短暂等真实 id(见 cancel_endpoint)。
-    job_state[f"{job_id}:call"] = _CALL_PENDING
     # local_nodes: {folder: digest} —— 本次工作流用到的自写节点及其期望版本。
     # 暖容器可能装着上一版,worker 侧据此判断要不要 reload+重装+重启(见 _refresh_local_nodes_if_stale)。
     local_nodes = payload.get("local_nodes") if isinstance(payload.get("local_nodes"), dict) else None
@@ -752,9 +789,16 @@ def cancel_endpoint(payload: dict):
             print(f"[bridge] cancel call {call_id} FAILED: {e}")
             return {"id": job_id, "status": s.get("status") or "unknown",
                     "error": f"cancel failed: {e}", "was_running": was_running}
-    # ⚠ 重新读一次再 merge:上面等占位 call_id 可能花了两秒,worker 在这期间会把状态写成
-    # running(带 started_at/progress)。拿函数开头那份快照回写,等于把 worker 写的东西冲掉。
-    job_state[job_id] = {**(job_state.get(job_id) or s), "status": "cancelled",
+    # ⚠ 重新读一次再 merge:上面等占位 call_id 可能花了两秒、cancel() 本身也是一次 RPC,
+    # worker 在这期间会把状态写成 running(带 started_at/progress),甚至直接写完 completed。
+    # 拿函数开头那份快照无条件盖成 cancelled 有两种害:轻则冲掉 worker 写的进度,
+    # 重则把**已经生成、已经付过钱**的产物判成"用户取消",前端看到 cancelled 就再不会去取。
+    # 所以终态优先:worker 抢先写了终态就保留它,如实告诉调用方"取消没赶上"。
+    cur = job_state.get(job_id)
+    if isinstance(cur, dict) and cur.get("status") in ("completed", "failed"):
+        print(f"[bridge] cancel {job_id}: worker 已先写 {cur['status']},保留终态不覆盖")
+        return {"id": job_id, **cur, "cancel_noop": True, "was_running": was_running}
+    job_state[job_id] = {**(cur if isinstance(cur, dict) else s), "status": "cancelled",
                          "completed_at": time.time()}
     return {"id": job_id, "status": "cancelled", "was_running": was_running}
 

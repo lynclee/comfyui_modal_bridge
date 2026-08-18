@@ -10,6 +10,7 @@ import socket
 import time
 import urllib.parse
 import uuid
+from pathlib import Path
 from io import BytesIO
 
 import requests
@@ -343,6 +344,17 @@ def materialize_desktop_outputs(refs: list[dict], job_id: str) -> tuple[list[dic
             # commit 由 modal_app._worker_run 在跑完后统一做(这里只写挂载点文件)。
             vp = f"_outputs/{job_id}/{ref['node_id']}__{ref['filename']}"
             dst = "/comfy-volume/" + vp
+            # 囚笼:job_id 来自 /run 的入参(已在那边消毒),filename 来自 ComfyUI 的
+            # history。两者都不是本函数生成的,而这里是往挂载卷**写文件** —— 逃出
+            # _outputs/ 就等于用 bridge_key 换到了任意 Volume 写权限。多一次 resolve 的
+            # 成本可以忽略,漏掉一次的代价是整个卷。
+            _root = Path("/comfy-volume/_outputs").resolve()
+            try:
+                Path(dst).resolve().relative_to(_root)
+            except ValueError:
+                errors.append(f"unsafe output path (job_id={job_id!r}, "
+                              f"filename={ref['filename']!r})")
+                continue
             os.makedirs(os.path.dirname(dst), exist_ok=True)
             with open(dst, "wb") as f:
                 f.write(image_bytes)

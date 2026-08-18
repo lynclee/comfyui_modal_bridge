@@ -23,6 +23,12 @@ DEST_DIR = Path("/comfyui/custom_nodes")
 # 已经启动的暖容器也能恢复 baked,不必继续运行内存/磁盘里的旧覆盖版。
 BACKUP_DIR = Path("/tmp/modal-bridge-baked-nodes")
 BAKED_SENTINEL = "__modal_bridge_baked__"
+# 解压了一个「有 zip 无 .digest」的残包时写这个值。不能不写:marker 缺失会被
+# current_digests / needs_refresh 读成「这个目录是镜像自带的 baked 版」,于是残留的旧本地
+# 代码一直跑下去还没人发现(见 local_nodes.remove_volume_local_node 的同一处注释)。
+# 写成一个永远对不上任何真实 digest 的值,expected 是 BAKED_SENTINEL 就触发回退 baked、
+# 是具体指纹就触发重装 —— 两条路都能自愈。
+UNKNOWN_DIGEST = "__modal_bridge_unknown__"
 
 
 def safe_members(names: list[str], dest: Path) -> tuple[list[str], list[str]]:
@@ -153,12 +159,16 @@ def extract_all() -> list[str]:
                     z.extract(n, target)
             # 落一份指纹在节点目录里:暖容器据此判断自己装的是不是最新那版(见 needs_refresh)
             dg = zp.with_suffix(".digest")
-            if dg.is_file():
-                try:
+            try:
+                if dg.is_file():
                     (target / ".mb_local_digest").write_text(
                         dg.read_text(encoding="utf-8").strip(), encoding="utf-8")
-                except Exception:
-                    pass
+                else:
+                    print(f"[bridge] ⚠ local-node {folder}: 缺 .digest(残包?)"
+                          f" → 标记为未知版本,下次提交会强制刷新")
+                    (target / ".mb_local_digest").write_text(UNKNOWN_DIGEST, encoding="utf-8")
+            except Exception as e:
+                print(f"[bridge] ⚠ local-node {folder}: 写指纹失败: {e}")
             _install_requirements(target)
             installed.append(folder)
             print(f"[bridge] local-node ✓ {folder} ({len(ok)} files)")
