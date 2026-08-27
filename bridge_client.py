@@ -105,12 +105,29 @@ class BridgeClient:
         return self._get("status", {"job_id": job_id}, timeout=20)
 
     def wait(self, job_id: str, timeout_s: int = 3600, poll_s: float = 2.0,
-             on_update=None) -> dict:
-        """轮询到终态。on_update(state) 每次状态/进度变化时回调(打印进度用)。"""
+             on_update=None, max_consecutive_errors: int = 5) -> dict:
+        """轮询到终态。on_update(state) 每次状态/进度变化时回调(打印进度用)。
+
+        ⚠ 单次查询失败只意味着"这一拍没看到",不是终态 —— 任务在云端照常跑。
+        以前任何 BridgeError 都直接打死整个 wait,而 _req 只重试一次:两次连续的
+        瞬态网络错(某些网络环境一天能撞好几回)就足以让一个跑了 20 分钟的任务
+        失去接管者,产物再也取不回、还继续计费。连续失败到上限才放弃,成功即清零。
+        """
         deadline = time.time() + timeout_s
         last_sig = None
+        errs = 0
         while time.time() < deadline:
-            s = self.status(job_id)
+            try:
+                s = self.status(job_id)
+                errs = 0
+            except BridgeError as e:
+                errs += 1
+                if errs >= max_consecutive_errors:
+                    raise BridgeError(
+                        f"连续 {errs} 次查询失败,放弃等待 —— 任务可能仍在云端跑,"
+                        f"可用 status/cancel 接管: {e}") from None
+                time.sleep(poll_s)
+                continue
             sig = (s.get("status"), json.dumps(s.get("progress") or {}, sort_keys=True))
             if sig != last_sig:
                 last_sig = sig

@@ -18,6 +18,7 @@ batch_upload)直接传到 Volume(CAS 去重,通用模型秒过)。Volume 查询�
 - Modal Secret  `comfyui-bridge-secrets`(BRIDGE_API_KEY 私有鉴权 + 可选 HF_TOKEN)
 - Modal Volume  `comfyui-bridge-models`(自动创建,本地脚本往里传模型)
 """
+import hmac
 import os
 import re
 import subprocess
@@ -589,7 +590,11 @@ _TOP_GPU_DISPLAY = "→".join(_TOP_GPU_LIST)        # 顶配档显示(如 "B200"
 # ============================================================================
 def _check(key: str):
     expected = os.environ.get("BRIDGE_API_KEY", "")
-    if expected and key == expected:
+    # 恒时比较:`==` 在第一个不等的字节就短路,响应时间随「已匹配前缀长度」变化,
+    # 理论上可被逐字节爆破出 key。走 bytes 是为了不受非 ASCII 输入影响
+    # (compare_digest 对非 ASCII 的 str 会抛 TypeError)。
+    if expected and hmac.compare_digest((key or "").encode("utf-8"),
+                                        expected.encode("utf-8")):
         return None
     from fastapi.responses import JSONResponse
     return JSONResponse({"error": "unauthorized — bad or missing bridge key"}, status_code=401)
@@ -677,8 +682,17 @@ def run_endpoint(payload: dict):
     #    中间窗口里 cancel 看到 status=queued 却查不到 :call,会直接标 cancelled 返回成功,
     #    而函数下一毫秒就开始跑 —— 谎报成功,违反本文件的 cancel 铁律。
     if rerun:
-        job_state[f"{job_id}:call"] = _CALL_PENDING
-    elif not job_state.put(f"{job_id}:call", _CALL_PENDING, skip_if_exists=True):
+        # rerun 要重用一个已终结的 id,旧占位/句柄必须先让位,否则下面的原子抢占永远失败。
+        # ⚠ 残留窗口(已知、刻意保留):del 与 put 之间不是原子的,两个**并发** rerun
+        # 理论上能各抢到一次 → 双 spawn 双计费。modal.Dict 只有 put(skip_if_exists)
+        # 这一个原子原语,且跨容器最终一致(回读自己刚写的 token 也可能是 stale),
+        # 做不出可靠互斥。rerun 是显式操作、并发同 id 极罕见,不为它引入外部锁 ——
+        # 窗口压到最小(紧邻两行)并记录在案。
+        try:
+            del job_state[f"{job_id}:call"]
+        except Exception:
+            pass
+    if not job_state.put(f"{job_id}:call", _CALL_PENDING, skip_if_exists=True):
         cur = job_state.get(job_id) if isinstance(job_state.get(job_id), dict) else {}
         print(f"[bridge] /run 并发同 job_id {job_id} — 已有请求在提交中,不重复 spawn")
         return {"id": job_id, "status": cur.get("status") or "queued",

@@ -45,8 +45,18 @@ def _clone_one(n: dict) -> str:
     """生成单个 custom_node 的 clone(+ 可选 checkout)命令。
     ⚠ url / name / commit 都插值进 shell,必须 quote:节点文件夹名含空格(Windows 用户常见)
     或 url 带 shell 元字符会让整个镜像 build 崩,报错还很难和"哪个节点"对上号。"""
-    path = _q(f"/comfyui/custom_nodes/{n['name']}")
-    base = f"git clone {_q(n['url'])} {path}"
+    url = (n.get("url") or "").strip()
+    name = (n.get("name") or "").strip()
+    if not url or not name:
+        # 第二道闸(第一道在 node_sync.write_baked_nodes):空 url 会生成
+        # `git clone '' /comfyui/custom_nodes/…`,让整个镜像 build 崩在一个
+        # 与真实原因完全对不上的报错里。返回空串交调用方过滤 —— 刻意不抛异常:
+        # 本模块在**容器运行时**也会被 import,抛了会让 worker 直接起不来,
+        # 把一个"少装一个节点"的问题升级成"整个 worker 挂掉"。
+        print(f"[bridge] ⚠ 跳过无效 custom_node 条目(url/name 为空): {n!r}")
+        return ""
+    path = _q(f"/comfyui/custom_nodes/{name}")
+    base = f"git clone {_q(url)} {path}"
     commit = (n.get("commit") or "").strip()
     if commit:
         return f"{base} && cd {path} && git checkout {_q(commit)}"
@@ -55,7 +65,7 @@ def _clone_one(n: dict) -> str:
 
 _CLONE_CMD = " && ".join([
     "mkdir -p /comfyui/custom_nodes",
-    *[_clone_one(n) for n in CUSTOM_NODES],
+    *[c for c in (_clone_one(n) for n in CUSTOM_NODES) if c],
 ])
 
 

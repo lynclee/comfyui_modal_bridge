@@ -1529,6 +1529,78 @@ def test_job_id_rule_identical_local_and_cloud():
     assert a.group(1) == b.group(1), f"规则漂移: 云端 {a.group(1)} vs 本地 {b.group(1)}"
 
 
+def test_bridge_client_wait_tolerates_transient_errors():
+    """轮询撞上瞬态错误只能重试,不能打死整个 wait —— 任务在云端照常跑、照常计费,
+    而 _req 只重试一次,两次连续网络错就足以让长任务失去接管者、产物再也取不回。"""
+    import bridge_client as bc
+    c = bc.BridgeClient("https://ws--comfyui-bridge", "k")
+    calls = {"n": 0}
+
+    def flaky(job_id):
+        calls["n"] += 1
+        if calls["n"] <= 3:              # 前三拍连续失败
+            raise bc.BridgeError("transient")
+        return {"status": "completed"}
+
+    c.status = flaky
+    assert c.wait("j", timeout_s=30, poll_s=0)["status"] == "completed"
+    assert calls["n"] == 4, "失败后要继续轮询,成功即清零"
+
+    # 但连续失败到上限必须如实报错 —— 绝不能假装成终态把任务判死
+    c2 = bc.BridgeClient("https://ws--comfyui-bridge", "k")
+
+    def always_down(job_id):
+        raise bc.BridgeError("down")
+
+    c2.status = always_down
+    try:
+        c2.wait("j", timeout_s=30, poll_s=0, max_consecutive_errors=3)
+        assert False, "连续失败到上限应当抛错"
+    except bc.BridgeError as e:
+        assert "连续" in str(e), f"错误信息要说清是连续失败: {e}"
+
+
+def test_save_config_atomic_and_private(tmp_path):
+    """config.json 里有 modal token / bridge key 四种凭据:必须原子写且不可他人读。
+    非原子的半个 JSON 会让 load_config 解析失败后**静默回落默认配置** ——
+    表现成"插件突然没配置过",没有任何报错指向真实原因。"""
+    import json
+    import os
+    import stat
+    import config as cfg_mod
+    p = tmp_path / "sub" / "config.json"
+    orig = cfg_mod._config_path
+    cfg_mod._config_path = lambda: p
+    try:
+        cfg_mod.save_config({"bridge_api_key": "s3cret", "x": 1})
+        assert json.loads(p.read_text(encoding="utf-8"))["bridge_api_key"] == "s3cret"
+        assert not list(p.parent.glob("*.tmp")), "临时文件必须被 replace 掉,不能残留"
+        mode = stat.S_IMODE(os.stat(p).st_mode)
+        assert mode & 0o077 == 0, f"组/其他不该有任何权限,实际 {oct(mode)}"
+    finally:
+        cfg_mod._config_path = orig
+
+
+def test_write_baked_nodes_drops_empty_url(tmp_path):
+    """空 url/name 的条目不能进 baked 清单:镜像 build 时会生成 `git clone ''`,
+    整个 RUN 崩掉而报错和「哪个节点」完全对不上号。"""
+    import node_sync as ns
+    f = tmp_path / "_custom_nodes_data.py"
+    orig = ns.DATA_FILE
+    ns.DATA_FILE = f
+    try:
+        ns.write_baked_nodes([
+            {"name": "good", "url": "https://github.com/a/b", "commit": "c" * 40},
+            {"name": "no-url", "url": "", "commit": "c" * 40},
+            {"name": "", "url": "https://github.com/a/c", "commit": ""},
+            {"name": "ws-url", "url": "   ", "commit": ""},
+        ])
+        names = {n.get("name") for n in ns.read_baked_nodes()}
+        assert names == {"good"}, f"只有合法条目该留下,实际 {names}"
+    finally:
+        ns.DATA_FILE = orig
+
+
 # ============================================================================
 # 无 pytest 时的简易运行器
 # ============================================================================

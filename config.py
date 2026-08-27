@@ -3,6 +3,7 @@ config.py — 配置文件管理
 路径:ComfyUI/user/default/modal_bridge/config.json
 """
 import json
+import os
 from pathlib import Path
 
 # 默认配置(用户问答确认)
@@ -122,7 +123,22 @@ def load_config() -> dict:
 
 
 def save_config(new_data: dict) -> None:
-    """覆盖写 config(完整对象)。"""
+    """覆盖写 config(完整对象)。原子 + 0600。
+
+    这个文件里躺着 modal_token_id / modal_token_secret / bridge_api_key /
+    comfy_api_key 四种凭据,直接 write_text 有两个问题:
+      1) 非原子 —— 写到一半崩(磁盘满、进程被杀)留下半个 JSON,而 load_config
+         解析失败后**静默回落默认配置**:endpoint 归零、凭据全丢,表现成"插件突然
+         没配置过",没有任何报错指向真实原因。
+      2) 默认 0644 —— 同机任意用户可读凭据。
+    tmp + os.replace 保证读者要么看到完整的旧的、要么看到完整的新的。
+    """
     p = _config_path()
     p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps(new_data, indent=2, ensure_ascii=False), encoding="utf-8")
+    tmp = p.with_name(p.name + ".tmp")
+    tmp.write_text(json.dumps(new_data, indent=2, ensure_ascii=False), encoding="utf-8")
+    try:
+        os.chmod(tmp, 0o600)   # Windows 上是 no-op,无害
+    except Exception:
+        pass
+    os.replace(tmp, p)

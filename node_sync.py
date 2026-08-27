@@ -218,6 +218,14 @@ def write_baked_nodes(nodes: list[dict]) -> None:
     """用固定模板重写 _custom_nodes_data.py(保证格式稳定,可被反复机改)。"""
     lines = [_DATA_HEADER, "CUSTOM_NODES = ["]
     for n in nodes:
+        # 出口校验:空 url / 空 name 会在镜像 build 时生成 `git clone '' ...`,
+        # 整个 RUN 崩掉而报错和「哪个节点」对不上号。入口(folder_git_info)只在
+        # url 非空时才判 has_git=True,正常流程产生不了空值 —— 但这个文件是
+        # 机器可改的本地状态(可能被手工编辑、也可能是历史遗留),坏条目宁可丢掉
+        # 也不能进镜像。丢弃要出声,静默跳过等于让节点"莫名其妙没装上"。
+        if not (n.get("url") or "").strip() or not (n.get("name") or "").strip():
+            print(f"[modal_bridge] ⚠ 跳过无效 baked 条目(url/name 为空): {n!r}")
+            continue
         lines.append("    {")
         lines.append(f'        "name": {json.dumps(n.get("name", ""), ensure_ascii=False)},')
         lines.append(f'        "url": {json.dumps(n.get("url", ""), ensure_ascii=False)},')
