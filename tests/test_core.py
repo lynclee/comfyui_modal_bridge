@@ -1630,13 +1630,16 @@ if __name__ == "__main__":
     sys.exit(1 if failed else 0)
 
 
-def test_modal_image_has_sage_int64_patch():
-    """镜像必须带 SageAttention int32 溢出补丁,且校验是 fail-closed 的。
+def test_modal_image_has_sage_patches():
+    """镜像必须带 SageAttention 的两个上游缺陷补丁,且校验是 fail-closed 的。
 
-    根因:triton/quant_per_thread.py 用 int32 算行偏移,H3 的 fused QKV(seq-stride=21504)
-    下行号 > 2^31/21504 ≈ 99865 即 wrap 成负 → 尾几帧塌灰噪 / 偶发 illegal memory access。
-    上游 main 至今未修,所以这层不能删——删了不会有任何报错,只会在长片子上静默出坏帧。
-    这里不跑镜像,只静态断言 modal_image.py 里那条 run_commands 还在、且保留了校验闸。
+    ① int32 行偏移溢出:H3 的 fused QKV(seq-stride=21504)下行号 > 2^31/21504 ≈ 99865
+       即 wrap 成负 → 尾几帧塌灰噪 / 偶发 illegal memory access。
+    ② V strided 进 CUDA 扩展:core.py 只在 kv_len%128!=0 时 cat(顺带变 contiguous),
+       整除时 V 以 strided 视图直进 per_channel_fp8 → 越界 crash。
+
+    两个上游都未修。这层删了不会有任何报错,只会在特定配置下静默出坏帧或崩掉,
+    所以这里静态钉死它还在、且保留了全部校验闸。
     """
     import ast
 
@@ -1652,13 +1655,41 @@ def test_modal_image_has_sage_int64_patch():
         and isinstance(n.args[0].value, str)
     ]
     patch = [c for c in cmds if "tl.int64" in c]
-    assert len(patch) == 1, f"期望恰好一条 int64 补丁命令,实际 {len(patch)} 条"
+    assert len(patch) == 1, f"期望恰好一条 sage 补丁命令,实际 {len(patch)} 条"
     cmd = patch[0]
 
-    # 替换动作本身
+    # ① int64
     assert "sed -i -E" in cmd and "offs_n" in cmd and "stride_" in cmd
-    # fail-closed 三闸:脆弱写法必须清零、int64 必须够数、结果必须仍是合法 Python
-    assert 'test "$(grep -c' in cmd, "缺少替换结果校验 —— 补丁静默失效将无法察觉"
     assert '" = 0' in cmd, "缺少『脆弱写法清零』断言"
     assert "-ge 4" in cmd, "缺少『int64 转换够数』断言"
+    # ② v.contiguous()
+    assert "v = v.contiguous()" in cmd, "缺少 V strided 补丁"
+    assert "transpose_pad_permute_cuda" in cmd, "V 补丁锚点丢失"
+    assert "grep -q 'v = v.contiguous()'" in cmd, "V 补丁缺少幂等判断"
+    # ③ 两文件语法校验
     assert "ast.parse" in cmd, "缺少补丁后语法校验"
+
+
+def test_no_api_key_in_query_string():
+    """鉴权 key 不得出现在 query string 里。
+
+    query 会落进反代 / CDN 访问日志、浏览器历史和 Referer,是长期暴露面。
+    GET 一律走 X-Bridge-Key 头(云端 modal_app 仍兼容旧的 ?key=,但本仓库自己的
+    客户端不许再往 query 里放)。这条测试钉死方向,防止新代码顺手写回 params={"key": ...}。
+    """
+    import re
+
+    bad = []
+    pat = re.compile(r'(?:params|urlencode\()\s*=?\s*\{[^}]*["\']key["\']\s*:')
+    for f in ("bridge_client.py", "modal_client.py", "routes.py", "web/modal_bridge.js"):
+        p = ROOT / f
+        if not p.exists():
+            continue
+        for i, line in enumerate(p.read_text(encoding="utf-8").splitlines(), 1):
+            if pat.search(line):
+                bad.append(f"{f}:{i}: {line.strip()}")
+    assert not bad, "这些地方把 key 放进了 query:\n" + "\n".join(bad)
+
+    # 反向:客户端确实在用请求头
+    assert 'X-Bridge-Key' in (ROOT / "bridge_client.py").read_text(encoding="utf-8")
+    assert 'X-Bridge-Key' in (ROOT / "modal_client.py").read_text(encoding="utf-8")

@@ -1,5 +1,5 @@
 """
-modal_client.py — 调用 Modal endpoint(私有 endpoint,自建鉴权:GET 走 ?key=,POST 走 body auth_key)
+modal_client.py — 调用 Modal endpoint(私有 endpoint,自建鉴权:GET 走 X-Bridge-Key 头,POST 走 body auth_key)
 """
 import asyncio
 import uuid
@@ -14,7 +14,8 @@ def _endpoint(base: str, label: str) -> str:
 
 
 def _key(cfg: dict) -> str:
-    """自建鉴权 key(私有 endpoint 用)。GET 走 query ?key=,POST 走 body auth_key。"""
+    """自建鉴权 key(私有 endpoint 用)。GET 走 X-Bridge-Key 头(不进 query,避免落进
+    反代 / CDN 日志),POST 走 body auth_key。云端 ≥0.8.3 认这个头。"""
     return cfg.get("bridge_api_key", "")
 
 
@@ -96,7 +97,7 @@ async def health(session, cfg) -> dict:
     last = None
     for attempt in range(3):
         try:
-            async with session.get(url, params={"key": _key(cfg)},
+            async with session.get(url, headers={"X-Bridge-Key": _key(cfg)},
                                    timeout=aiohttp.ClientTimeout(total=10)) as r:
                 if r.status == 401:
                     # 重试无意义,直接抛(RuntimeError 不在下面的 except 里,会冒到调用方)

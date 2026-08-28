@@ -586,8 +586,26 @@ _TOP_GPU_DISPLAY = "→".join(_TOP_GPU_LIST)        # 顶配档显示(如 "B200"
 # 鉴权 — 自建 API key(private endpoint)
 # 不用 Modal 的 requires_proxy_auth(要单独 Proxy Auth Token,没法程序化)。改成:
 # 部署时随机生成 BRIDGE_API_KEY 存进 Secret + 本地 config,每个 endpoint 校验。
-# key 经 query(GET ?key=)/ body(POST auth_key)传入;拒绝时函数体内 import fastapi 返 401。
+# key 传入方式(按优先级):
+#   - GET :  X-Bridge-Key 请求头  →  回退 ?key=(旧客户端兼容)
+#   - POST:  body 的 auth_key
+# ⚠ query string 会落进反代 / CDN / 浏览器历史 / Referer,是长期暴露面,新客户端一律走 header;
+#   ?key= 仅为兼容保留,等旧版插件都升上来后可以摘掉。
+# 拒绝时函数体内 import fastapi 返 401。
 # ============================================================================
+
+# fastapi 只在容器镜像里有:部署解析期跑的是 ComfyUI 内嵌解释器,那里装不了 fastapi,
+# 所以顶层 `from fastapi import Header` 会让 modal deploy 直接炸。
+# 而 Modal 在容器内会**重新 import 本模块**(MODAL_BRIDGE_* 那些环境变量也是靠这一点生效的),
+# 届时拿到的就是真的 Header,FastAPI 正常按请求头解析。
+# 部署期退化成"返回默认值的普通函数",签名变成 x_bridge_key: str = "",合法且不影响 app 解析。
+try:
+    from fastapi import Header as _Header
+except ImportError:  # 部署解析期
+    def _Header(default=None, **_kw):
+        return default
+
+
 def _check(key: str):
     expected = os.environ.get("BRIDGE_API_KEY", "")
     # 恒时比较:`==` 在第一个不等的字节就短路,响应时间随「已匹配前缀长度」变化,
@@ -723,8 +741,8 @@ def run_endpoint(payload: dict):
 
 @app.function(image=cuda_image, secrets=[bridge_secret], timeout=10)
 @modal.fastapi_endpoint(method="GET", label=f"{APP_NAME}-status")
-def status_endpoint(job_id: str, key: str = ""):
-    deny = _check(key)
+def status_endpoint(job_id: str, key: str = "", x_bridge_key: str = _Header("")):
+    deny = _check(x_bridge_key or key)
     if deny:
         return deny
     s = job_state.get(job_id)
@@ -736,13 +754,14 @@ def status_endpoint(job_id: str, key: str = ""):
 @app.function(image=cuda_image, volumes={"/comfy-volume": models_vol},
               secrets=[bridge_secret], timeout=300)
 @modal.fastapi_endpoint(method="GET", label=f"{APP_NAME}-fetch")
-def fetch_endpoint(job_id: str, path: str, key: str = "", delete: int = 0):
+def fetch_endpoint(job_id: str, path: str, key: str = "", delete: int = 0,
+                   x_bridge_key: str = _Header("")):
     """独立客户端(bridge_client / CLI / cloud 模式 MCP)取大文件:流式返回 Volume 上该 job 的
     产物。本地插件不用它(routes 走 modal SDK 直连);它的存在让外部消费者只凭 bridge_key 就能
     拿到走了 Volume 的视频/网格,不必持有 modal token。
     path 必须是该 job 某个 images[].volume_path(囚笼:仅限 _outputs/<job_id>/ 内,拒绝逃逸);
     delete=1 → 响应发送完成后删文件并 commit(与本地 SDK 取回后即删的行为一致)。"""
-    deny = _check(key)
+    deny = _check(x_bridge_key or key)
     if deny:
         return deny
     from fastapi.responses import JSONResponse, FileResponse
@@ -819,9 +838,9 @@ def cancel_endpoint(payload: dict):
 
 @app.function(image=cuda_image, secrets=[bridge_secret], timeout=10)
 @modal.fastapi_endpoint(method="GET", label=f"{APP_NAME}-health")
-def health_endpoint(key: str = ""):
+def health_endpoint(key: str = "", x_bridge_key: str = _Header("")):
     """健康 + 已装 custom_nodes(权威源:反映真实部署的镜像,供本地双向同步对比)。"""
-    deny = _check(key)
+    deny = _check(x_bridge_key or key)
     if deny:
         return deny
     info: dict = {"healthy": True, "app": APP_NAME, "volume": VOLUME_NAME,

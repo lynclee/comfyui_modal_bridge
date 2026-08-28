@@ -545,7 +545,8 @@ def _setup_routes():
         url = modal_client._endpoint(cfg["modal_endpoint_base"], "status")
         try:
             async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as session:
-                async with session.get(url, params={"job_id": job_id, "key": modal_client._key(cfg)}) as r:
+                async with session.get(url, params={"job_id": job_id},
+                                       headers={"X-Bridge-Key": modal_client._key(cfg)}) as r:
                     data = await r.json(content_type=None)
         except Exception as e:
             return web.json_response({"error": str(e)}, status=502)
@@ -1244,7 +1245,7 @@ def _setup_routes():
         url = modal_client._endpoint(cfg["modal_endpoint_base"], "health")
         try:
             async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=6)) as s:
-                async with s.get(url, params={"key": modal_client._key(cfg)}) as r:
+                async with s.get(url, headers={"X-Bridge-Key": modal_client._key(cfg)}) as r:
                     if r.status == 200:
                         h = await r.json(content_type=None)
                         if isinstance(h, dict):

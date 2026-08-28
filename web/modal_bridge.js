@@ -2248,7 +2248,8 @@ def run(wf, timeout=900):
     while time.time() - t0 < timeout:
         try:
             s = requests.get(BASE + "-status.modal.run",
-                             params={"job_id": jid, "key": KEY}, timeout=30).json()
+                             params={"job_id": jid},
+                             headers={"X-Bridge-Key": KEY}, timeout=30).json()
         except Exception as e:
             print("轮询抖动,重试:", e)
             time.sleep(3)

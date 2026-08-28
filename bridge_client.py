@@ -8,7 +8,8 @@ submit / status / wait / cancel / health / 产物落盘。是「脱离本地 Com
 前提:有人(通常是部署者)已经用完整插件部署过云端 app、模型已在 Volume、
 所需 custom_node 已在镜像 —— 本客户端只消费能力,不搬运模型/节点。
 
-鉴权:bridge_api_key(部署时生成,存部署者的 config.json;GET ?key= / POST body auth_key)。
+鉴权:bridge_api_key(部署时生成,存部署者的 config.json)。GET 走 X-Bridge-Key 头、
+POST 走 body 的 auth_key;云端仍兼容旧的 ?key=,但本客户端不再往 query 里放 key。
 大文件:worker 把 >阈值 的产物写 Volume,状态里给 volume_path;本客户端经云端
 /fetch 端点(0.7.3+)流式下载,不需要 modal token。
 
@@ -44,7 +45,9 @@ class BridgeClient:
         return f"{self.base}-{label}.modal.run"
 
     def _get(self, label: str, params: dict, timeout: int | None = None) -> dict:
-        qs = urllib.parse.urlencode({**params, "key": self.key})
+        # key 走 X-Bridge-Key 头,不进 query —— query string 会落进反代 / CDN 日志、
+        # 浏览器历史和 Referer。云端 ≥0.8.3 认这个头(旧版只认 ?key=,会返 401)。
+        qs = urllib.parse.urlencode(params)
         return self._req(f"{self._url(label)}?{qs}", None, timeout)
 
     def _post(self, label: str, body: dict, timeout: int | None = None) -> dict:
@@ -54,15 +57,19 @@ class BridgeClient:
         data = json.dumps(body).encode() if body is not None else None
         last: Exception | None = None
         for attempt in range(retries + 1):
-            req = urllib.request.Request(
-                url, data=data,
-                headers={"Content-Type": "application/json"} if data else {})
+            headers = {"X-Bridge-Key": self.key}
+            if data:
+                headers["Content-Type"] = "application/json"
+            req = urllib.request.Request(url, data=data, headers=headers)
             try:
                 with urllib.request.urlopen(req, timeout=timeout or self.timeout) as r:
                     return json.loads(r.read().decode())
             except urllib.error.HTTPError as e:
                 if e.code == 401:
-                    raise BridgeError("401 unauthorized — bridge key 不对/缺失") from None
+                    raise BridgeError(
+                        "401 unauthorized — bridge key 不对/缺失;"
+                        "若 key 没变过,多半是云端版本 < 0.8.3(还不认 X-Bridge-Key 头),"
+                        "在 Modal 面板重新部署一次即可") from None
                 if e.code in (502, 503, 504) and attempt < retries:
                     last = BridgeError(f"transient {e.code}")
                     time.sleep(1.5)
@@ -190,13 +197,14 @@ class BridgeClient:
     def _download_volume(self, job_id: str, vol_path: str, local: Path,
                          delete_remote: bool) -> int:
         qs = urllib.parse.urlencode({"job_id": job_id, "path": vol_path,
-                                     "key": self.key, "delete": int(delete_remote)})
+                                     "delete": int(delete_remote)})
         url = f"{self._url('fetch')}?{qs}"
+        dl_req = urllib.request.Request(url, headers={"X-Bridge-Key": self.key})
         # 先写 .part、校验后原子 rename:delete_remote 时远端边传边清,
         # 中断若直接写终名会留下"看起来完整"的残缺文件。
         part = local.with_name(local.name + ".part")
         try:
-            with urllib.request.urlopen(url, timeout=600) as r, open(part, "wb") as f:
+            with urllib.request.urlopen(dl_req, timeout=600) as r, open(part, "wb") as f:
                 expected = int(r.headers.get("Content-Length") or 0)
                 size = 0
                 while True:
