@@ -142,6 +142,35 @@ cuda_image = (
         "fastapi[standard]",
         "pyyaml",
     )
+    # SageAttention int32 指针溢出补丁(2026-08-28)—— 上游 main 至今未修,必须打。
+    # 根因:triton/quant_per_thread.py 的量化 kernel 用 int32 算行偏移 offs_n * stride_in。
+    # H3 的 fused QKV 布局下 Q 的 seq-stride=21504,行号 > 2^31/21504 ≈ 99865 时地址 wrap
+    # 成负数 → 读垃圾(**尾几帧塌灰噪**)或 illegal memory access(偶发 crash,极易被误判成
+    # "宿主机瞬态")。K 因 k-km 物化连续(stride=128)幸免;contiguous 布局永远安全。
+    # 定论与真机复现来自 comfyagent 会话(RunPod,2026-08-20),补丁等价于其
+    # scripts/patch_sage_int64.py,本地已逐字节比对一致。
+    #
+    # ⚠ attention kernel 走 CUDA(.so)不代表安全:量化是它前面的独立步骤,走 Triton。
+    # 而 sageattn_qk_int8_pv_fp8_cuda_sm90 的 qk_quant_gran 默认就是 "per_thread"、
+    # core.py 的 dispatch 也没覆盖它 —— H100 必然走到这条含 bug 的路径。
+    # 当前 0.9MP/15s 实测 L=90720,离 99865 只剩 10%:再长 10% 的片子就翻车。
+    #
+    # 为什么改 .py 就够:Triton kernel 是运行时 JIT 的 Python 源码,不进 .so,
+    # 所以不必重编译 wheel,也不必重发 Release。
+    # 为什么放在这里而不是紧跟 .pip_install(sageattention):放这儿只重建尾部轻层,
+    # 紧跟装包会击穿 ComfyUI requirements / custom_nodes clone 那几层重的。
+    # 补丁本身幂等(二次执行不产生双重 .to(tl.int64)),失败即 build 失败(fail-closed),
+    # 不会出现"镜像跑起来了但补丁没打上"的静默状态。
+    # 遗留:上游还有一个独立 bug —— L%128==0 时 V 不 pad、strided 直进 per_channel_fp8
+    # 会 crash。本补丁不涉及,换配置时注意 L 别整除 128。
+    .run_commands(
+        r"""P=$(python -c "import sageattention,os;print(os.path.join(os.path.dirname(sageattention.__file__),'triton','quant_per_thread.py'))") && """
+        r"""sed -i -E 's/offs_n([0-9]?)\[:, None\] \* stride_(in|on)/offs_n\1.to(tl.int64)[:, None] * stride_\2/g' "$P" && """
+        r"""test "$(grep -c 'offs_n[0-9]*\[:, None\] \* stride_' "$P")" = 0 && """
+        r"""test "$(grep -c 'to(tl.int64)' "$P")" -ge 4 && """
+        r"""python -c "import ast,os,sageattention;ast.parse(open(os.path.join(os.path.dirname(sageattention.__file__),'triton','quant_per_thread.py')).read())" && """
+        r"""echo '[bridge] sage int64 patch OK'"""
+    )
     .run_commands("mkdir -p /comfy-volume")
     # 把部署时的 MODAL_BRIDGE_* 配置烤进镜像环境 → 容器运行时能读到真实值。
     # ⚠ 关键:modal deploy 子进程的 env(node_sync.deploy_env 注入)只在"部署解析期"可见,
