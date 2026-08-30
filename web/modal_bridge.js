@@ -58,11 +58,6 @@ const I18N = {
   "dlg.gpu.note":     { zh: "⚡ 换档立即生效,无需部署;Auto 按显存自动选档 —— 悬停看详情", en: "⚡ Tier switch is instant, no redeploy; Auto picks by VRAM — hover for details" },
   "dlg.gpu.note_full":{ zh: "四档 worker(CPU/省钱/标准/顶配)是一次部署全建好的,选哪档只是运行时路由,空闲的档 scale-to-zero 不花钱。Auto:小图走省钱档、超主卡显存自动升顶配档(防 OOM),按工作流估算显存自动选。显存不够会退化成频繁 offload(慢几倍且不报错),但显存够之后再加大对速度帮助有限 —— 别只盯着最贵那档。想换某档具体是哪张卡(default_gpu/cheap_gpu/top_gpu),改 config.json 后需要重新部署。",
                         en: "All four workers (CPU/cheap/standard/top) are created by a single deploy; picking a tier is pure runtime routing and idle tiers scale to zero. Auto: small jobs go cheap, anything above the primary card's VRAM escalates to the top tier (OOM guard). Too little VRAM silently degrades into constant offloading (several times slower, no error), but past the point where the model fits, more VRAM buys little speed. Changing which card a tier maps to (default_gpu/cheap_gpu/top_gpu) requires editing config.json and redeploying." },
-  "dlg.sage.label":   { zh: "(有损加速;改完要点「部署」才生效)", en: "(lossy speedup; takes effect after Deploy)" },
-  "dlg.sage.saved":   { zh: "✓ 已保存 —— 点「部署」后生效(开关烤在镜像 env 里,只重建最后一层,秒级)", en: "✓ saved — takes effect after Deploy (flag baked into image env; only the last layer rebuilds, seconds)" },
-  "dlg.sage.failed":  { zh: "✗ 保存失败:{msg}", en: "✗ save failed: {msg}" },
-  "dlg.sage.note":    { zh: "QK 走 INT8 的有损加速,仅标准档 H100 生效;建议同 seed A/B 对比资产 —— 悬停看详情", en: "Lossy INT8-QK speedup, standard H100 tier only; A/B with a fixed seed — hover for details" },
-  "dlg.sage.note_full":{ zh: "用 SageAttention 换掉默认的 PyTorch SDPA:attention 的 QK 矩阵乘走 INT8(长序列视频里 attention 占单步约七成算力)。论文口径视频模型端到端损失 ~0.2%;但 H3 权重本身已剪枝+INT8,误差叠加建议同 seed A/B 对比资产(视频重点看音画同步与高频细节)再常开。仅标准档 H100 生效 —— 省钱/顶配档的卡不匹配编译目标,会自动回退 SDPA,不报错。", en: "Replaces default PyTorch SDPA with SageAttention: QK matmuls in INT8 (attention is ~70% of per-step FLOPs on long video sequences). Papers report ~0.2% end-to-end loss on video models, but H3 weights are already pruned+INT8 - A/B with a fixed seed (watch AV sync & high-freq detail) before leaving it on. Only the standard H100 tier benefits; cheap/top tiers silently fall back to SDPA." },
   "vram.warn.title":  { zh: "⚠ 显存可能不够", en: "⚠ VRAM may be tight" },
   "vram.warn.body":   { zh: "预估需 ~{est}GB(模型 {model}GB),超过所选 {gpu}({cap}GB)。可能 offload 变慢甚至 OOM。",
                         en: "Est. ~{est}GB ({model}GB models) exceeds the selected {gpu} ({cap}GB). May offload (slow) or OOM." },
@@ -81,8 +76,6 @@ const I18N = {
   "dlg.comfy.ph_saved":{ zh: "已保存(留空=沿用)", en: "saved (blank = keep)" },
   "dlg.comfy.note":   { zh: "⚠ 存进云端 Secret,worker 用它跑 API 节点 —— 账单走你的 comfy.org 额度。",
                         en: "⚠ Stored in the cloud Secret; the worker uses it to run API nodes — billed to your comfy.org credits." },
-  "dlg.aigc.toggle":  { zh: "AIGC Studio 网站交付(可选,大多数人用不到)",
-                        en: "AIGC Studio website delivery (optional, most users don't need this)" },
   "dlg.aigc.hint":    { zh: "(可选,网站 aigc-r2 交付才需要;本地用完全不用填)",
                         en: "(optional, only for website aigc-r2 delivery; leave blank for local use)" },
   "dlg.aigc.url_ph":  { zh: "https://你的站点.vercel.app(留空 = 不启用)", en: "https://your-site.vercel.app (blank = disabled)" },
@@ -246,6 +239,18 @@ const I18N = {
                         en: "Experimental: Modal container memory snapshot (CPU+GPU), cold start ~30s→~5s. Redeploy in Setup to take effect; verify per GPU tier (self-heals to a normal cold start if unsupported)." },
   "set.snapshot.on":  { zh: "已开启内存快照 —— 去 Setup 重新部署才生效(实验,前 2-3 次冷启偏慢=制作快照)", en: "Snapshot ON — redeploy in Setup to take effect (experimental; first 2-3 cold starts slower while snapshotting)" },
   "set.snapshot.off": { zh: "已关闭内存快照 —— 去 Setup 重新部署生效", en: "Snapshot OFF — redeploy in Setup to take effect" },
+  // ── 高级开关(2026-08-30 从 Setup 面板移到设置页:两者都是少数人用的进阶功能,
+  //    留在部署面板里会让每个新用户都要先看懂两段免责说明才敢点部署)──
+  "set.sage":         { zh: "高级:用 SageAttention 换掉默认 PyTorch SDPA,QK 矩阵乘走 INT8。长序列视频里 attention 约占单步七成算力,实测 H100 上采样快约一半;代价是有损——H3 权重本身已剪枝+INT8,误差会叠加,建议同 seed A/B 对比资产(视频重点看音画同步与高频细节)再常开。仅标准档 H100 生效,省钱/顶配档会自动回退 SDPA 不报错。改完要去 Setup 点部署才生效。",
+                        en: "Advanced: replace PyTorch SDPA with SageAttention (INT8 QK matmuls). Attention is ~70% of per-step FLOPs on long video; measured ~2x faster sampling on H100. Lossy — H3 weights are already pruned+INT8, so errors compound; A/B with a fixed seed before leaving it on. Standard H100 tier only; cheap/top tiers silently fall back to SDPA. Redeploy in Setup to take effect." },
+  "set.sage.on":      { zh: "已开启 SageAttention —— 去 Setup 点「部署」才生效(有损加速,建议同 seed 对比过再常开)", en: "SageAttention ON — redeploy in Setup to take effect (lossy; A/B before leaving it on)" },
+  "set.sage.off":     { zh: "已关闭 SageAttention —— 去 Setup 点「部署」生效", en: "SageAttention OFF — redeploy in Setup to take effect" },
+  "set.aigc":         { zh: "高级:把产物交付到自建的 AIGC Studio 网站(aigc-r2 模式)。本地 ComfyUI Desktop 用户用不到。打开后 Setup 面板会多出「AIGC Studio」一栏填地址和旁路密钥——密钥属于凭据,所以只放在那里,不放在设置页。",
+                        en: "Advanced: deliver outputs to your own AIGC Studio site (aigc-r2 mode). Not needed for local ComfyUI Desktop. Turning this on adds an \"AIGC Studio\" section to the Setup panel for the URL and bypass secret — the secret is a credential, so it lives there, not in Settings." },
+  // ── Setup 面板分组标题 ──
+  "dlg.grp.conn":     { zh: "连接", en: "Connection" },
+  "dlg.grp.run":      { zh: "运行", en: "Runtime" },
+  "dlg.grp.integr":   { zh: "集成", en: "Integrations" },
 };
 
 function t(key, vars) {
@@ -1583,11 +1588,32 @@ async function syncSnapshotToConfig(value) {
   } catch (e) { err("sync snapshot to config failed", e); }
 }
 
+// _advReady:同 _snapReady —— 启动期 ComfyUI 会用存储值触发 onChange,挡掉避免覆盖 config。
+let _advReady = false;
+async function syncSageToConfig(value) {
+  if (!_advReady) return;
+  try {
+    await api.fetchApi("/modal_bridge/config", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ use_sage_attention: !!value }),
+    });
+    log("use_sage_attention →", !!value, "(写回 config;重新部署后生效)");
+    notify(value ? t("set.sage.on") : t("set.sage.off"), "info");
+  } catch (e) { err("sync sage to config failed", e); }
+}
+
+// ⚠ 每一项都必须显式写 category,不能只靠 id 前缀:
+// 不给 category 时 ComfyUI 按 id 的 "." 拆分归类(ModalBridge.batchCount → 分类
+// "ModalBridge"、小节 "batchCount"),于是 ① 顶级分类名只能是无空格的 "ModalBridge",
+// ② 每个设置各占一个小节,设置页会碎成一长串。只要有一项写了带空格的 "Modal Bridge",
+// 就会和没写的那些分裂成两个同名分类(2026-08-30 踩过)。
+// category 是 [分类, 小节, 显示名];id 不变就不会丢用户已保存的值。
 const SETTINGS = [
   // 注:GPU 已统一为 H100→A100-80GB(原生 fallback),不再有显存档选项。
   {
     id: "ModalBridge.batchCount",
-    name: "Modal Bridge: Batch count",
+    name: "Batch count",
+    category: ["Modal Bridge", "General", "Batch count"],
     type: "number",
     defaultValue: 1,
     attrs: { min: 1, max: 20, step: 1 },
@@ -1595,7 +1621,8 @@ const SETTINGS = [
   },
   {
     id: "ModalBridge.pollIntervalSec",
-    name: "Modal Bridge: Poll interval (sec)",
+    name: "Poll interval (sec)",
+    category: ["Modal Bridge", "General", "Poll interval (sec)"],
     type: "number",
     defaultValue: 1.2,
     attrs: { min: 0.5, max: 10, step: 0.1 },
@@ -1603,7 +1630,8 @@ const SETTINGS = [
   },
   {
     id: "ModalBridge.timeoutSec",
-    name: "Modal Bridge: Timeout (sec)",
+    name: "Timeout (sec)",
+    category: ["Modal Bridge", "General", "Timeout (sec)"],
     type: "number",
     // 实际等待窗 = max(此值, 云端 worker 超时 + 3 分钟)(见 poll deadline 处):后端在提交
     // 响应里带回 worker_timeout_sec,前端自动跟上,不再要求手动同步两处 —— 历史上 900 vs
@@ -1615,25 +1643,48 @@ const SETTINGS = [
   },
   {
     id: "ModalBridge.autoSyncModels",
-    name: "Modal Bridge: Auto-sync models (local → Volume)",
+    name: "Auto-sync models (local → Volume)",
+    category: ["Modal Bridge", "General", "Auto-sync models (local → Volume)"],
     type: "boolean",
     defaultValue: true,
     tooltip: t("set.autosync_models"),
   },
   {
     id: "ModalBridge.autoCheckNodes",
-    name: "Modal Bridge: Auto-sync custom nodes",
+    name: "Auto-sync custom nodes",
+    category: ["Modal Bridge", "General", "Auto-sync custom nodes"],
     type: "boolean",
     defaultValue: true,
     tooltip: t("set.autosync_nodes"),
   },
   {
     id: "ModalBridge.enableSnapshot",
-    name: "Modal Bridge: Memory snapshot (experimental, faster cold start)",
+    name: "Memory snapshot (experimental, faster cold start)",
+    category: ["Modal Bridge", "General", "Memory snapshot (experimental)"],
     type: "boolean",
     defaultValue: true,
     tooltip: t("set.snapshot"),
     onChange: (v) => syncSnapshotToConfig(v),
+  },
+  // ── 高级:默认关。放在 Advanced 子分组,不再占 Setup 面板的版面 ──
+  {
+    id: "ModalBridge.useSageAttention",
+    name: "SageAttention (lossy speedup, H100 only)",
+    category: ["Modal Bridge", "Advanced", "SageAttention"],
+    type: "boolean",
+    defaultValue: false,
+    tooltip: t("set.sage"),
+    onChange: (v) => syncSageToConfig(v),
+  },
+  {
+    // 只控制 Setup 面板显不显示 AIGC 那一栏,不写 config —— 地址和旁路密钥属于凭据,
+    // 仍然只在面板里填(设置页是明文存储,不适合放 secret)。
+    id: "ModalBridge.enableAigcStudio",
+    name: "AIGC Studio delivery",
+    category: ["Modal Bridge", "Advanced", "AIGC Studio"],
+    type: "boolean",
+    defaultValue: false,
+    tooltip: t("set.aigc"),
   },
 ];
 
@@ -1755,82 +1806,108 @@ async function openDeployDialog() {
     maxHeight: "88vh", overflow: "auto", borderRadius: "10px", padding: "20px",
     boxShadow: "0 10px 40px rgba(0,0,0,0.5)", font: "13px/1.5 system-ui,sans-serif",
   });
+  // ── 视觉 token:抽出来统一,避免每个字段各写一串内联样式(重复=不一致的温床)──
   const inputCss =
-    "width:100%;box-sizing:border-box;margin:4px 0 10px;padding:7px 9px;" +
+    "width:100%;box-sizing:border-box;margin:2px 0 10px;padding:7px 9px;" +
     "background:#2a2a2a;border:1px solid #444;border-radius:6px;color:#eee;font:13px monospace;";
+  // 三级文字层级:字段名(亮) > 字段旁注(暗,同行) > 段落说明(暗,更小)
+  const labelCss = "display:block;font-size:12px;font-weight:600;color:#d7dde4;margin:0 0 2px;";
+  const hintCss  = "font-weight:400;color:#9aa;";
+  const noteCss  = "margin:-4px 0 12px;color:#9aa;font-size:11px;line-height:1.55;";
+  // 分组:靠间距和小标题分块,不用横线 —— 560px 宽的框里再加分隔线只会更碎。
+  // ⚠ 标题不用 letter-spacing / uppercase:那是拉丁字母的 eyebrow 手法,中文只会被撑散、
+  // 反而更弱(实测截图确认)。改用亮度 + 字重 + 一根短色条做视觉锚点。
+  const groupCss = "margin:22px 0 0;";
+  const groupHeadCss =
+    "display:flex;align-items:center;gap:7px;font-size:12px;font-weight:700;" +
+    "color:#aab4c0;margin:0 0 10px;";
+  // 刻意用中性色而不是主题蓝:蓝色在这个框里只属于「部署」那一个主行动,
+  // 结构标记跟着抢色会稀释它。
+  const groupBarCss = "display:inline-block;width:3px;height:12px;border-radius:2px;background:#4b5563;";
+  const btnCss = "padding:8px 16px;border:none;border-radius:6px;cursor:pointer;font:13px system-ui,sans-serif;";
+  const btnPrimaryCss = btnCss + "background:#2563eb;color:#fff;font-weight:600;";
+  const btnGhostCss   = btnCss + "background:#333a44;color:#c9d1d9;";
+  // 取消类操作再降一级:无底色,免得跟「测试连接」抢视线
+  const btnQuietCss   = btnCss + "background:transparent;color:#8b949e;";
   // 版本对齐徽标:绿=一致 / 黄=不一致(需重新部署)/ 灰=云端连不上
   const vDeployed = ver.reachable ? (ver.deployed || "unknown") : t("dlg.ver.notconn");
   const vColor = ver.match ? "#34d399" : (ver.reachable ? "#fbbf24" : "#9aa");
   const vHint = ver.match ? t("dlg.ver.aligned")
     : (ver.reachable ? t("dlg.ver.mismatch") : t("dlg.ver.unreach"));
+  // AIGC Studio 那一栏只在设置页开了才渲染。默认关 —— 它是自建网站交付用的,
+  // 本地 Desktop 用户永远用不到,却曾经占着部署面板最显眼的位置之一。
+  // 不渲染时 payload 里也不带这两个键,后端会保留 config 里已存的值(routes.py:1073 起)。
+  const aigcOn = !!getSetting("ModalBridge.enableAigcStudio", false);
   panel.innerHTML = `
-    <div style="font-size:16px;font-weight:600;margin-bottom:4px;">${t("dlg.title")}</div>
-    <div id="mb-dep-ver" style="margin-bottom:10px;font-size:12px;padding:6px 10px;border-radius:6px;
-         background:#222;border:1px solid #383838;">
+    <div style="display:flex;align-items:baseline;justify-content:space-between;gap:12px;">
+      <div style="font-size:16px;font-weight:600;">${t("dlg.title")}</div>
       <a href="https://github.com/lynclee/comfyui_modal_bridge" target="_blank"
-         style="float:right;color:#6cf;text-decoration:none;">GitHub ↗</a>
+         style="color:#6cf;text-decoration:none;font-size:12px;white-space:nowrap;">GitHub ↗</a>
+    </div>
+    <div id="mb-dep-ver" style="margin:8px 0 2px;font-size:12px;padding:7px 10px;border-radius:6px;
+         background:#222;border:1px solid #383838;">
       ${t("dlg.ver.local")}<b style="color:#eee;">${ver.local}</b>　·
       ${t("dlg.ver.deployed")}<b style="color:${vColor};">${vDeployed}</b>
       <span style="color:${vColor};">${vHint}</span>
     </div>
-    <div style="color:#9aa;margin-bottom:14px;">
-      ${t("dlg.intro")}
-      <a href="https://modal.com/settings/tokens" target="_blank" style="color:#6cf;">modal.com/settings/tokens</a>
-    </div>
-    <label>Workspace <span style="color:#9aa;">${t("dlg.ws.hint")}</span></label>
-    <input id="mb-dep-ws" type="text" style="${inputCss}" value="${cfg.modal_workspace || ""}" placeholder="your-workspace">
-    <label>Token ID <span style="color:#9aa;">(ak-...)</span></label>
-    <input id="mb-dep-id" type="text" style="${inputCss}" value="${cfg.modal_token_id || ""}" placeholder="ak-xxxxxxxx">
-    <label>Token Secret <span style="color:#9aa;">(as-...${cfg.has_token_secret ? t("dlg.secret.saved") : ""})</span></label>
-    <input id="mb-dep-secret" type="password" style="${inputCss}" value="" placeholder="${cfg.has_token_secret ? t("dlg.secret.ph_saved") : "as-xxxxxxxx"}">
-    <label>GPU <span style="color:#9aa;">${t("dlg.gpu.label")}</span></label>
-    <select id="mb-dep-gputier" style="${inputCss}">
-      <option value="auto"${curTier==="auto"?" selected":""}>${t("dlg.gpu.opt_auto")}</option>
-      <option value="cheap"${curTier==="cheap"?" selected":""}>${t("dlg.gpu.opt_cheap", { gpu: cfg.cheap_gpu || "L40S" })}</option>
-      <option value="primary"${curTier==="primary"?" selected":""}>${t("dlg.gpu.opt_primary", { gpu: cfg.default_gpu || "H100" })}</option>
-      <option value="top"${curTier==="top"?" selected":""}>${t("dlg.gpu.opt_top", { gpu: cfg.top_gpu || "B200" })}</option>
-    </select>
-    <div id="mb-dep-tiermsg" style="margin:0 0 4px;color:#10b981;font-size:12px;"></div>
-    <div style="margin:0 0 10px;color:#9aa;font-size:12px;cursor:help;" title="${t("dlg.gpu.note_full")}">${t("dlg.gpu.note")}</div>
-    <label style="display:flex;align-items:center;gap:8px;cursor:pointer;">
-      <input id="mb-dep-sage" type="checkbox" style="margin:0;"${cfg.use_sage_attention ? " checked" : ""}>
-      SageAttention <span style="color:#9aa;">${t("dlg.sage.label")}</span>
-    </label>
-    <div id="mb-dep-sagemsg" style="margin:0 0 4px;color:#10b981;font-size:12px;"></div>
-    <div style="margin:0 0 10px;color:#9aa;font-size:12px;cursor:help;" title="${t("dlg.sage.note_full")}">${t("dlg.sage.note")}</div>
-    <label>comfy.org API Key <span style="color:#9aa;">${t("dlg.comfy.hint")}</span></label>
-    <input id="mb-dep-comfy" type="password" style="${inputCss}" value="" placeholder="${cfg.has_comfy_api_key ? t("dlg.comfy.ph_saved") : t("dlg.comfy.ph")}">
-    <div style="margin:0 0 10px;color:#9aa;font-size:12px;">${t("dlg.comfy.note")}</div>
-    <div style="margin:2px 0 10px;">
-      <a id="mb-dep-aigc-toggle" href="#" style="color:#6cf;font-size:12px;text-decoration:none;"></a>
-    </div>
-    <div id="mb-dep-aigc-body" style="display:none;">
-      <label>AIGC Studio URL <span style="color:#9aa;">${t("dlg.aigc.hint")}</span></label>
-      <input id="mb-dep-aigc-url" type="text" style="${inputCss}" value="${cfg.aigc_studio_base_url || ""}" placeholder="${t("dlg.aigc.url_ph")}">
-      <label>AIGC Bypass Secret <span style="color:#9aa;">${t("dlg.aigc.bypass_hint")}</span></label>
-      <input id="mb-dep-aigc-bypass" type="password" style="${inputCss}" value="" placeholder="${cfg.has_aigc_bypass_secret ? t("dlg.comfy.ph_saved") : t("dlg.aigc.bypass_ph")}">
-      <div style="margin:0 0 10px;color:#9aa;font-size:12px;">${t("dlg.aigc.note")}</div>
-    </div>
-    <div style="margin:10px 0;">
-      <button id="mb-dep-go" style="padding:8px 18px;background:#2563eb;color:#fff;border:none;border-radius:6px;cursor:pointer;font-weight:600;">${t("dlg.btn.deploy")}</button>
-      <button id="mb-dep-test" style="padding:8px 14px;margin-left:8px;background:#374151;color:#ddd;border:none;border-radius:6px;cursor:pointer;">${t("dlg.btn.test")}</button>
-      <button id="mb-dep-close" style="padding:8px 14px;margin-left:8px;background:#333;color:#ccc;border:none;border-radius:6px;cursor:pointer;">${t("dlg.btn.close")}</button>
-      <span id="mb-dep-status" style="margin-left:12px;color:#9aa;"></span>
-    </div>
-    <pre id="mb-dep-log" style="display:none;background:#111;border:1px solid #333;border-radius:6px;padding:10px;max-height:280px;overflow:auto;white-space:pre-wrap;font:11px/1.4 monospace;color:#bdbdbd;"></pre>
 
-    <div style="margin-top:16px;border-top:1px solid #333;padding-top:12px;">
-      <div style="display:flex;align-items:center;justify-content:space-between;">
+    <div style="${groupCss}">
+      <div style="${groupHeadCss}"><span style="${groupBarCss}"></span>${t("dlg.grp.conn")}</div>
+      <label style="${labelCss}">Workspace <span style="${hintCss}">${t("dlg.ws.hint")}</span></label>
+      <input id="mb-dep-ws" type="text" style="${inputCss}" value="${cfg.modal_workspace || ""}" placeholder="your-workspace">
+      <label style="${labelCss}">Token ID <span style="${hintCss}">(ak-...)</span></label>
+      <input id="mb-dep-id" type="text" style="${inputCss}" value="${cfg.modal_token_id || ""}" placeholder="ak-xxxxxxxx">
+      <label style="${labelCss}">Token Secret <span style="${hintCss}">(as-...${cfg.has_token_secret ? t("dlg.secret.saved") : ""})</span></label>
+      <input id="mb-dep-secret" type="password" style="${inputCss}" value="" placeholder="${cfg.has_token_secret ? t("dlg.secret.ph_saved") : "as-xxxxxxxx"}">
+      <div style="${noteCss}">${t("dlg.intro")}
+        <a href="https://modal.com/settings/tokens" target="_blank" style="color:#6cf;">modal.com/settings/tokens</a>
+      </div>
+    </div>
+
+    <div style="${groupCss}">
+      <div style="${groupHeadCss}"><span style="${groupBarCss}"></span>${t("dlg.grp.run")}</div>
+      <label style="${labelCss}">GPU <span style="${hintCss}">${t("dlg.gpu.label")}</span></label>
+      <select id="mb-dep-gputier" style="${inputCss}">
+        <option value="auto"${curTier==="auto"?" selected":""}>${t("dlg.gpu.opt_auto")}</option>
+        <option value="cheap"${curTier==="cheap"?" selected":""}>${t("dlg.gpu.opt_cheap", { gpu: cfg.cheap_gpu || "L40S" })}</option>
+        <option value="primary"${curTier==="primary"?" selected":""}>${t("dlg.gpu.opt_primary", { gpu: cfg.default_gpu || "H100" })}</option>
+        <option value="top"${curTier==="top"?" selected":""}>${t("dlg.gpu.opt_top", { gpu: cfg.top_gpu || "B200" })}</option>
+      </select>
+      <div id="mb-dep-tiermsg" style="margin:0 0 6px;color:#10b981;font-size:12px;"></div>
+      <div style="${noteCss}margin-top:0;cursor:help;" title="${t("dlg.gpu.note_full")}">${t("dlg.gpu.note")}</div>
+    </div>
+
+    <div style="${groupCss}">
+      <div style="${groupHeadCss}"><span style="${groupBarCss}"></span>${t("dlg.grp.integr")}</div>
+      <label style="${labelCss}">comfy.org API Key <span style="${hintCss}">${t("dlg.comfy.hint")}</span></label>
+      <input id="mb-dep-comfy" type="password" style="${inputCss}" value="" placeholder="${cfg.has_comfy_api_key ? t("dlg.comfy.ph_saved") : t("dlg.comfy.ph")}">
+      <div style="${noteCss}">${t("dlg.comfy.note")}</div>
+      ${aigcOn ? `
+      <label style="${labelCss}">AIGC Studio URL <span style="${hintCss}">${t("dlg.aigc.hint")}</span></label>
+      <input id="mb-dep-aigc-url" type="text" style="${inputCss}" value="${cfg.aigc_studio_base_url || ""}" placeholder="${t("dlg.aigc.url_ph")}">
+      <label style="${labelCss}">AIGC Bypass Secret <span style="${hintCss}">${t("dlg.aigc.bypass_hint")}</span></label>
+      <input id="mb-dep-aigc-bypass" type="password" style="${inputCss}" value="" placeholder="${cfg.has_aigc_bypass_secret ? t("dlg.comfy.ph_saved") : t("dlg.aigc.bypass_ph")}">
+      <div style="${noteCss}">${t("dlg.aigc.note")}</div>` : ``}
+    </div>
+
+    <div style="display:flex;align-items:center;flex-wrap:wrap;gap:8px;margin:20px 0 0;">
+      <button id="mb-dep-go" style="${btnPrimaryCss}">${t("dlg.btn.deploy")}</button>
+      <button id="mb-dep-test" style="${btnGhostCss}">${t("dlg.btn.test")}</button>
+      <button id="mb-dep-close" style="${btnQuietCss}">${t("dlg.btn.close")}</button>
+      <span id="mb-dep-status" style="color:#9aa;font-size:12px;"></span>
+    </div>
+    <pre id="mb-dep-log" style="display:none;background:#111;border:1px solid #333;border-radius:6px;padding:10px;margin:10px 0 0;max-height:280px;overflow:auto;white-space:pre-wrap;font:11px/1.4 monospace;color:#bdbdbd;"></pre>
+
+    <div style="margin-top:20px;border-top:1px solid #333;padding-top:14px;">
+      <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;">
         <span style="font-weight:600;">${t("dlg.nodes.title")}</span>
-        <button id="mb-nodes-load" style="padding:5px 12px;background:#374151;color:#ddd;border:none;border-radius:6px;cursor:pointer;font-size:12px;">${t("dlg.nodes.load")}</button>
+        <button id="mb-nodes-load" style="${btnGhostCss}padding:5px 12px;font-size:12px;">${t("dlg.nodes.load")}</button>
       </div>
-      <div style="color:#9aa;margin-top:4px;font-size:12px;">
-        ${t("dlg.nodes.warn")}
-      </div>
+      <div style="${noteCss}margin:6px 0 0;">${t("dlg.nodes.warn")}</div>
       <div id="mb-nodes-list" style="margin-top:8px;max-height:200px;overflow:auto;"></div>
-      <div style="margin-top:8px;">
-        <button id="mb-nodes-prune" style="display:none;padding:7px 14px;background:#7f1d1d;color:#fff;border:none;border-radius:6px;cursor:pointer;font-weight:600;">${t("dlg.nodes.prune")}</button>
-        <span id="mb-nodes-status" style="margin-left:10px;color:#9aa;font-size:12px;"></span>
+      <div style="margin-top:8px;display:flex;align-items:center;gap:10px;">
+        <button id="mb-nodes-prune" style="${btnCss}display:none;background:#7f1d1d;color:#fff;font-weight:600;padding:7px 14px;">${t("dlg.nodes.prune")}</button>
+        <span id="mb-nodes-status" style="color:#9aa;font-size:12px;"></span>
       </div>
       <pre id="mb-nodes-log" style="display:none;background:#111;border:1px solid #333;border-radius:6px;padding:10px;margin-top:8px;max-height:200px;overflow:auto;white-space:pre-wrap;font:11px/1.4 monospace;color:#bdbdbd;"></pre>
     </div>
@@ -1853,17 +1930,10 @@ async function openDeployDialog() {
 
   // AIGC Studio 交付配置默认折叠(大多数人用不到);已配置过则自动展开。
   // 输入框折叠时仍在 DOM 里,提交 payload 照常读取。
-  const aigcToggle = panel.querySelector("#mb-dep-aigc-toggle");
-  const aigcBody = panel.querySelector("#mb-dep-aigc-body");
-  const setAigcOpen = (open) => {
-    aigcBody.style.display = open ? "block" : "none";
-    aigcToggle.textContent = (open ? "▾ " : "▸ ") + t("dlg.aigc.toggle");
-  };
-  setAigcOpen(!!(cfg.aigc_studio_base_url || cfg.has_aigc_bypass_secret));
-  aigcToggle.onclick = (e) => {
-    e.preventDefault();
-    setAigcOpen(aigcBody.style.display === "none");
-  };
+  // AIGC 那一栏由设置页的 ModalBridge.enableAigcStudio 决定渲不渲染,关着时这两个就是 null。
+  // 不再用「折叠区」——折叠也还是占版面、还要维护展开态,而这功能九成用户用不到。
+  const aigcUrlEl = panel.querySelector("#mb-dep-aigc-url");
+  const aigcBypassEl = panel.querySelector("#mb-dep-aigc-bypass");
 
   // 测试连接:真打一次 Modal /health,查出"app 被删 / endpoint 不通 / key 不对"——
   // 这些光看本地 config 有没有 token 是查不出的(config 字段在不代表云端 app 还活着)。
@@ -2038,26 +2108,6 @@ async function openDeployDialog() {
   // SageAttention:和 GPU 档位不同,它不是运行时路由 —— 开关经 deploy_env 烤进镜像 env,
   // 由 worker 启动参数(--use-sage-attention)消费,所以改完必须点「部署」才生效
   // (只重建最后的 .env() 层,秒级)。这里即时存 config,部署时 deploy_env 读走。
-  const sageChk = panel.querySelector("#mb-dep-sage");
-  const sageMsg = panel.querySelector("#mb-dep-sagemsg");
-  sageChk.onchange = async () => {
-    try {
-      const r = await api.fetchApi("/modal_bridge/config", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ use_sage_attention: sageChk.checked }),
-      });
-      if (!r.ok) throw new Error(`HTTP ${r.status}`);
-      sageMsg.style.color = "#10b981";
-      sageMsg.textContent = t("dlg.sage.saved");
-      log("sage attention →", sageChk.checked);
-    } catch (e) {
-      sageMsg.style.color = "#ef4444";
-      sageMsg.textContent = t("dlg.sage.failed", { msg: String(e) });
-      err("save sage attention failed", e);
-    }
-  };
-
   goBtn.onclick = async () => {
     const payload = {
       workspace: panel.querySelector("#mb-dep-ws").value.trim(),
@@ -2068,9 +2118,13 @@ async function openDeployDialog() {
       // 固定的(@app.cls 的 gpu= 参数),要换卡型得改 config.json 再部署。
       gpu_tier: tierSel.value,
       comfy_api_key: panel.querySelector("#mb-dep-comfy").value.trim(),
-      // AIGC Studio(可选,网站 aigc-r2 交付):URL 明文;bypass 密钥留空 = 沿用已存的
-      aigc_studio_base_url: panel.querySelector("#mb-dep-aigc-url").value.trim(),
-      aigc_bypass_secret: panel.querySelector("#mb-dep-aigc-bypass").value.trim(),
+      // AIGC Studio(可选,网站 aigc-r2 交付):URL 明文;bypass 密钥留空 = 沿用已存的。
+      // ⚠ 设置页关着时这一栏不渲染,payload 里就不带这两个键 —— 后端对「键不存在」是
+      // 保留 config 已存值(routes.py:1073 起),所以关掉开关不会把用户填过的配置抹掉。
+      ...(aigcUrlEl ? {
+        aigc_studio_base_url: aigcUrlEl.value.trim(),
+        aigc_bypass_secret: aigcBypassEl ? aigcBypassEl.value.trim() : "",
+      } : {}),
     };
     // token_secret 留空 = 沿用已存的(/config 不再回显它);只有填了才校验格式
     const secretOk = payload.token_secret === "" ? cfg.has_token_secret : payload.token_secret.startsWith("as-");
@@ -2328,7 +2382,9 @@ app.registerExtension({
     fetchConfig().then(async (cfg) => {
       // 用后端 config 的真实值初始化快照开关(UI 对齐部署现实),之后才放行 onChange 回写
       try { app.ui.settings.setSettingValue("ModalBridge.enableSnapshot", !!cfg.enable_snapshot); } catch (e) {}
+      try { app.ui.settings.setSettingValue("ModalBridge.useSageAttention", !!cfg.use_sage_attention); } catch (e) {}
       _snapReady = true;
+      _advReady = true;
       if (!isConfigured(cfg)) {
         notify(t("toast.not_deployed"), "warn");
       } else if (await isModalOutage()) {

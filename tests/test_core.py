@@ -1693,3 +1693,60 @@ def test_no_api_key_in_query_string():
     # 反向:客户端确实在用请求头
     assert 'X-Bridge-Key' in (ROOT / "bridge_client.py").read_text(encoding="utf-8")
     assert 'X-Bridge-Key' in (ROOT / "modal_client.py").read_text(encoding="utf-8")
+
+
+def test_advanced_toggles_not_in_setup_panel():
+    """SageAttention / AIGC Studio 必须留在设置页的 Advanced,不许挪回 Modal Setup 面板。
+
+    这两个都是少数人才用的进阶功能:sage 是有损加速(要自己同 seed 对比过才敢常开),
+    AIGC Studio 是自建网站交付(本地 Desktop 用户永远用不到)。它们曾经占着部署面板
+    最显眼的位置,导致每个新用户都要先读懂两段免责说明才敢点部署。
+
+    钉死三件事:① 面板模板里没有 sage 控件;② 两个设置项都注册了且默认关;
+    ③ AIGC 那一栏是按设置项条件渲染的。
+    """
+    src = (ROOT / "web" / "modal_bridge.js").read_text(encoding="utf-8")
+
+    # ① 面板里不该再有 sage 的常驻控件
+    assert 'id="mb-dep-sage"' not in src, "SageAttention 复选框被挪回了 Setup 面板"
+    assert "mb-dep-aigc-toggle" not in src, "AIGC 折叠开关被挪回了 Setup 面板"
+
+    # ② 两个设置项注册且默认关
+    for sid in ("ModalBridge.useSageAttention", "ModalBridge.enableAigcStudio"):
+        i = src.find(f'id: "{sid}"')
+        assert i > 0, f"设置项 {sid} 没注册"
+        block = src[i:i + 400]
+        assert "defaultValue: false" in block, f"{sid} 默认值不是 false"
+        assert '"Advanced"' in block, f"{sid} 没归到 Advanced 分组"
+
+    # ③ AIGC 一栏条件渲染，且关闭时 payload 不带这两个键（否则会抹掉用户已存配置）
+    assert 'getSetting("ModalBridge.enableAigcStudio"' in src, "AIGC 没有按设置项条件渲染"
+    assert "aigcUrlEl ? {" in src, "payload 没有对 AIGC 未渲染的情况做处理"
+
+
+def test_all_settings_share_one_category():
+    """所有 ModalBridge 设置项必须显式写 category,且顶级分类名一致。
+
+    不写 category 时 ComfyUI 按 id 的 "." 拆分归类(ModalBridge.batchCount → 分类
+    "ModalBridge"、小节 "batchCount"),于是顶级名只能是无空格的 "ModalBridge",
+    且每个设置各占一个小节。只要有一项写了带空格的 "Modal Bridge",就会和没写的
+    那些在设置页分裂成两个同名分类 —— 2026-08-30 真踩过。
+    """
+    import re
+
+    src = (ROOT / "web" / "modal_bridge.js").read_text(encoding="utf-8")
+    blk = src[src.index("const SETTINGS = ["):]
+    blk = blk[:blk.index("\n];")]
+
+    ids = re.findall(r'id:\s*"(ModalBridge\.\w+)"', blk)
+    assert len(ids) >= 8, f"只解析到 {len(ids)} 个设置项,正则可能失效"
+
+    cats = re.findall(r'category:\s*\[\s*"([^"]+)"\s*,\s*"([^"]+)"', blk)
+    assert len(cats) == len(ids), (
+        f"{len(ids)} 个设置项里只有 {len(cats)} 个写了 category —— "
+        "漏写的会按 id 前缀单独归类,设置页出现两个 Modal Bridge"
+    )
+    tops = {c[0] for c in cats}
+    assert len(tops) == 1, f"顶级分类名不统一: {sorted(tops)}"
+    subs = {c[1] for c in cats}
+    assert subs <= {"General", "Advanced"}, f"意外的小节名: {sorted(subs - {'General', 'Advanced'})}"
