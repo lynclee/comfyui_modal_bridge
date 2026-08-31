@@ -61,6 +61,11 @@ DEFAULT_CONFIG = {
     # 反过来只是多花一点(GPU 档 scale-to-zero,纯 API 工作流跑几秒就结束)。
     # 关掉 = auto 档一律走 GPU 梯子。保持 True 是为了不改变既有用户的账单;吃过误判亏就关掉。
     "cpu_tier_when_no_model": True,
+    # 是否允许从**非本机**取回 bridge_api_key(/modal_bridge/bridge_key)。默认否。
+    # 那把 key 直接对应部署者的 Modal 账单,而 ComfyUI 一旦 --listen 暴露到局域网,
+    # 同网段任何人 GET 一下就能拿走。只有"在服务器上跑 ComfyUI、从别的机器开界面
+    # 并且需要导出内嵌 key 的脚本"这一种场景才需要打开,且要自行确认网络可信。
+    "allow_remote_bridge_key": False,
     # 内存快照(实验):实测对 GPU worker 基本无效 —— ComfyUI 是子进程,Modal 快照盖不住
     # (2026-08-05 实测 7 启动 7 重建 0 复用),开着反添 ~5s/次创建开销,故默认关。
     # CPU worker 的 CPU 快照不受影响。换值需重新部署。

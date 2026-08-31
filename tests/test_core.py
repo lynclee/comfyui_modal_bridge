@@ -2038,3 +2038,28 @@ def test_cli_deploy_keeps_secret_fields_and_atomic_config():
     assert "CONFIG_DST.write_text" not in src, "还在直接 write_text 写 config"
     # 别再宣称与 GUI 等价 —— 它确实少做了几步
     assert "不等价于 GUI" in src, "docstring 应如实交代与 GUI 的差距"
+
+
+def test_bridge_key_endpoint_is_localhost_only():
+    """/bridge_key 是唯一会明文吐出 bridge_api_key 的端点,必须强制仅本机。
+
+    那把 key 直接对应部署者的 Modal 账单。以前 docstring 写着"仅本机"却没有任何强制,
+    ComfyUI 一旦 --listen 暴露到局域网,同网段任何人 GET 一下就拿走了。
+
+    判据必须用 request.remote(TCP 对端地址),不能用 Origin/Referer —— 后两者是请求头,
+    curl 随便伪造。
+    """
+    src = (ROOT / "routes.py").read_text(encoding="utf-8")
+    i = src.index('@routes.get("/modal_bridge/bridge_key")')
+    body = src[i:src.index("@routes.", i + 10)]
+
+    assert "request.remote" in body, "没有校验对端地址"
+    assert "127.0.0.1" in body, "本机白名单里没有 127.0.0.1"
+    assert "status=403" in body, "非本机没有被拒绝"
+    assert "allow_remote_bridge_key" in body, "没有留可配置的逃生口"
+    # 校验必须在读 key 之前
+    assert body.index("request.remote") < body.index('cfg.get("bridge_api_key"'), \
+        "先读了 key 才校验,等于没校验"
+
+    import config as cfg_mod
+    assert cfg_mod.DEFAULT_CONFIG["allow_remote_bridge_key"] is False, "默认必须是不允许"

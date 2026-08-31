@@ -446,8 +446,25 @@ def _setup_routes():
 
     @routes.get("/modal_bridge/bridge_key")
     async def _bridge_key(request: web.Request):
-        """仅本机:导出脚本「嵌入 KEY」时取回自己的 bridge_api_key。
-        /config 故意抹掉 key 不回吐浏览器;这里单独给(同机、owner 自己的 key,显式动作才调)。"""
+        """导出脚本「嵌入 KEY」时取回自己的 bridge_api_key。**强制仅本机**。
+
+        /config 故意抹掉 key 不回吐浏览器,这里是唯一会明文吐出它的地方 —— 而那把 key
+        直接对应你的 Modal 账单。以前 docstring 写着"仅本机"却没有任何强制:ComfyUI
+        一旦 --listen 暴露到局域网,同网段任何人 GET 一下就拿走了。
+
+        判据用 request.remote(TCP 对端地址)而不是 Origin/Referer —— 后两者是请求头,
+        curl 随便伪造;前者伪造要控网络路径。⚠ 反向代理后面 remote 恒为代理地址,
+        这道闸会失效也拦不住,那属于用户自己的部署选择,由 allow_remote_bridge_key 兜底。
+        """
+        remote = (request.remote or "").strip()
+        allow_remote = bool(cfg_mod.load_config().get("allow_remote_bridge_key", False))
+        if not allow_remote and remote not in ("127.0.0.1", "::1", "localhost"):
+            print(f"[modal_bridge] ⚠ 拒绝来自 {remote or '?'} 的 bridge_key 请求(非本机)")
+            return web.json_response(
+                {"error": "bridge_key 仅限本机取用。这把 key 直接对应部署者的 Modal 账单,"
+                          "所以不从局域网回吐。确需远程导出:在 config.json 里把 "
+                          "allow_remote_bridge_key 设为 true(自行评估所在网络是否可信)。"},
+                status=403)
         cfg = cfg_mod.load_config()
         return web.json_response({"key": cfg.get("bridge_api_key", "")})
 
