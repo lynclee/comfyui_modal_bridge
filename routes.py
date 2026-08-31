@@ -4,7 +4,6 @@ routes.py — 本地 ComfyUI 服务器上的 HTTP 路由
 """
 import asyncio
 import base64
-import os
 import subprocess
 from pathlib import Path
 
@@ -395,19 +394,26 @@ async def _run_blocking_streamed(resp: web.StreamResponse, fn):
 
 
 async def _ensure_modal(resp: web.StreamResponse) -> int:
-    """确保 ComfyUI 内嵌 Python 里有 modal 包,缺则 pip 装。返回 0=可用。"""
+    """确保 ComfyUI 内嵌 Python 里有 modal 包。缺则**报错并给出手动装法**,不自动装。
+
+    以前这里会起子进程装包。移除的原因是 ComfyUI Registry 明令禁止
+    「Runtime package installation through subprocess calls」——插件依赖统一由
+    ComfyUI Manager 在安装时装(modal 已声明进 pyproject.toml 的 dependencies
+    和 requirements.txt)。留着这段会让发布版本被判 Flagged,用户在 Manager 里
+    根本装不到新版,代价远大于"少一步自动安装"的便利。
+
+    正常路径下这个分支不会触发:通过 Manager / Registry 装本插件时 modal 已经装好了。
+    只有手动 git clone 进 custom_nodes、又没装依赖的用户会走到这里。
+    """
     if node_sync.modal_available():
         await _emit(resp, "== modal 包已就绪 ==\n")
         return 0
-    await _emit(resp, "== 未检测到 modal 包,正在装到 ComfyUI 内嵌 Python(约 30s)==\n")
-    rc = await _run_streamed(resp, node_sync.pip_install_modal_cmd(), cwd=str(node_sync._HERE), env=os.environ.copy())
-    if rc != 0:
-        await _emit(resp, "== ✗ pip install modal 失败 ==\n")
-        return rc
-    if not node_sync.modal_available():
-        await _emit(resp, "== ✗ 装完仍 import 不到 modal ==\n")
-        return 1
-    await _emit(resp, "== ✓ modal 安装完成 ==\n")
+    await _emit(resp, "== ✗ 未检测到 modal 包 ==\n")
+    await _emit(resp, "   本插件的依赖由 ComfyUI Manager 在安装时装。手动 clone 进 custom_nodes 的话,\n")
+    await _emit(resp, "   在 ComfyUI 用的那个 Python 环境里装一次即可:\n\n")
+    await _emit(resp, "       <ComfyUI 的 python> -m pip install -U modal\n\n")
+    await _emit(resp, "   装完重启 ComfyUI 再点部署。(也可以在 Manager 里卸载后重装本插件,依赖会自动装上)\n")
+    return 1
     return 0
 
 
@@ -1078,6 +1084,22 @@ def _setup_routes():
         endpoint_base = f"https://{workspace}--{app_name}"
         # 私有鉴权 key:已有就复用(不让旧 config 失效),否则新生成
         bridge_key = cfg.get("bridge_api_key") or node_sync.gen_bridge_key()
+
+        # 本地自写节点(Volume 通道)的 pip 依赖 → 写进 _local_nodes_data.py,由 modal_image
+        # 在 build 期装。⚠ 不能等到 worker 启动时装:ComfyUI Registry 明令禁止
+        # 「Runtime package installation through subprocess calls」,而且那样每个冷容器
+        # 都要重付一次。节点**代码**仍走 Volume(改一行免重 build),只有依赖变了才动这一层。
+        # 取 Volume 上的节点名(那正是会被解压进云端的那批),再从本机同名目录读 requirements。
+        try:
+            _local_folders = local_nodes.list_volume_local_nodes(cfg)
+            _local_reqs = local_nodes.collect_requirements(
+                _local_folders, Path(node_sync._comfyui_root()) / "custom_nodes")
+            node_sync.write_local_node_reqs(_local_reqs)
+            if _local_reqs:
+                await _emit(resp, f"   本地节点依赖({len(_local_reqs)} 条)将在镜像 build 期安装\n")
+        except Exception as _e:
+            # 收集失败不该挡住部署:最坏是沿用上次的清单(或空),节点导入时才暴露
+            await _emit(resp, f"   ⚠ 本地节点依赖收集失败({_e}),沿用上次清单\n")
 
         # ComfyUI 版本跟随本机:检测本机版本 → 解析云端 clone tag(无对应取最接近,只警告不中止)
         comfyui_version = node_sync.detect_local_comfyui_version()

@@ -1750,3 +1750,98 @@ def test_all_settings_share_one_category():
     assert len(tops) == 1, f"顶级分类名不统一: {sorted(tops)}"
     subs = {c[1] for c in cats}
     assert subs <= {"General", "Advanced"}, f"意外的小节名: {sorted(subs - {'General', 'Advanced'})}"
+
+
+def test_sage_copy_matches_worker_gate():
+    """SageAttention 的用户文案必须和 worker 的实际门控一致。
+
+    worker 用 compute_cap 白名单门控(modal_app.py 的 `cap in ("8.9", "9.0")`),
+    即 L40S(sm_89)与 H100(sm_90)都生效、B200(sm_100)回退 SDPA。
+    2026-08-30 踩过:把 multiarch wheel 之前的旧文案(「仅 H100 生效」)搬进了设置页,
+    会误导用户为了用 sage 去选更贵的 H100。
+    """
+    gate = (ROOT / "modal_app" / "modal_app.py").read_text(encoding="utf-8")
+    assert '("8.9", "9.0")' in gate, "worker 门控白名单变了,文案断言需要同步更新"
+
+    js = (ROOT / "web" / "modal_bridge.js").read_text(encoding="utf-8")
+    i = js.find('"set.sage":')
+    assert i > 0, "set.sage 文案不见了"
+    block = js[i:i + 1600]
+    assert "L40S" in block, "sage 文案没提 L40S —— 但 worker 门控放行 sm_89"
+    assert "仅标准档 H100 生效" not in block, "又抄回了 multiarch wheel 之前的旧文案"
+    assert "Standard H100 tier only" not in block, "英文文案仍是旧的 H100-only 说法"
+
+
+def test_no_runtime_pip_install_anywhere():
+    """包里不许有「运行时用 subprocess 装包」——ComfyUI Registry 的硬禁令。
+
+    官方原文:「Runtime package installation through subprocess calls is not permitted.」
+    2026-08-30 定位到这是 0.8.x 连续被判 Flagged 的最可能原因(0.7.9 里同样有这段代码,
+    只是当时规则还没收紧)。依赖统一由 ComfyUI Manager 装(pyproject.dependencies +
+    requirements.txt),自写节点的依赖改在镜像 build 期装(_local_nodes_data.py)。
+
+    这里扫真实代码行(剥掉注释与文档串),避免把说明文字误判成调用。
+    """
+    import ast
+
+    # 只扫 git 跟踪的文件 —— 那正是 `comfy node publish` 会打进 Registry 包的内容。
+    # 不用 rglob:插件目录下有第三方 lib/(已 gitignore、不进包),扫它既慢又会误报。
+    out = subprocess.run(["git", "ls-files", "*.py"], cwd=ROOT,
+                         capture_output=True, text=True, timeout=60)
+    rels = [x for x in out.stdout.splitlines() if x.strip()] if out.returncode == 0 else []
+    assert rels, "拿不到 git 跟踪的 py 文件清单(不在 git 仓库?),该测试失去意义"
+
+    offenders = []
+    for rel in rels:
+        if rel.startswith("tests/"):
+            continue
+        try:
+            tree = ast.parse((ROOT / rel).read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            # 取所有字面量字符串实参（含列表里的），拼起来判断是不是 pip 安装命令
+            flat = []
+            for a in ast.walk(node):
+                if isinstance(a, ast.Constant) and isinstance(a.value, str):
+                    flat.append(a.value)
+            joined = " ".join(flat)
+            if "pip" in joined and "install" in joined:
+                fn = node.func
+                name = getattr(fn, "attr", None) or getattr(fn, "id", "")
+                if name in ("run", "Popen", "call", "check_call", "check_output", "system"):
+                    offenders.append(f"{rel}:{node.lineno}")
+    assert not offenders, "运行时装包(Registry 禁令):\n  " + "\n  ".join(offenders)
+
+
+def test_local_node_reqs_roundtrip_and_sanitize(tmp_path):
+    """自写节点依赖:收集时要剔掉在云端没有意义的行,并能写入/读回。
+
+    -r/-e/-f/--index-url/本地路径/直链 在云端没有对应的文件系统上下文,留着只会让
+    build 挂在一个和真实原因无关的报错上。
+    """
+    import local_nodes as ln
+    import node_sync as ns
+
+    (tmp_path / "a").mkdir()
+    (tmp_path / "a" / "requirements.txt").write_text(
+        "# c\ntorch>=2.0\n\nnumpy==1.26.4\n-r other.txt\n-e .\nhttps://x/y.whl\n--index-url http://p\n",
+        encoding="utf-8")
+    (tmp_path / "b").mkdir()
+    (tmp_path / "b" / "requirements.txt").write_text("numpy==1.26.4\nrich\n", encoding="utf-8")
+    (tmp_path / "c").mkdir()          # 没有 requirements
+
+    got = ln.collect_requirements(["a", "b", "c", "../escape"], tmp_path)
+    assert got == ["torch>=2.0", "numpy==1.26.4", "rich"], got
+
+    old = ns.LOCAL_REQS_FILE
+    try:
+        ns.LOCAL_REQS_FILE = tmp_path / "_local_nodes_data.py"
+        ns.write_local_node_reqs(got)
+        assert ns.read_local_node_reqs() == got
+        ns.write_local_node_reqs([])
+        assert ns.read_local_node_reqs() == []
+    finally:
+        ns.LOCAL_REQS_FILE = old

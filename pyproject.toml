@@ -1,13 +1,18 @@
 [project]
 name = "comfyui_modal_bridge"
 description = "一键把当前 ComfyUI 工作流推到 Modal Serverless GPU(H100)跑,自动同步本地模型/自定义节点,出图回填画板,零终端。 | One-click run the current ComfyUI workflow on Modal Serverless GPU (H100); auto-sync local models/custom-nodes, results back to the canvas, no terminal."
-version = "0.8.4"
+version = "0.8.5"
 license = { text = "MIT" }
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "aiohttp",
     "pyyaml",
+    # 部署链路要在 ComfyUI 的内嵌 Python 里 import modal / 跑 `-m modal deploy`。
+    # ⚠ 必须声明在这里(和 requirements.txt),不能等到用户点部署时再自动 pip install:
+    # ComfyUI Registry 明令「Runtime package installation through subprocess calls
+    # is not permitted」,依赖统一由 ComfyUI Manager 装。
+    "modal",
 ]
 
 [project.urls]

@@ -22,6 +22,9 @@ from pathlib import Path
 _HERE = Path(__file__).resolve().parent
 MODAL_APP_DIR = _HERE / "modal_app"
 DATA_FILE = MODAL_APP_DIR / "_custom_nodes_data.py"
+# 本地自写节点的依赖清单。与 _custom_nodes_data.py 同性质:部署时生成的本地状态,
+# 不入库(.gitignore),缺了 modal_image 自愈成空列表。
+LOCAL_REQS_FILE = MODAL_APP_DIR / "_local_nodes_data.py"
 PYPROJECT = _HERE / "pyproject.toml"
 
 
@@ -233,6 +236,53 @@ def write_baked_nodes(nodes: list[dict]) -> None:
         lines.append("    },")
     lines.append("]")
     DATA_FILE.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+_LOCAL_REQS_HEADER = '''"""
+_local_nodes_data.py — 本地自写节点(走 Volume 通道那批)的 pip 依赖清单(纯数据)
+
+⚠ 部署时由 node_sync.write_local_node_reqs() 自动重写,别手改。
+
+**为什么依赖装在 build 期、而代码走 Volume**:代码要能改一行就重传、不重 build
+(那是 Volume 通道存在的全部意义);但依赖不能在 worker 启动时 pip install ——
+ComfyUI Registry 明令禁止「Runtime package installation through subprocess calls」,
+而且那样每个冷容器都要重付一次安装时间。依赖变更频率远低于代码,放 build 期正合适。
+
+改本地节点代码 → 重传 zip 即可,不用部署。
+新增/改依赖   → 需要重新部署一次(这个文件会跟着变,触发那一层重 build)。
+"""
+'''
+
+
+def write_local_node_reqs(reqs: list[str]) -> None:
+    """重写 _local_nodes_data.py(格式固定,可反复机改)。"""
+    lines = [_LOCAL_REQS_HEADER, "LOCAL_NODE_REQS = ["]
+    for r in reqs:
+        r = (r or "").strip()
+        if not r:
+            continue
+        lines.append(f"    {json.dumps(r, ensure_ascii=False)},")
+    lines.append("]")
+    LOCAL_REQS_FILE.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def read_local_node_reqs() -> list[str]:
+    """读 _local_nodes_data.py 的 LOCAL_NODE_REQS。缺文件/解析不了 → 空列表。
+
+    用 ast.literal_eval 而不是 import:这个文件是机器维护的纯数据,不该被执行。
+    """
+    try:
+        src = LOCAL_REQS_FILE.read_text(encoding="utf-8")
+    except Exception:
+        return []
+    try:
+        for node in ast.walk(ast.parse(src)):
+            if (isinstance(node, ast.Assign)
+                    and any(getattr(t, "id", "") == "LOCAL_NODE_REQS" for t in node.targets)):
+                return [str(x) for x in ast.literal_eval(node.value)]
+    except Exception:
+        pass
+    return []
 
 
 # ============================================================================
@@ -590,10 +640,6 @@ def modal_available() -> bool:
         return r.returncode == 0
     except Exception:
         return False
-
-
-def pip_install_modal_cmd() -> list[str]:
-    return [sys.executable, "-m", "pip", "install", "-U", "modal"]
 
 
 def gen_bridge_key() -> str:

@@ -164,6 +164,39 @@ def pack_node_dir(path: Path) -> tuple[bytes, str, int, int]:
 # ============================================================================
 # Volume 侧(需要 modal SDK,由 routes 调用)
 # ============================================================================
+# requirements 行的基本清洗:注释 / 空行 / 会让 pip 去读别的文件或装本地路径的指令一律丢弃。
+# 这些行在云端没有对应的文件系统上下文(-r 指向本地相对路径、-e 装的是本地目录),
+# 留着只会让 build 在一个和真实原因无关的报错上失败。
+_REQ_SKIP_PREFIX = ("-r", "--requirement", "-e", "--editable", "-f", "--find-links",
+                    "-i", "--index-url", "--extra-index-url", "-c", "--constraint",
+                    ".", "/", "git+", "http://", "https://", "file:")
+
+
+def collect_requirements(folders: list[str], root: Path) -> list[str]:
+    """把若干本地自写节点的 requirements.txt 汇成一个去重列表(保持首次出现顺序)。
+
+    给部署期用:这些依赖改在镜像 build 时装,不再由 worker 启动时 pip install
+    —— 后者是 ComfyUI Registry 明令禁止的模式(「Runtime package installation
+    through subprocess calls is not permitted」),也让每个冷容器都要重付一次。
+
+    只读文件、不解析版本语义;pip 自己会处理冲突。读不到就跳过(节点没有依赖是常态)。
+    """
+    seen: dict[str, None] = {}
+    for folder in folders:
+        try:
+            req = safe_folder(root, folder) / "requirements.txt"
+            if not req.is_file():
+                continue
+            for raw in req.read_text(encoding="utf-8", errors="replace").splitlines():
+                line = raw.split("#", 1)[0].strip()
+                if not line or line.lower().startswith(_REQ_SKIP_PREFIX):
+                    continue
+                seen.setdefault(line, None)
+        except Exception:
+            continue          # 单个节点读失败不该挡住整次部署
+    return list(seen)
+
+
 def expected_digests(folders: list[str], root: Path) -> dict:
     """本次提交期望云端跑的那版指纹 {folder: digest}(纯本地算,不查 Volume)。
     随 /run 一起发给 worker —— 暖容器据此发现自己装的是旧版并自我纠偏。"""

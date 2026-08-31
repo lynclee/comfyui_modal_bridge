@@ -29,6 +29,19 @@ try:
 except Exception:
     CUSTOM_NODES = []
 
+# _local_nodes_data.py:走 Volume 通道的自写节点的 pip 依赖(部署期由 node_sync 生成)。
+# 同样是 .gitignore 的本地状态,处理方式与上面一致 —— 缺则自建空清单。
+# ⚠ 这些依赖**必须**在 build 期装:worker 启动时 pip install 是 ComfyUI Registry
+# 明令禁止的模式(「Runtime package installation through subprocess calls is not
+# permitted」),而且那样每个冷容器都要重付一次安装时间。
+_LOCAL_REQS_FILE = _HERE / "_local_nodes_data.py"
+if not _LOCAL_REQS_FILE.exists():
+    _LOCAL_REQS_FILE.write_text("LOCAL_NODE_REQS = []\n", encoding="utf-8")
+try:
+    from _local_nodes_data import LOCAL_NODE_REQS
+except Exception:
+    LOCAL_NODE_REQS = []
+
 # extra_model_paths.yaml 也是部署期生成的本地状态(.gitignore;由 node_sync.write_extra_model_paths
 # 按本机模型目录类型生成)。缺则写标准基线,避免下面的 add_local_file 因文件不存在而炸。
 if not _EXTRA_MODEL_PATHS_YAML.exists():
@@ -142,6 +155,10 @@ cuda_image = (
         "fastapi[standard]",
         "pyyaml",
     )
+    # 本地自写节点(Volume 通道)的依赖。清单空时 pip_install() 不生成任何层,
+    # 所以没有自写节点的用户完全不受影响。
+    # 代码仍走 Volume(改一行免重 build);只有依赖变了才会动这一层。
+    .pip_install(*LOCAL_NODE_REQS)
     # SageAttention 两个上游缺陷的 build 期补丁(2026-08-28)—— 上游 main 至今都未修。
     #
     # ① int32 指针溢出(**已致 H3 尾几帧塌坏**):triton/quant_per_thread.py 的量化 kernel
@@ -207,5 +224,5 @@ cuda_image = (
     ) if _os.environ.get(k)})
     .add_local_file(str(_EXTRA_MODEL_PATHS_YAML), "/comfyui/extra_model_paths.yaml")
     .add_local_python_source("modal_image", "_comfy_ws", "_custom_nodes_data", "comfy_log",
-                             "aigc_delivery", "_local_nodes_boot")
+                             "aigc_delivery", "_local_nodes_boot", "_local_nodes_data")
 )

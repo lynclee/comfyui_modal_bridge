@@ -241,8 +241,9 @@ const I18N = {
   "set.snapshot.off": { zh: "已关闭内存快照 —— 去 Setup 重新部署生效", en: "Snapshot OFF — redeploy in Setup to take effect" },
   // ── 高级开关(2026-08-30 从 Setup 面板移到设置页:两者都是少数人用的进阶功能,
   //    留在部署面板里会让每个新用户都要先看懂两段免责说明才敢点部署)──
-  "set.sage":         { zh: "高级:用 SageAttention 换掉默认 PyTorch SDPA,QK 矩阵乘走 INT8。长序列视频里 attention 约占单步七成算力,实测 H100 上采样快约一半;代价是有损——H3 权重本身已剪枝+INT8,误差会叠加,建议同 seed A/B 对比资产(视频重点看音画同步与高频细节)再常开。仅标准档 H100 生效,省钱/顶配档会自动回退 SDPA 不报错。改完要去 Setup 点部署才生效。",
-                        en: "Advanced: replace PyTorch SDPA with SageAttention (INT8 QK matmuls). Attention is ~70% of per-step FLOPs on long video; measured ~2x faster sampling on H100. Lossy — H3 weights are already pruned+INT8, so errors compound; A/B with a fixed seed before leaving it on. Standard H100 tier only; cheap/top tiers silently fall back to SDPA. Redeploy in Setup to take effect." },
+  "set.sage":         { zh: "高级:用 SageAttention 换掉默认 PyTorch SDPA,QK 矩阵乘走 INT8。长序列视频里 attention 约占单步七成算力,实测 H100 上采样快约一半;代价是有损——H3 权重本身已剪枝+INT8,误差会叠加,建议同 seed A/B 对比资产(视频重点看音画同步与高频细节)再常开。**标准档 H100 与省钱档 L40S 都生效**(实测 L40S 88→50.6 s/it,约 −43%;单条成本与 H100 几乎打平、墙钟约 2.2 倍),顶配档 B200(sm_100)自动回退 SDPA 不报错。改完要去 Setup 点部署才生效。",
+                        en: "Advanced: replace PyTorch SDPA with SageAttention (INT8 QK matmuls). Attention is ~70% of per-step FLOPs on long video; measured ~2x faster sampling on H100. Lossy — H3 weights are already pruned+INT8, so errors compound; A/B with a fixed seed before leaving it on. Works on both the standard H100 and cheap L40S tiers (L40S measured 88→50.6 s/it, ~-43%); the top B200 tier (sm_100) cleanly falls back to SDPA. Redeploy in Setup to take effect." },
+  "set.save_failed":  { zh: "✗ 设置没保存成功:{msg} —— 请重试(改动未写入 config)", en: "✗ Setting not saved: {msg} — please retry (config unchanged)" },
   "set.sage.on":      { zh: "已开启 SageAttention —— 去 Setup 点「部署」才生效(有损加速,建议同 seed 对比过再常开)", en: "SageAttention ON — redeploy in Setup to take effect (lossy; A/B before leaving it on)" },
   "set.sage.off":     { zh: "已关闭 SageAttention —— 去 Setup 点「部署」生效", en: "SageAttention OFF — redeploy in Setup to take effect" },
   "set.aigc":         { zh: "高级:把产物交付到自建的 AIGC Studio 网站(aigc-r2 模式)。本地 ComfyUI Desktop 用户用不到。打开后 Setup 面板会多出「AIGC Studio」一栏填地址和旁路密钥——密钥属于凭据,所以只放在那里,不放在设置页。",
@@ -1579,13 +1580,18 @@ let _snapReady = false;
 async function syncSnapshotToConfig(value) {
   if (!_snapReady) return;  // 启动期/初始化触发的 onChange 不回写
   try {
-    await api.fetchApi("/modal_bridge/config", {
+    // ⚠ fetchApi 对 4xx/5xx 也照常 resolve —— 不查 r.ok 就会「提示已保存、实际没写进去」
+    const r = await api.fetchApi("/modal_bridge/config", {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ enable_snapshot: !!value }),
     });
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
     log("enable_snapshot →", !!value, "(写回 config;重新部署后生效)");
     notify(value ? t("set.snapshot.on") : t("set.snapshot.off"), "info");
-  } catch (e) { err("sync snapshot to config failed", e); }
+  } catch (e) {
+    err("sync snapshot to config failed", e);
+    notify(t("set.save_failed", { msg: String(e) }), "error");
+  }
 }
 
 // _advReady:同 _snapReady —— 启动期 ComfyUI 会用存储值触发 onChange,挡掉避免覆盖 config。
@@ -1593,13 +1599,17 @@ let _advReady = false;
 async function syncSageToConfig(value) {
   if (!_advReady) return;
   try {
-    await api.fetchApi("/modal_bridge/config", {
+    const r = await api.fetchApi("/modal_bridge/config", {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ use_sage_attention: !!value }),
     });
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
     log("use_sage_attention →", !!value, "(写回 config;重新部署后生效)");
     notify(value ? t("set.sage.on") : t("set.sage.off"), "info");
-  } catch (e) { err("sync sage to config failed", e); }
+  } catch (e) {
+    err("sync sage to config failed", e);
+    notify(t("set.save_failed", { msg: String(e) }), "error");
+  }
 }
 
 // ⚠ 每一项都必须显式写 category,不能只靠 id 前缀:

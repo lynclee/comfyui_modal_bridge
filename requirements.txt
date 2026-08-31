@@ -1,0 +1,6 @@
+# ComfyUI Manager 装插件时会跑这个文件。
+# modal 也声明在 pyproject.toml 的 dependencies 里 —— 两条渠道都要有:
+# Manager 读 requirements.txt，ComfyUI Registry 读 pyproject。
+aiohttp
+pyyaml
+modal

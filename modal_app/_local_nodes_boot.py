@@ -5,15 +5,13 @@ _local_nodes_boot.py — worker 启动时把 Volume 上的「本地自写节点�
 这边在 ComfyUI 进程起来之前解压到 /comfyui/custom_nodes/<folder>/。
 
 为什么放运行时而不是 build 时:这条通道存在的意义就是「改代码不必重 build 镜像」。
-代价是每个冷容器付一次解压(代码包很小,毫秒级)+ 可能的 pip install(见下)。
+代价是每个冷容器付一次解压(代码包很小,毫秒级)。依赖不在这里装 —— 见 _warn_if_requirements。
 
 ⚠ 解压必须防 zip-slip:包虽然是用户自己传的,但解压路径来自 zip 内的字符串,
 一个 ../../ 就能写到 /comfyui 之外。这里逐条校验规范化后的目标路径仍在目标目录内。
 """
 import os
 import shutil
-import subprocess
-import sys
 import zipfile
 from pathlib import Path
 
@@ -52,20 +50,22 @@ def safe_members(names: list[str], dest: Path) -> tuple[list[str], list[str]]:
     return ok, bad
 
 
-def _install_requirements(node_dir: Path) -> None:
-    """节点有 requirements.txt 就装。失败只警告 —— 一个节点的依赖问题不该让整个 worker 起不来。"""
-    req = node_dir / "requirements.txt"
-    if not req.is_file():
+def _warn_if_requirements(node_dir: Path) -> None:
+    """节点带 requirements.txt 时提示一句 —— 依赖由镜像 build 期安装,这里不装。
+
+    这里以前会起子进程装依赖。改掉有两个原因,后者才是硬约束:
+      1. 每个冷容器都要重付一次安装时间;
+      2. ComfyUI Registry 明令禁止「Runtime package installation through subprocess
+         calls」—— 这条会让发布版本被判 Flagged,用户在 Manager 里装不到新版。
+
+    现在依赖走 node_sync.write_local_node_reqs() → _local_nodes_data.py →
+    modal_image 的 pip_install 层。**代码仍走 Volume(改一行免重 build)**,
+    只有新增/改依赖才需要重新部署一次。
+    """
+    if not (node_dir / "requirements.txt").is_file():
         return
-    print(f"[bridge] local-node {node_dir.name}: pip install -r requirements.txt")
-    try:
-        r = subprocess.run([sys.executable, "-m", "pip", "install", "-q", "-r", str(req)],
-                           capture_output=True, text=True, timeout=600)
-        if r.returncode != 0:
-            print(f"[bridge] ⚠ {node_dir.name} 依赖安装失败(节点可能导入不了): "
-                  f"{(r.stderr or '').strip()[:400]}")
-    except Exception as e:
-        print(f"[bridge] ⚠ {node_dir.name} 依赖安装异常: {e}")
+    print(f"[bridge] local-node {node_dir.name}: 有 requirements.txt —— 依赖在镜像 build 期已装。"
+          f"若该节点导入失败提示缺包,说明依赖是新加的,去 Setup 重新部署一次即可。")
 
 
 def current_digests() -> dict:
@@ -169,7 +169,7 @@ def extract_all() -> list[str]:
                     (target / ".mb_local_digest").write_text(UNKNOWN_DIGEST, encoding="utf-8")
             except Exception as e:
                 print(f"[bridge] ⚠ local-node {folder}: 写指纹失败: {e}")
-            _install_requirements(target)
+            _warn_if_requirements(target)
             installed.append(folder)
             print(f"[bridge] local-node ✓ {folder} ({len(ok)} files)")
         except Exception as e:
