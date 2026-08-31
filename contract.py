@@ -7,22 +7,79 @@ routes.py 本身 import 不进测试(相对导入 + 依赖 ComfyUI 的 folder_pa
 """
 import posixpath
 import re
+import ipaddress
+from urllib.parse import urlsplit
 
 # job_id 会拼进本地落盘路径(output/<subfolder>/<job_id>/)。云端产生的 id 是 uuid4
 # 或 AIGC Studio 的任务 UUID,都在这个字符集内;别的一律拒。
 _SAFE_JOB_ID = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
+PUBLIC_CONFIG_WRITE_FIELDS = frozenset({
+    "gpu_tier", "enable_snapshot", "use_sage_attention", "cpu_tier_when_no_model",
+})
 
 
 def is_safe_job_id(job_id) -> bool:
     """job_id 能不能安全地拼进文件路径。
 
-    ⚠ /fetch_result 的 job_id 直接来自 HTTP body,而本地 API 无鉴权(设计如此,同机任意
-    进程都能打)。filename 一直有 basename 防逃逸,job_id 以前没有 —— {"job_id": "../../x"}
+    ⚠ /fetch_result 的 job_id 直接来自 HTTP body；即使管理 API 已有 capability，路径边界
+    仍不能依赖鉴权。filename 一直有 basename 防逃逸,job_id 以前没有 —— {"job_id": "../../x"}
     就能把 base64 内容写到 output 目录之外。插件对 folders / path / blend_path 都做了囚笼,
     这里是漏的那个。"""
     return (isinstance(job_id, str)
             and bool(_SAFE_JOB_ID.match(job_id))
             and ".." not in job_id)
+
+
+def is_direct_loopback_request(remote: str | None, host: str | None,
+                               forwarded_for: str | None = None) -> bool:
+    """请求是否真的是通过 localhost/127.0.0.1/::1 访问。
+
+    只看 TCP peer 会把本机反向代理后的所有远程访客都认成 127.0.0.1；因此 peer 和
+    浏览器实际访问的 Host 必须同时是 loopback。Host 头本身可伪造,但远程攻击者仍需
+    先让 TCP peer 变成 loopback；常规浏览器经过反代时 Host 是外部域名,会被拒绝。
+    """
+    def _loopback(value: str | None, *, host_value: bool = False) -> bool:
+        raw = (value or "").strip()
+        if not raw:
+            return False
+        if host_value:
+            try:
+                raw = urlsplit("//" + raw).hostname or ""
+            except ValueError:
+                return False
+        raw = raw.strip("[]").split("%", 1)[0]
+        if raw.lower() == "localhost":
+            return True
+        try:
+            addr = ipaddress.ip_address(raw)
+            mapped = getattr(addr, "ipv4_mapped", None)
+            return addr.is_loopback or bool(mapped and mapped.is_loopback)
+        except ValueError:
+            return False
+
+    if not (_loopback(remote) and _loopback(host, host_value=True)):
+        return False
+    # 常见反代会把 Host 重写成上游 127.0.0.1，但同时带 X-Forwarded-For/X-Real-IP。
+    # 链里出现任意非 loopback 就不能享受本机免鉴权。没带转发信息的反代无法从应用层
+    # 与真本机区分，部署文档要求它保留外部 Host 或传该头。
+    if forwarded_for:
+        return all(_loopback(x.strip()) for x in forwarded_for.split(",") if x.strip())
+    return True
+
+
+def merge_public_config(current: dict, body: dict) -> dict:
+    """应用设置页可写字段；凭据、部署状态和未知字段一律拒绝。"""
+    unknown = sorted(set(body) - PUBLIC_CONFIG_WRITE_FIELDS)
+    if unknown:
+        raise ValueError(f"这些字段不能经通用 config API 修改: {unknown}")
+    if "gpu_tier" in body and body["gpu_tier"] not in ("auto", "cheap", "primary", "top"):
+        raise ValueError("gpu_tier 非法")
+    for key in ("enable_snapshot", "use_sage_attention", "cpu_tier_when_no_model"):
+        if key in body and not isinstance(body[key], bool):
+            raise ValueError(f"{key} 必须是 boolean")
+    out = dict(current)
+    out.update({k: body[k] for k in PUBLIC_CONFIG_WRITE_FIELDS if k in body})
+    return out
 
 
 def compute_contract(local, deployed, reachable, local_gpu, deployed_gpu,

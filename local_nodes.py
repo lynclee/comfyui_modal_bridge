@@ -10,8 +10,8 @@ local_nodes.py — 本地自写 custom_node 的上云通道(不走 git)。
   - **私有代码不必推到 GitHub**(公司资产 / 半成品 / 一次性实验节点)
   - **改一行不用重 build 镜像**:Volume 是运行时挂载,重传 zip 即生效,省掉 3-5 分钟部署
 
-代价:节点的 requirements.txt 只能在 worker 启动时 pip install(每个冷容器付一次),
-所以重依赖的节点仍建议走 git 路线烤进镜像。
+依赖与代码分流:requirements manifest 随包进 Volume,变化时自动重建镜像依赖层；
+纯代码仍在 worker 启动时解压,改一行不用重 build。
 
 Volume 布局:
   _local_nodes/<folder>.zip      节点目录打包(已剔除 .git / __pycache__ / 模型文件)
@@ -19,6 +19,8 @@ Volume 布局:
 """
 import hashlib
 import io
+import json
+import re
 import zipfile
 from pathlib import Path
 
@@ -58,7 +60,7 @@ _SKIP_NAMES = {".DS_Store", "Thumbs.db", ".gitignore", ".gitattributes"}
 
 def safe_folder(root: Path, folder: str) -> Path:
     """把「节点文件夹名」解析成 root 下的真实路径,越界即抛错。
-    folder 来自 HTTP body(本地 API 无鉴权,同机任意进程/网页都能打)——不能直接 root / folder:
+    folder 来自 HTTP body；即使管理 API 有 capability,也不能直接 root / folder:
     `../x` 会跑出 custom_nodes,把用户任意目录打包上传。要求单段名 + resolve 后仍在 root 内。"""
     name = (folder or "").strip()
     if not name or name in (".", "..") or "/" in name or "\\" in name:
@@ -166,10 +168,11 @@ def pack_node_dir(path: Path) -> tuple[bytes, str, int, int]:
 # ============================================================================
 # requirements 行的基本清洗:注释 / 空行 / 会让 pip 去读别的文件或装本地路径的指令一律丢弃。
 # 这些行在云端没有对应的文件系统上下文(-r 指向本地相对路径、-e 装的是本地目录),
-# 留着只会让 build 在一个和真实原因无关的报错上失败。
+# 留着只会让 build 在一个和真实原因无关的报错上失败。远程 wheel / git+ URL 合法,
+# 必须保留；它们不依赖当前机器的文件系统。
 _REQ_SKIP_PREFIX = ("-r", "--requirement", "-e", "--editable", "-f", "--find-links",
                     "-i", "--index-url", "--extra-index-url", "-c", "--constraint",
-                    ".", "/", "git+", "http://", "https://", "file:")
+                    ".", "/", "file:")
 
 
 def collect_requirements(folders: list[str], root: Path) -> list[str]:
@@ -188,8 +191,15 @@ def collect_requirements(folders: list[str], root: Path) -> list[str]:
             if not req.is_file():
                 continue
             for raw in req.read_text(encoding="utf-8", errors="replace").splitlines():
-                line = raw.split("#", 1)[0].strip()
-                if not line or line.lower().startswith(_REQ_SKIP_PREFIX):
+                line = raw.strip()
+                if not line or line.startswith("#"):
+                    continue
+                # requirements 的行尾注释要求 # 前有空白；URL fragment(`#egg=` / hash)
+                # 属于依赖本体,不能用 split("#") 一刀切掉。
+                line = re.split(r"\s+#", line, maxsplit=1)[0].strip()
+                low = line.lower()
+                if (not line or low.startswith(_REQ_SKIP_PREFIX)
+                        or re.search(r"\s@\s*(?:file:|\.?\.?[/\\])", low)):
                     continue
                 seen.setdefault(line, None)
         except Exception:
@@ -232,10 +242,40 @@ def volume_digests(cfg: dict, folders: list[str]) -> dict:
     return out
 
 
+def volume_local_node_requirements(cfg: dict, folders: list[str] | None = None) -> dict[str, list[str]]:
+    """读取每个 Volume 本地节点随包上传的依赖 manifest。
+
+    manifest 与 zip/digest 同批上传，使任意一台机器重部署时都能恢复多机节点依赖；
+    不能只扫当前机器的 custom_nodes，否则另一台机器上传的私有节点会在重部署后掉包。
+    旧包没有 manifest 时不出现在结果里，调用方会保留旧的 flat requirements 兼容迁移。
+    """
+    names = list(folders) if folders is not None else list_volume_local_nodes(cfg, max_age=0)
+    out: dict[str, list[str]] = {}
+    try:
+        vol = _mv().get_volume(cfg)
+        try:
+            vol.reload()
+        except Exception:
+            pass
+    except Exception:
+        return out
+    for folder in names:
+        buf = io.BytesIO()
+        try:
+            vol.read_file_into_fileobj(f"{VOLUME_PREFIX}/{folder}.requirements.json", buf)
+            value = json.loads(buf.getvalue().decode("utf-8"))
+            if isinstance(value, list) and all(isinstance(x, str) for x in value):
+                out[folder] = value
+        except Exception:
+            pass
+    return out
+
+
 def plan_local_uploads(cfg: dict, folders: list[str], root: Path) -> dict:
     """哪些本地节点需要传 / 已是最新 / 打包失败。
     返回 {upload: [{folder, digest, files, raw_mb}], uptodate: [folder], failed: [{folder, error}]}"""
     remote = volume_digests(cfg, folders)
+    remote_reqs = volume_local_node_requirements(cfg, folders)
     upload, uptodate, failed = [], [], []
     for folder in folders:
         try:
@@ -245,7 +285,8 @@ def plan_local_uploads(cfg: dict, folders: list[str], root: Path) -> dict:
                 failed.append({"folder": folder, "error": "目录为空或全被排除"})
                 continue
             digest = compute_digest(files)
-            if remote.get(folder) == digest:
+            # 旧版本没有依赖 manifest：即使 zip digest 相同也重传一次完成迁移。
+            if remote.get(folder) == digest and folder in remote_reqs:
                 uptodate.append({"folder": folder, "digest": digest})
             else:
                 upload.append({"folder": folder, "digest": digest,
@@ -262,7 +303,8 @@ def upload_local_nodes(cfg: dict, folders: list[str], root: Path, on_progress=No
     for folder in folders:
         try:
             blob, digest, count, raw = pack_node_dir(safe_folder(root, folder))
-            packs.append((folder, blob, digest, count, raw))
+            reqs = collect_requirements([folder], root)
+            packs.append((folder, blob, digest, count, raw, reqs))
         except Exception as e:
             failed.append({"folder": folder, "error": str(e)})
     if not packs:
@@ -273,9 +315,11 @@ def upload_local_nodes(cfg: dict, folders: list[str], root: Path, on_progress=No
                      "folders": [p[0] for p in packs]})
     vol = _mv().get_volume(cfg)
     with vol.batch_upload(force=True) as batch:  # force:同名覆盖(节点改了就是要覆盖)
-        for folder, blob, digest, count, _raw in packs:
+        for folder, blob, digest, count, _raw, reqs in packs:
             batch.put_file(io.BytesIO(blob), f"{VOLUME_PREFIX}/{folder}.zip")
             batch.put_file(io.BytesIO(digest.encode()), f"{VOLUME_PREFIX}/{folder}.digest")
+            batch.put_file(io.BytesIO(json.dumps(reqs).encode()),
+                           f"{VOLUME_PREFIX}/{folder}.requirements.json")
             # 回传实际上传的那个 digest:提交时必须声明「Volume 上真实存在的版本」,
             # 而不是提交那一刻重新扫目录算出来的(编辑器在两步之间保存一下就对不上了,
             # 结果是声明了一个云端根本没有的版本 → worker 永远刷新不到 → 任务失败)。
@@ -335,7 +379,7 @@ def remove_volume_local_node(cfg: dict, folder: str) -> dict:
         vol = _mv().get_volume(cfg)
     except Exception as e:
         return {"ok": False, "removed": [], "errors": [{"path": folder, "error": str(e)}]}
-    for suffix in (".zip", ".digest"):
+    for suffix in (".zip", ".digest", ".requirements.json"):
         path = f"{VOLUME_PREFIX}/{folder}{suffix}"
         try:
             vol.remove_file(path, recursive=False)

@@ -115,6 +115,11 @@ def _within(path: Path, root: Path) -> bool:
         return False
 
 
+def is_path_within_roots(path: Path | str, roots) -> bool:
+    """公开给 routes 的同一份囚笼：真实路径必须落在至少一个已配置模型根内。"""
+    return any(_within(Path(path), Path(root)) for root in roots)
+
+
 def find_local_model(type_: str, filename: str, roots) -> Path | None:
     """在给定若干根目录里找 <filename>(先平铺再递归)。roots: 该 type 对应的本地目录列表。
 
@@ -135,15 +140,15 @@ def find_local_model(type_: str, filename: str, roots) -> Path | None:
         # 绝对路径 / .. 都在这里被 _within 挡掉(而不是靠先判断字符串形态 —— 那种
         # 判法容易漏 Windows 盘符、UNC 之类的变体)
         direct = r / filename
-        if direct.is_file() and _within(direct, r):
+        if direct.is_file() and is_path_within_roots(direct, [r]):
             return direct
         flat = r / base
-        if flat.is_file() and _within(flat, r):
+        if flat.is_file() and is_path_within_roots(flat, [r]):
             return flat
         # 递归兜底(Desktop 有人按子目录归类模型)。rglob 结果天然在 r 下,
         # 但符号链接可能指到外面,所以同样过一次 _within。
         for hit in r.rglob(base):
-            if hit.is_file() and _within(hit, r):
+            if hit.is_file() and is_path_within_roots(hit, [r]):
                 return hit
     return None
 

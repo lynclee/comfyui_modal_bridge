@@ -3,7 +3,8 @@
 插件在 ComfyUI 本地服务上注册的机器接口——UI 用它,任何脚本 / agent / MCP 也可以直接调。
 
 - **Base URL**:ComfyUI 本地服务地址(Desktop 默认 `http://127.0.0.1:8000`,OSS 默认 `:8188`;容器内访问宿主机用 `host.docker.internal`)
-- **鉴权**:无(同机信任模型,与 ComfyUI 本体一致)。云端调用的鉴权(bridge_api_key)由后端自动附加,调用方不用管
+- **本地管理鉴权**:`localhost/127.0.0.1/::1` 直连免配置；局域网、反向代理、`host.docker.internal` 等非本机 origin 必须带 `X-Modal-Bridge-Capability`。值在服务器 `config.json` 的 `local_api_capability`；首次远程管理请求会自动生成,不会由 API 回吐。反代必须保留外部 `Host`，或正确追加 `X-Forwarded-For`/`X-Real-IP`，不能把请求伪装成无转发头的纯 localhost
+- **云端鉴权**:云端调用的 `bridge_api_key` 由本地后端自动附加,调用方不用管
 - **密钥**:`/config` 读写永不回吐 `modal_token_secret` / `bridge_api_key` / `comfy_api_key` / `aigc_bypass_secret`,只回 `has_*` 布尔标志
 - **prompt 格式**:均为 ComfyUI **API prompt**(`{node_id: {class_type, inputs}}`,即前端 `graphToPrompt().output`),不是画布 JSON
 
@@ -57,7 +58,7 @@ curl -X POST http://127.0.0.1:8000/modal_bridge/submit \
 | `/modal_bridge/estimate_vram` | POST | `{prompt}` | 返回 `{est_vram_gb, est_basis, category, total_mb, unknown[]}`。视频类在能从工作流抠出 分辨率×帧数 字面量时走激活公式(`est_basis:"activation"`,实测校准),否则回退权重×系数(`"legacy"`,偏保守) |
 | `/modal_bridge/check_required_inputs` | POST | `{prompt}` | 找出缺必填输入的节点(老工作流 × 新节点定义),`{missing:[{node_id, class_type, missing[]}]}` |
 | `/modal_bridge/check_models` | POST | `{prompt}` | 对比工作流所需模型 vs 云端 Volume,返回缺失清单 |
-| `/modal_bridge/check_nodes` | POST | `{prompt}` | 对比工作流 custom_node vs 云端镜像清单。分流:`add`/`update`(有 git 且已推送 → 进镜像,要重部署)、`local_pack`(自写节点或 commit 未推送 → 走 Volume 打包通道,**不用重部署**)、`missing_no_git`(本地连目录都没有 → 补不了) |
+| `/modal_bridge/check_nodes` | POST | `{prompt}` | 对比工作流 custom_node vs 云端镜像清单。分流:`add`/`update`(有 git 且已推送 → 进镜像,要重部署)、`local_pack`(自写节点或 commit 未推送 → 代码走 Volume；仅依赖变化时自动重部署)、`missing_no_git`(本地连目录都没有 → 补不了) |
 
 ## 同步与部署(耗时操作,内部有互斥锁)
 
@@ -65,7 +66,7 @@ curl -X POST http://127.0.0.1:8000/modal_bridge/submit \
 |---|---|---|
 | `/modal_bridge/sync_models` | POST | 本地模型 → Modal Volume(SDK batch_upload,CAS 去重) |
 | `/modal_bridge/sync_nodes` | POST | custom_node 清单同步 + 触发重新部署 |
-| `/modal_bridge/sync_local_nodes` | POST | `{folders:[...]}` → 自写节点(无 git remote / commit 未推送)打包传 Volume。**不重建镜像**,worker 启动时解压;内容指纹去重,没改就跳过 |
+| `/modal_bridge/sync_local_nodes` | POST | `{folders:[...]}` → 自写节点打包传 Volume；代码变化只重传,`requirements.txt` 变化会自动重建依赖层。每个包携带 manifest,支持多机恢复 |
 | `/modal_bridge/list_local_nodes` | GET | Volume 上现存的本地节点包名单 |
 | `/modal_bridge/remove_local_node` | POST | `{folder}` → 从 Volume 删掉某个本地节点包 |
 | `/modal_bridge/deploy` | POST | 重新部署云端 app(drain 语义:在跑的任务在旧版本上跑完) |
@@ -78,8 +79,8 @@ curl -X POST http://127.0.0.1:8000/modal_bridge/submit \
 | `/modal_bridge/health` | GET | 云端 app 健康(`{ok, modal:{...}}`) |
 | `/modal_bridge/version` | GET | 版本契约:`{local, deployed, match, reachable}`,不匹配应引导重新部署 |
 | `/modal_bridge/platform_status` | GET | Modal 官方状态页聚合态(`operational/degraded/...`),区分平台故障 vs 未部署 |
-| `/modal_bridge/config` | GET/POST | 读/写插件配置(密钥字段永不回吐;POST 是浅合并) |
-| `/modal_bridge/bridge_key` | GET | 取回本机 bridge_api_key(显式动作用,如导出脚本) |
+| `/modal_bridge/config` | GET/POST | GET 返回脱敏配置；POST 只接受 GPU/高级设置 allowlist,不能改凭据或管理鉴权字段 |
+| `/modal_bridge/bridge_key` | GET | 取回 bridge_api_key；localhost 或有效 admin capability 才能调用 |
 | `/modal_bridge/job_event` | POST | 前端/调用方上报客户端侧结局(`{job_id, event, detail}`)进后端日志留痕 |
 
 ## 无 ComfyUI 直连云端(standalone)

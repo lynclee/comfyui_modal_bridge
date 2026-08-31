@@ -4,6 +4,8 @@ config.py — 配置文件管理
 """
 import json
 import os
+import secrets
+import threading
 from pathlib import Path
 
 # 默认配置(用户问答确认)
@@ -21,6 +23,12 @@ DEFAULT_CONFIG = {
     "modal_token_id": "",      # ak-xxx(account token,仅本机 deploy 用)
     "modal_token_secret": "",  # as-xxx
     "bridge_api_key": "",      # 部署时随机生成,调私有 endpoint 用(自建鉴权)
+    # 本地 HTTP 管理面的 capability。127.0.0.1/localhost 访问免填；经局域网、反向代理
+    # 或 host.docker.internal 访问时,所有读写本机/花费云账单的端点都必须带它。
+    # 首次远程调用时自动生成并原子写入 config；不会经 /config 回吐给浏览器。
+    "local_api_capability": "",
+    # 最近一次成功 deploy 时镜像包含的本地私有节点依赖指纹；内部状态,不由前端修改。
+    "local_node_reqs_deployed_hash": "",
     "comfy_api_key": "",       # 可选:comfy.org API key,供工作流里的 ComfyUI API 节点鉴权(账单走你的 comfy.org)
 
     # ── 运行选项 ──
@@ -61,11 +69,6 @@ DEFAULT_CONFIG = {
     # 反过来只是多花一点(GPU 档 scale-to-zero,纯 API 工作流跑几秒就结束)。
     # 关掉 = auto 档一律走 GPU 梯子。保持 True 是为了不改变既有用户的账单;吃过误判亏就关掉。
     "cpu_tier_when_no_model": True,
-    # 是否允许从**非本机**取回 bridge_api_key(/modal_bridge/bridge_key)。默认否。
-    # 那把 key 直接对应部署者的 Modal 账单,而 ComfyUI 一旦 --listen 暴露到局域网,
-    # 同网段任何人 GET 一下就能拿走。只有"在服务器上跑 ComfyUI、从别的机器开界面
-    # 并且需要导出内嵌 key 的脚本"这一种场景才需要打开,且要自行确认网络可信。
-    "allow_remote_bridge_key": False,
     # 内存快照(实验):实测对 GPU worker 基本无效 —— ComfyUI 是子进程,Modal 快照盖不住
     # (2026-08-05 实测 7 启动 7 重建 0 复用),开着反添 ~5s/次创建开销,故默认关。
     # CPU worker 的 CPU 快照不受影响。换值需重新部署。
@@ -119,6 +122,10 @@ def ensure_config() -> Path:
         return p
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(json.dumps(DEFAULT_CONFIG, indent=2, ensure_ascii=False), encoding="utf-8")
+    try:
+        os.chmod(p, 0o600)
+    except Exception:
+        pass
     print(f"[modal_bridge] generated default config: {p}")
     return p
 
@@ -138,7 +145,7 @@ def save_config(new_data: dict) -> None:
     """覆盖写 config(完整对象)。原子 + 0600。
 
     这个文件里躺着 modal_token_id / modal_token_secret / bridge_api_key /
-    comfy_api_key 四种凭据,直接 write_text 有两个问题:
+    comfy_api_key / local_api_capability 等凭据,直接 write_text 有两个问题:
       1) 非原子 —— 写到一半崩(磁盘满、进程被杀)留下半个 JSON,而 load_config
          解析失败后**静默回落默认配置**:endpoint 归零、凭据全丢,表现成"插件突然
          没配置过",没有任何报错指向真实原因。
@@ -154,3 +161,27 @@ def save_config(new_data: dict) -> None:
     except Exception:
         pass
     os.replace(tmp, p)
+
+
+_CAPABILITY_LOCK = threading.Lock()
+
+
+def ensure_local_api_capability() -> str:
+    """返回持久化的本地管理 capability；缺失时生成一次。
+
+    不在模块 import 时生成，避免只读安装/打包流程无故改配置。第一次非本机管理请求
+    才需要它；生成后放在 0600 config 中，调用方从服务器本机读取并在远程浏览器配对。
+    """
+    cfg = load_config()
+    value = str(cfg.get("local_api_capability") or "").strip()
+    if value:
+        return value
+    with _CAPABILITY_LOCK:
+        cfg = load_config()
+        value = str(cfg.get("local_api_capability") or "").strip()
+        if not value:
+            value = "lc-" + secrets.token_urlsafe(32)
+            cfg["local_api_capability"] = value
+            save_config(cfg)
+            print(f"[modal_bridge] generated local API capability: {_config_path()}")
+        return value

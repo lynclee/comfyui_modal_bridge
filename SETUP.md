@@ -23,7 +23,7 @@
 ## 方式 A:GUI 部署(推荐,零终端)
 
 点右上角 **[⚙️ Modal Setup]** → 填 Workspace / Token ID / Token Secret → **部署**。
-背后:后端自动 `pip install modal` → 建 Secret(随机生成私有鉴权 key `BRIDGE_API_KEY`)→ `modal deploy` → 写 config → 验证 health。首次拉镜像约 3-5 分钟。
+背后:ComfyUI Manager 安装声明依赖 → 建 Secret(随机生成私有鉴权 key `BRIDGE_API_KEY`)→ `modal deploy` → 写 config → 验证 health。手动 clone 需先安装一次 `requirements.txt`;首次拉镜像约 3-5 分钟。
 
 - **测试连接**:Setup 里有「测试连接」按钮,ping 一次 health,确认 app 是否真活着(光看本地有没有 token 查不出 app 是否被删)。
 - **Token Secret 已保存后**:重新部署时可留空,自动沿用已存的(`/config` 不会把 secret 回显到前端)。
@@ -147,7 +147,7 @@ comfyui_modal_bridge/
 ├── modal_volume.py       本地 SDK 操作 Volume(查 + 传模型)
 ├── node_sync.py          custom_node 同步规划 + 部署命令
 ├── sync_models.py        命令行:本地模型整体同步到 Volume
-├── deploy.py             命令行部署(= GUI [Modal Setup])
+├── deploy.py             简化命令行部署(不等价于 GUI [Modal Setup])
 ├── web/modal_bridge.js   前端按钮 + 进度卡片 + 同步流程
 ├── tests/test_core.py    核心纯函数单测
 ├── categories.py        工作流类别画像(图/视频:显存估算 + 超时)
@@ -194,7 +194,7 @@ Push the current ComfyUI workflow to a Modal Serverless GPU (H100) with one clic
 ## Option A: GUI deploy (recommended, no terminal)
 
 Click **[⚙️ Modal Setup]** → fill Workspace / Token ID / Token Secret → **Deploy**.
-Behind the scenes: backend auto `pip install modal` → create Secret (random `BRIDGE_API_KEY`) → `modal deploy` → write config → verify health. First image pull ~3-5 min.
+Behind the scenes: dependencies are installed by ComfyUI Manager → create Secret (random `BRIDGE_API_KEY`) → `modal deploy` → write config → verify health. A manual git clone must install `requirements.txt` once. First image pull ~3-5 min.
 
 - **Test connection**: the "Test connection" button pings health to confirm the app is actually alive (having a token locally doesn't mean the app still exists).
 - **After secret is saved**: leave it blank on redeploy to reuse the stored one (`/config` never returns the secret to the frontend).
@@ -320,7 +320,7 @@ comfyui_modal_bridge/
 ├── modal_volume.py       local SDK over the Volume (list + upload models)
 ├── node_sync.py          custom_node sync planning + deploy commands
 ├── sync_models.py        CLI: bulk-sync local models to the Volume
-├── deploy.py             CLI deploy (= GUI [Modal Setup])
+├── deploy.py             simplified CLI deploy (not equivalent to GUI [Modal Setup])
 ├── web/modal_bridge.js   frontend buttons + progress cards + sync flow
 ├── tests/test_core.py    unit tests for core pure functions
 └── modal_app/

@@ -99,6 +99,8 @@ def main():
     # 走 config.save_config 而不是直接 write_text:那边是「临时文件 + chmod 600 + os.replace」。
     # 直接写的话既非原子(写一半崩 → 半个 JSON → 加载静默回落默认值,表现成"配置没了"),
     # 权限也是默认的 0644,而这个文件里有 Modal token / bridge key 等四种凭据。
+    cfg["local_node_reqs_deployed_hash"] = node_sync.local_node_reqs_hash(
+        node_sync.read_local_node_reqs())
     cfg_mod.save_config(cfg)
     print(f"\n✓ 写入 {cfg_mod._config_path()}")
     print(f"  endpoint base: {cfg['modal_endpoint_base']}")

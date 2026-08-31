@@ -7,6 +7,7 @@ Modal Bridge MCP server — 让 Claude Code / Codex 等 agent 把「云端 GPU �
 功能最全:模型/节点自动同步、显存估算、GPU 自动路由都由插件后端完成。
     MODAL_BRIDGE_URL   本地 ComfyUI 地址,默认 http://127.0.0.1:8000(容器内访问宿主机
                        用 http://host.docker.internal:8000)
+    MODAL_BRIDGE_LOCAL_CAPABILITY  BASE 不是 localhost 时必填；值来自服务器 config.json
 
 **cloud 模式** — 经 bridge_client.py 直连 Modal 云端 endpoint,**不需要本地 ComfyUI**。
 前提:部署者已用完整插件部署过(模型在 Volume、节点在镜像)。适合拿到 endpoint + key 的
@@ -64,15 +65,16 @@ _OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 _OUT_DIR = os.environ.get("MODAL_BRIDGE_OUT_DIR", "./modal_bridge_outputs")
 _INPUT_DIRS = [d for d in os.environ.get("MODAL_BRIDGE_INPUT_DIRS", ".").split(":") if d]
+_LOCAL_CAPABILITY = os.environ.get("MODAL_BRIDGE_LOCAL_CAPABILITY", "").strip()
 
 
 def _call(path: str, body: dict | None = None, timeout: int = 120) -> dict:
     url = f"{BASE}{path}"
     data = json.dumps(body).encode() if body is not None else None
-    req = urllib.request.Request(
-        url, data=data,
-        headers={"Content-Type": "application/json"} if data else {},
-    )
+    headers = {"Content-Type": "application/json"} if data else {}
+    if _LOCAL_CAPABILITY:
+        headers["X-Modal-Bridge-Capability"] = _LOCAL_CAPABILITY
+    req = urllib.request.Request(url, data=data, headers=headers)
     try:
         with _OPENER.open(req, timeout=timeout) as r:
             return json.loads(r.read().decode())

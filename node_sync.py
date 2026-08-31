@@ -11,6 +11,7 @@ node_sync.py — custom_node 同步:把本地工作流用到、但 Modal 镜像�
 重新 modal deploy 就会把新节点 clone 进镜像。
 """
 import ast
+import hashlib
 import inspect
 import json
 import os
@@ -249,7 +250,7 @@ ComfyUI Registry 明令禁止「Runtime package installation through subprocess 
 而且那样每个冷容器都要重付一次安装时间。依赖变更频率远低于代码,放 build 期正合适。
 
 改本地节点代码 → 重传 zip 即可,不用部署。
-新增/改依赖   → 需要重新部署一次(这个文件会跟着变,触发那一层重 build)。
+新增/改依赖   → 同步链自动重新部署一次(这个文件会跟着变,只触发依赖层及之后)。
 """
 '''
 
@@ -283,6 +284,12 @@ def read_local_node_reqs() -> list[str]:
     except Exception:
         pass
     return []
+
+
+def local_node_reqs_hash(reqs: list[str]) -> str:
+    """稳定标识当前镜像应包含的本地节点依赖清单。"""
+    payload = json.dumps(list(reqs), ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 # ============================================================================
@@ -623,7 +630,7 @@ def apply_node_plan(plan: dict) -> None:
 #
 # 关键:一切 modal 调用都用 sys.executable -m modal,保证和 ComfyUI 同一个解释器。
 #   - 不依赖系统 PATH 上的 modal(GUI 启动的 app PATH 很精简,常找不到)
-#   - GUI「部署」按钮先 pip install modal 到这个解释器,后续 deploy / add_nodes 都用它
+#   - modal 由 Manager/Registry 按项目依赖安装,后续 deploy / add_nodes 都用同一解释器
 #   - 不写 ~/.modal.toml,鉴权全靠 env 注入 MODAL_TOKEN_ID/SECRET(更干净、可移植)
 # ============================================================================
 def python_executable() -> str:

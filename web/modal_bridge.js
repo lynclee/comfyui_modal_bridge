@@ -120,8 +120,8 @@ const I18N = {
   "node.scan":        { zh: "扫描工作流 custom nodes...", en: "Scanning workflow custom nodes..." },
   "node.nogit":       { zh: "这些 custom_node 在本地找不到目录,无法自动补(单文件节点?):\n{list}",
                         en: "No local directory for these custom_nodes, cannot auto-add (single-file node?):\n{list}" },
-  "node.local_pack":  { zh: "打包 {n} 个本地节点上传(不需重新部署)...",
-                        en: "Packing {n} local node(s) for upload (no redeploy needed)..." },
+  "node.local_pack":  { zh: "打包 {n} 个本地节点上传(依赖变化时自动部署)...",
+                        en: "Packing {n} local node(s) (auto-deploys only if dependencies changed)..." },
   "node.local_fail":  { zh: "本地节点上传失败,已停止提交,避免云端静默运行旧版本。请修复上面的上传错误后重试。",
                         en: "Local node upload failed. Submission was stopped to prevent the cloud from silently running stale code. Fix the upload error above and retry." },
   "node.local_rm_fail": { zh: "旧的本地节点覆盖包清理失败: {list}",
@@ -241,9 +241,13 @@ const I18N = {
   "set.snapshot.off": { zh: "已关闭内存快照 —— 去 Setup 重新部署生效", en: "Snapshot OFF — redeploy in Setup to take effect" },
   // ── 高级开关(2026-08-30 从 Setup 面板移到设置页:两者都是少数人用的进阶功能,
   //    留在部署面板里会让每个新用户都要先看懂两段免责说明才敢点部署)──
-  "set.sage":         { zh: "高级:用 SageAttention 换掉默认 PyTorch SDPA,QK 矩阵乘走 INT8。长序列视频里 attention 约占单步七成算力,实测 H100 上采样快约一半;代价是有损——H3 权重本身已剪枝+INT8,误差会叠加,建议同 seed A/B 对比资产(视频重点看音画同步与高频细节)再常开。**标准档 H100 与省钱档 L40S 都生效**(实测 L40S 88→50.6 s/it,约 −43%;单条成本与 H100 几乎打平、墙钟约 2.2 倍),顶配档 B200(sm_100)自动回退 SDPA 不报错。改完要去 Setup 点部署才生效。",
+  "set.sage":         { zh: "高级:用 SageAttention 换掉默认 PyTorch SDPA,QK 矩阵乘走 INT8。长序列视频里 attention 约占单步七成算力,实测 H100 上采样快约一半;代价是有损——H3 权重本身已剪枝+INT8,误差会叠加,建议同 seed A/B 对比资产(视频重点看音画同步与高频细节)再常开。标准档 H100 与省钱档 L40S 都生效(实测 L40S 88→50.6 s/it,约 −43%;单条成本与 H100 几乎打平、墙钟约 2.2 倍),顶配档 B200(sm_100)自动回退 SDPA 不报错。改完要去 Setup 点部署才生效。",
                         en: "Advanced: replace PyTorch SDPA with SageAttention (INT8 QK matmuls). Attention is ~70% of per-step FLOPs on long video; measured ~2x faster sampling on H100. Lossy — H3 weights are already pruned+INT8, so errors compound; A/B with a fixed seed before leaving it on. Works on both the standard H100 and cheap L40S tiers (L40S measured 88→50.6 s/it, ~-43%); the top B200 tier (sm_100) cleanly falls back to SDPA. Redeploy in Setup to take effect." },
   "set.save_failed":  { zh: "✗ 设置没保存成功:{msg} —— 请重试(改动未写入 config)", en: "✗ Setting not saved: {msg} — please retry (config unchanged)" },
+  "set.cpu_guess":    { zh: "Auto 档下,仅凭‘没扫描到本地模型’把任务送进 CPU。只适合确定是纯 API 的工作流；节点内部下载权重、CUDA/Triton 图像处理、3D/光流可能被误判。关掉后,扫不到模型也走 GPU 梯子。改完立即生效。",
+                        en: "In Auto tier, route to CPU solely when no local model is detected. Suitable only for known pure-API workflows; nodes downloading weights internally or using CUDA/Triton, 3D, or optical flow can be misclassified. Turn off to keep model-less workflows on the GPU ladder. Takes effect immediately." },
+  "auth.capability":  { zh: "这是远程 ComfyUI。请输入服务器 config.json 里的 local_api_capability；它只保存在当前浏览器,不会写入工作流。",
+                        en: "This is a remote ComfyUI. Enter local_api_capability from the server's config.json. It is stored only in this browser, never in the workflow." },
   "set.sage.on":      { zh: "已开启 SageAttention —— 去 Setup 点「部署」才生效(有损加速,建议同 seed 对比过再常开)", en: "SageAttention ON — redeploy in Setup to take effect (lossy; A/B before leaving it on)" },
   "set.sage.off":     { zh: "已关闭 SageAttention —— 去 Setup 点「部署」生效", en: "SageAttention OFF — redeploy in Setup to take effect" },
   "set.aigc":         { zh: "高级:把产物交付到自建的 AIGC Studio 网站(aigc-r2 模式)。本地 ComfyUI Desktop 用户用不到。打开后 Setup 面板会多出「AIGC Studio」一栏填地址和旁路密钥——密钥属于凭据,所以只放在那里,不放在设置页。",
@@ -267,11 +271,35 @@ function t(key, vars) {
 // =====================================================================
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+// 本机 localhost 直连无需 capability；局域网/反向代理/host.docker.internal 访问时,
+// 后端以 403 + 专用响应头发起配对。capability 只留在当前 origin 的 localStorage,
+// 不进 ComfyUI settings(可能同步)、工作流或日志。请求体都是可重放的 JSON 字符串,
+// 所以配对成功后安全重试一次即可。
+const LOCAL_CAP_KEY = "modal_bridge.local_api_capability";
+async function bridgeFetch(path, options = {}) {
+  const call = async (allowPair) => {
+    const headers = new Headers(options.headers || {});
+    const saved = (localStorage.getItem(LOCAL_CAP_KEY) || "").trim();
+    if (saved) headers.set("X-Modal-Bridge-Capability", saved);
+    const res = await api.fetchApi(path, { ...options, headers });
+    if (allowPair && res.status === 403 &&
+        res.headers.get("X-Modal-Bridge-Auth") === "capability-required") {
+      localStorage.removeItem(LOCAL_CAP_KEY);  // 已存值失效时也允许重新配对
+      const entered = (window.prompt(t("auth.capability")) || "").trim();
+      if (!entered) return res;
+      localStorage.setItem(LOCAL_CAP_KEY, entered);
+      return call(false);
+    }
+    return res;
+  };
+  return call(true);
+}
+
 // 上报 job 客户端侧结局(超时/取消/失败)给后端记日志——否则这些只在浏览器,
 // ComfyUI 后端 log 看不到(用户反馈"报错没进 log")。fire-and-forget,失败无所谓。
 function reportJobEvent(jobId, event, detail) {
   try {
-    api.fetchApi("/modal_bridge/job_event", {
+    bridgeFetch("/modal_bridge/job_event", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ job_id: jobId, event, detail: detail || "" }),
@@ -283,7 +311,7 @@ function reportJobEvent(jobId, event, detail) {
 // 返回 true=平台异常(downtime/degraded/maintenance)。查询失败=false(不误报)。
 async function isModalOutage() {
   try {
-    const r = await api.fetchApi("/modal_bridge/platform_status");
+    const r = await bridgeFetch("/modal_bridge/platform_status");
     const d = await r.json();
     return d.state && d.state !== "operational" && d.state !== "unknown";
   } catch (e) { return false; }
@@ -477,7 +505,7 @@ function storePendingResult(wfKey, outputNodeIds, outputs) {
 // 写回清单 + 重部署。本地始终是真源。全程在 ComfyUI 里完成,不用开终端。
 // =====================================================================
 async function checkNodesOnModal(prompt) {
-  const res = await api.fetchApi("/modal_bridge/check_nodes", {
+  const res = await bridgeFetch("/modal_bridge/check_nodes", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ prompt }),
@@ -488,7 +516,7 @@ async function checkNodesOnModal(prompt) {
 
 // 流式 POST(/deploy、/add_nodes 共用):逐行回调 onLine,返回 __DEPLOY_DONE__ 的 rc(无则 null)
 async function streamPost(path, body, onLine) {
-  const res = await api.fetchApi(path, {
+  const res = await bridgeFetch(path, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
@@ -544,7 +572,7 @@ function escHtml(s) {
 
 const LOCAL_NODE_BAKED_SENTINEL = "__modal_bridge_baked__";
 
-// 本地自写节点 → 打包上传 Volume(不重建镜像:worker 启动时解压)。返回是否成功
+// 本地自写节点 → 代码打包上传 Volume；只有 requirements 变化时后端自动重部署。返回是否成功
 async function syncLocalNodes(localPack, ctx) {
   const folders = localPack.map((p) => p.folder);
   let syncedDigests = null;
@@ -582,7 +610,7 @@ async function removeLocalOverrides(folders, ctx) {
   for (const folder of folders || []) {
     ctx.stage("nodes", t("node.local_cleaning", { folder }), false);
     try {
-      const r = await api.fetchApi("/modal_bridge/remove_local_node", {
+      const r = await bridgeFetch("/modal_bridge/remove_local_node", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ folder }),
@@ -921,7 +949,7 @@ function removeActiveJob(jobId) {
 async function requestCancel(jobId, ctx, wfName = null) {
   let d;
   try {
-    const r = await api.fetchApi("/modal_bridge/cancel", {
+    const r = await bridgeFetch("/modal_bridge/cancel", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ job_id: jobId }),
@@ -943,7 +971,7 @@ async function requestCancel(jobId, ctx, wfName = null) {
   if (d.cancel_noop && d.status === "completed") {
     notify(t("cancel.noop"), "warn");
     try {
-      const fr = await api.fetchApi("/modal_bridge/fetch_result", {
+      const fr = await bridgeFetch("/modal_bridge/fetch_result", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ job_id: jobId, modal_state: d }),
@@ -968,7 +996,7 @@ async function runOnceOnModal(workflowPrompt, outputNodeIds, ctx, submitGuard, b
 
   ctx.stage("submitting", batchSuffix + "POST /submit", false);
 
-  const subRes = await api.fetchApi("/modal_bridge/submit", {
+  const subRes = await bridgeFetch("/modal_bridge/submit", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
@@ -1040,7 +1068,7 @@ async function runOnceOnModal(workflowPrompt, outputNodeIds, ctx, submitGuard, b
       if (cancelled) return { jobId, gpu, cancelled: true };
       let pData;
       try {
-        const pRes = await api.fetchApi(`/modal_bridge/poll?job_id=${encodeURIComponent(jobId)}`);
+        const pRes = await bridgeFetch(`/modal_bridge/poll?job_id=${encodeURIComponent(jobId)}`);
         pData = await pRes.json();
       } catch (e) {
         log("poll error (will retry)", e);
@@ -1133,7 +1161,7 @@ async function runOnceOnModal(workflowPrompt, outputNodeIds, ctx, submitGuard, b
   }
 
   ctx.stage("downloading", `${batchSuffix}Decoding base64...`, false);
-  const fetchRes = await api.fetchApi("/modal_bridge/fetch_result", {
+  const fetchRes = await bridgeFetch("/modal_bridge/fetch_result", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ job_id: jobId, modal_state: final }),
@@ -1169,7 +1197,7 @@ async function runOnceOnModal(workflowPrompt, outputNodeIds, ctx, submitGuard, b
 async function ensureModelsAvailable(prompt, ctx) {
   ctx.stage("checking", "Scanning workflow + Modal Volume...");
 
-  const checkRes = await api.fetchApi("/modal_bridge/check_models", {
+  const checkRes = await bridgeFetch("/modal_bridge/check_models", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ prompt }),
@@ -1246,7 +1274,7 @@ async function vramPreflightOrConfirm(prompt, cfgNow) {
       : (cfgNow.default_gpu || "H100");
     const cap = GPU_VRAM[gpu];
     if (!cap) return true;
-    const r = await api.fetchApi("/modal_bridge/estimate_vram", {
+    const r = await bridgeFetch("/modal_bridge/estimate_vram", {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ prompt }),
     });
@@ -1272,7 +1300,7 @@ async function vramPreflightOrConfirm(prompt, cfgNow) {
 // 任何异常都放行(预检是辅助,不该挡正常流程)。
 async function requiredInputsPreflight(prompt) {
   try {
-    const r = await api.fetchApi("/modal_bridge/check_required_inputs", {
+    const r = await bridgeFetch("/modal_bridge/check_required_inputs", {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ prompt }),
     });
@@ -1422,7 +1450,7 @@ async function queueOnModal() {
 // =====================================================================
 async function doHealthCheck() {
   try {
-    const r = await api.fetchApi("/modal_bridge/health");
+    const r = await bridgeFetch("/modal_bridge/health");
     const h = await r.json();
     log("health check", h);
   } catch (e) {
@@ -1454,7 +1482,7 @@ function setRunReady(v) {
 }
 async function refreshRunReady() {
   try {
-    setRunReady(await (await api.fetchApi("/modal_bridge/version")).json());
+    setRunReady(await (await bridgeFetch("/modal_bridge/version")).json());
   } catch (e) { setRunReady(null); }
 }
 
@@ -1506,7 +1534,7 @@ async function recoverOne(pending, maxAgeSec) {
     if (cancelled) return;
     let pData;
     try {
-      const pRes = await api.fetchApi(`/modal_bridge/poll?job_id=${encodeURIComponent(jobId)}`);
+      const pRes = await bridgeFetch(`/modal_bridge/poll?job_id=${encodeURIComponent(jobId)}`);
       pData = await pRes.json();
     } catch (e) {
       // 临时网络错误只能重试,绝不能借机结束这张卡(见函数头注释)。
@@ -1548,7 +1576,7 @@ async function recoverOne(pending, maxAgeSec) {
 
   ctx.stage("downloading", "Fetching result of recovered job...", false);
   try {
-    const fr = await api.fetchApi("/modal_bridge/fetch_result", {
+    const fr = await bridgeFetch("/modal_bridge/fetch_result", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ job_id: jobId, modal_state: final }),
@@ -1581,7 +1609,7 @@ async function syncSnapshotToConfig(value) {
   if (!_snapReady) return;  // 启动期/初始化触发的 onChange 不回写
   try {
     // ⚠ fetchApi 对 4xx/5xx 也照常 resolve —— 不查 r.ok 就会「提示已保存、实际没写进去」
-    const r = await api.fetchApi("/modal_bridge/config", {
+    const r = await bridgeFetch("/modal_bridge/config", {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ enable_snapshot: !!value }),
     });
@@ -1599,7 +1627,7 @@ let _advReady = false;
 async function syncSageToConfig(value) {
   if (!_advReady) return;
   try {
-    const r = await api.fetchApi("/modal_bridge/config", {
+    const r = await bridgeFetch("/modal_bridge/config", {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ use_sage_attention: !!value }),
     });
@@ -1608,6 +1636,20 @@ async function syncSageToConfig(value) {
     notify(value ? t("set.sage.on") : t("set.sage.off"), "info");
   } catch (e) {
     err("sync sage to config failed", e);
+    notify(t("set.save_failed", { msg: String(e) }), "error");
+  }
+}
+
+async function syncCpuGuessToConfig(value) {
+  if (!_advReady) return;
+  try {
+    const r = await bridgeFetch("/modal_bridge/config", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ cpu_tier_when_no_model: !!value }),
+    });
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+  } catch (e) {
+    err("sync cpu routing policy failed", e);
     notify(t("set.save_failed", { msg: String(e) }), "error");
   }
 }
@@ -1679,12 +1721,21 @@ const SETTINGS = [
   // ── 高级:默认关。放在 Advanced 子分组,不再占 Setup 面板的版面 ──
   {
     id: "ModalBridge.useSageAttention",
-    name: "SageAttention (lossy speedup, H100 only)",
+    name: "SageAttention (lossy speedup, H100/L40S)",
     category: ["Modal Bridge", "Advanced", "SageAttention"],
     type: "boolean",
     defaultValue: false,
     tooltip: t("set.sage"),
     onChange: (v) => syncSageToConfig(v),
+  },
+  {
+    id: "ModalBridge.cpuTierWhenNoModel",
+    name: "Route model-less workflows to CPU",
+    category: ["Modal Bridge", "Advanced", "CPU routing heuristic"],
+    type: "boolean",
+    defaultValue: true,
+    tooltip: t("set.cpu_guess"),
+    onChange: (v) => syncCpuGuessToConfig(v),
   },
   {
     // 只控制 Setup 面板显不显示 AIGC 那一栏,不写 config —— 地址和旁路密钥属于凭据,
@@ -1699,11 +1750,11 @@ const SETTINGS = [
 ];
 
 // =====================================================================
-// GUI 一键部署对话框(零终端:后端自动 pip 装 modal → 建 secret → deploy → 写 config)
+// GUI 一键部署对话框(依赖由 Manager 安装；后端建 secret → deploy → 写 config)
 // =====================================================================
 async function fetchConfig() {
   try {
-    const r = await api.fetchApi("/modal_bridge/config");
+    const r = await bridgeFetch("/modal_bridge/config");
     return await r.json();
   } catch (e) { return {}; }
 }
@@ -1722,7 +1773,7 @@ async function checkVersionOrBlock() {
   // 只有连不上/版本不一致才提示(下面)。
   let v;
   try {
-    const r = await api.fetchApi("/modal_bridge/version");
+    const r = await bridgeFetch("/modal_bridge/version");
     v = await r.json();
   } catch (e) {
     log("version check failed, skip:", e);
@@ -1774,7 +1825,7 @@ async function refreshVerBanner(panel) {
   const el = panel?.querySelector?.("#mb-dep-ver");
   if (!el) return;
   let v;
-  try { v = await (await api.fetchApi("/modal_bridge/version")).json(); } catch (e) { return; }
+  try { v = await (await bridgeFetch("/modal_bridge/version")).json(); } catch (e) { return; }
   setRunReady(v);  // Setup 里刷新版本时,顺带更新 RunModal 按钮颜色
   const dep = v.reachable ? (v.deployed || "unknown") : t("dlg.ver.notconn");
   const color = v.match ? "#34d399" : (v.reachable ? "#fbbf24" : "#9aa");
@@ -1954,7 +2005,7 @@ async function openDeployDialog() {
     logEl.style.display = "block";
     logEl.textContent = "GET /modal_bridge/health …\n";
     try {
-      const r = await api.fetchApi("/modal_bridge/health");
+      const r = await bridgeFetch("/modal_bridge/health");
       const data = await r.json();
       // 只打 modal/error,不打 data.config(里面含 token)
       logEl.textContent += JSON.stringify(data.modal ?? { error: data.error ?? "unknown" }, null, 2) + "\n";
@@ -1991,13 +2042,13 @@ async function openDeployDialog() {
     nodesStatusEl.textContent = t("mn.loading");
     nodesStatusEl.style.color = "#9aa";
     try {
-      const r = await api.fetchApi("/modal_bridge/list_nodes");
+      const r = await bridgeFetch("/modal_bridge/list_nodes");
       const d = await r.json();
       // 镜像里 clone 的节点(/health 枚举)+ Volume 上的本地包 —— 后者不在镜像文件系统里,
       // 只列 /health 会让自写节点在这个面板上「不存在」,既看不到也删不掉。
       let localPkgs = [];
       try {
-        const lr = await api.fetchApi("/modal_bridge/list_local_nodes");
+        const lr = await bridgeFetch("/modal_bridge/list_local_nodes");
         localPkgs = (await lr.json()).nodes || [];
       } catch (e) { log("list_local_nodes failed:", e); }
       loadedNodes = [
@@ -2052,7 +2103,7 @@ async function openDeployDialog() {
       const localFailed = [];
       for (const n of localChecked) {
         try {
-          const rr = await api.fetchApi("/modal_bridge/remove_local_node", {
+          const rr = await bridgeFetch("/modal_bridge/remove_local_node", {
             method: "POST", headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ folder: n.name }),
           });
@@ -2098,7 +2149,7 @@ async function openDeployDialog() {
   tierSel.onchange = async () => {
     const tier = tierSel.value;
     try {
-      const r = await api.fetchApi("/modal_bridge/config", {
+      const r = await bridgeFetch("/modal_bridge/config", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ gpu_tier: tier }),
@@ -2231,7 +2282,7 @@ async function exportModalApi() {
   );
   if (!safe) {
     try {
-      const kd = await (await api.fetchApi("/modal_bridge/bridge_key")).json();
+      const kd = await (await bridgeFetch("/modal_bridge/bridge_key")).json();
       if (kd && kd.key) {
         keyValue = kd.key;
         keyNote =
@@ -2393,6 +2444,7 @@ app.registerExtension({
       // 用后端 config 的真实值初始化快照开关(UI 对齐部署现实),之后才放行 onChange 回写
       try { app.ui.settings.setSettingValue("ModalBridge.enableSnapshot", !!cfg.enable_snapshot); } catch (e) {}
       try { app.ui.settings.setSettingValue("ModalBridge.useSageAttention", !!cfg.use_sage_attention); } catch (e) {}
+      try { app.ui.settings.setSettingValue("ModalBridge.cpuTierWhenNoModel", cfg.cpu_tier_when_no_model !== false); } catch (e) {}
       _snapReady = true;
       _advReady = true;
       if (!isConfigured(cfg)) {

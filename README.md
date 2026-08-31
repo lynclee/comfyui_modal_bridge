@@ -10,7 +10,7 @@
 
 - 🖥️ **Runs on any machine — zero local GPU required.** Mac, thin laptops, iGPU-only — all fine. VRAM-hungry models like FLUX.2 run **entirely on a cloud GPU** (Auto mode picks L40S/H100/B200 by VRAM to save cost); your machine only serializes the workflow and receives images. Run flux2 on a potato.
 - ⚡ **Multi-task concurrency.** Submit and run multiple workflows at once — each gets its own progress card (draggable / cancelable / closable), no blocking, no clobbering.
-- 🚀 **Fully automatic deploy, zero terminal.** Enter your Modal token once in the GUI; the backend auto `pip install modal`, creates the secret, runs `modal deploy`, writes config. Never touch the command line. First image-pull ~3-5 min, instant afterward.
+- 🚀 **Fully automatic deploy, zero terminal.** ComfyUI Manager installs the declared dependencies; enter your Modal token once in the GUI and the backend creates the secret, runs `modal deploy`, and writes config. First image-pull ~3-5 min, instant afterward.
 - 🧩 **Custom nodes auto-sync.** Nodes your workflow uses but the cloud lacks are **auto-baked into the image and redeployed**; across machines the image is the **union, never cross-deleted** — switch machines seamlessly.
 - 🎨 **Images / video / 3D — all supported.** Outputs from SaveImage / SaveVideo / SaveGLB / Preview3D flow back locally and render right on the canvas (3D shows a rotatable mesh); large files (video / meshes) are pulled back directly via the Volume, free of the base64 size ceiling.
 - 🤖 **API nodes + auto cost-saving.** Workflows with ComfyUI API nodes (Kling / Luma / Tripo / OpenAI, etc.) run too (enter a comfy.org key once in Setup); **pure-API workflows with no local model auto-route to a CPU container — GPU bill ≈ 0**.
@@ -22,7 +22,7 @@ You don't have a big-VRAM GPU locally (Mac / thin laptop / a 4090 that can't fit
 
 ## Highlights (details)
 
-- **Zero-terminal deploy**: click `⚙️ Modal Setup`, enter your Modal token → the backend auto `pip install modal`, creates the Secret, runs `modal deploy`, writes config, verifies health.
+- **Zero-terminal deploy**: install through ComfyUI Manager, then click `⚙️ Modal Setup` and enter your Modal token → the backend creates the Secret, runs `modal deploy`, writes config, and verifies health. Manual clones must install `requirements.txt` once.
 - **Machine-agnostic local side**: locally it only serializes + uploads + receives — **no inference** — so it has no requirement on your GPU/VRAM; consistent across Mac / Windows / Linux (streams deploy logs via a subprocess to dodge the Windows event-loop pitfall).
 - **Four GPU tiers, switchable without redeploying**: in Modal Setup pick **Auto (chooses by VRAM, cheaper)**, **cheap** (L40S by default), **standard** (H100) or **top** (B200). All four workers (CPU / cheap / standard / top) are **created by a single deploy** and each scales to zero when idle (**an un-routed tier costs $0**), so **switching tiers is pure runtime routing — it takes effect on your next submit, no redeploy** (only changing which card a tier maps to requires one). Auto estimates each workflow's VRAM and picks the cheapest tier that fits: small images (e.g. **Z-Image-Turbo**) → cheap, normal (e.g. **FLUX.2-dev**) → standard, and only above the primary card's VRAM does it escalate to top (OOM guard). ⚠ **Too little VRAM does not raise — it silently degrades into constant offloading (several times slower) until the job hits its timeout**; the progress card now warns when a run takes unusually long so you know where to look. Conversely, past the point where the model fits, more VRAM buys little speed (measured on one workflow: B200 is 13.5% faster than H100 but costs 58% more per second) — **don't just pick the priciest tier**. Before running, VRAM is estimated per category (video includes multi-frame activations) and warned on.
 - **Images / video / 3D output + canvas preview**: collects outputs from every output node — SaveImage/SaveVideo for images/video, **SaveGLB / Preview3D for 3D meshes rendered as a turntable on the canvas** (routed per source node, no cross-bleed across multiple outputs); large files (video / meshes >8MB) come back via **direct Volume download**, bypassing the base64/Dict size ceiling, small ones stay base64.
@@ -34,7 +34,7 @@ You don't have a big-VRAM GPU locally (Mac / thin laptop / a 4090 that can't fit
 - **Memory snapshot (experimental, off by default)**: measured to be **mostly ineffective for GPU workers** — ComfyUI runs as a subprocess, which Modal's memory snapshot doesn't cover (measured: 7 container starts, 7 snapshot rebuilds, zero reuse), while adding ~5s of snapshot-creation overhead per boot; hence off by default now. The CPU worker's GA CPU snapshot is unaffected. Kept as an experimental toggle pending upstream subprocess support.
 - **Multi-task concurrency & progress**: each concurrent workflow gets its own progress card (draggable / cancelable / closable); uploads show rate + ETA; job state auto-cleans without clobbering.
 - **Custom-node auto-sync & multi-machine**: auto-adds nodes the workflow needs and redeploys (one time); across machines it's the **union, never cross-deleted**; cleanup is manual via "Manage cloud nodes" in Setup.
-- **Your own private nodes work too — no GitHub required**: nodes you wrote yourself (no git remote), or whose local commits aren't pushed yet, take a separate path — the folder is packed and uploaded to the Volume, and the worker unpacks it into `custom_nodes/` at boot. Two consequences: **private code never has to leave your machine for GitHub**, and **editing a node doesn't rebuild the image** — re-upload takes seconds instead of a 3-5 min redeploy. Content-fingerprinted, so unchanged nodes skip the upload entirely; `.git`/`__pycache__`/model weights are stripped from the pack. (A node's `requirements.txt` is installed at worker boot, so dependency-heavy nodes are still better off on the git path, baked into the image.)
+- **Your own private nodes work too — no GitHub required**: nodes you wrote yourself (no git remote), or whose local commits aren't pushed yet, take a separate path — the folder is packed and uploaded to the Volume, and the worker unpacks it into `custom_nodes/` at boot. **Code-only edits do not rebuild the image**; each package also carries a dependency manifest, and only a changed `requirements.txt` triggers an automatic rebuild of the dependency layer. Content-fingerprinted, multi-machine safe, and `.git`/`__pycache__`/model weights are stripped from the pack.
 - **Cloud ComfyUI version follows your machine**: at deploy time it detects your local ComfyUI version and clones the **same tag** into the cloud image (no exact tag → nearest one, warn-only); after you upgrade locally, RunModal nudges you to redeploy so the cloud catches up — nodes that work locally work in the cloud.
 - **Node compatibility self-check (every deploy)**: after a successful deploy it boots ComfyUI once in the **same cloud image** and reports each custom node's import OK / FAILED (failed = incompatible with that ComfyUI version / missing deps / bad commit). **Warn-only, never blocks** — a broken node doesn't affect other workflows.
 - **Local → Volume models**: download models locally; missing ones upload on submit; **block-level dedup (CAS) makes common big models instant** — only custom/private models actually use upstream bandwidth. No HF download, no hand-maintained registry.
@@ -92,7 +92,7 @@ MIT
 
 - 🖥️ **不挑机器,本地零显卡要求** — Mac、轻薄本、核显本都行。FLUX.2 这种吃显存的大模型,**算力全在云端 GPU**(Auto 模式按显存自动选 L40S/H100/B200,省钱),本地只负责发起工作流、收图。本地再弱也能跑 flux2,不用为了跑图换电脑。
 - ⚡ **多任务并发** — 多个工作流可同时提交、同时跑,各有独立进度卡片(可拖动 / 取消 / 关闭),互不阻塞、互不覆盖。
-- 🚀 **全自动部署,零终端** — GUI 填一次 Modal token,后端自动 `pip install modal`、建密钥、`modal deploy`、写配置。全程不碰命令行,首次拉镜像约 3-5 分钟,之后秒进。
+- 🚀 **全自动部署,零终端** — ComfyUI Manager 按声明安装依赖；GUI 填一次 Modal token,后端建密钥、`modal deploy`、写配置。首次拉镜像约 3-5 分钟,之后秒进。
 - 🧩 **custom node 自动同步** — 工作流用到的自定义节点,云端镜像没有就**自动装进镜像并重部署**;多台机器各装一部分时取**并集、互不删**,换机无缝。
 - 🎨 **图 / 视频 / 3D 全支持** — SaveImage / SaveVideo / SaveGLB / Preview3D 的产物都回流本地,并直接回填画板预览(3D 出可转动的网格);大文件(视频 / 网格)自动走 Volume 直连取回,不受 base64 体积限制。
 - 🤖 **API 节点 + 自动省钱** — 工作流含 ComfyUI API 节点(Kling / Luma / Tripo / OpenAI 等)也能跑(Setup 填一次 comfy.org key);**没有本地模型的纯 API 工作流自动路由到 CPU 容器,GPU 账单≈0**。
@@ -104,7 +104,7 @@ MIT
 
 ## 关键特性(细节)
 
-- **零终端部署**:点 `⚙️ Modal Setup` 填 Modal token → 后端自动 `pip install modal`、建 Secret、`modal deploy`、写配置并验证 health。
+- **零终端部署**:通过 ComfyUI Manager 安装后,点 `⚙️ Modal Setup` 填 Modal token → 后端建 Secret、`modal deploy`、写配置并验证 health。手动 clone 的用户需先安装一次 `requirements.txt`。
 - **不挑本地机器**:本地只做序列化 + 上传 + 收图,**不跑推理**,所以对本地显卡/显存无要求;Mac / Windows / Linux 一致(子进程串流部署日志,绕开 Windows 事件循环坑)。
 - **GPU 分四档 + 换档免部署**:Modal Setup 里选 **Auto(按显存自动选,更省钱)**、**省钱档**(默认 L40S)、**标准档**(默认 H100)或 **顶配档**(默认 B200)。四档 worker(CPU / 省钱 / 标准 / 顶配)**一次部署全部建好**、空闲各自 scale-to-zero(**没被路由到的档 0 成本**),所以**换档只是运行时路由 —— 选完下次提交即生效,不用重新部署**(只有换某档具体绑哪张卡才需要重部署)。Auto 会按工作流估算显存自动选最省又够用的档:小图(如 **Z-Image-Turbo**)走省钱档、常规(如 **FLUX.2-dev**)走标准档、真超主卡显存才升顶配档(防 OOM)。⚠ **显存不够不会报错,只会静默退化成频繁 offload(慢几倍)直到撞超时** —— 跑得异常久时进度卡片会提示往这个方向查;反过来,显存够了之后再加大对速度帮助有限(实测同一工作流 B200 比 H100 快 13.5%、单价却贵 58%),**别只盯着最贵那档**。点 RunModal 前还会按类别估算显存预警(视频含多帧激活)。
 - **图 / 视频 / 3D 输出 + 画板预览**:扫工作流所有输出节点收产物 —— SaveImage/SaveVideo 出图、视频,**SaveGLB / Preview3D 出 3D 网格并在画板内渲染转盘**(按来源节点回填,多输出不串台);大文件(视频 / 网格 >8MB)走 **Volume 直连取回**,绕开 base64/Dict 体积上限,小文件仍 base64。
@@ -116,7 +116,7 @@ MIT
 - **内存快照(实验,默认关)**:实测对 GPU worker **基本无效**——ComfyUI 以子进程运行,Modal 内存快照难以覆盖(实测 7 次容器启动 7 次重建快照、零复用),开着反添 ~5s/次的快照创建开销,故默认已关;CPU worker 的 CPU 快照(GA)不受影响。留作实验开关,等上游支持子进程快照再评估。
 - **多任务并发 & 进度**:多工作流并发各有独立进度卡片(可拖动/取消/关闭);上传带速率 + ETA;job 状态自动清理,不会互相覆盖。
 - **custom_node 自动同步 + 多机友好**:自动加工作流需要的节点并重部署(只这一次);多机取并集、互不删;清理走 Setup 的「管理云端节点」手动勾选。
-- **自己写的私有节点也能上云,不必推 GitHub**:自写节点(没有 git remote)、或本地 commit 还没推的,走另一条通道 —— 目录打包传 Volume,worker 启动时解压进 `custom_nodes/`。两个实质好处:**私有代码不用为了上云先推到 GitHub**;**改节点不重建镜像** —— 重传几秒,省掉 3-5 分钟重新部署。按内容指纹去重(没改就不传),打包时自动剔除 `.git`/`__pycache__`/模型权重。(节点的 `requirements.txt` 在 worker 启动时装,所以依赖重的节点仍建议走 git 路线烤进镜像。)
+- **自己写的私有节点也能上云,不必推 GitHub**:自写节点(没有 git remote)、或本地 commit 还没推的,走另一条通道 —— 目录打包传 Volume,worker 启动时解压进 `custom_nodes/`。**只改代码不重建镜像**,重传几秒即生效；每个包同时携带依赖 manifest,只有 `requirements.txt` 变化时才自动重建依赖层。按内容指纹去重、多机可恢复,并自动剔除 `.git`/`__pycache__`/模型权重。
 - **云端 ComfyUI 版本跟随本机**:部署时自动检测本机 ComfyUI 版本,云端镜像 clone **同一个 tag**(本机版本无对应 tag 时取最接近的,只警告不中止);本机升级后点 RunModal 会提示重新部署让云端跟上 —— 本地能跑的节点云端基本就能跑。
 - **节点兼容自检(每次部署)**:部署成功后自动在云端**同镜像**里 boot 一次 ComfyUI,逐个报告自定义节点导入成功 / 失败(失败 = 与该 ComfyUI 版本不兼容 / 缺依赖 / commit 坏)。**只警告不阻断**:坏节点不影响其它工作流。
 - **模型本地 → Volume**:模型在本地 ComfyUI 下好,提交时自动把云端缺的传上去;**块级去重(CAS)让通用大模型秒过**,只有自训练/私有模型才真占上行带宽。不从 HF 下载、不依赖手维护的 registry。

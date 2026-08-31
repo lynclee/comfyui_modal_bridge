@@ -4,6 +4,8 @@ routes.py — 本地 ComfyUI 服务器上的 HTTP 路由
 """
 import asyncio
 import base64
+import functools
+import secrets
 import subprocess
 from pathlib import Path
 
@@ -46,17 +48,19 @@ def _local_model_resolver():
         search_types = [type_, *_TYPE_ALIASES.get(type_, [])]
         roots = []
         if folder_paths is not None:
+            # 先收齐所有合法根。get_full_path 会规范化绝对路径/..，但会跟随根内 symlink；
+            # 命中后仍必须 resolve 再确认没有借 symlink 跳到配置根之外。
+            for t in search_types:
+                try:
+                    roots += folder_paths.get_folder_paths(t) or []
+                except Exception:
+                    pass
             # 1) ComfyUI 官方解析(认 extra_model_paths.yaml 的所有根,最权威);别名类型逐个试
             for t in search_types:
                 try:
                     full = folder_paths.get_full_path(t, filename)
-                    if full:
+                    if full and modal_volume.is_path_within_roots(full, roots):
                         return Path(full)
-                except Exception:
-                    pass
-            for t in search_types:
-                try:
-                    roots += folder_paths.get_folder_paths(t) or []
                 except Exception:
                     pass
         # 2) 兜底:默认 models/<type>(含别名目录)里找
@@ -213,7 +217,7 @@ async def _write_results(final: dict, job_id: str, subfolder: str, cfg: dict) ->
     # 囚笼:job_id / subfolder 都参与拼路径,必须确认结果仍在 output/ 内。
     # filename 早就做了 basename 防逃逸,job_id 这条以前是漏的(它来自 HTTP body,
     # {"job_id": "../../x"} 就能写到 output 之外)。入口有正则,这里再兜一层:
-    # 本地 API 无鉴权(设计如此,同机任意进程都能打),单点校验不够。
+    # 路由虽有 admin capability,路径边界仍须独立成立,不能把鉴权当囚笼。
     out_root = _output_dir().resolve()
     out_dir = (out_root / subfolder / job_id).resolve()
     try:
@@ -374,6 +378,77 @@ _DEPLOY_LOCK = asyncio.Lock()
 _LAST_POLL_STATUS: dict = {}
 _LAST_POLL_MAX = 500
 
+_ADMIN_HEADER = "X-Modal-Bridge-Capability"
+_ADMIN_REQUIRED_HEADER = "X-Modal-Bridge-Auth"
+
+
+def _admin_denial(request: web.Request) -> web.Response | None:
+    """本机直连免配置；其它访问必须带持久 capability。
+
+    peer+Host 双判避免反向代理把远程访客伪装成 127.0.0.1。capability 只存在本机
+    0600 config 和调用方浏览器 localStorage 中,绝不从匿名端点回吐。
+    """
+    try:
+        host = request.host
+    except Exception:
+        host = ""
+    forwarded = ",".join(x for x in (
+        request.headers.get("X-Forwarded-For", ""),
+        request.headers.get("X-Real-IP", ""),
+    ) if x)
+    if contract.is_direct_loopback_request(request.remote, host, forwarded):
+        return None
+    expected = cfg_mod.ensure_local_api_capability()
+    supplied = (request.headers.get(_ADMIN_HEADER) or "").strip()
+    if supplied and secrets.compare_digest(supplied, expected):
+        return None
+    return web.json_response(
+        {"error": "admin capability required",
+         "code": "modal_bridge_admin_capability_required"},
+        status=403,
+        headers={_ADMIN_REQUIRED_HEADER: "capability-required"},
+    )
+
+
+def _admin_only(handler):
+    @functools.wraps(handler)
+    async def guarded(request: web.Request):
+        denial = _admin_denial(request)
+        if denial is not None:
+            return denial
+        return await handler(request)
+    return guarded
+
+
+def _refresh_local_node_reqs(cfg: dict) -> list[str]:
+    """从 Volume 每个私有节点的 manifest 重建镜像依赖清单。
+
+    多机环境不能只扫当前机器目录。旧 zip 没有 manifest 时保留已有 flat 清单；该节点
+    下次参与同步会被强制重传并完成迁移。调用方须在 _DEPLOY_LOCK 内写文件。
+    """
+    folders = local_nodes.list_volume_local_nodes(cfg, max_age=0)
+    if not folders:
+        # 空可能是真空,也可能是 Modal/网络瞬断；保留旧依赖只会多装几个包，清空却会
+        # 让仍在 Volume 的私有节点全部 import 失败。取安全的一侧。
+        reqs = node_sync.read_local_node_reqs()
+        node_sync.write_local_node_reqs(reqs)
+        return reqs
+    manifests = local_nodes.volume_local_node_requirements(cfg, folders)
+    reqs: list[str] = []
+    seen: set[str] = set()
+    for folder in sorted(manifests):
+        for req in manifests[folder]:
+            if req not in seen:
+                seen.add(req)
+                reqs.append(req)
+    if set(folders) - set(manifests):
+        for req in node_sync.read_local_node_reqs():
+            if req not in seen:
+                seen.add(req)
+                reqs.append(req)
+    node_sync.write_local_node_reqs(reqs)
+    return reqs
+
 
 async def _run_blocking_streamed(resp: web.StreamResponse, fn):
     """在线程里跑一个阻塞函数 fn(emit),emit(line) 线程安全地把日志流式写回 resp。
@@ -438,57 +513,54 @@ def _setup_routes():
         cfg["has_token_secret"] = bool(cfg.get("modal_token_secret"))
         cfg["has_comfy_api_key"] = bool(cfg.get("comfy_api_key"))
         cfg["has_aigc_bypass_secret"] = bool(cfg.get("aigc_bypass_secret"))
+        cfg["has_local_api_capability"] = bool(cfg.get("local_api_capability"))
         cfg.pop("modal_token_secret", None)
         cfg.pop("bridge_api_key", None)
         cfg.pop("comfy_api_key", None)  # 账单凭据,不回吐浏览器(同 bridge_api_key)
         cfg.pop("aigc_bypass_secret", None)  # Vercel 旁路密钥,同上
+        cfg.pop("local_api_capability", None)  # 本地管理 capability,永不匿名回吐
+        cfg.pop("local_node_reqs_deployed_hash", None)  # 内部部署状态
         return web.json_response(cfg)
 
     @routes.get("/modal_bridge/bridge_key")
+    @_admin_only
     async def _bridge_key(request: web.Request):
-        """导出脚本「嵌入 KEY」时取回自己的 bridge_api_key。**强制仅本机**。
+        """导出脚本「嵌入 KEY」时取回自己的 bridge_api_key。
 
-        /config 故意抹掉 key 不回吐浏览器,这里是唯一会明文吐出它的地方 —— 而那把 key
-        直接对应你的 Modal 账单。以前 docstring 写着"仅本机"却没有任何强制:ComfyUI
-        一旦 --listen 暴露到局域网,同网段任何人 GET 一下就拿走了。
-
-        判据用 request.remote(TCP 对端地址)而不是 Origin/Referer —— 后两者是请求头,
-        curl 随便伪造;前者伪造要控网络路径。⚠ 反向代理后面 remote 恒为代理地址,
-        这道闸会失效也拦不住,那属于用户自己的部署选择,由 allow_remote_bridge_key 兜底。
+        localhost 直连可用；远程访问必须通过统一 admin capability。不存在可由匿名
+        /config 打开的逃生开关,反向代理也要同时满足外部 Host 校验。
         """
-        remote = (request.remote or "").strip()
-        allow_remote = bool(cfg_mod.load_config().get("allow_remote_bridge_key", False))
-        if not allow_remote and remote not in ("127.0.0.1", "::1", "localhost"):
-            print(f"[modal_bridge] ⚠ 拒绝来自 {remote or '?'} 的 bridge_key 请求(非本机)")
-            return web.json_response(
-                {"error": "bridge_key 仅限本机取用。这把 key 直接对应部署者的 Modal 账单,"
-                          "所以不从局域网回吐。确需远程导出:在 config.json 里把 "
-                          "allow_remote_bridge_key 设为 true(自行评估所在网络是否可信)。"},
-                status=403)
         cfg = cfg_mod.load_config()
         return web.json_response({"key": cfg.get("bridge_api_key", "")})
 
     @routes.post("/modal_bridge/config")
+    @_admin_only
     async def _set_config(request: web.Request):
         body = await request.json()
         if not isinstance(body, dict):
             return web.json_response({"error": "body must be object"}, status=400)
-        cur = cfg_mod.load_config()
-        cur.update(body)
+        try:
+            cur = contract.merge_public_config(cfg_mod.load_config(), body)
+        except ValueError as e:
+            return web.json_response({"error": str(e)}, status=400)
         cfg_mod.save_config(cur)
         # 不回吐密钥(和 GET /config 一致):抹掉 token_secret / bridge_api_key
         safe = dict(cur)
         safe["has_token_secret"] = bool(safe.get("modal_token_secret"))
         safe["has_comfy_api_key"] = bool(safe.get("comfy_api_key"))
         safe["has_aigc_bypass_secret"] = bool(safe.get("aigc_bypass_secret"))
+        safe["has_local_api_capability"] = bool(safe.get("local_api_capability"))
         safe.pop("modal_token_secret", None)
         safe.pop("bridge_api_key", None)
         safe.pop("comfy_api_key", None)
         safe.pop("aigc_bypass_secret", None)
+        safe.pop("local_api_capability", None)
+        safe.pop("local_node_reqs_deployed_hash", None)
         return web.json_response(safe)
 
     # -------- 异步提交(返回 job_id,不阻塞)--------
     @routes.post("/modal_bridge/submit")
+    @_admin_only
     async def _submit(request: web.Request):
         body = await request.json()
         prompt = body.get("prompt")
@@ -577,6 +649,7 @@ def _setup_routes():
 
     # -------- 轮询单次状态(前端高频调用,显示进度)--------
     @routes.get("/modal_bridge/poll")
+    @_admin_only
     async def _poll(request: web.Request):
         job_id = request.query.get("job_id")
         if not job_id:
@@ -609,6 +682,7 @@ def _setup_routes():
 
     # -------- 前端上报 job 客户端侧结局(超时/取消/错误)→ 记进后端日志 --------
     @routes.post("/modal_bridge/job_event")
+    @_admin_only
     async def _job_event(request: web.Request):
         """前端在 job 出现客户端侧结局(Polling timed out / 用户取消 / 出错)时调,
         让 ComfyUI 后端日志留痕——否则这些只在浏览器,后端无记录(用户反馈'报错没进 log')。"""
@@ -624,6 +698,7 @@ def _setup_routes():
 
     # -------- 拉结果(完成后调,写文件 + 返回 outputs)--------
     @routes.post("/modal_bridge/fetch_result")
+    @_admin_only
     async def _fetch_result(request: web.Request):
         body = await request.json()
         job_id = body.get("job_id")
@@ -648,6 +723,7 @@ def _setup_routes():
     # -------- 模型同步(本地 → Volume,全程本地 modal SDK,不经 endpoint)--------
 
     @routes.post("/modal_bridge/check_models")
+    @_admin_only
     async def _check_models(request: web.Request):
         """
         查工作流要的模型 Volume 有没有 / 本地能不能补(本地 SDK 直查 Volume)。
@@ -708,6 +784,7 @@ def _setup_routes():
             return None
 
     @routes.post("/modal_bridge/check_required_inputs")
+    @_admin_only
     async def _check_required_inputs(request: web.Request):
         """提交前预检:按当前本地节点定义,找出 prompt 里「缺必填输入」的节点。
         body: {prompt}  返回: {missing:[{node_id,class_type,missing:[...]}]}
@@ -723,6 +800,7 @@ def _setup_routes():
         return web.json_response({"missing": missing})
 
     @routes.post("/modal_bridge/estimate_vram")
+    @_admin_only
     async def _estimate_vram(request: web.Request):
         """估工作流要加载的模型本地总大小(MB),供前端 ×1.3 对比所选显卡做显存预警。
         body: {prompt}
@@ -770,6 +848,7 @@ def _setup_routes():
         })
 
     @routes.post("/modal_bridge/sync_models")
+    @_admin_only
     async def _sync_models(request: web.Request):
         """
         把本地有、Volume 没有的模型上传到 Volume(batch_upload,CAS 去重)。stream 回传进度。
@@ -830,10 +909,11 @@ def _setup_routes():
         return resp
 
     @routes.post("/modal_bridge/sync_local_nodes")
+    @_admin_only
     async def _sync_local_nodes(request: web.Request):
         """
         本地自写 custom_node(无 git remote / commit 未推送)打包上传 Volume。stream 回传进度。
-        worker 启动时会解压进 /comfyui/custom_nodes/ —— **不需要重新部署镜像**。
+        worker 启动时会解压进 /comfyui/custom_nodes/；纯代码变化不重部署，依赖变化自动部署。
         body: {folders: ["my_node", ...]}  (前端从 check_nodes 的 local_pack 拿)
         最后一行: __DEPLOY_DONE__ rc=<code>
         """
@@ -841,7 +921,7 @@ def _setup_routes():
         folders = body.get("folders")
         if not isinstance(folders, list) or not folders:
             return web.json_response({"error": "folders (non-empty list) required"}, status=400)
-        # 入口即校验:本地 API 无鉴权(同机信任),但 folders 直接参与路径拼接 ——
+        # 入口即校验:folders 直接参与路径拼接,即使已有 admin capability 也不能省掉囚笼 ——
         # 越界的名字必须在这里挡住,别指望下游。local_nodes.safe_folder 还会再囚一次(纵深)。
         bad = [f for f in folders
                if not isinstance(f, str) or not f.strip()
@@ -864,7 +944,7 @@ def _setup_routes():
 
         root = Path(node_sync._comfyui_root()) / "custom_nodes"
         await _emit(resp, f"== 打包上传 {len(folders)} 个本地节点到 Volume ==\n")
-        await _emit(resp, "== 这条通道不重建镜像:worker 启动时从 Volume 解压,改完重传即生效 ==\n\n")
+        await _emit(resp, "== 代码走 Volume 秒级生效；requirements 变化时只重建依赖层 ==\n\n")
 
         def do_upload(emit):
             plan = local_nodes.plan_local_uploads(cfg, folders, root)
@@ -909,6 +989,38 @@ def _setup_routes():
             await _emit(resp, f"  ✗ {f['folder']}: {f['error']}\n")
         await _emit(resp, f"\n== {'✓' if rc == 0 else '⚠'} 本地节点同步完成:"
                           f"{len(result.get('uploaded', []))} 个上传,{len(failed)} 个失败 ==\n")
+
+        # requirements 不能在 worker 启动时装(Registry 禁令)。每个节点随 zip 上传 manifest，
+        # 这里汇总整个 Volume 的依赖；只有与最近成功部署的指纹不同时才重建镜像。
+        if rc == 0:
+            if _DEPLOY_LOCK.locked():
+                await _emit(resp, "== 另有部署进行中,等待后核对私有节点依赖… ==\n")
+            async with _DEPLOY_LOCK:
+                try:
+                    latest_cfg = cfg_mod.load_config()
+                    reqs = await asyncio.to_thread(_refresh_local_node_reqs, latest_cfg)
+                    target_hash = node_sync.local_node_reqs_hash(reqs)
+                    deployed_hash = latest_cfg.get("local_node_reqs_deployed_hash", "")
+                    needs_redeploy = target_hash != deployed_hash and bool(reqs or deployed_hash)
+                    if needs_redeploy:
+                        await _emit(resp, f"== 私有节点依赖已变化({len(reqs)} 条),自动重新部署 ==\n")
+                        rc = await _ensure_modal(resp)
+                        if rc == 0:
+                            rc = await _run_streamed(
+                                resp, node_sync.deploy_command(),
+                                cwd=str(node_sync.MODAL_APP_DIR),
+                                env=node_sync.deploy_env(latest_cfg),
+                            )
+                        if rc == 0:
+                            final_cfg = cfg_mod.load_config()
+                            final_cfg["local_node_reqs_deployed_hash"] = target_hash
+                            cfg_mod.save_config(final_cfg)
+                            await _emit(resp, "== ✓ 私有节点依赖镜像已更新 ==\n")
+                        else:
+                            await _emit(resp, "== ✗ 私有节点依赖部署失败,停止本次提交 ==\n")
+                except Exception as e:
+                    rc = 1
+                    await _emit(resp, f"== ✗ 私有节点依赖同步失败:{e} ==\n")
         # 只有全部成功才给可提交的版本契约。失败时发空/部分 map 会让前端漏掉失败节点,
         # 暖容器反而可能继续跑它的旧版本。
         if rc == 0:
@@ -919,6 +1031,7 @@ def _setup_routes():
         return resp
 
     @routes.get("/modal_bridge/list_local_nodes")
+    @_admin_only
     async def _list_local_nodes(request: web.Request):
         """Volume 上现有的本地节点包名单(「管理云端节点」面板用)。返回 {ok, nodes:[name]}"""
         cfg = cfg_mod.load_config()
@@ -927,6 +1040,7 @@ def _setup_routes():
         return web.json_response({"ok": True, "nodes": local_nodes.list_volume_local_nodes(cfg)})
 
     @routes.post("/modal_bridge/remove_local_node")
+    @_admin_only
     async def _remove_local_node(request: web.Request):
         """从 Volume 删掉某个本地节点包。body: {folder}"""
         body = await request.json()
@@ -944,6 +1058,7 @@ def _setup_routes():
     # -------- custom_node 双向同步 --------
 
     @routes.get("/modal_bridge/list_nodes")
+    @_admin_only
     async def _list_nodes(request: web.Request):
         """
         列出镜像实装的 custom_nodes 全集(供「管理云端节点」面板手动清理)。
@@ -972,6 +1087,7 @@ def _setup_routes():
         return web.json_response({"ok": True, "source": source, "nodes": nodes})
 
     @routes.post("/modal_bridge/check_nodes")
+    @_admin_only
     async def _check_nodes(request: web.Request):
         """
         双向同步规划:对比工作流用到的 custom_node 与 Modal 镜像,算出加/改/删。全本地解析,瞬时。
@@ -1009,6 +1125,7 @@ def _setup_routes():
         return web.json_response(result)
 
     @routes.post("/modal_bridge/sync_nodes")
+    @_admin_only
     async def _sync_nodes(request: web.Request):
         """
         按 plan 的 new_baked 重写镜像清单(增/改/删)并重部署。stream 回传 modal deploy 日志。
@@ -1043,6 +1160,8 @@ def _setup_routes():
         # 写清单 + deploy 整段独占:并发请求会互相覆盖 _custom_nodes_data.py、两个 deploy 也冲突
         async with _DEPLOY_LOCK:
             node_sync.write_baked_nodes(clean)
+            reqs = await asyncio.to_thread(_refresh_local_node_reqs, cfg)
+            reqs_hash = node_sync.local_node_reqs_hash(reqs)
             print(f"[modal_bridge] sync_nodes: baked → {len(clean)} 条 (add={summary.get('add')} "
                   f"update={summary.get('update')} prune={summary.get('prune')})")
 
@@ -1057,14 +1176,19 @@ def _setup_routes():
                 return resp
 
             rc = await _run_streamed(resp, node_sync.deploy_command(), cwd=cwd, env=node_sync.deploy_env(cfg))
+            if rc == 0:
+                final_cfg = cfg_mod.load_config()
+                final_cfg["local_node_reqs_deployed_hash"] = reqs_hash
+                cfg_mod.save_config(final_cfg)
         await _emit(resp, f"\n__DEPLOY_DONE__ rc={rc}\n")
         await resp.write_eof()
         return resp
 
     @routes.post("/modal_bridge/deploy")
+    @_admin_only
     async def _deploy(request: web.Request):
         """
-        GUI 一键部署/重新部署:pip 装 modal → 建 secret → modal deploy → 写 config(路径必对)。
+        GUI 一键部署/重新部署:检查 Manager 已装的 modal → 建 secret → modal deploy → 写 config。
         全程在 ComfyUI 进程里,零终端。stream 回传日志,最后 __DEPLOY_DONE__ rc=<code>。
         body: {token_id, token_secret, workspace, hf_token?, civitai_token?,
                app_name?, volume_name?, default_gpu?, scaledown_window?,
@@ -1119,22 +1243,6 @@ def _setup_routes():
         endpoint_base = f"https://{workspace}--{app_name}"
         # 私有鉴权 key:已有就复用(不让旧 config 失效),否则新生成
         bridge_key = cfg.get("bridge_api_key") or node_sync.gen_bridge_key()
-
-        # 本地自写节点(Volume 通道)的 pip 依赖 → 写进 _local_nodes_data.py,由 modal_image
-        # 在 build 期装。⚠ 不能等到 worker 启动时装:ComfyUI Registry 明令禁止
-        # 「Runtime package installation through subprocess calls」,而且那样每个冷容器
-        # 都要重付一次。节点**代码**仍走 Volume(改一行免重 build),只有依赖变了才动这一层。
-        # 取 Volume 上的节点名(那正是会被解压进云端的那批),再从本机同名目录读 requirements。
-        try:
-            _local_folders = local_nodes.list_volume_local_nodes(cfg)
-            _local_reqs = local_nodes.collect_requirements(
-                _local_folders, Path(node_sync._comfyui_root()) / "custom_nodes")
-            node_sync.write_local_node_reqs(_local_reqs)
-            if _local_reqs:
-                await _emit(resp, f"   本地节点依赖({len(_local_reqs)} 条)将在镜像 build 期安装\n")
-        except Exception as _e:
-            # 收集失败不该挡住部署:最坏是沿用上次的清单(或空),节点导入时才暴露
-            await _emit(resp, f"   ⚠ 本地节点依赖收集失败({_e}),沿用上次清单\n")
 
         # ComfyUI 版本跟随本机:检测本机版本 → 解析云端 clone tag(无对应取最接近,只警告不中止)
         comfyui_version = node_sync.detect_local_comfyui_version()
@@ -1199,6 +1307,12 @@ def _setup_routes():
 
             # 3) 部署 app(首次拉镜像 3-5 分钟)
             node_sync.ensure_baked_file()  # 本地清单是 .gitignore 状态,缺则建空,免得 modal_image 打包炸
+            # 私有节点依赖来自 Volume 中每个包的 manifest,而不是只扫当前机器；这样多机
+            # 上传的私有节点在任意一台机器重部署时都不会掉依赖。
+            _local_reqs = await asyncio.to_thread(_refresh_local_node_reqs, cfg)
+            _local_reqs_hash = node_sync.local_node_reqs_hash(_local_reqs)
+            if _local_reqs:
+                await _emit(resp, f"   私有节点依赖:{len(_local_reqs)} 条(镜像 build 期安装)\n")
             # 云端模型目录跟随本机:生成 extra_model_paths.yaml(覆盖自定义类别如 geometry_estimation)
             _mtypes = node_sync.write_extra_model_paths()
             _custom_mtypes = [t for t in _mtypes if t not in node_sync.STANDARD_MODEL_TYPES]
@@ -1213,6 +1327,7 @@ def _setup_routes():
                 return resp
 
             # 4) 写本地 config(在 ComfyUI 进程里,路径用 folder_paths,必对)
+            cfg["local_node_reqs_deployed_hash"] = _local_reqs_hash
             cfg_mod.save_config(cfg)
             await _emit(resp, f"\n== ✓ config 已写入(endpoint={endpoint_base})==\n")
 
@@ -1240,6 +1355,7 @@ def _setup_routes():
 
     # -------- 取消(代理 Modal /cancel)--------
     @routes.post("/modal_bridge/cancel")
+    @_admin_only
     async def _cancel(request: web.Request):
         body = await request.json()
         job_id = body.get("job_id")

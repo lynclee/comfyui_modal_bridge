@@ -1819,22 +1819,24 @@ def test_no_runtime_pip_install_anywhere():
 def test_local_node_reqs_roundtrip_and_sanitize(tmp_path):
     """自写节点依赖:收集时要剔掉在云端没有意义的行,并能写入/读回。
 
-    -r/-e/-f/--index-url/本地路径/直链 在云端没有对应的文件系统上下文,留着只会让
-    build 挂在一个和真实原因无关的报错上。
+    -r/-e/-f/--index-url/本地路径在云端没有对应的文件系统上下文,必须剔除；
+    远程 wheel 和 git+ VCS 是合法云端依赖,必须保留。
     """
     import local_nodes as ln
     import node_sync as ns
 
     (tmp_path / "a").mkdir()
     (tmp_path / "a" / "requirements.txt").write_text(
-        "# c\ntorch>=2.0\n\nnumpy==1.26.4\n-r other.txt\n-e .\nhttps://x/y.whl\n--index-url http://p\n",
+        "# c\ntorch>=2.0\n\nnumpy==1.26.4\n-r other.txt\n-e .\nhttps://x/y.whl\n"
+        "git+https://github.com/x/y.git@abc#egg=y\n--index-url http://p\n",
         encoding="utf-8")
     (tmp_path / "b").mkdir()
     (tmp_path / "b" / "requirements.txt").write_text("numpy==1.26.4\nrich\n", encoding="utf-8")
     (tmp_path / "c").mkdir()          # 没有 requirements
 
     got = ln.collect_requirements(["a", "b", "c", "../escape"], tmp_path)
-    assert got == ["torch>=2.0", "numpy==1.26.4", "rich"], got
+    assert got == ["torch>=2.0", "numpy==1.26.4", "https://x/y.whl",
+                   "git+https://github.com/x/y.git@abc#egg=y", "rich"], got
 
     old = ns.LOCAL_REQS_FILE
     try:
@@ -1845,6 +1847,53 @@ def test_local_node_reqs_roundtrip_and_sanitize(tmp_path):
         assert ns.read_local_node_reqs() == []
     finally:
         ns.LOCAL_REQS_FILE = old
+
+
+def test_local_node_upload_carries_dependency_manifest(tmp_path, monkeypatch):
+    """zip/digest/requirements manifest 必须同批上传,供另一台机器重建依赖层。"""
+    import json
+    import types
+    import local_nodes as ln
+
+    node = tmp_path / "private_node"
+    node.mkdir()
+    (node / "__init__.py").write_text("X = 1\n", encoding="utf-8")
+    (node / "requirements.txt").write_text(
+        "numpy==1.26.4\ngit+https://github.com/x/y.git\n", encoding="utf-8")
+
+    uploaded = {}
+
+    class Batch:
+        def __enter__(self): return self
+        def __exit__(self, *args): return False
+        def put_file(self, src, dst): uploaded[dst] = src.read()
+
+    class Vol:
+        def batch_upload(self, force=False):
+            assert force is True
+            return Batch()
+
+    monkeypatch.setattr(ln, "_mv", lambda: types.SimpleNamespace(get_volume=lambda cfg: Vol()))
+    result = ln.upload_local_nodes({}, ["private_node"], tmp_path)
+    assert not result["failed"]
+    manifest = json.loads(uploaded["_local_nodes/private_node.requirements.json"])
+    assert manifest == ["numpy==1.26.4", "git+https://github.com/x/y.git"]
+
+
+def test_legacy_local_node_without_manifest_forces_migration(tmp_path, monkeypatch):
+    """旧 zip digest 即使相同,缺 manifest 也必须重传一次。"""
+    import local_nodes as ln
+
+    node = tmp_path / "private_node"
+    node.mkdir()
+    (node / "__init__.py").write_text("X = 1\n", encoding="utf-8")
+    files, _ = ln.scan_node_dir(node)
+    digest = ln.compute_digest(files)
+    monkeypatch.setattr(ln, "volume_digests", lambda cfg, folders: {"private_node": digest})
+    monkeypatch.setattr(ln, "volume_local_node_requirements", lambda cfg, folders: {})
+    plan = ln.plan_local_uploads({}, ["private_node"], tmp_path)
+    assert [x["folder"] for x in plan["upload"]] == ["private_node"]
+    assert not plan["uptodate"]
 
 
 def test_output_path_jail():
@@ -1966,6 +2015,16 @@ def test_find_local_model_stays_in_root(tmp_path):
         return                                    # Windows 无权限建链接时跳过这一段
     assert mv.find_local_model("ckpt", "link.safetensors", [root]) is None            # 符号链接
 
+    # 真实 resolver 先走 ComfyUI folder_paths.get_full_path；该命中也必须过同一囚笼，
+    # 不能只修 fallback 的 find_local_model。
+    src = (ROOT / "routes.py").read_text(encoding="utf-8")
+    i = src.index("def _local_model_resolver()")
+    body = src[i:src.index("\n\n\n", i)]
+    get_full = body.index("folder_paths.get_full_path")
+    cage = body.index("modal_volume.is_path_within_roots")
+    returned = body.index("return Path(full)")
+    assert get_full < cage < returned
+
 
 def test_volume_download_is_atomic():
     """Volume 下载必须写 .part 再 rename。
@@ -2040,26 +2099,66 @@ def test_cli_deploy_keeps_secret_fields_and_atomic_config():
     assert "不等价于 GUI" in src, "docstring 应如实交代与 GUI 的差距"
 
 
-def test_bridge_key_endpoint_is_localhost_only():
-    """/bridge_key 是唯一会明文吐出 bridge_api_key 的端点,必须强制仅本机。
+def test_admin_capability_closes_bridge_key_and_config_bypass():
+    """本机免配置；远程/反代必须 capability，且通用 config 不能改安全字段。"""
+    import pytest
+    from contract import is_direct_loopback_request, merge_public_config
 
-    那把 key 直接对应部署者的 Modal 账单。以前 docstring 写着"仅本机"却没有任何强制,
-    ComfyUI 一旦 --listen 暴露到局域网,同网段任何人 GET 一下就拿走了。
+    assert is_direct_loopback_request("127.0.0.1", "127.0.0.1:8188")
+    assert is_direct_loopback_request("::1", "[::1]:8188")
+    assert is_direct_loopback_request("::ffff:127.0.0.1", "localhost:8188")
+    assert not is_direct_loopback_request("10.0.0.23", "10.0.0.5:8188")
+    # 反向代理的 TCP peer 是 loopback,但浏览器访问 Host 是外部域名,不能当本机。
+    assert not is_direct_loopback_request("127.0.0.1", "comfy.example.com")
+    # 即使代理把 Host 也改成上游 localhost,常见 X-Forwarded-For 仍能识别远端。
+    assert not is_direct_loopback_request("127.0.0.1", "127.0.0.1:8188", "10.0.0.23")
 
-    判据必须用 request.remote(TCP 对端地址),不能用 Origin/Referer —— 后两者是请求头,
-    curl 随便伪造。
-    """
+    cur = {"gpu_tier": "auto", "local_api_capability": "lc-secret",
+           "bridge_api_key": "bk-secret"}
+    assert merge_public_config(cur, {"gpu_tier": "top"})["gpu_tier"] == "top"
+    for forbidden in ("local_api_capability", "bridge_api_key", "allow_remote_bridge_key"):
+        with pytest.raises(ValueError):
+            merge_public_config(cur, {forbidden: "attacker"})
+
     src = (ROOT / "routes.py").read_text(encoding="utf-8")
     i = src.index('@routes.get("/modal_bridge/bridge_key")')
     body = src[i:src.index("@routes.", i + 10)]
+    assert "@_admin_only" in body
 
-    assert "request.remote" in body, "没有校验对端地址"
-    assert "127.0.0.1" in body, "本机白名单里没有 127.0.0.1"
-    assert "status=403" in body, "非本机没有被拒绝"
-    assert "allow_remote_bridge_key" in body, "没有留可配置的逃生口"
-    # 校验必须在读 key 之前
-    assert body.index("request.remote") < body.index('cfg.get("bridge_api_key"'), \
-        "先读了 key 才校验,等于没校验"
+    i = src.index('@routes.post("/modal_bridge/config")')
+    config_body = src[i:src.index("@routes.", i + 10)]
+    assert "@_admin_only" in config_body
+    assert "contract.merge_public_config" in config_body
 
+
+def test_local_api_capability_is_persistent_and_private(tmp_path, monkeypatch):
+    import stat
     import config as cfg_mod
-    assert cfg_mod.DEFAULT_CONFIG["allow_remote_bridge_key"] is False, "默认必须是不允许"
+
+    path = tmp_path / "config.json"
+    monkeypatch.setattr(cfg_mod, "_config_path", lambda: path)
+    first = cfg_mod.ensure_local_api_capability()
+    second = cfg_mod.ensure_local_api_capability()
+    assert first == second and first.startswith("lc-") and len(first) >= 40
+    assert cfg_mod.load_config()["local_api_capability"] == first
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+
+
+def test_privileged_local_routes_are_all_admin_guarded():
+    """只有脱敏配置/健康/平台状态/版本四个 GET 可匿名；其余路由不能漏装 guard。"""
+    import re
+
+    src = (ROOT / "routes.py").read_text(encoding="utf-8")
+    public = {
+        ("get", "/modal_bridge/config"),
+        ("get", "/modal_bridge/health"),
+        ("get", "/modal_bridge/platform_status"),
+        ("get", "/modal_bridge/version"),
+    }
+    found = re.findall(r'@routes\.(get|post)\("([^"]+)"\)(\n\s+@_admin_only)?', src)
+    assert found
+    for method, path, guard in found:
+        if (method, path) in public:
+            assert not guard, f"公开只读端点意外要求 capability:{method} {path}"
+        else:
+            assert guard, f"高权限端点漏了 @_admin_only:{method} {path}"

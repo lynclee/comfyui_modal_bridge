@@ -58,9 +58,9 @@ def _warn_if_requirements(node_dir: Path) -> None:
       2. ComfyUI Registry 明令禁止「Runtime package installation through subprocess
          calls」—— 这条会让发布版本被判 Flagged,用户在 Manager 里装不到新版。
 
-    现在依赖走 node_sync.write_local_node_reqs() → _local_nodes_data.py →
+    现在依赖 manifest 随节点包进 Volume,同步链汇总后走 _local_nodes_data.py →
     modal_image 的 pip_install 层。**代码仍走 Volume(改一行免重 build)**,
-    只有新增/改依赖才需要重新部署一次。
+    新增/改依赖时同步链自动重新部署一次。
     """
     if not (node_dir / "requirements.txt").is_file():
         return

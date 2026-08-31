@@ -13,7 +13,7 @@
 ## 2. 部署 Modal endpoint
 
 点右上角 **[⚙️ Modal Setup]**:填 Workspace + Token ID/Secret → 部署(零终端,自动建 Secret + `modal deploy` + 写 config)。
-命令行等价:`python deploy.py --workspace <ws> --token-id ak-xxx --token-secret as-xxx`。详见 [SETUP.md](./SETUP.md)。
+简化命令行路径:`python deploy.py --workspace <ws> --token-id ak-xxx --token-secret as-xxx`。它不做 GUI 的 ComfyUI tag、额外模型目录和节点依赖同步,差异见 [SETUP.md](./SETUP.md)。
 
 ## 3. 使用
 
@@ -48,7 +48,7 @@ Deps: `aiohttp`, `pyyaml` (usually already bundled with ComfyUI).
 ## 2. Deploy the Modal endpoint
 
 Click **[⚙️ Modal Setup]**: enter Workspace + Token ID/Secret → Deploy (no terminal; auto-creates Secret, runs `modal deploy`, writes config).
-CLI equivalent: `python deploy.py --workspace <ws> --token-id ak-xxx --token-secret as-xxx`. See [SETUP.md](./SETUP.md).
+Simplified CLI path: `python deploy.py --workspace <ws> --token-id ak-xxx --token-secret as-xxx`. It omits the GUI's ComfyUI-tag, extra-model-path, and node-dependency sync; see [SETUP.md](./SETUP.md).
 
 ## 3. Usage
 
