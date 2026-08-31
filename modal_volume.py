@@ -106,22 +106,44 @@ def volume_files_by_type(cfg, types) -> dict:
 # ============================================================================
 # 本地模型查找
 # ============================================================================
+def _within(path: Path, root: Path) -> bool:
+    """path 解析后是否仍在 root 内(跟随符号链接后判断)。"""
+    try:
+        path.resolve().relative_to(root.resolve())
+        return True
+    except Exception:
+        return False
+
+
 def find_local_model(type_: str, filename: str, roots) -> Path | None:
-    """在给定若干根目录里找 <filename>(先平铺再递归)。roots: 该 type 对应的本地目录列表。"""
+    """在给定若干根目录里找 <filename>(先平铺再递归)。roots: 该 type 对应的本地目录列表。
+
+    ⚠ filename 来自工作流 JSON(可由任何能访问本地 API 的人提交),必须囚在 roots 内:
+      - Python 的 `Path("/models") / "/etc/passwd"` 会**丢弃左边**,直接等于绝对路径 ——
+        不挡的话 filename 传绝对路径就能定位到模型根目录之外的任意文件;
+      - `../` 同理;
+      - resolve() 之后再比,顺带挡住经符号链接绕出去的情况。
+    找到的路径会被上传进 Volume,所以逃逸 = 任意本地文件外泄。
+    """
     base = Path(filename).name  # 容错:workflow 里偶有 "subdir/x.safetensors"
+    if not base:
+        return None
     for root in roots:
         r = Path(root)
         if not r.exists():
             continue
+        # 绝对路径 / .. 都在这里被 _within 挡掉(而不是靠先判断字符串形态 —— 那种
+        # 判法容易漏 Windows 盘符、UNC 之类的变体)
         direct = r / filename
-        if direct.is_file():
+        if direct.is_file() and _within(direct, r):
             return direct
         flat = r / base
-        if flat.is_file():
+        if flat.is_file() and _within(flat, r):
             return flat
-        # 递归兜底(Desktop 有人按子目录归类模型)
+        # 递归兜底(Desktop 有人按子目录归类模型)。rglob 结果天然在 r 下,
+        # 但符号链接可能指到外面,所以同样过一次 _within。
         for hit in r.rglob(base):
-            if hit.is_file():
+            if hit.is_file() and _within(hit, r):
                 return hit
     return None
 
@@ -256,9 +278,23 @@ def download_volume_file(cfg: dict, vol_path: str, local_path: str) -> int:
         vol.reload()  # 最终一致:worker 刚 commit,本地读前刷新一下视图
     except Exception:
         pass
-    Path(local_path).parent.mkdir(parents=True, exist_ok=True)
-    with open(local_path, "wb") as f:
-        return vol.read_file_into_fileobj(vol_path, f)
+    # 先写 .part、成功后原子 rename:直接写正式名的话,下载中断会在 ComfyUI 的 output
+    # 里留下一个**看起来完整**的截断视频/3D 文件 —— 用户点开才发现坏了,而且下次同名
+    # 去重逻辑还会把它当成已存在的产物。routes._atomic_write 走的也是这个模式。
+    dst = Path(local_path)
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    part = dst.with_name(dst.name + ".part")
+    try:
+        with open(part, "wb") as f:
+            n = vol.read_file_into_fileobj(vol_path, f)
+        os.replace(part, dst)
+        return n
+    except Exception:
+        try:
+            part.unlink()
+        except Exception:
+            pass
+        raise
 
 
 def remove_volume_path(cfg: dict, vol_path: str) -> None:

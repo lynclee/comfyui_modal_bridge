@@ -404,7 +404,16 @@ def _worker_run(workflow: dict, job_id: str, input_images: list | None = None,
         try:
             models_vol.commit()
         except Exception as e:
+            # ⚠ commit 失败 = 本地 SDK 根本看不到刚写进 _outputs 的文件。以前这里只
+            # print 一句就继续往下写 completed,用户看到"成功"却怎么也取不回产物,
+            # 而且没有任何线索指向真实原因。产物取不到就是失败,如实记。
+            import traceback
+            job_state[job_id] = {**job_state.get(job_id, {}), "status": "failed",
+                                 "error": f"volume commit 失败,产物无法取回: {e}",
+                                 "trace": traceback.format_exc()[-2000:],
+                                 "completed_at": time.time()}
             print(f"[bridge] volume commit 失败: {e}")
+            raise
     # 有 images(多图)就只存 images,不再冗余存 data_base64/filename(那是 images[0] 的重复,
     # 白白让 job_state 体积翻倍);只有极老回退路径(没 images)才退回单图字段。
     done = {**job_state.get(job_id, {}), "status": "completed",

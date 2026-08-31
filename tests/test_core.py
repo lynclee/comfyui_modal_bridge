@@ -1938,3 +1938,60 @@ def test_execution_error_never_becomes_completed():
     # worker 侧确实会把异常转成 failed（否则上面的 raise 白抛）
     worker = (ROOT / "modal_app" / "modal_app.py").read_text(encoding="utf-8")
     assert '"status": "failed"' in worker, "worker 不再把异常写成 failed"
+
+
+def test_find_local_model_stays_in_root(tmp_path):
+    """模型查找必须囚在 roots 内 —— filename 来自工作流 JSON,找到的文件会被上传进 Volume。
+
+    ⚠ Python 的 `Path("/models") / "/etc/passwd"` **丢弃左边**,直接等于那个绝对路径。
+    所以不能只靠"拼一下再判 is_file",必须 resolve 后确认仍在 root 内。
+    符号链接也要挡:rglob 的结果天然在 root 下,但链接可以指到外面。
+    """
+    import os as _os
+    import modal_volume as mv
+
+    root = tmp_path / "models"
+    root.mkdir()
+    (root / "ok.safetensors").write_bytes(b"x")
+    outside = tmp_path / "secrets"
+    outside.mkdir()
+    (outside / "secret.txt").write_bytes(b"s")
+
+    assert mv.find_local_model("ckpt", "ok.safetensors", [root]) is not None
+    assert mv.find_local_model("ckpt", str(outside / "secret.txt"), [root]) is None   # 绝对路径
+    assert mv.find_local_model("ckpt", "../secrets/secret.txt", [root]) is None       # ..
+    try:
+        _os.symlink(outside / "secret.txt", root / "link.safetensors")
+    except (OSError, NotImplementedError):
+        return                                    # Windows 无权限建链接时跳过这一段
+    assert mv.find_local_model("ckpt", "link.safetensors", [root]) is None            # 符号链接
+
+
+def test_volume_download_is_atomic():
+    """Volume 下载必须写 .part 再 rename。
+
+    直接写正式名的话,下载中断会在 ComfyUI 的 output 里留下一个**看起来完整**的
+    截断视频/3D 文件,用户点开才发现坏了,同名去重还会把它当成已存在的产物。
+    """
+    src = (ROOT / "modal_volume.py").read_text(encoding="utf-8")
+    i = src.index("def download_volume_file(")
+    body = src[i:src.index("\n\ndef ", i)]
+    assert '".part"' in body, "下载没写 .part"
+    assert "os.replace(" in body, "没有原子 rename"
+    assert body.index('".part"') < body.index("os.replace("), "顺序不对"
+
+
+def test_commit_failure_is_not_completed():
+    """Volume commit 失败必须让任务失败,不能照样写 completed。
+
+    commit 失败 = 本地 SDK 看不到刚写进 _outputs 的文件。以前只 print 一句就继续,
+    用户看到"成功"却取不回产物,且没有任何线索指向真实原因。
+    """
+    src = (ROOT / "modal_app" / "modal_app.py").read_text(encoding="utf-8")
+    i = src.index("models_vol.commit()")
+    seg = src[i:i + 700]
+    assert '"status": "failed"' in seg, "commit 失败没写 failed"
+    assert "raise" in seg, "commit 失败没有中断流程"
+    completed_at = seg.find('"status": "completed"')
+    assert completed_at == -1 or seg.index('"status": "failed"') < completed_at, \
+        "failed 分支必须在写 completed 之前"
