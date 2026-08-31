@@ -480,8 +480,20 @@ def _setup_routes():
 
         cfg = cfg_mod.load_config()
         tier = (body.get("tier") or "40g").lower()
-        # 工作流无本地模型节点(纯 API / 轻节点)= 不需要 GPU → 路由到 CPU worker(账单≈0);否则 GPU worker。
-        needs_gpu = bool(extract_required_models(prompt))
+        # 是否需要 GPU。三条判据,任一成立就给 GPU:
+        #   1) 用户**显式选了档位**(非 auto)—— 那是明确表达"我要这张卡",不该再被
+        #      "扫不到模型"这种负向推断推翻。以前只要扫不到模型,选了 H100 也照样进 CPU worker。
+        #   2) 工作流里扫到了本地模型。
+        #   3) 关掉了 cpu_tier_when_no_model —— 默认 True(维持既有账单),但那条推断不可靠:
+        #      节点内部下载权重、无模型文件的 CUDA/Triton 图像处理与 3D/光流节点、
+        #      模型参数不是文件名字符串的节点,都扫不到却真要 GPU。误判代价不对称:
+        #      给错 CPU = 跑不动耗到超时、白烧钱零产出。
+        _tier_sel = resolve_gpu_tier(cfg)
+        needs_gpu = (
+            _tier_sel != "auto"
+            or bool(extract_required_models(prompt))
+            or not cfg.get("cpu_tier_when_no_model", True)
+        )
         # 需要 GPU 时再按估算显存自动选档:放得下便宜卡 → cheap(L40S),否则 primary(H100)。
         gpu_class = "primary"
         if needs_gpu:

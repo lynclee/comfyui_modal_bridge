@@ -1995,3 +1995,46 @@ def test_commit_failure_is_not_completed():
     completed_at = seg.find('"status": "completed"')
     assert completed_at == -1 or seg.index('"status": "failed"') < completed_at, \
         "failed 分支必须在写 completed 之前"
+
+
+def test_explicit_tier_never_routed_to_cpu():
+    """用户显式选了 GPU 档位时,不许再用"扫不到模型"把它推翻成 CPU worker。
+
+    以前 needs_gpu 只看 extract_required_models():只要工作流里扫不到本地模型文件名,
+    哪怕用户明明选了 H100,也照样被送进强制 --cpu 的 worker。而那条推断本身不可靠 ——
+    节点内部下载权重、无模型文件的 CUDA/Triton 图像处理与 3D/光流节点、模型参数不是
+    文件名字符串的节点,都扫不到却真要 GPU。给错 CPU = 跑不动耗到超时、白烧钱零产出。
+    """
+    src = (ROOT / "routes.py").read_text(encoding="utf-8")
+    i = src.index("needs_gpu = (")
+    expr = src[i:src.index(")", src.index("cpu_tier_when_no_model", i))]
+
+    assert '_tier_sel != "auto"' in expr, "显式选档没有短路成 needs_gpu"
+    assert "extract_required_models(prompt)" in expr, "丢了原有的模型扫描判据"
+    assert "cpu_tier_when_no_model" in expr, "没接策略开关"
+
+    # 开关默认值必须是 True —— 改默认等于改所有既有用户的账单，那是用户的决定
+    import config as cfg_mod
+    assert cfg_mod.DEFAULT_CONFIG["cpu_tier_when_no_model"] is True, \
+        "改这个默认值会改变既有用户的账单模型,应由用户显式决定"
+
+
+def test_cli_deploy_keeps_secret_fields_and_atomic_config():
+    """CLI 部署不能丢 Secret 字段,也不能绕过 config 的原子写 + 0600。
+
+    以前 secret_create_cmd 只传了 hf_token 和 bridge_key,comfy_api_key / aigc_* 吃函数
+    默认的空串 —— 用 CLI 部署一次,工作流里的 ComfyUI API 节点鉴权和 aigc-r2 交付就
+    静默失效(config 里明明配着)。config 又是直接 write_text:非原子(写一半崩 → 半个
+    JSON → 加载静默回落默认值,表现成"配置没了"),权限还是 0644,而里面有四种凭据。
+    """
+    src = (ROOT / "deploy.py").read_text(encoding="utf-8")
+
+    i = src.index("secret_create_cmd(")
+    call = src[i:src.index(")", src.index("aigc_bypass_secret", i))]
+    for field in ("comfy_api_key", "aigc_studio_base_url", "aigc_bypass_secret"):
+        assert field in call, f"CLI 部署漏传 Secret 字段: {field}"
+
+    assert "save_config(" in src, "config 写入没走 save_config(原子 + 0600)"
+    assert "CONFIG_DST.write_text" not in src, "还在直接 write_text 写 config"
+    # 别再宣称与 GUI 等价 —— 它确实少做了几步
+    assert "不等价于 GUI" in src, "docstring 应如实交代与 GUI 的差距"
