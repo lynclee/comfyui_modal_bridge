@@ -458,7 +458,16 @@ def run_workflow(workflow: dict, job_id: str, input_images: list[dict] | None = 
             except json.JSONDecodeError:
                 continue
 
-        if not execution_done and not errors:
+        # ⚠ 执行出错必须直接失败,不能因为 history 里恰好有前序节点的产物就当成功。
+        # 旧写法把「没完成」和「没出错」用 and 连起来做唯一的抛出条件 —— 于是出错时反而
+        # **不抛**,继续往下从 history 捞产物返回,worker 那边无条件写 completed。
+        # 结果:一个 BrokenNode 报错的工作流,只要前面某个节点落过一张图,就会被报成
+        # "成功"、照常计费、并被 AIGC Studio 当完整产物发布出去(codex 已复现)。
+        # 部分产物对报错的工作流几乎没有价值(视频只生成了前半段),而伪装成功的代价
+        # 远大于丢弃它们。真要保留得另立 failed_with_outputs 契约,不是在这里含糊过去。
+        if errors:
+            raise RuntimeError("工作流执行出错: " + "; ".join(errors))
+        if not execution_done:
             raise ValueError("Workflow ended without completion")
 
         history = get_history(prompt_id)

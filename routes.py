@@ -251,6 +251,12 @@ async def _write_results(final: dict, job_id: str, subfolder: str, cfg: dict) ->
             fn = _dedup(Path(img.get("filename") or "output.png").name)  # basename 防路径逃逸
             local = out_dir / fn
             if vp:
+                # ⚠ vp 整个来自浏览器提交的 modal_state,没人替我们验过 —— 而这条路
+                # **绕过云端 fetch_endpoint、直连 Volume SDK**,云端那道囚笼管不到。
+                # 伪造成 models/... 就能把模型下载走并删掉(取回后即删是既定行为),
+                # 删除不可逆。所以本地必须自己囚一次(规则与云端逐字相同)。
+                if not contract.is_safe_output_path(job_id, vp):
+                    raise RuntimeError(f"volume_path 越界(必须在 _outputs/{job_id}/ 内): {vp!r}")
                 # 大文件:从 Volume 直连下载(不走 base64/Dict),下完删 Volume 上的副本
                 try:
                     size = await asyncio.to_thread(modal_volume.download_volume_file, cfg, vp, str(local))

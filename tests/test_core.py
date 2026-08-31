@@ -1845,3 +1845,96 @@ def test_local_node_reqs_roundtrip_and_sanitize(tmp_path):
         assert ns.read_local_node_reqs() == []
     finally:
         ns.LOCAL_REQS_FILE = old
+
+
+def test_output_path_jail():
+    """volume_path 必须囚在 _outputs/<job_id>/ 内。
+
+    这条路(routes._write_results)**绕过云端 fetch_endpoint、直连 Volume SDK**,
+    云端那道校验管不到;而 volume_path 整个来自浏览器提交的 modal_state。
+    伪造成 models/... 就能把上传过的模型下载走**并删掉**(取回后即删是既定行为),
+    删除不可逆 —— 几十 GB 的模型重传代价极高。
+    """
+    from contract import is_safe_output_path as ok
+
+    assert ok("job1", "_outputs/job1/a.png")
+    assert ok("job1", "_outputs/job1/sub/a.png")
+    # 攻击向量
+    assert not ok("job1", "models/checkpoints/x.safetensors")
+    assert not ok("job1", "_local_nodes/foo.zip")
+    assert not ok("job1", "_outputs/job2/a.png")          # 别人的 job
+    assert not ok("job1", "_outputs/job1/../../models/x")
+    assert not ok("job1", "./_outputs/job1/a.png")
+    assert not ok("job1", "_outputs/job1//a.png")
+    assert not ok("job1", "")
+    assert not ok("job1", None)
+    assert not ok("job1", "_outputs/job10/a.png")         # 前缀相近的别的 job
+
+
+def test_output_path_jail_identical_local_and_cloud():
+    """云端 fetch_endpoint 里另有一份同规则实现(云端不能 import contract)。
+
+    ⚠ 两边不能逐字比较:本地必须用 posixpath.normpath —— 插件会跑在 Windows 上,
+    而 os.path.normpath 在 Windows 会把 / 转成 \\,把合法路径判成越界。
+    云端跑在 Linux 容器里,两者等价。所以这里比对的是「三重判据都在」。
+    """
+    cloud = (ROOT / "modal_app" / "modal_app.py").read_text(encoding="utf-8")
+    i = cloud.find('prefix = f"_outputs/{job_id}/"')
+    assert i > 0, "云端的输出路径囚笼不见了"
+    seg = cloud[i:i + 320]
+    assert "startswith(prefix)" in seg, "云端缺前缀校验"
+    assert '".." in path' in seg, "云端缺 .. 校验"
+    assert "normpath(path)" in seg, "云端缺规范化校验"
+
+    local = (ROOT / "contract.py").read_text(encoding="utf-8")
+    assert "posixpath.normpath" in local, "本地必须用 posixpath(Windows 兼容)"
+    assert 'f"_outputs/{job_id}/"' in local, "本地缺前缀校验"
+
+
+def test_write_results_actually_calls_the_jail():
+    """routes._write_results 必须在用 vp 之前调用囚笼 —— 光有函数没人调等于没有。
+
+    这是静态检查(比对源码顺序),不是真实调用:routes.py 用相对导入且依赖
+    aiohttp/server,单测里 import 不进来。covering 真实路由需要另起一套测试基建
+    (codex review 也指出了这个缺口),在那之前先用顺序断言挡住"摘掉调用"这类回归 ——
+    上一版测试就漏过了它。
+    """
+    src = (ROOT / "routes.py").read_text(encoding="utf-8")
+    i = src.index("async def _write_results(")
+    body = src[i:src.index("\n\n\n", i)]
+
+    call = body.find("contract.is_safe_output_path(job_id, vp)")
+    dl = body.find("download_volume_file")
+    rm = body.find("remove_volume_path")
+    assert call > 0, "_write_results 里没调用 is_safe_output_path —— 囚笼被摘了"
+    assert dl > 0 and rm > 0, "下载/删除调用不见了,测试锚点需更新"
+    assert call < dl, "囚笼必须在 download_volume_file 之前"
+    assert call < rm, "囚笼必须在 remove_volume_path 之前"
+
+
+def test_execution_error_never_becomes_completed():
+    """ComfyUI 报 execution_error 时必须让任务失败,不能因为 history 里有前序产物就当成功。
+
+    旧写法 `if not execution_done and not errors: raise` 在 errors 非空时**不抛**,
+    于是继续往下从 history 捞产物返回,而 worker 那边无条件写 completed。
+    一个 BrokenNode 报错的工作流,只要前面某节点落过一张图,就会被报成"成功"、
+    照常计费、还被当完整产物交付出去。
+
+    静态检查:错误分支必须在 discover_outputs 之前 raise。真实的 WS 时序测试需要
+    另起基建(codex review 指出的缺口),在那之前先挡住这类回归。
+    """
+    src = (ROOT / "modal_app" / "_comfy_ws.py").read_text(encoding="utf-8")
+
+    raise_at = src.find('raise RuntimeError("工作流执行出错')
+    discover_at = src.find("refs = discover_outputs(")
+    assert raise_at > 0, "execution_error 的失败分支不见了 —— 错误会被吞成 completed"
+    assert discover_at > 0, "discover_outputs 调用不见了,测试锚点需更新"
+    assert raise_at < discover_at, "必须在捞产物之前就失败"
+
+    # 旧的「errors 非空反而不抛」写法不许回来
+    assert "if not execution_done and not errors:" not in src, \
+        "回退成了 errors 非空时不抛的旧逻辑"
+
+    # worker 侧确实会把异常转成 failed（否则上面的 raise 白抛）
+    worker = (ROOT / "modal_app" / "modal_app.py").read_text(encoding="utf-8")
+    assert '"status": "failed"' in worker, "worker 不再把异常写成 failed"

@@ -5,6 +5,7 @@ routes.py 本身 import 不进测试(相对导入 + 依赖 ComfyUI 的 folder_pa
 「决定行为对错」的判断都抽到这里:版本/GPU 契约(compute_contract,直接决定前端会不会
 拦截 RunModal)、外部输入的合法性(is_safe_job_id)。
 """
+import posixpath
 import re
 
 # job_id 会拼进本地落盘路径(output/<subfolder>/<job_id>/)。云端产生的 id 是 uuid4
@@ -50,3 +51,25 @@ def compute_contract(local, deployed, reachable, local_gpu, deployed_gpu,
         "deploy_comfyui": deploy_comfyui,
         "comfyui_match": comfyui_match,
     }
+
+
+def is_safe_output_path(job_id: str, path: str) -> bool:
+    """产物的 Volume 路径是否落在本 job 的输出目录内。
+
+    ⚠ 这份规则在云端 modal_app.fetch_endpoint 里另有一份逐字相同的实现(云端不能
+    import 本模块,它不在镜像的 add_local_python_source 名单里),由
+    test_output_path_jail_identical_local_and_cloud 钉死两边一致。
+
+    为什么本地也要囚:routes 取回大文件时**绕过云端 endpoint、直连 Volume SDK**,
+    云端那道校验管不到。而 volume_path 整个来自浏览器提交的 modal_state,伪造成
+    `models/checkpoints/x.safetensors` 就能把上传过的模型下载走、**并且删掉**
+    (取回后即删是既定行为)。删除不可逆,几十 GB 的模型重传一次代价极高。
+
+    三重判据与云端一致:前缀 + 不含 .. + 规范化后与原串相同(挡 `./` `//` 等变体)。
+    """
+    if not isinstance(path, str) or not path:
+        return False
+    prefix = f"_outputs/{job_id}/"
+    return (path.startswith(prefix)
+            and ".." not in path
+            and path == posixpath.normpath(path))
