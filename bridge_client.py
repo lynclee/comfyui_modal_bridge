@@ -19,6 +19,7 @@ localhost 直连策略相反,勿混用。
 import base64
 import json
 import mimetypes
+import os
 import time
 import urllib.error
 import urllib.parse
@@ -184,8 +185,19 @@ class BridgeClient:
             if vp:
                 size = self._download_volume(job_id, vp, local, delete_remote)
             elif img.get("data_base64"):
+                # 与大文件那条路一致:写 .part、成功后原子 rename。直接写正式名的话,
+                # 进程中断会在输出目录里留下一个**看起来完整**的截断文件。
                 blob = base64.b64decode(img["data_base64"])
-                local.write_bytes(blob)
+                part = local.with_name(local.name + ".part")
+                try:
+                    part.write_bytes(blob)
+                    os.replace(part, local)
+                except Exception:
+                    try:
+                        part.unlink()
+                    except Exception:
+                        pass
+                    raise
                 size = len(blob)
             else:
                 continue
@@ -245,9 +257,21 @@ class BridgeClient:
             pn = Path(n)
             if pn.is_absolute() or ".." in pn.parts:
                 raise BridgeError(f"输入图路径非法(绝对路径或含 ..): {n}")
-            p = next((Path(d) / n for d in search_dirs if (Path(d) / n).is_file()), None)
+            # ⚠ 只挡字符串形态不够:搜索目录里放一个指向目录外的**符号链接**,
+            # is_file() 照样为真、read_bytes() 就把目录外的内容读出来上传了
+            # (2026-08-31 codex 实测成功)。必须 resolve 后确认仍在该搜索目录内。
+            # 本模块是零依赖的独立客户端,所以这里自带一份,不 import 插件的其它模块。
+            def _within(cand: Path, root: Path) -> bool:
+                try:
+                    cand.resolve().relative_to(Path(root).resolve())
+                    return True
+                except Exception:
+                    return False
+
+            p = next((Path(d) / n for d in search_dirs
+                      if (Path(d) / n).is_file() and _within(Path(d) / n, Path(d))), None)
             if p is None:
-                raise BridgeError(f"输入图找不到: {n}(搜索目录: {search_dirs})")
+                raise BridgeError(f"输入图找不到或越界: {n}(搜索目录: {search_dirs})")
             mime = mimetypes.guess_type(str(p))[0] or "image/png"
             b64 = base64.b64encode(p.read_bytes()).decode("ascii")
             out.append({"name": n, "image": f"data:{mime};base64,{b64}"})

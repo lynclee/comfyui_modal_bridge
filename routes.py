@@ -339,10 +339,19 @@ def _extract_input_image_names(prompt: dict) -> list[str]:
 
 
 def _read_input_as_b64(name: str) -> dict:
-    """读 input/<name>,返回 Modal 期望的 {name, image (data uri)} 格式。"""
-    p = _input_dir() / name
+    """读 input/<name>,返回 Modal 期望的 {name, image (data uri)} 格式。
+
+    ⚠ name 来自工作流 JSON。上游 _extract_input_image_names 已挡掉子路径形态,但那只是
+    字符串检查:input 目录里放一个指向目录外的**符号链接**,exists() 照样为真、
+    read_bytes() 就把目录外内容读出来上传了。必须 resolve 后确认仍在 input 目录内
+    —— 与模型查找用的是同一份囚笼(modal_volume.is_path_within_roots)。
+    """
+    root = _input_dir()
+    p = root / name
     if not p.exists():
         raise FileNotFoundError(f"Input image not found locally: {p}")
+    if not modal_volume.is_path_within_roots(p, [root]):
+        raise FileNotFoundError(f"输入图越界(解析后不在 input 目录内): {name}")
     blob = p.read_bytes()
     ext = p.suffix.lower().lstrip(".") or "png"
     mime = {"jpg": "jpeg", "jpe": "jpeg"}.get(ext, ext)
@@ -791,7 +800,9 @@ def _setup_routes():
 
         if not modal_volume.modal_importable():
             return web.json_response(
-                {"error": "本地没装 modal(先点 [Modal Setup] 部署一次,会自动装 modal)"}, status=400)
+                {"error": "本地没装 modal。插件依赖由 ComfyUI Manager 在安装时装 —— "
+                          "手动 clone 进 custom_nodes 的话,在 ComfyUI 用的那个 Python 里 "
+                          "安装 modal 后重启;也可以在 Manager 里卸载后重装本插件。"}, status=400)
 
         cfg = cfg_mod.load_config()
         resolver = _local_model_resolver()

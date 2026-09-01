@@ -44,12 +44,23 @@ def _load_cli_cfg() -> dict:
 
 
 def _save_cli_cfg(d: dict) -> None:
+    """写 CLI 配置(含 bridge_key)。临时文件 → chmod 0600 → os.replace。
+
+    ⚠ 不能"先 write_text 再 chmod":
+      - 非原子 —— 写到一半崩掉会留下半截 JSON,而 _load_cli_cfg 的 except 会把它静默
+        当成空配置,表现成"凭据莫名其妙没了",没有任何线索指向真实原因;
+      - 中间存在 0644 窗口 —— 文件先以默认权限落地,chmod 之前同机其他用户可读;
+      - 原实现还吞掉 chmod 失败,于是权限没设上也无人知晓。
+    与主配置 config.save_config 用的是同一套模式。
+    """
     CLI_CFG.parent.mkdir(parents=True, exist_ok=True)
-    CLI_CFG.write_text(json.dumps(d, indent=2, ensure_ascii=False))
+    tmp = CLI_CFG.with_name(CLI_CFG.name + ".tmp")
+    tmp.write_text(json.dumps(d, indent=2, ensure_ascii=False), encoding="utf-8")
     try:
-        CLI_CFG.chmod(0o600)  # 含 bridge_key
+        os.chmod(tmp, 0o600)   # Windows 上是 no-op,无害
     except Exception:
         pass
+    os.replace(tmp, CLI_CFG)
 
 
 def _client(args) -> BridgeClient:

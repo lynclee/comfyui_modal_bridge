@@ -100,6 +100,29 @@ _INSTALL_REQS_CMD = " && ".join(
 cuda_image = (
     modal.Image.from_registry(
         "nvidia/cuda:13.0.0-cudnn-runtime-ubuntu24.04",
+        # ⚠ 3.12 而不是 3.13,而且这不是"求稳"那么简单 —— **3.13 会让一整类老包装不上**。
+        # Python 3.13 实装了 PEP 667(Consistent views of namespaces):函数作用域的
+        # locals() 改为返回**独立快照**,exec() 往里写的东西在后续 locals() 里看不到。
+        # 而"用 exec() 执行 version.py、再从 locals() 取 __version__"是 2020 年前
+        # setup.py 里非常常见的写法:
+        #     def get_version():
+        #         with open(version_file) as f: exec(compile(f.read(), version_file, 'exec'))
+        #         return locals()['__version__']          # 3.13 上 KeyError
+        # 于是 basicsr 之类的包在云端直接构建失败,而本地(3.12)装得好好的。
+        # 实测:容器 py3.11 跑同样写法返回 1.4.2,云端 py3.13 抛 KeyError '__version__'。
+        #
+        # ⚠ 钉 setuptools<81 救不了这条:失败发生在 pip 的隔离构建环境
+        # (/tmp/pip-build-env-*/overlay),那里用的是临时装的最新 setuptools,
+        # 镜像里这份够不着 —— 与"钉版本不拖累构建"是同一枚硬币的两面。
+        #
+        # 用户的诉求是"本地能跑,推上云端就能跑",而本地是历史累积的环境、云端是从零按
+        # requirements.txt 全新安装,差异天然存在;对齐 Python 版本能消掉其中最大的一块。
+        # 后续可考虑像 MODAL_BRIDGE_COMFYUI_TAG 那样**跟随本机**版本,而不是写死。
+        # ⚠⚠ **暂时仍是 3.13,因为改不动**:本仓库自托管的 SageAttention wheel 是
+        #     sageattention-2.2.0-**cp313**-cp313-linux_x86_64.whl —— 带 C 扩展,ABI 锁死
+        #     在 CPython 3.13,pip 在 3.12 上会判定 not supported,直接让镜像构建失败。
+        #     要改 3.12 必须先重编一份 cp312 的 wheel(配方与构建脚本挂在该 Release 下,
+        #     参考成本 $0.09),否则这一行改了等于部署不了。
         add_python="3.13",
     )
     .apt_install("git", "wget", "libgl1", "libglib2.0-0", "libsm6", "libxext6", "libxrender1", "ffmpeg")
