@@ -76,13 +76,6 @@ const I18N = {
   "dlg.comfy.ph_saved":{ zh: "已保存(留空=沿用)", en: "saved (blank = keep)" },
   "dlg.comfy.note":   { zh: "⚠ 存进云端 Secret,worker 用它跑 API 节点 —— 账单走你的 comfy.org 额度。",
                         en: "⚠ Stored in the cloud Secret; the worker uses it to run API nodes — billed to your comfy.org credits." },
-  "dlg.aigc.hint":    { zh: "(可选,网站 aigc-r2 交付才需要;本地用完全不用填)",
-                        en: "(optional, only for website aigc-r2 delivery; leave blank for local use)" },
-  "dlg.aigc.url_ph":  { zh: "https://你的站点.vercel.app(留空 = 不启用)", en: "https://your-site.vercel.app (blank = disabled)" },
-  "dlg.aigc.bypass_hint": { zh: "(可选,域名开了 Vercel Protection 才需要)", en: "(optional, only if Vercel Protection is on)" },
-  "dlg.aigc.bypass_ph": { zh: "Vercel Protection Bypass 密钥", en: "Vercel protection bypass secret" },
-  "dlg.aigc.note":    { zh: "⚠ 存进云端 Secret,worker 交付结果时回调这个网站换预签名 R2 上传地址 —— R2 长期密钥永不进 Modal。",
-                        en: "⚠ Stored in the cloud Secret; the worker calls this site for presigned R2 upload URLs — long-term R2 keys never enter Modal." },
   "api.warn.title":   { zh: "⚠ 工作流含 API 节点", en: "⚠ Workflow uses API nodes" },
   "api.warn.body":    { zh: "这个工作流用了 ComfyUI API 节点(Kling/Luma/OpenAI 等),在云端跑需要 comfy.org API key,但你还没配。\n\n现在跑这些 API 节点会 401 失败。\n\n建议先去 Setup 填 comfy.org API key。",
                         en: "This workflow uses ComfyUI API nodes (Kling/Luma/OpenAI, etc.). Running them in the cloud needs a comfy.org API key, which isn't configured.\n\nThose API nodes will fail (401) if you run now.\n\nAdd your comfy.org API key in Setup first." },
@@ -178,12 +171,16 @@ const I18N = {
   "toast.recover_to": { zh: "⚠ Job {id} 恢复等待超时,已请求取消云端任务", en: "⚠ Job {id} recovery timed out; cancel requested" },
   "cancel.noop":      { zh: "取消没赶上 —— 云端已跑完(费用已产生),正在取回结果",
                         en: "Too late to cancel — the job already finished (already billed); fetching the result" },
-  "ver.unreach_toast":{ zh: "云端连不上(app 可能没部署/被删)。点 [⚙️ Modal Setup] 重新部署",
-                        en: "Cloud unreachable (app maybe undeployed/deleted). Click [⚙️ Modal Setup] to redeploy." },
+  // ⚠ 走到这两条时,状态页已确认 Modal 平台正常(见 checkVersionOrBlock 的第 ② 档),
+  // 所以措辞里不提平台故障、也不引导去 status.modal.com。
+  "ver.unreach_toast":{ zh: "云端连不上,但 Modal 平台正常 —— 多半是本机网络慢,或云端 app 没部署/被删。点 [⚙️ Modal Setup] 重新部署",
+                        en: "Cloud unreachable while Modal itself is healthy — likely slow local network, or the app was never deployed / was deleted. Click [⚙️ Modal Setup] to redeploy." },
+  "ver.local_busy_toast":{ zh: "本地 ComfyUI 正忙,版本检查跳过 —— 照常提交到云端(本地采样会阻塞检查,与 Modal 无关)",
+                        en: "Local ComfyUI is busy, version check skipped — submitting to the cloud anyway (local sampling blocks the check; unrelated to Modal)." },
   "ver.mismatch_toast":{ zh: "插件版本 {local} 与云端部署的 {deployed} 不一致,需重新部署。",
                         en: "Plugin {local} differs from deployed {deployed}; redeploy needed." },
-  "ver.unreach_msg":  { zh: "云端 Modal 连不上(没部署 / app 被删)。\n\n点「确定」打开部署窗口。",
-                        en: "Cloud Modal unreachable (not deployed / app deleted).\n\nOK to open the deploy dialog." },
+  "ver.unreach_msg":  { zh: "连不上云端,但 Modal 官方状态页显示平台正常。\n\n可能是本机网络较慢,或云端 app 没部署过 / 已被删。\n\n点「确定」打开部署窗口;只是网络抖动的话,直接关掉重试即可。",
+                        en: "Can't reach the cloud, but Modal's status page reports the platform is healthy.\n\nLikely a slow local network, or the app was never deployed / was deleted.\n\nOK to open the deploy dialog; if it was just a network blip, close this and retry." },
   "ver.mismatch_msg": { zh: "⚠ 版本不一致:\n  插件(本地):{local}\n  云端部署:{deployed}\n\n你升级了插件但还没重新部署,云端跑的是旧代码,会出问题。\n\n点「确定」打开部署窗口重新部署。",
                         en: "⚠ Version mismatch:\n  Plugin (local): {local}\n  Deployed: {deployed}\n\nYou upgraded the plugin but haven't redeployed; the cloud runs old code.\n\nOK to open the deploy dialog." },
   "export.done":      { zh: "已导出 {name}_modal.py —— 给别人:让他装 requests、填 KEY、python 跑即可(模型/节点需已同步过)。",
@@ -1829,15 +1826,33 @@ async function checkVersionOrBlock() {
     return false;  // 拦截:必须重新部署
   }
 
-  // 连不上:先查 Modal 官方状态页(权威)判断是不是平台故障。
-  // 平台故障 → 引导查状态页(部署也会失败,等恢复);否则按 err_kind 当没部署 → 引导部署。
+  // 连不上。分三种,别混成一句"平台故障":
   if (!v.reachable) {
+    // ① 本地 ComfyUI 正忙 —— 后端已确认队列里有活。ComfyUI 单进程,同步采样期间
+    //    event loop 调度不到,那 6 秒挂钟超时纯粹是本地阻塞,**云端状态未知、不是连不上**。
+    //    而"本地忙的时候把活推到云端"恰恰是 RunModal 存在的理由,绝不能拦
+    //    —— 这里和函数开头「检查本身失败不阻塞」是同一条原则。
+    if (v.err_kind === "local_busy") {
+      notify(t("ver.local_busy_toast"), "info");
+      log("version check skipped: 本地队列忙,event loop 被阻塞");
+      return true;   // 放行
+    }
+    // ② 只有状态页(权威)说故障才叫平台故障。以前把 timeout/unreachable 也算进来,
+    //    于是本地一忙就误报成 Modal 挂了,还引导用户去看状态页 —— 归因完全是反的。
     const outage = await isModalOutage();  // 查 status.modal.com 的 aggregate_state
-    const platform = outage || v.err_kind === "timeout" || v.err_kind === "unreachable";
-    notify(platform ? t("ver.platform_toast") : t("ver.notdeployed_toast"), "warn");
-    if (confirm(platform ? t("ver.platform_msg") : t("ver.notdeployed_msg"))) {
-      if (platform) { try { window.open("https://status.modal.com", "_blank"); } catch (e) {} }
-      else { try { openDeployDialog(); } catch (e) {} }
+    if (outage) {
+      notify(t("ver.platform_toast"), "warn");
+      if (confirm(t("ver.platform_msg"))) {
+        try { window.open("https://status.modal.com", "_blank"); } catch (e) {}
+      }
+      return false;
+    }
+    // ③ 状态页正常却连不上:本机网络慢 / 云端 app 被删 / key 不对。引导重新部署,
+    //    但文案不再甩锅给 Modal。
+    const netLike = v.err_kind === "timeout" || v.err_kind === "unreachable";
+    notify(netLike ? t("ver.unreach_toast") : t("ver.notdeployed_toast"), "warn");
+    if (confirm(netLike ? t("ver.unreach_msg") : t("ver.notdeployed_msg"))) {
+      try { openDeployDialog(); } catch (e) {}
     }
   } else {
     // 版本不一致(连得上,但本地↔云端版本不同)→ 引导重新部署

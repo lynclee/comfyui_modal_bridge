@@ -146,6 +146,27 @@ def _estimate_workflow_vram(prompt: dict) -> tuple[float, str, int]:
 _TIER_GPU_KEY = {"cheap": "cheap_gpu", "primary": "default_gpu", "top": "top_gpu"}
 
 
+def _local_queue_busy() -> bool:
+    """ComfyUI 本地是否有正在跑/排队的任务。拿不到就返回 False(不做推断)。
+
+    为什么需要它:ComfyUI 是单进程 aiohttp + 同步执行图,KSampler 的 PyTorch 采样是
+    同步阻塞调用,采样期间 event loop 基本调度不到。于是我们自己的 /version 里那个
+    6 秒**挂钟**超时,在一个 3 s/it 的工作流上两个迭代就吃满了 —— 请求还没轮到处理
+    就 TimeoutError。以前这会被前端当成「Modal 平台故障」,而云端其实完全正常
+    (2026-08-31 实测:本地队列空闲后同一接口 1.4 s 返回、各项全匹配)。
+
+    ⚠ 用户在本地忙的时候点 RunModal,恰恰是这个插件最该工作的场景(把活推到云端)。
+    所以这个判定的目的不是"拦住他",而是把超时如实归因成 local_busy、别再拦。
+    """
+    try:
+        from server import PromptServer  # type: ignore
+        q = PromptServer.instance.prompt_queue
+        running, pending = q.get_current_queue()
+        return bool(running) or bool(pending)
+    except Exception:
+        return False
+
+
 def resolve_gpu_tier(cfg: dict) -> str:
     """config → 生效的 GPU 档位。'auto' 表示按显存自动选,其余为固定档。
     新配置用 gpu_tier;为空则回落到旧的 auto_downgrade 语义(关=固定 primary)。"""
@@ -1430,8 +1451,17 @@ def _setup_routes():
                     else:
                         err_kind = "http_error"
         except asyncio.TimeoutError:
-            err_kind = "timeout"   # 超时 = 多半 Modal 平台故障 / 冷启动慢
-            print("[modal_bridge] version check: health 超时(可能 Modal 平台故障,查 status.modal.com)")
+            # ⚠ 这个 6 秒是**挂钟**超时,而 ComfyUI 是单进程:本地采样(同步的 PyTorch 调用)
+            # 期间 event loop 调度不到,3 s/it 的工作流两个迭代就吃满 —— 请求根本没轮到处理。
+            # 以前一律记成 timeout,前端据此弹「Modal 平台故障」,而云端完全正常。
+            # 先问一句本地队列忙不忙,把这种情况如实归因,前端才能不拦(见 checkVersionOrBlock)。
+            if _local_queue_busy():
+                err_kind = "local_busy"
+                print("[modal_bridge] version check: 本地有任务在跑,event loop 被阻塞导致超时 —— "
+                      "与 Modal 无关,放行提交")
+            else:
+                err_kind = "timeout"
+                print("[modal_bridge] version check: health 超时(本机网络慢 / 云端未部署 / 平台故障)")
         except Exception as e:
             err_kind = "unreachable"
             print(f"[modal_bridge] version check: health 不可达 ({e})")

@@ -2171,3 +2171,40 @@ def test_privileged_local_routes_are_all_admin_guarded():
             assert not guard, f"公开只读端点意外要求 capability:{method} {path}"
         else:
             assert guard, f"高权限端点漏了 @_admin_only:{method} {path}"
+
+
+def test_local_busy_is_not_reported_as_modal_outage():
+    """本地 ComfyUI 忙导致的版本检查超时,不许被归因成「Modal 平台故障」,更不许拦住提交。
+
+    ComfyUI 是单进程 aiohttp + 同步执行图:KSampler 的 PyTorch 采样是同步阻塞调用,
+    采样期间 event loop 调度不到。/version 那个 6 秒是**挂钟**超时,3 s/it 的工作流
+    两个迭代就吃满 —— 请求还没轮到处理就 TimeoutError。
+
+    2026-08-31 实测:本地跑图时点 RunModal 弹「Modal 平台故障」,而队列空闲后同一接口
+    1.4 s 返回、各项全匹配,云端完全正常。归因是反的。
+
+    ⚠ 而且它是**阻断式**的(checkVersionOrBlock 返回 false 就取消提交)——
+    "本地忙的时候把活推到云端"恰恰是 RunModal 存在的理由,拦掉等于废掉核心场景。
+    """
+    py = (ROOT / "routes.py").read_text(encoding="utf-8")
+    js = (ROOT / "web" / "modal_bridge.js").read_text(encoding="utf-8")
+
+    # 后端：超时时先问本地队列，忙就归因成 local_busy
+    assert "def _local_queue_busy(" in py, "缺少本地队列忙判定"
+    i = py.index("except asyncio.TimeoutError:")
+    seg = py[i:i + 900]
+    assert "_local_queue_busy()" in seg, "超时分支没有区分本地忙"
+    assert '"local_busy"' in seg, "没有 local_busy 这个归因"
+
+    # 前端：local_busy 必须放行，且必须在查状态页之前
+    k = js.index("if (!v.reachable) {")
+    body = js[k:k + 2000]
+    busy_at = body.find('v.err_kind === "local_busy"')
+    outage_at = body.find("await isModalOutage()")
+    assert busy_at > 0, "前端没有处理 local_busy"
+    assert busy_at < outage_at, "local_busy 必须先短路，不该还去查状态页"
+    assert "return true" in body[busy_at:outage_at], "local_busy 必须放行提交，不能拦"
+
+    # platform 判定只认状态页，不再把 timeout/unreachable 算作平台故障
+    assert 'outage || v.err_kind === "timeout"' not in js, \
+        "又把 timeout 当成平台故障了 —— 本地一忙就会误报 Modal 挂了"
