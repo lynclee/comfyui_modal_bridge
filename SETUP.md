@@ -130,7 +130,7 @@ https://<ws>--comfyui-bridge-health.modal.run  (GET 健康 + 已装 custom_nodes
   **流式直传 Cloudflare R2**(找网站换几分钟有效的预签名 PUT 地址),传完回调网站落库。
   全程不经过本地 ComfyUI,用户关机也不丢结果;回调失败时 manifest 留在 `/status` 里供网站兜底恢复。
 
-启用方法:[⚙️ Modal Setup] 里填 **AIGC Studio URL**(可选再填 Vercel Protection 的
+启用方法:**设置 → Modal Bridge → Advanced** 里填 **AIGC Studio URL**(可选再填 Vercel Protection 的
 Bypass Secret)→ 重新部署。留空 = 不启用,desktop 交付完全不受影响。
 
 安全铁律:R2 长期密钥只在 Vercel,**永不进入 Modal**;任务 token 只在内存里用,

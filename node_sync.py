@@ -684,7 +684,8 @@ def diagnose_build_failure(text: str) -> str:
             f"镜像里的 Python 版本(当前 3.13),setup.py 在隔离构建下跑不起来。\n"
             f"   处理办法:在用到它的那个私有节点的 requirements.txt 里把 `{pkg}` 去掉"
             f"(先确认代码是否真的 import 了它)、换一个仍在维护的版本,或改用不依赖它的实现;\n"
-            f"   改完在 Setup 里点「同步本机私有节点」或直接重新部署即可。")
+            f"   改完在 Setup 里点「推送到云端」即可 —— 它会自动比对差异,"
+            f"把改动的节点推上去、需要时重建镜像。")
 
 
 def gen_bridge_key() -> str:

@@ -2311,7 +2311,8 @@ def test_deploy_syncs_local_nodes_before_reading_manifest():
     """
     src = (ROOT / "routes.py").read_text(encoding="utf-8")
     i = src.index("# 3) 部署 app")
-    seg = src[i:i + 3000]
+    # 窗口要够大：这一段随着 fail-closed 分支的加入长了不少，切太短会把锚点切掉
+    seg = src[i:i + 6000]
 
     # ⚠ 锚点要用真实调用而不是裸名字:注释里也提到了 _refresh_local_node_reqs,
     # 用裸名字会匹配到那句注释、把顺序判反(这个坑本会话踩过三次)。
@@ -2370,20 +2371,90 @@ def test_image_pins_setuptools_for_pkg_resources():
 
 
 def test_no_copy_points_at_removed_ui():
-    """面向用户的文案不许指向已经不存在的按钮。
+    """面向用户的文案不许指向已经不存在的按钮 —— JS、Python 字符串、文档三处都要查。
 
-    0.8.15 加过「同步本机私有节点」按钮,并在版本不一致的引导里让用户去点它;
-    0.8.19 把它合并进「推送到云端」后,那句引导就成了指向空气的指路牌 ——
-    比没有引导更糟:用户会在界面上翻找一个不存在的东西。
+    0.8.15 加过「同步本机私有节点」按钮,并在多处引导用户去点它;0.8.19 把它合并进
+    「推送到云端」后,那些话就成了指向空气的指路牌 —— 比没有引导更糟,用户会在界面上
+    翻找一个不存在的东西。
+
+    ⚠ 这条测试第一版只搜了 JS,于是漏掉 node_sync.py 的构建失败提示和 SETUP.md 的
+    配置说明(codex review 抓到)。现在三处都查:
+      - JS:直接搜;
+      - Python:只看**字符串字面量**,跳过注释与 docstring(那里讲历史是应该的);
+      - Markdown:搜正文。
     """
-    js = (ROOT / "web" / "modal_bridge.js").read_text(encoding="utf-8")
+    import ast
 
-    # 已删掉的按钮不许再被文案提及
-    for gone in ("同步本机私有节点", "Sync local private nodes"):
-        assert gone not in js, f"文案仍指向已移除的按钮: {gone}"
+    gone_names = ("同步本机私有节点", "Sync local private nodes")
+    offenders = []
+
+    js = (ROOT / "web" / "modal_bridge.js").read_text(encoding="utf-8")
+    for g in gone_names:
+        if g in js:
+            offenders.append(f"web/modal_bridge.js: {g}")
+
+    out = subprocess.run(["git", "ls-files", "*.py", "*.md"], cwd=ROOT,
+                         capture_output=True, text=True, timeout=60)
+    for rel in [x for x in out.stdout.splitlines() if x.strip()]:
+        if rel.startswith("tests/"):
+            continue
+        text = (ROOT / rel).read_text(encoding="utf-8")
+        if not any(g in text for g in gone_names):
+            continue
+        if rel.endswith(".md"):
+            offenders += [f"{rel}: {g}" for g in gone_names if g in text]
+            continue
+        # .py：只查真正会显示给用户的字符串字面量，注释和 docstring 里讲历史是应该的
+        try:
+            tree = ast.parse(text)
+        except Exception:
+            continue
+        docs = set()
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+                body = getattr(node, "body", None) or []
+                if body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant):
+                    docs.add(id(body[0].value))
+        for node in ast.walk(tree):
+            if (isinstance(node, ast.Constant) and isinstance(node.value, str)
+                    and id(node) not in docs
+                    and any(g in node.value for g in gone_names)):
+                offenders.append(f"{rel}:{node.lineno}")
+
+    assert not offenders, "这些地方仍指向已移除的按钮:\n  " + "\n  ".join(offenders)
 
     # 主按钮与状态文案口径一致（都说"推送"，不再说"部署"）
     for key in ('"dlg.btn.deploy"', '"dep.ok"', '"dep.ok.toast"', '"dep.running"'):
         i = js.index(key)
         line = js[i:js.index("\n", i)]
         assert "推送" in line, f"{key} 的中文文案没跟主按钮统一口径: {line[:80]}"
+
+
+def test_push_fails_closed_on_node_upload_failure():
+    """推送时私有节点上传失败必须**中止并报错**,不能继续用旧依赖构建还报成功。
+
+    codex review 抓到:部署前那段同步一次性丢掉了三处失败信号 ——
+    plan_local_uploads 的 failed 没看、upload_local_nodes 的返回值直接丢弃、
+    异常只打一句 warning 就往下走,最终仍 rc=0、前端显示"已推送到云端",
+    而云端跑的可能还是旧代码旧依赖。
+
+    /sync_local_nodes 一直是"任意节点失败即失败",统一入口后更该一致。
+    这正是本插件反复强调要避免的那类"静默成功"。
+    """
+    src = (ROOT / "routes.py").read_text(encoding="utf-8")
+    i = src.index("# 3.0) 先把**本机**的私有节点推上 Volume")
+    seg = src[i:i + 4200]
+
+    # ⚠ 不能只查"字符串出现过" —— 把 `if _pfail:` 改成 `if False:` 也照样能过。
+    # 要查它真的被用作分支条件，并且分支里会抛。
+    assert '_pfail = _plan.get("failed")' in seg, "打包阶段的 failed 没有被取出"
+    assert "if _pfail:" in seg, "打包失败没有被用作分支条件"
+    assert '_ufail = (_ures or {}).get("failed")' in seg, "上传返回值的 failed 没有被取出"
+    assert "if _ufail:" in seg, "上传失败没有被用作分支条件"
+    # 两个分支里各要有一个 raise
+    assert "raise RuntimeError" in seg[seg.index("if _pfail:"):seg.index("_todo = ")], \
+        "打包失败分支没有抛错"
+    assert "raise RuntimeError" in seg[seg.index("if _ufail:"):], "上传失败分支没有抛错"
+    assert "__DEPLOY_DONE__ rc=1" in seg, "异常分支没有以失败码结束"
+    # 并发保护：与 /sync_local_nodes 争同一把锁
+    assert "_UPLOAD_LOCK" in seg, "部署路径的上传绕过了 _UPLOAD_LOCK，会与其它上传竞态"

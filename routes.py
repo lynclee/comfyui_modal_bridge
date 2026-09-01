@@ -1378,22 +1378,49 @@ def _setup_routes():
                     await _emit(resp, f"   私有节点:云端有 {len(_vol_folders)} 个,但本机都没有对应目录"
                                       f"(多机场景,由拥有源码的那台推送)\n")
                 else:
-                    _plan = await asyncio.to_thread(local_nodes.plan_local_uploads, cfg, _present, _root)
-                    _todo = [u["folder"] for u in _plan.get("upload", [])]
-                    if _todo:
-                        await _emit(resp, f"   私有节点:{len(_todo)}/{len(_present)} 个有改动,正在推送 —— "
-                                          f"{', '.join(_todo)}\n")
-                        await asyncio.to_thread(local_nodes.upload_local_nodes, cfg, _todo, _root)
-                        local_nodes.invalidate_list_cache()
-                        await _emit(resp, f"   ✓ 已推送 {len(_todo)} 个(代码走 Volume 秒级生效;"
-                                          f"若其 requirements 也变了,下面会重建依赖层)\n")
-                    else:
-                        # 没改动也要出声 —— 静默会让用户以为"这一步没跑",转头又去找别的按钮
-                        await _emit(resp, f"   私有节点:{len(_present)} 个,与云端一致,无需推送\n")
+                    # ⚠ 上传必须与 /sync_local_nodes 争同一把锁:两个 tab、远程客户端、
+                    # 或 RunModal 的自动同步与这里并发时,会同时覆盖同一个
+                    # .zip/.digest/.requirements.json,随后读到的 manifest 未必对应
+                    # 自己刚上传的代码,local_node_reqs_deployed_hash 也会与 Volume 错位。
+                    if _UPLOAD_LOCK.locked():
+                        await _emit(resp, "   另有节点上传进行中,排队等待…\n")
+                    async with _UPLOAD_LOCK:
+                        _plan = await asyncio.to_thread(local_nodes.plan_local_uploads,
+                                                        cfg, _present, _root)
+                        # 打包阶段就失败的(目录空/读不了)必须当场报错。以前只取 upload、
+                        # 把 failed 整个丢掉,于是坏包被静默跳过、后面照样报"已推送"。
+                        _pfail = _plan.get("failed") or []
+                        if _pfail:
+                            _d = "; ".join(f"{f.get('folder')}: {f.get('error')}" for f in _pfail)
+                            raise RuntimeError(f"私有节点打包失败 —— {_d}")
+                        _todo = [u["folder"] for u in _plan.get("upload", [])]
+                        if _todo:
+                            await _emit(resp, f"   私有节点:{len(_todo)}/{len(_present)} 个有改动,"
+                                              f"正在推送 —— {', '.join(_todo)}\n")
+                            _ures = await asyncio.to_thread(local_nodes.upload_local_nodes,
+                                                            cfg, _todo, _root)
+                            local_nodes.invalidate_list_cache()
+                            # 同上:upload 的返回值以前直接丢弃,任何一个包传失败都无人知晓。
+                            _ufail = (_ures or {}).get("failed") or []
+                            if _ufail:
+                                _d = "; ".join(str(f) for f in _ufail)
+                                raise RuntimeError(f"私有节点上传失败 —— {_d}")
+                            await _emit(resp, f"   ✓ 已推送 {len(_todo)} 个(代码走 Volume 秒级生效;"
+                                              f"若其 requirements 也变了,下面会重建依赖层)\n")
+                        else:
+                            # 没改动也要出声 —— 静默会让用户以为"这一步没跑",转头又去找别的按钮
+                            await _emit(resp, f"   私有节点:{len(_present)} 个,与云端一致,无需推送\n")
             except Exception as _e:
-                # 同步失败不中止部署:最坏是沿用 Volume 上的旧 manifest —— 与这段代码
-                # 存在之前的行为一致,而且构建失败时用户能从日志看到这里的告警。
-                await _emit(resp, f"   ⚠ 本机私有节点同步失败({_e}),将沿用云端已有的依赖清单\n")
+                # ⚠ fail-closed:同步失败就**停止本次推送**,不能沿用旧 manifest 继续。
+                # 以前这里只打一句 warning 就往下走,最终仍返回 rc=0、前端显示"已推送到云端",
+                # 而云端跑的可能还是旧代码、旧 requirements —— 这正是本插件反复强调要避免的
+                # "静默成功"。/sync_local_nodes 一直是任意节点失败即失败,统一入口后更该一致。
+                await _emit(resp, f"\n== ✗ 私有节点推送失败:{_e} ==\n")
+                await _emit(resp, "   已停止本次推送 —— 继续下去云端会用旧代码/旧依赖构建,"
+                                  "那种「成功」比失败更难查。\n")
+                await _emit(resp, "\n__DEPLOY_DONE__ rc=1\n")
+                await resp.write_eof()
+                return resp
 
             # 私有节点依赖来自 Volume 中每个包的 manifest,而不是只扫当前机器；这样多机
             # 上传的私有节点在任意一台机器重部署时都不会掉依赖。
