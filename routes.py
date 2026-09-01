@@ -357,12 +357,24 @@ async def _emit(resp: web.StreamResponse, text: str) -> None:
         pass
 
 
+# 失败时回灌到 ComfyUI 控制台的尾部行数。够看清一个 pip / 镜像构建的报错,又不至于刷屏。
+_TAIL_ON_FAIL = 40
+
+
 async def _run_streamed(resp: web.StreamResponse, cmd: list[str], cwd: str, env: dict) -> int:
     """跑一个命令,stdout/stderr 实时流式回前端,返回 returncode(找不到可执行文件返回 127)。
     用线程 + subprocess.Popen(不走 asyncio 子进程)——避免 Windows 上事件循环不支持
-    子进程(SelectorEventLoop → NotImplementedError)的坑,Mac/Linux/Win 一致。"""
+    子进程(SelectorEventLoop → NotImplementedError)的坑,Mac/Linux/Win 一致。
+
+    ⚠ 失败时把尾部若干行**同时 print 到 ComfyUI 控制台**。以前输出只写进 HTTP 流:
+    前端拿到了完整内容,却只 console.log 一份、再截断成 72 字符闪过进度窗,最后抛一句
+    通用文案。于是镜像构建失败(典型:某个 custom_node 的 requirements 装不上)在
+    ComfyUI 日志里**一行痕迹都没有**,用户必须自己去 `modal app logs` 才看得到真错误
+    (2026-08-31 由 skybox-ai 会话实测报告)。真实报错留在服务端日志里,是排查的起点。"""
     # ⚠ 用 redact_cmd 而不是 ' '.join —— secret create 的 argv 里是明文凭据,见 node_sync.redact_cmd
     await _emit(resp, f"$ {node_sync.redact_cmd(cmd)}\n")
+
+    tail: list[str] = []
 
     def work(emit):
         try:
@@ -375,11 +387,21 @@ async def _run_streamed(resp: web.StreamResponse, cmd: list[str], cwd: str, env:
             emit(f"  ✗ 找不到可执行文件: {cmd[0]}\n")
             return 127
         for line in proc.stdout:
+            tail.append(line)
+            if len(tail) > _TAIL_ON_FAIL:
+                tail.pop(0)
             emit(line)
         proc.wait()
         return proc.returncode
 
-    return await _run_blocking_streamed(resp, work)
+    rc = await _run_blocking_streamed(resp, work)
+    if rc != 0 and tail:
+        print(f"[modal_bridge] ✗ 命令失败 rc={rc}: {node_sync.redact_cmd(cmd)}")
+        print(f"[modal_bridge] --- 输出尾部 {len(tail)} 行 ---")
+        for line in tail:
+            print(f"[modal_bridge] | {line.rstrip()}")
+        print("[modal_bridge] --- 完整日志见上方进度窗 / 浏览器控制台 ---")
+    return rc
 
 
 _STREAM_SENTINEL = object()

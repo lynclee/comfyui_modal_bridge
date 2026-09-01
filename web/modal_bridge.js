@@ -115,6 +115,8 @@ const I18N = {
                         en: "No local directory for these custom_nodes, cannot auto-add (single-file node?):\n{list}" },
   "node.local_pack":  { zh: "打包 {n} 个本地节点上传(依赖变化时自动部署)...",
                         en: "Packing {n} local node(s) (auto-deploys only if dependencies changed)..." },
+  "node.local_fail_detail":{ zh: "私有节点同步失败,已停止提交(避免云端静默跑旧代码):\n\n{msg}\n\n完整日志见 ComfyUI 控制台(失败时会打印命令输出尾部)。常见原因是某个节点的 requirements 在云端装不上。",
+                        en: "Private node sync failed; submission stopped to avoid running stale code in the cloud:\n\n{msg}\n\nFull log is in the ComfyUI console (the tail of the command output is printed on failure). A common cause is a node's requirements failing to install in the cloud." },
   "node.local_fail":  { zh: "本地节点上传失败,已停止提交,避免云端静默运行旧版本。请修复上面的上传错误后重试。",
                         en: "Local node upload failed. Submission was stopped to prevent the cloud from silently running stale code. Fix the upload error above and retry." },
   "node.local_rm_fail": { zh: "旧的本地节点覆盖包清理失败: {list}",
@@ -576,6 +578,10 @@ const LOCAL_NODE_BAKED_SENTINEL = "__modal_bridge_baked__";
 async function syncLocalNodes(localPack, ctx) {
   const folders = localPack.map((p) => p.folder);
   let syncedDigests = null;
+  // 后端用 "✗" 打头标记失败原因(上传失败 / 依赖部署失败 / 依赖同步异常)。留最后一条,
+  // 失败时带进异常文案 —— 否则真实原因只在浏览器 console 和被截断成 72 字符的进度窗里
+  // 一闪而过,用户看到的永远是一句通用的"上传失败"。
+  let lastError = "";
   try {
     const rc = await streamPost(
       "/modal_bridge/sync_local_nodes",
@@ -588,16 +594,22 @@ async function syncLocalNodes(localPack, ctx) {
           try { syncedDigests = JSON.parse(m[1]); } catch (e) { log("digest parse:", e); }
           return;
         }
+        if (line.includes("✗")) lastError = line.replace(/^[=\s]+|[=\s]+$/g, "").trim();
         log("local-node:", line);
         ctx.stage("uploading", line.length > 72 ? line.slice(0, 72) + "…" : line, false);
       },
     );
-    if (rc !== 0 || !syncedDigests || folders.some((f) => !syncedDigests[f])) return false;
+    if (rc !== 0 || !syncedDigests || folders.some((f) => !syncedDigests[f])) {
+      // ⚠ 区分两种失败:上传成功(rc 由后端在部署阶段才置非零)后仍可能因为
+      // 「私有节点依赖变化 → 自动重建镜像」那一步挂掉。统一报"上传失败"是错的归因,
+      // 用户会去查 zip / 网络,而真因往往是某个节点的 requirements 装不上。
+      return { ok: false, message: lastError || "" };
+    }
     ctx._localDigests = { ...(ctx._localDigests || {}), ...syncedDigests };
-    return true;
+    return { ok: true };
   } catch (e) {
     log("sync_local_nodes failed:", e);
-    return false;
+    return { ok: false, message: String(e) };
   }
 }
 
@@ -655,8 +667,12 @@ async function ensureNodesAvailable(prompt, ctx) {
   // 放在部署之前:即使同一批还要重部署,本地节点也已经在 Volume 上,一次提交全齐。
   if (local_pack.length) {
     ctx.stage("nodes", t("node.local_pack", { n: local_pack.length }), false);
-    const ok = await syncLocalNodes(local_pack, ctx);
-    if (!ok) throw new Error(t("node.local_fail"));
+    const res = await syncLocalNodes(local_pack, ctx);
+    if (!res.ok) {
+      throw new Error(res.message
+        ? t("node.local_fail_detail", { msg: res.message })
+        : t("node.local_fail"));
+    }
   }
 
   if (plan.needs_deploy) {

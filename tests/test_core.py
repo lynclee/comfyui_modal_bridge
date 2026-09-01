@@ -2208,3 +2208,34 @@ def test_local_busy_is_not_reported_as_modal_outage():
     # platform 判定只认状态页，不再把 timeout/unreachable 算作平台故障
     assert 'outage || v.err_kind === "timeout"' not in js, \
         "又把 timeout 当成平台故障了 —— 本地一忙就会误报 Modal 挂了"
+
+
+def test_command_failure_reaches_comfyui_log_and_frontend():
+    """命令失败(典型:私有节点依赖装不上导致镜像构建挂掉)必须在两个地方留下真实原因。
+
+    2026-08-31 实测报告:用户点 RunModal 后只看到「本地节点上传失败」,而
+    **宿主机 ComfyUI 日志里一行痕迹都没有** —— 必须自己去 `modal app logs` 才看得到
+    真错误(basicsr 在 Python 3.13 下 setup.py 取版本号失败)。
+
+    两处缺口:
+      1. _run_streamed 的输出只写进 HTTP 流,没有 print 到 ComfyUI 控制台;
+      2. 前端拿到了完整错误行,却只 console.log 一份、再截断成 72 字符闪过进度窗,
+         最后抛的是通用文案 —— 而且归因还错了:上传其实成功了,挂的是随后的依赖重部署。
+    """
+    py = (ROOT / "routes.py").read_text(encoding="utf-8")
+    js = (ROOT / "web" / "modal_bridge.js").read_text(encoding="utf-8")
+
+    # 后端：失败时把输出尾部回灌到服务端日志
+    i = py.index("async def _run_streamed(")
+    body = py[i:py.index("\n\n\n", i)]
+    assert "tail" in body, "没有保留输出尾部"
+    assert "if rc != 0 and tail:" in body, "失败时没有回灌日志"
+    assert "print(" in body.split("if rc != 0 and tail:")[1], "尾部没有 print 到 ComfyUI 控制台"
+
+    # 前端：失败要带出真实原因，不能只报一句通用文案
+    j = js.index("async function syncLocalNodes(")
+    fn = js[j:js.index("\n}", j)]
+    assert "lastError" in fn, "前端没有留存后端标记的失败原因"
+    assert "return { ok: false, message:" in fn, "失败没有把原因带回调用方"
+    assert "return { ok: true }" in fn, "成功路径的返回值没有跟着改"
+    assert "node.local_fail_detail" in js, "缺少带详情的失败文案"
