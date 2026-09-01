@@ -22,6 +22,7 @@ import hmac
 import os
 import re
 import subprocess
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -171,6 +172,55 @@ _WORKER_KW = dict(
 )
 
 
+# ComfyUI 启动输出的副本。只留启动阶段那段(足够覆盖 "Import times for custom nodes"),
+# 不无限增长 —— worker 可能连续跑几小时。
+_BOOT_LOG: list = []
+_BOOT_LOG_MAX = 3000
+
+
+def _pump_comfy_output(proc) -> None:
+    """把 ComfyUI 的 stdout 转发到容器日志,顺带留一份启动阶段的副本。
+
+    ⚠ 这个线程不能停:stdout=PIPE 之后没人读,管道满了 ComfyUI 就卡死在 write 上。
+    所以整段用 try 包住,出任何问题都只是少了诊断信息,不影响 ComfyUI 本身。
+    """
+    try:
+        for line in proc.stdout:
+            print(line, end="", flush=True)     # 容器日志照旧
+            if len(_BOOT_LOG) < _BOOT_LOG_MAX:
+                _BOOT_LOG.append(line)
+    except Exception as e:
+        print(f"[bridge] ComfyUI 日志转发停止: {e}")
+
+
+def import_failure_hint(class_type: str = "") -> str:
+    """任务报"节点不存在"时,回一句真因提示;没有导入失败记录就返回空串。
+
+    ComfyUI 对"包 import 失败"和"包根本没装"给的是同一句
+    "The custom node may not be installed",而这两者的处理办法完全相反:
+    前者要修依赖,后者才是去同步节点。分不清的话用户只会反复点同步。
+    """
+    try:
+        from comfy_log import parse_import_failures
+        failed = parse_import_failures("".join(_BOOT_LOG)).get("failed") or []
+    except Exception:
+        return ""
+    if not failed:
+        return ""
+    lines = [f"⚠ 本 worker 有 {len(failed)} 个 custom_node 包**导入失败**(不是没装):"]
+    for f in failed[:6]:
+        name = f.get("name") or f.get("path") or "?"
+        why = (f.get("error") or "").strip()
+        lines.append(f"    - {name}" + (f": {why[:200]}" if why else ""))
+    if len(failed) > 6:
+        lines.append(f"    …还有 {len(failed) - 6} 个")
+    lines.append("  导入失败 = 包在云端装了但 import 时抛错(通常缺依赖或版本不兼容),"
+                 "再点几次「同步节点」也不会好 —— 要修的是那个包的依赖。")
+    if class_type:
+        lines.append(f"  你要的节点 `{class_type}` 很可能就在其中某个包里。")
+    return "\n".join(lines)
+
+
 def _gpu_compute_cap() -> str:
     """探测容器内 GPU 的 compute capability(如 "9.0"),探测失败返回 ""。
     故意用 nvidia-smi 而非 import torch:boot wrapper 进程不必为这一个数字付 torch 冷 import 的钱。
@@ -229,7 +279,22 @@ def _worker_boot(self, cpu: bool = False, load_local_nodes: bool = True):
         else:
             print(f"[bridge] sage-attention skipped: compute_cap={cap or '?'} "
                   f"(wheel 只有 sm_89/sm_90 kernel) → 回退 PyTorch SDPA")
-    self.proc = subprocess.Popen(cmd)
+    # 捕获 ComfyUI 的输出:转发到容器日志(可观测性不能丢),同时留一份启动阶段的副本。
+    # 用途:节点整包 import 失败时(依赖缺失/版本不兼容),ComfyUI 只在启动日志里打
+    # `(IMPORT FAILED): <path>`,而任务失败回到前端只剩一句
+    # "Node 'X' not found. The custom node may not be installed." —— 用户完全无从推断
+    # 是依赖缺失导致整包没加载,只会以为节点没同步上去、反复去点同步。
+    # 2026-08-31 实测撞上的是 art-venture:setuptools≥84 移除了 pkg_resources,整包挂掉。
+    # ⚠ stdout=PIPE 就必须持续读:不读的话管道缓冲区满了,ComfyUI 会阻塞在 write 上。
+    #   所以下面那个 pump 线程是硬要求,不是优化。任何一步出问题都退化成不捕获。
+    _BOOT_LOG[:] = []
+    try:
+        self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                     text=True, bufsize=1, errors="replace")
+        threading.Thread(target=_pump_comfy_output, args=(self.proc,), daemon=True).start()
+    except Exception as e:
+        print(f"[bridge] ⚠ 无法捕获 ComfyUI 输出({e}),退化为直连 stdout(诊断信息会少一些)")
+        self.proc = subprocess.Popen(cmd)
     from _comfy_ws import wait_comfy_ready
     wait_comfy_ready(timeout_s=180)
     if cpu:
@@ -396,8 +461,18 @@ def _worker_run(workflow: dict, job_id: str, input_images: list | None = None,
     except Exception as e:
         import traceback
         tb = traceback.format_exc()
+        msg = str(e)
+        # 「节点不存在」时补一句真因:ComfyUI 对"包 import 失败"和"包根本没装"给的是同一句
+        # "The custom node may not be installed",而两者的处理办法完全相反 ——
+        # 前者要修那个包的依赖,后者才是去同步节点。分不清的话用户只会反复点同步。
+        if "not found" in msg or "missing_node_type" in msg:
+            m = re.search(r"class_type[\"':\s]+([A-Za-z0-9_.\-]+)", msg)
+            hint = import_failure_hint(m.group(1) if m else "")
+            if hint:
+                msg = f"{msg}\n\n{hint}"
+                print(f"[bridge] {hint}")
         job_state[job_id] = {**job_state.get(job_id, {}), "status": "failed",
-                             "error": str(e), "trace": tb[-2000:], "completed_at": time.time()}
+                             "error": msg, "trace": tb[-2000:], "completed_at": time.time()}
         raise
     # 大文件走了 Volume(item 带 volume_path)→ commit 一次,本地 SDK 才看得到刚写进 _outputs 的文件
     if any(i.get("volume_path") for i in (result.get("images") or [])):

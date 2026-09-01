@@ -154,6 +154,18 @@ cuda_image = (
         "requests",
         "fastapi[standard]",
         "pyyaml",
+        # ⚠ 钉住提供 pkg_resources 的 setuptools。**setuptools 84.0.0 把 pkg_resources
+        # 整个移除了**(实测:80.9.0 的 wheel 里 19 个文件、84.0.0 里 0 个),而
+        # `import pkg_resources` 是 2023 年前一大批 custom_node 的标配写法。
+        # 云端一旦装到 ≥84,这些节点会**整包 IMPORT FAILED**,而用户在前端只看到
+        # 「Node 'X' not found / missing_node_type」—— 完全无从推断是依赖缺失,
+        # 只会以为节点没同步上去、反复去点同步(2026-08-31 实测,撞上的是 art-venture)。
+        # 本地 venv 自带旧 setuptools 所以从不暴露,上云才炸 —— 和 basicsr 那次同构:
+        # 本地"缺了也能跑",云端是全有或全无。
+        #
+        # 为什么不怕拖累构建:pip 默认开 build isolation,构建别的包时用的是隔离环境里
+        # 临时装的新 setuptools,和镜像里这份互不相干。这里钉的只是**运行时**那份。
+        "setuptools<81",
     )
     # 本地自写节点(Volume 通道)的依赖。清单空时 pip_install() 不生成任何层,
     # 所以没有自写节点的用户完全不受影响。

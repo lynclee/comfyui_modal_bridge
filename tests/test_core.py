@@ -2322,3 +2322,49 @@ def test_deploy_syncs_local_nodes_before_reading_manifest():
     assert read_at > 0, "找不到依赖清单刷新调用,测试锚点需更新"
     assert sync_at < read_at, "同步必须在读 manifest 之前，否则读到的还是旧的"
     assert "plan_local_uploads" in seg, "没有先比对 digest（应只推有改动的）"
+
+
+def test_import_failure_hint_and_boot_capture():
+    """节点整包 import 失败时,必须能把真因带回前端,而不是只报「节点不存在」。
+
+    2026-08-31 实测(art-venture):setuptools≥84 移除了 pkg_resources,整包 IMPORT FAILED。
+    worker 日志里写得清清楚楚是 ModuleNotFoundError,但回到前端只剩一句
+    "Node 'LLM API Config' not found. The custom node may not be installed."
+    —— 用户完全无从推断是依赖缺失,只会以为节点没同步上去、反复去点同步(而同步是好的)。
+
+    ComfyUI 对「包 import 失败」和「包根本没装」给的是同一句话,但处理办法完全相反。
+    """
+    src = (ROOT / "modal_app" / "modal_app.py").read_text(encoding="utf-8")
+
+    # ① 启动输出必须被捕获，否则无从得知 IMPORT FAILED
+    assert "stdout=subprocess.PIPE" in src, "worker 没有捕获 ComfyUI 启动输出"
+    assert "_pump_comfy_output" in src, "缺少输出转发线程"
+    # ⚠ stdout=PIPE 而不持续读会让 ComfyUI 阻塞在 write 上，pump 是硬要求
+    pump = src[src.index("def _pump_comfy_output"):src.index("def import_failure_hint")]
+    assert "print(line" in pump, "转发线程没把输出打回容器日志(可观测性会丢)"
+    assert "for line in proc.stdout" in pump, "没有持续读管道"
+    # 捕获失败要能退化，不能让 worker 起不来
+    boot = src[src.index("_BOOT_LOG[:] = []"):]
+    boot = boot[:boot.index("wait_comfy_ready")]
+    assert "except Exception" in boot and "subprocess.Popen(cmd)" in boot, \
+        "捕获失败时没有退化成不捕获 —— 这会让 worker 起不来"
+
+    # ② 失败路径要调用诊断
+    i = src.index("import_failure_hint(m.group(1)")
+    seg = src[max(0, i - 700):i + 300]
+    assert "not found" in seg, "没有针对「节点不存在」这类错误"
+    assert '"status": "failed"' in seg, "诊断没有接在写 failed 状态的路径上"
+
+
+def test_image_pins_setuptools_for_pkg_resources():
+    """镜像必须钉住提供 pkg_resources 的 setuptools。
+
+    setuptools 84.0.0 把 pkg_resources 整个移除了(实测:80.9.0 的 wheel 里 19 个文件、
+    84.0.0 里 0 个),而 `import pkg_resources` 是 2023 年前一大批 custom_node 的标配。
+    云端装到 ≥84 时这些节点会整包 IMPORT FAILED,而本地 venv 自带旧 setuptools 从不暴露
+    —— 和 basicsr 那次同构:本地"缺了也能跑",上云是全有或全无。
+
+    不怕拖累构建:pip 默认开 build isolation,构建别的包用的是隔离环境里的新 setuptools。
+    """
+    src = (ROOT / "modal_app" / "modal_image.py").read_text(encoding="utf-8")
+    assert "setuptools<81" in src, "镜像没钉 setuptools —— 老节点会因缺 pkg_resources 整包挂掉"
