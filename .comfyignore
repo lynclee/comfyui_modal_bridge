@@ -2,3 +2,13 @@
 # publish 本就只打包 git 跟踪的文件,这里再显式排除一层,确保本地状态文件
 # 即便在非 git 目录下发布也不会进 Registry 包。
 modal_app/_custom_nodes_data.py
+
+# ⚠ 测试与 CI 配置不进 Registry 包。它们对装插件的用户零价值,却贡献了大量
+# 「扫描器眼里的可疑模式」:tests/test_core.py 一个文件就有 384 个 assert(S101)、
+# 5 处硬编码假凭据(S105/S106)、34 处静默 except(S110);.github/workflows 里则是
+# 一串 shell 命令(pip install / python -m ...)。
+# 数据:0.7.9 的测试 1494 行 / 259 个 ruff-S 告警 → Registry 判 Active;
+#       0.8.x 涨到 2241 行 / 395 个 → 连续四版 Flagged。未必是根因(Registry 不给理由),
+#       但把它们排除出去是明确正确的:包从 643 KB 降到 ~540 KB,可疑模式基本清零。
+tests/
+.github/
