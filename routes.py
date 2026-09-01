@@ -1078,6 +1078,36 @@ def _setup_routes():
         await resp.write_eof()
         return resp
 
+    @routes.post("/modal_bridge/local_nodes_diff")
+    @_admin_only
+    async def _local_nodes_diff(request: web.Request):
+        """这些私有节点里,哪些与 Volume 上的**内容真的不一样**。
+
+        为什么需要:plan_node_sync 的 local_pack 只按"无 git remote / 未推送 / dirty"
+        分类 —— 那是**通道选择**(走 Volume 而不是镜像),不是"有改动"。只要工作流含
+        自写节点,它每次都非空。提交前若直接拿它去弹确认,用户每跑一次图都要点一次,
+        而绝大多数时候云端和本机根本一致(codex review 抓到)。
+
+        真正的差异要比对 digest,那需要读 Volume,所以单独一个端点、只在有私有节点时调。
+        """
+        body = await request.json()
+        folders = body.get("folders")
+        if not isinstance(folders, list) or not all(isinstance(f, str) for f in folders):
+            return web.json_response({"error": "folders (string list) required"}, status=400)
+        cfg = cfg_mod.load_config()
+        root = Path(node_sync._comfyui_root()) / "custom_nodes"
+        try:
+            plan = await asyncio.to_thread(local_nodes.plan_local_uploads, cfg, folders, root)
+        except Exception as e:
+            # 查不出来就别拦路:退化成"当作有改动",最坏是多问一次
+            return web.json_response({"upload": folders, "uptodate": [], "failed": [],
+                                      "degraded": str(e)})
+        return web.json_response({
+            "upload": [u["folder"] for u in plan.get("upload", [])],
+            "uptodate": [u["folder"] for u in plan.get("uptodate", [])],
+            "failed": plan.get("failed", []),
+        })
+
     @routes.get("/modal_bridge/list_local_nodes")
     @_admin_only
     async def _list_local_nodes(request: web.Request):

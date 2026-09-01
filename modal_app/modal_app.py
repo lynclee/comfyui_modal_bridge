@@ -493,6 +493,11 @@ def _worker_run(workflow: dict, job_id: str, input_images: list | None = None,
     # 白白让 job_state 体积翻倍);只有极老回退路径(没 images)才退回单图字段。
     done = {**job_state.get(job_id, {}), "status": "completed",
             "image_url": result.get("image_url"), "completed_at": time.time()}
+    # 非致命告警也要留痕:走到这里说明产物齐了(数量对不上会在 _comfy_ws 里抛),
+    # 但过程中可能有过重试/跳过之类的信息。以前 result["errors"] 直接丢掉,
+    # 出了问题事后完全无从追溯。
+    if result.get("errors"):
+        done["warnings"] = result["errors"][:20]
     if result.get("images"):
         done["images"] = result["images"]
     else:

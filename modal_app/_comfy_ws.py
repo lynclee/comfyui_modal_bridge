@@ -485,6 +485,18 @@ def run_workflow(workflow: dict, job_id: str, input_images: list[dict] | None = 
         errors.extend(mat_errors)
         if not images:
             raise ValueError(f"No usable output (image/video/3d) in result. errors={errors}")
+        # ⚠ 部分产物取回失败也必须失败。materialize 对每个 ref 要么产出一条记录、要么
+        # append 一条 error 后 continue,所以数量对不上就是真丢了东西。
+        # 旧写法只在"一个都没成功"时抛,于是「2 个输出只拿到 1 个」会照常返回、worker
+        # 写 completed、errors 还被丢掉 —— 用户拿到残缺结果却显示全成功,而且照常计费。
+        # 这和之前修过的「执行错误被吞成 completed」是同一类状态机漏洞:宁可明确失败。
+        # 真要保留部分产物,得另立 failed_with_outputs / completed_with_warnings 契约,
+        # 而不是在这里含糊过去。
+        if len(images) < len(refs):
+            lost = len(refs) - len(images)
+            raise ValueError(
+                f"{len(refs)} 个产物只取回 {len(images)} 个,缺 {lost} 个 —— "
+                f"拒绝当成功返回(残缺结果比明确失败难查)。原因: {mat_errors}")
         return {
             "image_url": None,
             "images": images,

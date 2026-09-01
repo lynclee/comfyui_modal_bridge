@@ -13,8 +13,13 @@ from urllib.parse import urlsplit
 # job_id 会拼进本地落盘路径(output/<subfolder>/<job_id>/)。云端产生的 id 是 uuid4
 # 或 AIGC Studio 的任务 UUID,都在这个字符集内;别的一律拒。
 _SAFE_JOB_ID = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
+# 设置页可经通用 /config 写入的字段。**凭据一律不在此列** —— 这个 allowlist 存在的
+# 意义就是挡住"先改配置、再取 key"那类两步绕过,往里加密钥等于自己开口子。
+# aigc_studio_base_url 是站点地址、不是凭据,可以进;它的旁路密钥走部署面板的
+# 专用输入框 → /deploy,只写 0600 的 config.json,不经这里、也不进 comfy.settings.json。
 PUBLIC_CONFIG_WRITE_FIELDS = frozenset({
     "gpu_tier", "enable_snapshot", "use_sage_attention", "cpu_tier_when_no_model",
+    "aigc_studio_base_url",
 })
 
 
@@ -77,6 +82,14 @@ def merge_public_config(current: dict, body: dict) -> dict:
     for key in ("enable_snapshot", "use_sage_attention", "cpu_tier_when_no_model"):
         if key in body and not isinstance(body[key], bool):
             raise ValueError(f"{key} 必须是 boolean")
+    if "aigc_studio_base_url" in body:
+        v = body["aigc_studio_base_url"]
+        if not isinstance(v, str):
+            raise ValueError("aigc_studio_base_url 必须是字符串")
+        v = v.strip()
+        if v and not (v.startswith("http://") or v.startswith("https://")):
+            raise ValueError("aigc_studio_base_url 必须以 http:// 或 https:// 开头")
+        body = {**body, "aigc_studio_base_url": v.rstrip("/")}
     out = dict(current)
     out.update({k: body[k] for k in PUBLIC_CONFIG_WRITE_FIELDS if k in body})
     return out

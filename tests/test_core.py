@@ -1709,7 +1709,9 @@ def test_advanced_toggles_not_in_setup_panel():
 
     # ① 面板里不该再有这些控件
     assert 'id="mb-dep-sage"' not in src, "SageAttention 复选框被挪回了 Setup 面板"
-    assert "mb-dep-aigc" not in src, "AIGC 输入框被挪回了 Setup 面板"
+    # AIGC 的两个字段刻意分处两地:URL 在设置页(非凭据、可经 /config 写),
+    # 旁路密钥留在面板的专用密码框(凭据,不进 comfy.settings.json)。
+    assert 'id="mb-dep-aigc-url"' not in src, "AIGC URL 应该在设置页,不该回到面板"
 
     # ② sage 开关：注册、默认关、归 Advanced
     i = src.find('id: "ModalBridge.useSageAttention"')
@@ -1718,19 +1720,28 @@ def test_advanced_toggles_not_in_setup_panel():
     assert "defaultValue: false" in block, "sage 默认值不是 false"
     assert '"Advanced"' in block, "sage 没归到 Advanced 分组"
 
-    # ③ AIGC 两个字段：注册、归 Advanced、密钥必须是 password 类型
-    for sid, want_type in (("ModalBridge.aigcStudioUrl", "text"),
-                           ("ModalBridge.aigcBypassSecret", "password")):
-        k = src.find(f'id: "{sid}"')
-        assert k > 0, f"设置项 {sid} 没注册"
-        blk = src[k:k + 400]
-        assert '"Advanced"' in blk, f"{sid} 没归到 Advanced 分组"
-        assert f'type: "{want_type}"' in blk, f"{sid} 类型应为 {want_type}"
-        assert "syncAigcFieldToConfig" in blk, f"{sid} 没有把值同步回 config"
+    # ③ 只有 URL 进 Settings；**密钥绝不能是 ComfyUI Setting**
+    k = src.find('id: "ModalBridge.aigcStudioUrl"')
+    assert k > 0, "设置项 ModalBridge.aigcStudioUrl 没注册"
+    blk = src[k:k + 400]
+    assert '"Advanced"' in blk and 'type: "text"' in blk
+    assert "syncAigcFieldToConfig" in blk, "URL 没有把值同步回 config"
 
-    # ④ 密钥不许被启动回填覆盖 —— /config 不回吐它，用空串回填会把用户填过的值清掉
+    # ⚠ 旁路密钥是凭据。注册成 ComfyUI Setting 会明文落进 comfy.settings.json(0644),
+    # 且任何第三方 custom node 的 JS 都读得到;而 /config 的 allowlist 是为挡住
+    # 「先改配置再取 key」那类两步绕过设的,把凭据加进去等于自己开口子。
+    # 2026-08-31 一度两者都进了 Settings —— 结果是最糟的组合:泄露面扩大,而 allowlist
+    # 又拒收,部署根本没拿到新值(codex review 抓到)。密钥只走部署面板的专用密码框。
+    assert 'id: "ModalBridge.aigcBypassSecret"' not in src, \
+        "旁路密钥不许注册成 ComfyUI Setting(明文落盘 + 第三方插件可读)"
+    assert 'id="mb-dep-aigc-bypass"' in src, "部署面板缺少密钥的专用密码框"
     assert 'setSettingValue("ModalBridge.aigcStudioUrl"' in src, "URL 应当用 config 真值回填"
-    assert 'setSettingValue("ModalBridge.aigcBypassSecret"' not in src,         "密钥不该被回填 —— /config 不回吐它,回填只会用空串清掉用户填过的值"
+
+    import contract as _c
+    assert "aigc_studio_base_url" in _c.PUBLIC_CONFIG_WRITE_FIELDS, \
+        "URL 不在 allowlist 里,设置页改了也写不进 config"
+    assert "aigc_bypass_secret" not in _c.PUBLIC_CONFIG_WRITE_FIELDS, \
+        "凭据进了通用 config allowlist —— 那道闸就是为挡住这个而设的"
 
 
 def test_all_settings_share_one_category():
@@ -2475,8 +2486,16 @@ def test_submit_asks_before_pushing_private_nodes():
     js = (ROOT / "web" / "modal_bridge.js").read_text(encoding="utf-8")
 
     i = js.index("if (local_pack.length) {")
-    seg = js[i:i + 1400]
+    seg = js[i:i + 3000]
+
+    # ⚠ local_pack 只表示"走 Volume 通道",不等于有改动。必须先问后端真实 digest 差异,
+    # 否则只要工作流含自写节点就每次都弹确认(codex review 抓到)。
+    diff_at = seg.find("/modal_bridge/local_nodes_diff")
+    assert diff_at > 0, "弹确认前没有先比对真实差异,会变成每次运行都打扰用户"
+    assert "_changed.length === 0" in seg, "全都一致时没有跳过确认"
+
     confirm_at = seg.find('confirm(t("node.local_push_confirm"')
+    assert diff_at < confirm_at, "差异预检必须在确认之前"
     sync_at = seg.find("await syncLocalNodes(")
     assert confirm_at > 0, "推送私有节点前没有确认"
     assert sync_at > 0, "找不到同步调用,测试锚点需更新"
@@ -2490,3 +2509,27 @@ def test_submit_asks_before_pushing_private_nodes():
     blk = js[js.index('"node.local_push_confirm"'):][:1200]
     assert "重建镜像" in blk, "确认文案没说明可能要重建镜像"
     assert "旧代码" in blk, "确认文案没说明不推的后果"
+
+
+def test_partial_output_loss_is_a_failure():
+    """多输出任务只取回一部分,必须失败,不能报 completed。
+
+    codex review 抓到:旧写法只在"一个产物都没成功"时抛,于是「2 个输出只拿到 1 个」
+    会照常返回,worker 无条件写 completed,连 errors 都丢掉 —— 用户拿到残缺结果却显示
+    全成功,而且照常计费。这和之前修过的「执行错误被吞成 completed」是同一类漏洞。
+
+    判据用 len(images) < len(refs) 而不是 not images:materialize 对每个 ref 要么产出
+    一条记录、要么记一条 error 后 continue,所以数量对不上就是真丢了东西。
+    """
+    src = (ROOT / "modal_app" / "_comfy_ws.py").read_text(encoding="utf-8")
+    i = src.index("images, mat_errors = materialize_desktop_outputs(")
+    seg = src[i:i + 1500]
+    assert "len(images) < len(refs)" in seg, "没有按数量比对,部分丢失会被当成成功"
+    assert "raise ValueError" in seg[seg.index("len(images) < len(refs)"):], "数量对不上没有抛错"
+
+    # worker 侧即使成功也要留痕，便于事后追溯
+    # ⚠ 锚点要精确:文件里有多处 "status": "completed"（aigc-r2 交付分支也有一处），
+    # 用裸字符串会命中错的那个。
+    worker = (ROOT / "modal_app" / "modal_app.py").read_text(encoding="utf-8")
+    j = worker.index('done = {**job_state.get(job_id, {}), "status": "completed"')
+    assert "warnings" in worker[j:j + 700], "worker 把 result['errors'] 丢掉了,出问题无从追溯"

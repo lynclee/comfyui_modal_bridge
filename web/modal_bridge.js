@@ -121,7 +121,7 @@ const I18N = {
                         en: "Packing {n} local node(s) (auto-deploys only if dependencies changed)..." },
   "node.local_fail_detail":{ zh: "私有节点同步失败,已停止提交(避免云端静默跑旧代码):\n\n{msg}\n\n完整日志见 ComfyUI 控制台(失败时会打印命令输出尾部)。常见原因是某个节点的 requirements 在云端装不上。",
                         en: "Private node sync failed; submission stopped to avoid running stale code in the cloud:\n\n{msg}\n\nFull log is in the ComfyUI console (the tail of the command output is printed on failure). A common cause is a node's requirements failing to install in the cloud." },
-  "node.local_push_confirm":{ zh: "检测到 {n} 个私有节点有改动,需要先推送到云端:\n\n  {list}\n\n代码推上去是秒级的;但如果这些节点的 requirements.txt 也改了,还要**重建镜像**(约 3-5 分钟)。\n\n点「确定」现在推送并继续提交。\n点「取消」中止本次提交 —— 不推就跑的话,云端用的是旧代码,出来的结果和你改的不一样,而且不会有任何报错。",
+  "node.local_push_confirm":{ zh: "检测到 {n} 个私有节点有改动,需要先推送到云端:\n\n  {list}\n\n代码推上去是秒级的;但如果这些节点的 requirements.txt 也改了,还要重建镜像(约 3-5 分钟)。\n\n点「确定」现在推送并继续提交。\n点「取消」中止本次提交 —— 不推就跑的话,云端用的是旧代码,出来的结果和你改的不一样,而且不会有任何报错。",
                         en: "{n} private node(s) changed and must be pushed to the cloud first:\n\n  {list}\n\nPushing the code is instant; but if their requirements.txt also changed, the image has to be rebuilt (~3-5 min).\n\nOK: push now and continue submitting.\nCancel: abort this submission — running without pushing means the cloud uses stale code, producing results that differ from your edits with no error at all." },
   "node.local_push_cancelled":{ zh: "已取消 —— 未推送私有节点,本次提交中止(避免云端静默跑旧代码)",
                         en: "Cancelled — private nodes were not pushed and the submission was aborted (prevents the cloud silently running stale code)." },
@@ -257,10 +257,12 @@ const I18N = {
                         en: "This is a remote ComfyUI. Enter local_api_capability from the server's config.json. It is stored only in this browser, never in the workflow." },
   "set.sage.on":      { zh: "已开启 SageAttention —— 去 Setup 点「部署」才生效(有损加速,建议同 seed 对比过再常开)", en: "SageAttention ON — redeploy in Setup to take effect (lossy; A/B before leaving it on)" },
   "set.sage.off":     { zh: "已关闭 SageAttention —— 去 Setup 点「部署」生效", en: "SageAttention OFF — redeploy in Setup to take effect" },
+  "dlg.aigc.bypass_hint":{ zh: "(可选,站点开了 Vercel Protection 才需要)", en: "(optional; only if the site has Vercel Protection)" },
+  "dlg.aigc.bypass_ph": { zh: "留空 = 不启用 / 沿用已存的", en: "empty = disabled / keep existing" },
+  "dlg.aigc.bypass_note":{ zh: "⚠ 凭据,只写进本机 config.json(0600)并存进云端 Secret —— 刻意不放设置页:那里会明文落盘,且任何第三方 custom node 的 JS 都读得到。",
+                        en: "⚠ Credential. Written only to your local config.json (0600) and the cloud Secret — deliberately not a ComfyUI Setting: those are stored in plaintext and readable by any third-party custom node's JS." },
   "set.aigc.url":     { zh: "高级:自建 AIGC Studio 网站的地址(aigc-r2 交付模式)。本地 ComfyUI Desktop 用户用不到,留空即不启用。填了要去 Setup 点「部署」才写进云端 Secret。",
                         en: "Advanced: base URL of your own AIGC Studio site (aigc-r2 delivery). Not needed for local ComfyUI Desktop — leave empty to disable. Redeploy in Setup to write it into the cloud Secret." },
-  "set.aigc.secret":  { zh: "高级:上面那个站点的 Vercel Protection 旁路密钥,没开保护就不用填。⚠ 这是凭据,而设置值会明文存进 comfy.settings.json(权限 0644、前端可读)—— password 类型只遮显示、挡截图,不改存储。介意的话把它留空,改用部署面板里的 comfy.org API Key 那种走 config.json(0600)的通道。填了要去 Setup 点「部署」才生效。",
-                        en: "Advanced: Vercel Protection bypass secret for that site; leave empty if protection is off. ⚠ This is a credential, and settings are stored in plaintext in comfy.settings.json (mode 0644, readable by the frontend) — the password type only masks display. Redeploy in Setup to apply." },
   "set.aigc.saved":   { zh: "✓ 已保存 —— 去 Setup 点「部署」后写入云端 Secret 才生效", en: "✓ Saved — redeploy in Setup to write it into the cloud Secret" },
   // ── Setup 面板分组标题 ──
   "dlg.grp.conn":     { zh: "连接", en: "Connection" },
@@ -678,14 +680,38 @@ async function ensureNodesAvailable(prompt, ctx) {
     // 但只要它们的 requirements 也变了,后端就会顺带**重建镜像**(几分钟)。
     // 以前这里全自动、零提示,于是点一次「运行」可能突然卡好几分钟,用户不知道在等什么。
     // 「运行」就该是运行,把重建镜像这种事悄悄塞进去,代价是整个流程不可预测。
-    const _names = local_pack.map((p) => p.folder).join("、");
-    if (!confirm(t("node.local_push_confirm", { n: local_pack.length, list: _names }))) {
+    // ⚠ local_pack 只表示"这些节点走 Volume 通道"(无 git remote / 未推送),**不等于有改动**。
+    // 直接拿它弹确认的话,只要工作流含自写节点就每次都问一遍,而绝大多数时候云端和本机
+    // 一致。先问一次后端:哪些 digest 真的不一样。查不出来时后端退化成"当作有改动",
+    // 最坏是多问一次,不会漏推。
+    let _changed = local_pack.map((p) => p.folder);
+    try {
+      const dr = await bridgeFetch("/modal_bridge/local_nodes_diff", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ folders: _changed }),
+      });
+      if (dr.ok) {
+        const dj = await dr.json();
+        if (Array.isArray(dj.upload)) _changed = dj.upload;
+        if (dj.degraded) log("local_nodes_diff degraded:", dj.degraded);
+      }
+    } catch (e) { log("local_nodes_diff failed, 当作有改动:", e); }
+
+    if (_changed.length === 0) {
+      // 全都和云端一致 —— 不打扰用户,直接往下走
+      log("private nodes: 与云端一致,无需推送");
+    } else {
+    const _names = _changed.join("、");
+    if (!confirm(t("node.local_push_confirm", { n: _changed.length, list: _names }))) {
       // 取消 = 中止提交,**不提供"跳过继续"**:私有节点不同步就跑,云端用的是旧代码,
       // 结果和你改的不一样、而且没有任何报错 —— 这种静默偏差比明确失败难查得多。
       notify(t("node.local_push_cancelled"), "warn");
       return false;
     }
+    }
     ctx.stage("nodes", t("node.local_pack", { n: local_pack.length }), false);
+    // 仍传整个 local_pack:后端会自己比对 digest 只推有改动的,而它返回的 digest map
+    // 要覆盖本次工作流用到的**全部**私有节点(提交时要带上完整版本契约)。
     const res = await syncLocalNodes(local_pack, ctx);
     if (!res.ok) {
       throw new Error(res.message
@@ -1659,6 +1685,12 @@ async function syncSnapshotToConfig(value) {
 
 // _advReady:同 _snapReady —— 启动期 ComfyUI 会用存储值触发 onChange,挡掉避免覆盖 config。
 let _advReady = false;
+// 只用于 AIGC Studio 的 **URL**。旁路密钥刻意不走这条路:
+//   - /config 的 allowlist 是为挡住"先改配置、再取 key"那类两步绕过而设的,往里加凭据
+//     等于自己开口子(contract.PUBLIC_CONFIG_WRITE_FIELDS 有说明);
+//   - 注册成 ComfyUI Setting 的值一定会明文落进 comfy.settings.json(0644),
+//     而且**任何第三方 custom node 的 JS 都能读到**。
+// 密钥改回部署面板的专用密码框 → /deploy,只写 0600 的 config.json。
 async function syncAigcFieldToConfig(field, value) {
   if (!_advReady) return;
   try {
@@ -1801,15 +1833,6 @@ const SETTINGS = [
     defaultValue: "",
     tooltip: t("set.aigc.url"),
     onChange: (v) => syncAigcFieldToConfig("aigc_studio_base_url", v),
-  },
-  {
-    id: "ModalBridge.aigcBypassSecret",
-    name: "AIGC Bypass Secret",
-    category: ["Modal Bridge", "Advanced", "AIGC Bypass Secret"],
-    type: "password",
-    defaultValue: "",
-    tooltip: t("set.aigc.secret"),
-    onChange: (v) => syncAigcFieldToConfig("aigc_bypass_secret", v),
   },
 ];
 
@@ -2021,6 +2044,10 @@ async function openDeployDialog() {
       <label style="${labelCss}">comfy.org API Key <span style="${hintCss}">${t("dlg.comfy.hint")}</span></label>
       <input id="mb-dep-comfy" type="password" style="${inputCss}" value="" placeholder="${cfg.has_comfy_api_key ? t("dlg.comfy.ph_saved") : t("dlg.comfy.ph")}">
       <div style="${noteCss}">${t("dlg.comfy.note")}</div>
+      ${(cfg.aigc_studio_base_url || "") ? `
+      <label style="${labelCss}">AIGC Bypass Secret <span style="${hintCss}">${t("dlg.aigc.bypass_hint")}</span></label>
+      <input id="mb-dep-aigc-bypass" type="password" style="${inputCss}" value="" placeholder="${cfg.has_aigc_bypass_secret ? t("dlg.comfy.ph_saved") : t("dlg.aigc.bypass_ph")}">
+      <div style="${noteCss}">${t("dlg.aigc.bypass_note")}</div>` : ``}
     </div>
 
     <div style="display:flex;align-items:center;flex-wrap:wrap;gap:8px;margin:20px 0 0;">
@@ -2247,9 +2274,14 @@ async function openDeployDialog() {
       // 固定的(@app.cls 的 gpu= 参数),要换卡型得改 config.json 再部署。
       gpu_tier: tierSel.value,
       comfy_api_key: panel.querySelector("#mb-dep-comfy").value.trim(),
-      // AIGC Studio 两个字段现在只在「设置 → Modal Bridge → Advanced」里填,改动即时写回
-      // config。这里刻意不带这两个键 —— 后端对「键不存在」是保留 config 已存值
-      // (routes.py 的 deploy 分支),所以部署会用设置页里最后保存的那份。
+      // AIGC Studio 的 **URL** 在「设置 → Modal Bridge → Advanced」里填,改动即时写回 config,
+      // 所以这里不带那个键(后端对「键不存在」保留已存值)。
+      // 而**旁路密钥是凭据**,只从下面这个专用密码框走:留空 = 沿用 config 里已存的,
+      // 规则与 comfy.org API Key 一致。密钥不进 ComfyUI Settings —— 那里会明文落盘且
+      // 任何第三方 custom node 都读得到。
+      ...(panel.querySelector("#mb-dep-aigc-bypass")
+          ? { aigc_bypass_secret: panel.querySelector("#mb-dep-aigc-bypass").value.trim() }
+          : {}),
     };
     // token_secret 留空 = 沿用已存的(/config 不再回显它);只有填了才校验格式
     const secretOk = payload.token_secret === "" ? cfg.has_token_secret : payload.token_secret.startsWith("as-");
