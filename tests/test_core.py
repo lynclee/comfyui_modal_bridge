@@ -2239,3 +2239,30 @@ def test_command_failure_reaches_comfyui_log_and_frontend():
     assert "return { ok: false, message:" in fn, "失败没有把原因带回调用方"
     assert "return { ok: true }" in fn, "成功路径的返回值没有跟着改"
     assert "node.local_fail_detail" in js, "缺少带详情的失败文案"
+
+
+def test_local_nodes_have_a_push_entry_point():
+    """必须有一条「本机 → Volume」方向的手动同步入口,否则会形成互锁。
+
+    2026-08-31 由 skybox-ai 会话报告、用户实际卡住:
+    依赖清单以 Volume 的 manifest 为唯一真相源(多机场景下这是对的),而全项目**只有**
+    ensureNodesAvailable 那一条路径会刷新它 —— 偏偏那条路径在提交前先过版本检查。
+    于是「本地改了私有节点依赖」+「插件版本也变了」同时发生时:
+        版本不一致 → 拦提交、让去 Setup 重新部署
+          → 部署从 Volume 读到的还是旧 manifest → 构建照样失败 → 版本永远升不上去
+          → 而唯一能刷新 manifest 的路径被第一步拦着
+    用户从 UI 出不去,只能靠「先移除该节点再重部署」这种绕行。
+    """
+    js = (ROOT / "web" / "modal_bridge.js").read_text(encoding="utf-8")
+
+    # Setup 面板里要有这个按钮，且它真的会调 sync_local_nodes
+    assert 'id="mb-nodes-resync"' in js, "Setup 面板缺少「同步本机私有节点」按钮"
+    i = js.index("nodesResyncBtn.onclick")
+    body = js[i:i + 2200]
+    assert "/modal_bridge/list_local_nodes" in body, "同步按钮没有取 Volume 上的节点列表"
+    assert "/modal_bridge/sync_local_nodes" in body, "同步按钮没有调用上传端点"
+    assert "refreshVerBanner" in body, "同步后没有刷新版本徽标(依赖变化会顺带重部署)"
+
+    # 版本不一致的引导文案要提醒这条死路
+    assert "同步本机私有节点" in js.split('"ver.mismatch_msg"')[1][:900], \
+        "版本不一致的引导没提「先同步私有节点」—— 依赖也变了的话那条路是死的"
