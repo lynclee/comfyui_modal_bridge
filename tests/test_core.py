@@ -1696,32 +1696,41 @@ def test_no_api_key_in_query_string():
 
 
 def test_advanced_toggles_not_in_setup_panel():
-    """SageAttention / AIGC Studio 必须留在设置页的 Advanced,不许挪回 Modal Setup 面板。
+    """SageAttention 与 AIGC Studio 必须留在设置页的 Advanced,不许回到 Modal Setup 面板。
 
-    这两个都是少数人才用的进阶功能:sage 是有损加速(要自己同 seed 对比过才敢常开),
-    AIGC Studio 是自建网站交付(本地 Desktop 用户永远用不到)。它们曾经占着部署面板
-    最显眼的位置,导致每个新用户都要先读懂两段免责说明才敢点部署。
+    两者都是少数人才用的进阶功能,曾经占着部署面板最显眼的位置,逼每个新用户先读懂
+    两段免责说明才敢点部署。
 
-    钉死三件事:① 面板模板里没有 sage 控件;② 两个设置项都注册了且默认关;
-    ③ AIGC 那一栏是按设置项条件渲染的。
+    AIGC 的两个字段在 2026-08-31 从「面板输入 + 设置页开关」改成**全部放设置页**
+    (用户明确选择):URL 用 text、旁路密钥用 password。已知代价是设置值会明文落进
+    comfy.settings.json(0644、前端可读),password 只遮显示不改存储 —— 换来配置集中在一处。
     """
     src = (ROOT / "web" / "modal_bridge.js").read_text(encoding="utf-8")
 
-    # ① 面板里不该再有 sage 的常驻控件
+    # ① 面板里不该再有这些控件
     assert 'id="mb-dep-sage"' not in src, "SageAttention 复选框被挪回了 Setup 面板"
-    assert "mb-dep-aigc-toggle" not in src, "AIGC 折叠开关被挪回了 Setup 面板"
+    assert "mb-dep-aigc" not in src, "AIGC 输入框被挪回了 Setup 面板"
 
-    # ② 两个设置项注册且默认关
-    for sid in ("ModalBridge.useSageAttention", "ModalBridge.enableAigcStudio"):
-        i = src.find(f'id: "{sid}"')
-        assert i > 0, f"设置项 {sid} 没注册"
-        block = src[i:i + 400]
-        assert "defaultValue: false" in block, f"{sid} 默认值不是 false"
-        assert '"Advanced"' in block, f"{sid} 没归到 Advanced 分组"
+    # ② sage 开关：注册、默认关、归 Advanced
+    i = src.find('id: "ModalBridge.useSageAttention"')
+    assert i > 0, "设置项 ModalBridge.useSageAttention 没注册"
+    block = src[i:i + 400]
+    assert "defaultValue: false" in block, "sage 默认值不是 false"
+    assert '"Advanced"' in block, "sage 没归到 Advanced 分组"
 
-    # ③ AIGC 一栏条件渲染，且关闭时 payload 不带这两个键（否则会抹掉用户已存配置）
-    assert 'getSetting("ModalBridge.enableAigcStudio"' in src, "AIGC 没有按设置项条件渲染"
-    assert "aigcUrlEl ? {" in src, "payload 没有对 AIGC 未渲染的情况做处理"
+    # ③ AIGC 两个字段：注册、归 Advanced、密钥必须是 password 类型
+    for sid, want_type in (("ModalBridge.aigcStudioUrl", "text"),
+                           ("ModalBridge.aigcBypassSecret", "password")):
+        k = src.find(f'id: "{sid}"')
+        assert k > 0, f"设置项 {sid} 没注册"
+        blk = src[k:k + 400]
+        assert '"Advanced"' in blk, f"{sid} 没归到 Advanced 分组"
+        assert f'type: "{want_type}"' in blk, f"{sid} 类型应为 {want_type}"
+        assert "syncAigcFieldToConfig" in blk, f"{sid} 没有把值同步回 config"
+
+    # ④ 密钥不许被启动回填覆盖 —— /config 不回吐它，用空串回填会把用户填过的值清掉
+    assert 'setSettingValue("ModalBridge.aigcStudioUrl"' in src, "URL 应当用 config 真值回填"
+    assert 'setSettingValue("ModalBridge.aigcBypassSecret"' not in src,         "密钥不该被回填 —— /config 不回吐它,回填只会用空串清掉用户填过的值"
 
 
 def test_all_settings_share_one_category():

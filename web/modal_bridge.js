@@ -250,8 +250,11 @@ const I18N = {
                         en: "This is a remote ComfyUI. Enter local_api_capability from the server's config.json. It is stored only in this browser, never in the workflow." },
   "set.sage.on":      { zh: "已开启 SageAttention —— 去 Setup 点「部署」才生效(有损加速,建议同 seed 对比过再常开)", en: "SageAttention ON — redeploy in Setup to take effect (lossy; A/B before leaving it on)" },
   "set.sage.off":     { zh: "已关闭 SageAttention —— 去 Setup 点「部署」生效", en: "SageAttention OFF — redeploy in Setup to take effect" },
-  "set.aigc":         { zh: "高级:把产物交付到自建的 AIGC Studio 网站(aigc-r2 模式)。本地 ComfyUI Desktop 用户用不到。打开后 Setup 面板会多出「AIGC Studio」一栏填地址和旁路密钥——密钥属于凭据,所以只放在那里,不放在设置页。",
-                        en: "Advanced: deliver outputs to your own AIGC Studio site (aigc-r2 mode). Not needed for local ComfyUI Desktop. Turning this on adds an \"AIGC Studio\" section to the Setup panel for the URL and bypass secret — the secret is a credential, so it lives there, not in Settings." },
+  "set.aigc.url":     { zh: "高级:自建 AIGC Studio 网站的地址(aigc-r2 交付模式)。本地 ComfyUI Desktop 用户用不到,留空即不启用。填了要去 Setup 点「部署」才写进云端 Secret。",
+                        en: "Advanced: base URL of your own AIGC Studio site (aigc-r2 delivery). Not needed for local ComfyUI Desktop — leave empty to disable. Redeploy in Setup to write it into the cloud Secret." },
+  "set.aigc.secret":  { zh: "高级:上面那个站点的 Vercel Protection 旁路密钥,没开保护就不用填。⚠ 这是凭据,而设置值会明文存进 comfy.settings.json(权限 0644、前端可读)—— password 类型只遮显示、挡截图,不改存储。介意的话把它留空,改用部署面板里的 comfy.org API Key 那种走 config.json(0600)的通道。填了要去 Setup 点「部署」才生效。",
+                        en: "Advanced: Vercel Protection bypass secret for that site; leave empty if protection is off. ⚠ This is a credential, and settings are stored in plaintext in comfy.settings.json (mode 0644, readable by the frontend) — the password type only masks display. Redeploy in Setup to apply." },
+  "set.aigc.saved":   { zh: "✓ 已保存 —— 去 Setup 点「部署」后写入云端 Secret 才生效", en: "✓ Saved — redeploy in Setup to write it into the cloud Secret" },
   // ── Setup 面板分组标题 ──
   "dlg.grp.conn":     { zh: "连接", en: "Connection" },
   "dlg.grp.run":      { zh: "运行", en: "Runtime" },
@@ -1624,6 +1627,22 @@ async function syncSnapshotToConfig(value) {
 
 // _advReady:同 _snapReady —— 启动期 ComfyUI 会用存储值触发 onChange,挡掉避免覆盖 config。
 let _advReady = false;
+async function syncAigcFieldToConfig(field, value) {
+  if (!_advReady) return;
+  try {
+    const r = await bridgeFetch("/modal_bridge/config", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ [field]: String(value ?? "") }),
+    });
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    log(`${field} → ${field.endsWith("secret") ? "(已更新)" : String(value ?? "")}`);
+    notify(t("set.aigc.saved"), "info");
+  } catch (e) {
+    err(`sync ${field} to config failed`, e);
+    notify(t("set.save_failed", { msg: String(e) }), "error");
+  }
+}
+
 async function syncSageToConfig(value) {
   if (!_advReady) return;
   try {
@@ -1737,15 +1756,28 @@ const SETTINGS = [
     tooltip: t("set.cpu_guess"),
     onChange: (v) => syncCpuGuessToConfig(v),
   },
+  // AIGC Studio 交付(自建网站 aigc-r2 模式)。两个字段都在这里填,Setup 面板不再有这一栏。
+  // ⚠ 已知代价(用户 2026-08-31 明确选择接受):设置值会明文持久化进 comfy.settings.json,
+  // 那个文件是 0644、且前端 getSetting 能直接读出明文;而真实存储 config.json 是 0600、
+  // /config 端点还会显式抹掉密钥不回吐。password 类型只遮显示(挡截图/录屏),不改存储。
+  // 换来的是配置集中在一处,不必在设置页和部署面板之间来回跳。
   {
-    // 只控制 Setup 面板显不显示 AIGC 那一栏,不写 config —— 地址和旁路密钥属于凭据,
-    // 仍然只在面板里填(设置页是明文存储,不适合放 secret)。
-    id: "ModalBridge.enableAigcStudio",
-    name: "AIGC Studio delivery",
-    category: ["Modal Bridge", "Advanced", "AIGC Studio"],
-    type: "boolean",
-    defaultValue: false,
-    tooltip: t("set.aigc"),
+    id: "ModalBridge.aigcStudioUrl",
+    name: "AIGC Studio URL",
+    category: ["Modal Bridge", "Advanced", "AIGC Studio URL"],
+    type: "text",
+    defaultValue: "",
+    tooltip: t("set.aigc.url"),
+    onChange: (v) => syncAigcFieldToConfig("aigc_studio_base_url", v),
+  },
+  {
+    id: "ModalBridge.aigcBypassSecret",
+    name: "AIGC Bypass Secret",
+    category: ["Modal Bridge", "Advanced", "AIGC Bypass Secret"],
+    type: "password",
+    defaultValue: "",
+    tooltip: t("set.aigc.secret"),
+    onChange: (v) => syncAigcFieldToConfig("aigc_bypass_secret", v),
   },
 ];
 
@@ -1895,10 +1927,6 @@ async function openDeployDialog() {
   const vColor = ver.match ? "#34d399" : (ver.reachable ? "#fbbf24" : "#9aa");
   const vHint = ver.match ? t("dlg.ver.aligned")
     : (ver.reachable ? t("dlg.ver.mismatch") : t("dlg.ver.unreach"));
-  // AIGC Studio 那一栏只在设置页开了才渲染。默认关 —— 它是自建网站交付用的,
-  // 本地 Desktop 用户永远用不到,却曾经占着部署面板最显眼的位置之一。
-  // 不渲染时 payload 里也不带这两个键,后端会保留 config 里已存的值(routes.py:1073 起)。
-  const aigcOn = !!getSetting("ModalBridge.enableAigcStudio", false);
   panel.innerHTML = `
     <div style="display:flex;align-items:baseline;justify-content:space-between;gap:12px;">
       <div style="font-size:16px;font-weight:600;">${t("dlg.title")}</div>
@@ -1943,12 +1971,6 @@ async function openDeployDialog() {
       <label style="${labelCss}">comfy.org API Key <span style="${hintCss}">${t("dlg.comfy.hint")}</span></label>
       <input id="mb-dep-comfy" type="password" style="${inputCss}" value="" placeholder="${cfg.has_comfy_api_key ? t("dlg.comfy.ph_saved") : t("dlg.comfy.ph")}">
       <div style="${noteCss}">${t("dlg.comfy.note")}</div>
-      ${aigcOn ? `
-      <label style="${labelCss}">AIGC Studio URL <span style="${hintCss}">${t("dlg.aigc.hint")}</span></label>
-      <input id="mb-dep-aigc-url" type="text" style="${inputCss}" value="${cfg.aigc_studio_base_url || ""}" placeholder="${t("dlg.aigc.url_ph")}">
-      <label style="${labelCss}">AIGC Bypass Secret <span style="${hintCss}">${t("dlg.aigc.bypass_hint")}</span></label>
-      <input id="mb-dep-aigc-bypass" type="password" style="${inputCss}" value="" placeholder="${cfg.has_aigc_bypass_secret ? t("dlg.comfy.ph_saved") : t("dlg.aigc.bypass_ph")}">
-      <div style="${noteCss}">${t("dlg.aigc.note")}</div>` : ``}
     </div>
 
     <div style="display:flex;align-items:center;flex-wrap:wrap;gap:8px;margin:20px 0 0;">
@@ -1991,10 +2013,6 @@ async function openDeployDialog() {
 
   // AIGC Studio 交付配置默认折叠(大多数人用不到);已配置过则自动展开。
   // 输入框折叠时仍在 DOM 里,提交 payload 照常读取。
-  // AIGC 那一栏由设置页的 ModalBridge.enableAigcStudio 决定渲不渲染,关着时这两个就是 null。
-  // 不再用「折叠区」——折叠也还是占版面、还要维护展开态,而这功能九成用户用不到。
-  const aigcUrlEl = panel.querySelector("#mb-dep-aigc-url");
-  const aigcBypassEl = panel.querySelector("#mb-dep-aigc-bypass");
 
   // 测试连接:真打一次 Modal /health,查出"app 被删 / endpoint 不通 / key 不对"——
   // 这些光看本地 config 有没有 token 是查不出的(config 字段在不代表云端 app 还活着)。
@@ -2179,13 +2197,9 @@ async function openDeployDialog() {
       // 固定的(@app.cls 的 gpu= 参数),要换卡型得改 config.json 再部署。
       gpu_tier: tierSel.value,
       comfy_api_key: panel.querySelector("#mb-dep-comfy").value.trim(),
-      // AIGC Studio(可选,网站 aigc-r2 交付):URL 明文;bypass 密钥留空 = 沿用已存的。
-      // ⚠ 设置页关着时这一栏不渲染,payload 里就不带这两个键 —— 后端对「键不存在」是
-      // 保留 config 已存值(routes.py:1073 起),所以关掉开关不会把用户填过的配置抹掉。
-      ...(aigcUrlEl ? {
-        aigc_studio_base_url: aigcUrlEl.value.trim(),
-        aigc_bypass_secret: aigcBypassEl ? aigcBypassEl.value.trim() : "",
-      } : {}),
+      // AIGC Studio 两个字段现在只在「设置 → Modal Bridge → Advanced」里填,改动即时写回
+      // config。这里刻意不带这两个键 —— 后端对「键不存在」是保留 config 已存值
+      // (routes.py 的 deploy 分支),所以部署会用设置页里最后保存的那份。
     };
     // token_secret 留空 = 沿用已存的(/config 不再回显它);只有填了才校验格式
     const secretOk = payload.token_secret === "" ? cfg.has_token_secret : payload.token_secret.startsWith("as-");
@@ -2445,6 +2459,10 @@ app.registerExtension({
       try { app.ui.settings.setSettingValue("ModalBridge.enableSnapshot", !!cfg.enable_snapshot); } catch (e) {}
       try { app.ui.settings.setSettingValue("ModalBridge.useSageAttention", !!cfg.use_sage_attention); } catch (e) {}
       try { app.ui.settings.setSettingValue("ModalBridge.cpuTierWhenNoModel", cfg.cpu_tier_when_no_model !== false); } catch (e) {}
+      // AIGC 的 URL 用 config 真值回填(它明文回吐)。**密钥不回填** —— /config 显式抹掉
+      // 它不回吐浏览器,前端根本拿不到;而设置页自己会持久化用户上次输入的值,
+      // 这里若用空串去覆盖,反而会把它清掉。
+      try { app.ui.settings.setSettingValue("ModalBridge.aigcStudioUrl", cfg.aigc_studio_base_url || ""); } catch (e) {}
       _snapReady = true;
       _advReady = true;
       if (!isConfigured(cfg)) {
