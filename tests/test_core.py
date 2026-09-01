@@ -2268,26 +2268,6 @@ def test_local_nodes_have_a_push_entry_point():
         "版本不一致的引导没提「先同步私有节点」—— 依赖也变了的话那条路是死的"
 
 
-def _load_routes_func(name, extra_ns=None):
-    """从 routes.py 里取出一个纯函数来单测。
-
-    routes.py 顶层 import aiohttp / server,单测环境里进不来;而这些函数本身是纯逻辑。
-    只 exec 需要的那几个顶层节点,不执行整个模块。
-    """
-    import ast
-    import re as _re
-
-    src = (ROOT / "routes.py").read_text(encoding="utf-8")
-    tree = ast.parse(src)
-    ns = {"re": _re, **(extra_ns or {})}
-    for node in tree.body:
-        if isinstance(node, (ast.Assign, ast.FunctionDef)):
-            dump = ast.dump(node)
-            if name in dump or "_PIP_" in dump:
-                exec(compile(ast.Module([node], []), "<routes>", "exec"), ns)
-    return ns[name]
-
-
 def test_diagnose_build_failure():
     """构建失败要能从 pip 输出里认出包名,给一句可操作的话;认不出就别硬猜。
 
@@ -2295,7 +2275,7 @@ def test_diagnose_build_failure():
     `File "<string>", line 79, in get_version` / `KeyError: '__version__'`,
     要翻 30 行 traceback 才能找到包名叫 basicsr。原始日志留着,但得有一句人话。
     """
-    d = _load_routes_func("diagnose_build_failure")
+    from node_sync import diagnose_build_failure as d
 
     # ① 真实形态：现代 pip 只打 Collecting，报错紧跟其后，没有 "Failed building wheel" 行
     real = (

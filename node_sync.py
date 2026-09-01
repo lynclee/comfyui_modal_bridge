@@ -649,6 +649,44 @@ def modal_available() -> bool:
         return False
 
 
+# pip 装包失败时的形态。现代 pip 会先打 `Collecting <pkg>`,再在该包的构建段落里报错;
+# 末尾往往还有一句 `Failed building wheel for <pkg>` / `Failed to build <pkg>`。
+# 两头都认,取到就够给一句人话 —— 用户面对的原始信息是几十行 traceback,里面
+# `KeyError: '__version__'` 这种东西跟"我该改什么"看不出任何关系。
+_PIP_COLLECT_RE = re.compile(r"^\s*Collecting\s+([A-Za-z0-9._-]+)", re.M)
+_PIP_FAILED_RE = re.compile(
+    r"(?:Failed building wheel for|Failed to build|Could not build wheels for)\s+([A-Za-z0-9._-]+)")
+_PIP_FAIL_MARKS = ("subprocess-exited-with-error", "did not run successfully",
+                   "error: metadata-generation-failed", "ERROR: Failed building wheel")
+
+
+def diagnose_build_failure(text: str) -> str:
+    """从命令输出里认出常见的构建失败形态,返回一句可操作的中文提示;认不出返回空串。
+
+    纯函数,可单测。目前只认 pip 装包失败这一种 —— 它是私有节点上云最常见的坑
+    (2026-08-31 实测:basicsr 1.4.2 停更于 2022,镜像的 Python 3.13 + 新 setuptools
+    隔离构建下 setup.py 取版本号抛 KeyError)。认不出就别硬猜,原始日志已经在上面。
+    """
+    if not text:
+        return ""
+    pkg = ""
+    m = _PIP_FAILED_RE.search(text)
+    if m:
+        pkg = m.group(1)
+    elif any(k in text for k in _PIP_FAIL_MARKS):
+        # 没有显式的 "Failed building wheel for X" 时,取最后一个 Collecting 的包
+        # —— pip 是顺序处理的,报错紧跟在它后面。
+        found = _PIP_COLLECT_RE.findall(text)
+        pkg = found[-1] if found else ""
+    if not pkg:
+        return ""
+    return (f"💡 看起来是云端安装 `{pkg}` 失败。常见原因:这个包已停止维护、或不兼容"
+            f"镜像里的 Python 版本(当前 3.13),setup.py 在隔离构建下跑不起来。\n"
+            f"   处理办法:在用到它的那个私有节点的 requirements.txt 里把 `{pkg}` 去掉"
+            f"(先确认代码是否真的 import 了它)、换一个仍在维护的版本,或改用不依赖它的实现;\n"
+            f"   改完在 Setup 里点「同步本机私有节点」或直接重新部署即可。")
+
+
 def gen_bridge_key() -> str:
     """私有 endpoint 自建鉴权 key(部署时生成,存 Modal Secret + 本地 config)。"""
     import secrets
