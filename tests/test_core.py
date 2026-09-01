@@ -2458,3 +2458,35 @@ def test_push_fails_closed_on_node_upload_failure():
     assert "__DEPLOY_DONE__ rc=1" in seg, "异常分支没有以失败码结束"
     # 并发保护：与 /sync_local_nodes 争同一把锁
     assert "_UPLOAD_LOCK" in seg, "部署路径的上传绕过了 _UPLOAD_LOCK，会与其它上传竞态"
+
+
+def test_submit_asks_before_pushing_private_nodes():
+    """提交前推送私有节点必须先问一句,取消则中止提交(不给"跳过继续")。
+
+    改动前:检测到私有节点有改动就**全自动**推送,而这一步可能顺带重建镜像
+    (依赖变了的话几分钟)。于是点一次「运行」会突然卡住,用户不知道在等什么。
+    「运行」就该是运行 —— 把重建镜像这种事悄悄塞进去,整个流程就不可预测了。
+
+    ⚠ 取消时**不能**提供"跳过继续跑"的选项:私有节点不同步就提交,云端用的是旧代码,
+    结果和用户改的不一样、且不会有任何报错。这种静默偏差比明确失败难查得多
+    (本仓库为"残包静默跑旧码"专门修过一轮)。对照:镜像节点那条路径给了跳过选项,
+    因为缺节点会**明确报错**,风险性质不同。
+    """
+    js = (ROOT / "web" / "modal_bridge.js").read_text(encoding="utf-8")
+
+    i = js.index("if (local_pack.length) {")
+    seg = js[i:i + 1400]
+    confirm_at = seg.find('confirm(t("node.local_push_confirm"')
+    sync_at = seg.find("await syncLocalNodes(")
+    assert confirm_at > 0, "推送私有节点前没有确认"
+    assert sync_at > 0, "找不到同步调用,测试锚点需更新"
+    assert confirm_at < sync_at, "确认必须在推送之前"
+    assert "return false" in seg[confirm_at:sync_at], "取消后没有中止提交"
+    # 不许出现"跳过继续"那种二次确认
+    assert "node.skip_confirm" not in seg[confirm_at:sync_at], \
+        "私有节点不同步就跑会让云端静默跑旧代码，不该给跳过选项"
+
+    # 文案要讲清楚代价：可能重建镜像、以及不推的后果
+    blk = js[js.index('"node.local_push_confirm"'):][:1200]
+    assert "重建镜像" in blk, "确认文案没说明可能要重建镜像"
+    assert "旧代码" in blk, "确认文案没说明不推的后果"

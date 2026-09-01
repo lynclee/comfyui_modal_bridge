@@ -121,6 +121,10 @@ const I18N = {
                         en: "Packing {n} local node(s) (auto-deploys only if dependencies changed)..." },
   "node.local_fail_detail":{ zh: "私有节点同步失败,已停止提交(避免云端静默跑旧代码):\n\n{msg}\n\n完整日志见 ComfyUI 控制台(失败时会打印命令输出尾部)。常见原因是某个节点的 requirements 在云端装不上。",
                         en: "Private node sync failed; submission stopped to avoid running stale code in the cloud:\n\n{msg}\n\nFull log is in the ComfyUI console (the tail of the command output is printed on failure). A common cause is a node's requirements failing to install in the cloud." },
+  "node.local_push_confirm":{ zh: "检测到 {n} 个私有节点有改动,需要先推送到云端:\n\n  {list}\n\n代码推上去是秒级的;但如果这些节点的 requirements.txt 也改了,还要**重建镜像**(约 3-5 分钟)。\n\n点「确定」现在推送并继续提交。\n点「取消」中止本次提交 —— 不推就跑的话,云端用的是旧代码,出来的结果和你改的不一样,而且不会有任何报错。",
+                        en: "{n} private node(s) changed and must be pushed to the cloud first:\n\n  {list}\n\nPushing the code is instant; but if their requirements.txt also changed, the image has to be rebuilt (~3-5 min).\n\nOK: push now and continue submitting.\nCancel: abort this submission — running without pushing means the cloud uses stale code, producing results that differ from your edits with no error at all." },
+  "node.local_push_cancelled":{ zh: "已取消 —— 未推送私有节点,本次提交中止(避免云端静默跑旧代码)",
+                        en: "Cancelled — private nodes were not pushed and the submission was aborted (prevents the cloud silently running stale code)." },
   "node.local_fail":  { zh: "本地节点上传失败,已停止提交,避免云端静默运行旧版本。请修复上面的上传错误后重试。",
                         en: "Local node upload failed. Submission was stopped to prevent the cloud from silently running stale code. Fix the upload error above and retry." },
   "node.local_rm_fail": { zh: "旧的本地节点覆盖包清理失败: {list}",
@@ -670,6 +674,17 @@ async function ensureNodesAvailable(prompt, ctx) {
   // 本地自写节点(无 git remote / commit 未推送)→ 打包传 Volume,worker 启动时解压。
   // 放在部署之前:即使同一批还要重部署,本地节点也已经在 Volume 上,一次提交全齐。
   if (local_pack.length) {
+    // ⚠ 先问一句再推。这一步不是"传个 zip"那么轻:节点代码走 Volume 确实是秒级,
+    // 但只要它们的 requirements 也变了,后端就会顺带**重建镜像**(几分钟)。
+    // 以前这里全自动、零提示,于是点一次「运行」可能突然卡好几分钟,用户不知道在等什么。
+    // 「运行」就该是运行,把重建镜像这种事悄悄塞进去,代价是整个流程不可预测。
+    const _names = local_pack.map((p) => p.folder).join("、");
+    if (!confirm(t("node.local_push_confirm", { n: local_pack.length, list: _names }))) {
+      // 取消 = 中止提交,**不提供"跳过继续"**:私有节点不同步就跑,云端用的是旧代码,
+      // 结果和你改的不一样、而且没有任何报错 —— 这种静默偏差比明确失败难查得多。
+      notify(t("node.local_push_cancelled"), "warn");
+      return false;
+    }
     ctx.stage("nodes", t("node.local_pack", { n: local_pack.length }), false);
     const res = await syncLocalNodes(local_pack, ctx);
     if (!res.ok) {
