@@ -106,7 +106,8 @@ const I18N = {
   "dep.ok":           { zh: "✓ 部署成功!可以关掉这个窗口去出资产了",
                         en: "✓ Deployed! Close this window and start generating." },
   "dep.ok.toast":     { zh: "✓ Modal 部署成功", en: "✓ Modal deployed" },
-  "dep.fail":         { zh: "✗ 部署失败 rc={rc}(看上面日志)", en: "✗ Deploy failed rc={rc} (see log above)" },
+  "dep.fail":         { zh: "✗ 部署失败(rc={rc})—— 云端保持原样,本次改动未生效。上方版本徽标已刷新为云端真实版本;失败原因见日志(常见是某个私有节点的依赖在云端装不上)。",
+                        en: "✗ Deploy failed (rc={rc}) — the cloud is unchanged; this attempt did not take effect. The version badge above now shows the real deployed version. See the log for the cause (commonly a private node's dependency failing to install)." },
   "dep.fail.toast":   { zh: "Modal 部署失败 rc={rc}", en: "Modal deploy failed rc={rc}" },
   "nodes.redeploying":{ zh: "重部署中(约 1-3 分钟,别关窗口)...", en: "Redeploying (~1-3 min, keep window open)..." },
   // —— 节点同步 ——
@@ -2318,6 +2319,10 @@ async function openDeployDialog() {
         statusEl.textContent = t("dep.fail", { rc });
         statusEl.style.color = "#f87171";
         notify(t("dep.fail.toast", { rc }), "error");
+        // 失败后也要刷新版本徽标。以前只在成功分支刷,于是部署挂了之后徽标停在打开
+        // 对话框时的旧值,用户无从知道"云端现在到底是什么状态、这次改动生效了没有"。
+        // 徽标本身会显示真实的 deployed_version 并标黄(不一致),配合下面的文案就清楚了。
+        refreshVerBanner(panel);
       }
     } catch (e) {
       statusEl.textContent = "✗ " + (e.message || e);

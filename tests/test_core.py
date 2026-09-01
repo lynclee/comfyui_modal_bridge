@@ -2266,3 +2266,79 @@ def test_local_nodes_have_a_push_entry_point():
     # 版本不一致的引导文案要提醒这条死路
     assert "同步本机私有节点" in js.split('"ver.mismatch_msg"')[1][:900], \
         "版本不一致的引导没提「先同步私有节点」—— 依赖也变了的话那条路是死的"
+
+
+def _load_routes_func(name, extra_ns=None):
+    """从 routes.py 里取出一个纯函数来单测。
+
+    routes.py 顶层 import aiohttp / server,单测环境里进不来;而这些函数本身是纯逻辑。
+    只 exec 需要的那几个顶层节点,不执行整个模块。
+    """
+    import ast
+    import re as _re
+
+    src = (ROOT / "routes.py").read_text(encoding="utf-8")
+    tree = ast.parse(src)
+    ns = {"re": _re, **(extra_ns or {})}
+    for node in tree.body:
+        if isinstance(node, (ast.Assign, ast.FunctionDef)):
+            dump = ast.dump(node)
+            if name in dump or "_PIP_" in dump:
+                exec(compile(ast.Module([node], []), "<routes>", "exec"), ns)
+    return ns[name]
+
+
+def test_diagnose_build_failure():
+    """构建失败要能从 pip 输出里认出包名,给一句可操作的话;认不出就别硬猜。
+
+    2026-08-31 实测:用户点部署 → 白等一轮构建 → 看到的是
+    `File "<string>", line 79, in get_version` / `KeyError: '__version__'`,
+    要翻 30 行 traceback 才能找到包名叫 basicsr。原始日志留着,但得有一句人话。
+    """
+    d = _load_routes_func("diagnose_build_failure")
+
+    # ① 真实形态：现代 pip 只打 Collecting，报错紧跟其后，没有 "Failed building wheel" 行
+    real = (
+        "Collecting py360convert\n"
+        "  Downloading py360convert-1.0.3-py3-none-any.whl\n"
+        "Collecting basicsr\n"
+        "  Downloading basicsr-1.4.2.tar.gz (172 kB)\n"
+        "  Preparing metadata (setup.py) ... error\n"
+        "  error: subprocess-exited-with-error\n"
+        "  × python setup.py egg_info did not run successfully.\n"
+        '  File "<string>", line 79, in get_version\n'
+        "  KeyError: '__version__'\n"
+    )
+    out = d(real)
+    assert "basicsr" in out, "没认出失败的包名"
+    assert "py360convert" not in out, "认成了前一个成功的包"
+    assert "requirements.txt" in out, "没给出可操作的处理办法"
+
+    # ② 有显式标记时也要认
+    assert "basicsr" in d("Collecting a\nFailed building wheel for basicsr\n")
+
+    # ③ 认不出就返回空 —— 硬猜一个包名比不猜更糟
+    assert d("some unrelated error\n") == ""
+    assert d("") == ""
+
+
+def test_deploy_syncs_local_nodes_before_reading_manifest():
+    """部署流程必须先把本机私有节点推上 Volume,再去读 manifest 生成依赖清单。
+
+    用户点「部署」的心智模型是"把我现在的状态推上去"。而依赖清单以 Volume 的 manifest
+    为准,于是「本地改了私有节点 requirements → 点部署」会用旧 manifest 构建、照样失败。
+    2026-08-31 实测:0.8.15 加了「同步本机私有节点」按钮,但用户不知道要先点它,
+    白等了一轮构建 —— 入口存在 ≠ 用户知道要用它。
+    """
+    src = (ROOT / "routes.py").read_text(encoding="utf-8")
+    i = src.index("# 3) 部署 app")
+    seg = src[i:i + 3000]
+
+    # ⚠ 锚点要用真实调用而不是裸名字:注释里也提到了 _refresh_local_node_reqs,
+    # 用裸名字会匹配到那句注释、把顺序判反(这个坑本会话踩过三次)。
+    sync_at = seg.find("await asyncio.to_thread(local_nodes.upload_local_nodes")
+    read_at = seg.find("await asyncio.to_thread(_refresh_local_node_reqs")
+    assert sync_at > 0, "部署流程里没有把本机私有节点推上 Volume"
+    assert read_at > 0, "找不到依赖清单刷新调用,测试锚点需更新"
+    assert sync_at < read_at, "同步必须在读 manifest 之前，否则读到的还是旧的"
+    assert "plan_local_uploads" in seg, "没有先比对 digest（应只推有改动的）"

@@ -5,6 +5,7 @@ routes.py — 本地 ComfyUI 服务器上的 HTTP 路由
 import asyncio
 import base64
 import functools
+import re
 import secrets
 import subprocess
 from pathlib import Path
@@ -357,6 +358,44 @@ async def _emit(resp: web.StreamResponse, text: str) -> None:
         pass
 
 
+# pip 装包失败时的形态。现代 pip 会先打 `Collecting <pkg>`,再在该包的构建段落里报错;
+# 末尾往往还有一句 `Failed building wheel for <pkg>` / `Failed to build <pkg>`。
+# 两头都认,取到就够给一句人话 —— 用户面对的原始信息是几十行 traceback,里面
+# `KeyError: '__version__'` 这种东西跟"我该改什么"看不出任何关系。
+_PIP_COLLECT_RE = re.compile(r"^\s*Collecting\s+([A-Za-z0-9._-]+)", re.M)
+_PIP_FAILED_RE = re.compile(
+    r"(?:Failed building wheel for|Failed to build|Could not build wheels for)\s+([A-Za-z0-9._-]+)")
+_PIP_FAIL_MARKS = ("subprocess-exited-with-error", "did not run successfully",
+                   "error: metadata-generation-failed", "ERROR: Failed building wheel")
+
+
+def diagnose_build_failure(text: str) -> str:
+    """从命令输出里认出常见的构建失败形态,返回一句可操作的中文提示;认不出返回空串。
+
+    纯函数,可单测。目前只认 pip 装包失败这一种 —— 它是私有节点上云最常见的坑
+    (2026-08-31 实测:basicsr 1.4.2 停更于 2022,镜像的 Python 3.13 + 新 setuptools
+    隔离构建下 setup.py 取版本号抛 KeyError)。认不出就别硬猜,原始日志已经在上面。
+    """
+    if not text:
+        return ""
+    pkg = ""
+    m = _PIP_FAILED_RE.search(text)
+    if m:
+        pkg = m.group(1)
+    elif any(k in text for k in _PIP_FAIL_MARKS):
+        # 没有显式的 "Failed building wheel for X" 时,取最后一个 Collecting 的包
+        # —— pip 是顺序处理的,报错紧跟在它后面。
+        found = _PIP_COLLECT_RE.findall(text)
+        pkg = found[-1] if found else ""
+    if not pkg:
+        return ""
+    return (f"💡 看起来是云端安装 `{pkg}` 失败。常见原因:这个包已停止维护、或不兼容"
+            f"镜像里的 Python 版本(当前 3.13),setup.py 在隔离构建下跑不起来。\n"
+            f"   处理办法:在用到它的那个私有节点的 requirements.txt 里把 `{pkg}` 去掉"
+            f"(先确认代码是否真的 import 了它)、换一个仍在维护的版本,或改用不依赖它的实现;\n"
+            f"   改完在 Setup 里点「同步本机私有节点」或直接重新部署即可。")
+
+
 # 失败时回灌到 ComfyUI 控制台的尾部行数。够看清一个 pip / 镜像构建的报错,又不至于刷屏。
 _TAIL_ON_FAIL = 40
 
@@ -401,6 +440,11 @@ async def _run_streamed(resp: web.StreamResponse, cmd: list[str], cwd: str, env:
         for line in tail:
             print(f"[modal_bridge] | {line.rstrip()}")
         print("[modal_bridge] --- 完整日志见上方进度窗 / 浏览器控制台 ---")
+        # 认得出的失败形态,给一句人话 —— 同时进前端进度窗和 ComfyUI 控制台。
+        hint = diagnose_build_failure("".join(tail))
+        if hint:
+            print(f"[modal_bridge] {hint}")
+            await _emit(resp, f"\n{hint}\n")
     return rc
 
 
@@ -1350,6 +1394,35 @@ def _setup_routes():
 
             # 3) 部署 app(首次拉镜像 3-5 分钟)
             node_sync.ensure_baked_file()  # 本地清单是 .gitignore 状态,缺则建空,免得 modal_image 打包炸
+            # 3.0) 先把**本机**的私有节点推上 Volume,再去读 manifest。
+            #
+            # 用户点「部署」的心智模型是"把我现在的状态推上去"。而依赖清单以 Volume 的
+            # manifest 为准(多机场景下这是对的),于是「本地改了某个私有节点的
+            # requirements → 点部署」会用**旧** manifest 构建、照样失败,而失败信息是
+            # 一个 Python 包的 traceback,跟"我该点哪个按钮"看不出任何关系。
+            # 2026-08-31 实测:用户就这么白等了一轮构建 —— 0.8.15 加的「同步本机私有节点」
+            # 按钮功能是对的,但**入口存在 ≠ 用户知道要用它**。所以这里不做提示、不加勾选框,
+            # 直接在部署流程里先同步一次:没变化时 plan_local_uploads 判 uptodate、零开销。
+            # 「同步」按钮保留 —— 用于"只想推节点、不想重部署"和版本互锁那两种场景。
+            try:
+                _vol_folders = await asyncio.to_thread(local_nodes.list_volume_local_nodes, cfg, 0)
+                _root = Path(node_sync._comfyui_root()) / "custom_nodes"
+                # 只推本机也有的:多机场景下别的机器传的节点,这台机器没有源码,跳过即可
+                # (它们的 manifest 已在 Volume 上,_refresh_local_node_reqs 照样读得到)。
+                _present = [f for f in _vol_folders if (_root / f).is_dir()]
+                if _present:
+                    _plan = await asyncio.to_thread(local_nodes.plan_local_uploads, cfg, _present, _root)
+                    _todo = [u["folder"] for u in _plan.get("upload", [])]
+                    if _todo:
+                        await _emit(resp, f"   本机私有节点有改动,先推上云端:{', '.join(_todo)}\n")
+                        await asyncio.to_thread(local_nodes.upload_local_nodes, cfg, _todo, _root)
+                        local_nodes.invalidate_list_cache()
+                        await _emit(resp, f"   ✓ 已同步 {len(_todo)} 个私有节点(依赖清单随之更新)\n")
+            except Exception as _e:
+                # 同步失败不中止部署:最坏是沿用 Volume 上的旧 manifest —— 与这段代码
+                # 存在之前的行为一致,而且构建失败时用户能从日志看到这里的告警。
+                await _emit(resp, f"   ⚠ 本机私有节点同步失败({_e}),将沿用云端已有的依赖清单\n")
+
             # 私有节点依赖来自 Volume 中每个包的 manifest,而不是只扫当前机器；这样多机
             # 上传的私有节点在任意一台机器重部署时都不会掉依赖。
             _local_reqs = await asyncio.to_thread(_refresh_local_node_reqs, cfg)
