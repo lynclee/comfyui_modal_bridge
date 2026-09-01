@@ -2241,32 +2241,31 @@ def test_command_failure_reaches_comfyui_log_and_frontend():
     assert "node.local_fail_detail" in js, "缺少带详情的失败文案"
 
 
-def test_local_nodes_have_a_push_entry_point():
-    """必须有一条「本机 → Volume」方向的手动同步入口,否则会形成互锁。
+def test_single_push_entry_point():
+    """「把本机状态弄到云端」必须只有一个入口,且它自己会分流。
 
-    2026-08-31 由 skybox-ai 会话报告、用户实际卡住:
-    依赖清单以 Volume 的 manifest 为唯一真相源(多机场景下这是对的),而全项目**只有**
-    ensureNodesAvailable 那一条路径会刷新它 —— 偏偏那条路径在提交前先过版本检查。
-    于是「本地改了私有节点依赖」+「插件版本也变了」同时发生时:
-        版本不一致 → 拦提交、让去 Setup 重新部署
-          → 部署从 Volume 读到的还是旧 manifest → 构建照样失败 → 版本永远升不上去
-          → 而唯一能刷新 manifest 的路径被第一步拦着
-    用户从 UI 出不去,只能靠「先移除该节点再重部署」这种绕行。
+    历史:0.8.15 为了解互锁加过一个独立的「同步本机私有节点」按钮,与「部署」并列。
+    但两者职责高度重叠(同步后依赖变了会自动部署;部署前会自动比对 digest 推节点),
+    用户却要先想明白"我这次改的是代码还是依赖"才知道点哪个 —— 而这恰恰是系统自己
+    完全能判断的事(digest 比对 + 依赖指纹比对)。2026-08-31 用户明确要求合并。
+
+    根源不是命名,是私有节点的代码和依赖走了两条路:代码进 Volume 的 zip(worker 启动
+    解压、秒级生效),依赖的**声明**进 Volume 的 manifest、**安装**却发生在镜像 build 期。
+    这个分离有它的理由(改代码不必重建镜像),但那是实现约束,不该变成用户的认知负担。
     """
     js = (ROOT / "web" / "modal_bridge.js").read_text(encoding="utf-8")
 
-    # Setup 面板里要有这个按钮，且它真的会调 sync_local_nodes
-    assert 'id="mb-nodes-resync"' in js, "Setup 面板缺少「同步本机私有节点」按钮"
-    i = js.index("nodesResyncBtn.onclick")
-    body = js[i:i + 2200]
-    assert "/modal_bridge/list_local_nodes" in body, "同步按钮没有取 Volume 上的节点列表"
-    assert "/modal_bridge/sync_local_nodes" in body, "同步按钮没有调用上传端点"
-    assert "refreshVerBanner" in body, "同步后没有刷新版本徽标(依赖变化会顺带重部署)"
+    # 只剩一个主动作，且名字说的是目的而不是手段
+    assert "mb-nodes-resync" not in js, "又出现了与主按钮并列的第二个推送入口"
+    assert "推送到云端" in js, "主按钮应叫「推送到云端」而不是「部署」"
 
-    # 版本不一致的引导文案要提醒这条死路
-    assert "同步本机私有节点" in js.split('"ver.mismatch_msg"')[1][:900], \
-        "版本不一致的引导没提「先同步私有节点」—— 依赖也变了的话那条路是死的"
-
+    # 而它真的会分流：推节点 + 按需重建（后端顺序由 test_deploy_syncs_... 钉死）
+    py = (ROOT / "routes.py").read_text(encoding="utf-8")
+    i = py.index("# 3) 部署 app")
+    seg = py[i:i + 3000]
+    assert "plan_local_uploads" in seg, "主流程没有自动比对本机 digest"
+    assert "await asyncio.to_thread(local_nodes.upload_local_nodes" in seg, \
+        "主流程没有自动推送有改动的私有节点"
 
 def test_diagnose_build_failure():
     """构建失败要能从 pip 输出里认出包名,给一句可操作的话;认不出就别硬猜。
@@ -2368,3 +2367,23 @@ def test_image_pins_setuptools_for_pkg_resources():
     """
     src = (ROOT / "modal_app" / "modal_image.py").read_text(encoding="utf-8")
     assert "setuptools<81" in src, "镜像没钉 setuptools —— 老节点会因缺 pkg_resources 整包挂掉"
+
+
+def test_no_copy_points_at_removed_ui():
+    """面向用户的文案不许指向已经不存在的按钮。
+
+    0.8.15 加过「同步本机私有节点」按钮,并在版本不一致的引导里让用户去点它;
+    0.8.19 把它合并进「推送到云端」后,那句引导就成了指向空气的指路牌 ——
+    比没有引导更糟:用户会在界面上翻找一个不存在的东西。
+    """
+    js = (ROOT / "web" / "modal_bridge.js").read_text(encoding="utf-8")
+
+    # 已删掉的按钮不许再被文案提及
+    for gone in ("同步本机私有节点", "Sync local private nodes"):
+        assert gone not in js, f"文案仍指向已移除的按钮: {gone}"
+
+    # 主按钮与状态文案口径一致（都说"推送"，不再说"部署"）
+    for key in ('"dlg.btn.deploy"', '"dep.ok"', '"dep.ok.toast"', '"dep.running"'):
+        i = js.index(key)
+        line = js[i:js.index("\n", i)]
+        assert "推送" in line, f"{key} 的中文文案没跟主按钮统一口径: {line[:80]}"

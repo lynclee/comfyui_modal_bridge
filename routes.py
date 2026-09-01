@@ -1355,6 +1355,7 @@ def _setup_routes():
 
             # 3) 部署 app(首次拉镜像 3-5 分钟)
             node_sync.ensure_baked_file()  # 本地清单是 .gitignore 状态,缺则建空,免得 modal_image 打包炸
+            await _emit(resp, "\n== 推送到云端:比对本机与云端的差异,只推有变化的部分 ==\n")
             # 3.0) 先把**本机**的私有节点推上 Volume,再去读 manifest。
             #
             # 用户点「部署」的心智模型是"把我现在的状态推上去"。而依赖清单以 Volume 的
@@ -1371,14 +1372,24 @@ def _setup_routes():
                 # 只推本机也有的:多机场景下别的机器传的节点,这台机器没有源码,跳过即可
                 # (它们的 manifest 已在 Volume 上,_refresh_local_node_reqs 照样读得到)。
                 _present = [f for f in _vol_folders if (_root / f).is_dir()]
-                if _present:
+                if not _vol_folders:
+                    await _emit(resp, "   私有节点:云端没有,跳过\n")
+                elif not _present:
+                    await _emit(resp, f"   私有节点:云端有 {len(_vol_folders)} 个,但本机都没有对应目录"
+                                      f"(多机场景,由拥有源码的那台推送)\n")
+                else:
                     _plan = await asyncio.to_thread(local_nodes.plan_local_uploads, cfg, _present, _root)
                     _todo = [u["folder"] for u in _plan.get("upload", [])]
                     if _todo:
-                        await _emit(resp, f"   本机私有节点有改动,先推上云端:{', '.join(_todo)}\n")
+                        await _emit(resp, f"   私有节点:{len(_todo)}/{len(_present)} 个有改动,正在推送 —— "
+                                          f"{', '.join(_todo)}\n")
                         await asyncio.to_thread(local_nodes.upload_local_nodes, cfg, _todo, _root)
                         local_nodes.invalidate_list_cache()
-                        await _emit(resp, f"   ✓ 已同步 {len(_todo)} 个私有节点(依赖清单随之更新)\n")
+                        await _emit(resp, f"   ✓ 已推送 {len(_todo)} 个(代码走 Volume 秒级生效;"
+                                          f"若其 requirements 也变了,下面会重建依赖层)\n")
+                    else:
+                        # 没改动也要出声 —— 静默会让用户以为"这一步没跑",转头又去找别的按钮
+                        await _emit(resp, f"   私有节点:{len(_present)} 个,与云端一致,无需推送\n")
             except Exception as _e:
                 # 同步失败不中止部署:最坏是沿用 Volume 上的旧 manifest —— 与这段代码
                 # 存在之前的行为一致,而且构建失败时用户能从日志看到这里的告警。

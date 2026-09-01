@@ -81,7 +81,10 @@ const I18N = {
                         en: "This workflow uses ComfyUI API nodes (Kling/Luma/OpenAI, etc.). Running them in the cloud needs a comfy.org API key, which isn't configured.\n\nThose API nodes will fail (401) if you run now.\n\nAdd your comfy.org API key in Setup first." },
   "api.warn.run":     { zh: "仍要跑", en: "Run anyway" },
   "api.warn.setup":   { zh: "去 Setup 配置", en: "Configure in Setup" },
-  "dlg.btn.deploy":   { zh: "部署", en: "Deploy" },
+  // 「推送到云端」而不是「部署」:用户面对的是"把我这边的状态弄到云端去"这一件事,
+  // 至于其中哪些是重建镜像、哪些只是传个 zip,是我们的实现约束,不该外露成他要先想清楚
+  // 的问题。0.8.17 之后这个按钮本来就会自动先推私有节点、再按需重建,名实相符。
+  "dlg.btn.deploy":   { zh: "推送到云端", en: "Push to cloud" },
   "dlg.btn.test":     { zh: "测试连接", en: "Test connection" },
   "dlg.btn.close":    { zh: "关闭", en: "Close" },
   "dlg.nodes.title":  { zh: "管理云端节点", en: "Manage cloud nodes" },
@@ -101,11 +104,11 @@ const I18N = {
   "dep.fill_saved":   { zh: "请填对 workspace + ak- token(secret 可留空沿用)",
                         en: "Fill workspace + ak- token (secret may be left blank)" },
   "dep.fill_all":     { zh: "请填对 workspace + ak-/as- token", en: "Fill workspace + ak-/as- token" },
-  "dep.running":      { zh: "部署中(首次拉镜像约 3-5 分钟,别关窗口)...",
+  "dep.running":      { zh: "推送中…(需要重建镜像时约 3-5 分钟,别关窗口)",
                         en: "Deploying (first image pull ~3-5 min, keep window open)..." },
-  "dep.ok":           { zh: "✓ 部署成功!可以关掉这个窗口去出资产了",
+  "dep.ok":           { zh: "✓ 已推送到云端!可以关掉这个窗口去出资产了",
                         en: "✓ Deployed! Close this window and start generating." },
-  "dep.ok.toast":     { zh: "✓ Modal 部署成功", en: "✓ Modal deployed" },
+  "dep.ok.toast":     { zh: "✓ 已推送到云端", en: "✓ Pushed to cloud" },
   "dep.fail":         { zh: "✗ 部署失败(rc={rc})—— 云端保持原样,本次改动未生效。上方版本徽标已刷新为云端真实版本;失败原因见日志(常见是某个私有节点的依赖在云端装不上)。",
                         en: "✗ Deploy failed (rc={rc}) — the cloud is unchanged; this attempt did not take effect. The version badge above now shows the real deployed version. See the log for the cause (commonly a private node's dependency failing to install)." },
   "dep.fail.toast":   { zh: "Modal 部署失败 rc={rc}", en: "Modal deploy failed rc={rc}" },
@@ -184,8 +187,8 @@ const I18N = {
                         en: "Plugin {local} differs from deployed {deployed}; redeploy needed." },
   "ver.unreach_msg":  { zh: "连不上云端,但 Modal 官方状态页显示平台正常。\n\n可能是本机网络较慢,或云端 app 没部署过 / 已被删。\n\n点「确定」打开部署窗口;只是网络抖动的话,直接关掉重试即可。",
                         en: "Can't reach the cloud, but Modal's status page reports the platform is healthy.\n\nLikely a slow local network, or the app was never deployed / was deleted.\n\nOK to open the deploy dialog; if it was just a network blip, close this and retry." },
-  "ver.mismatch_msg": { zh: "⚠ 版本不一致:\n  插件(本地):{local}\n  云端部署:{deployed}\n\n你升级了插件但还没重新部署,云端跑的是旧代码,会出问题。\n\n点「确定」打开部署窗口重新部署。\n\n💡 如果你**同时**改过私有节点的 requirements,先在部署窗口底部点「同步本机私有节点」—— 云端依赖清单以 Volume 上的为准,不先推上去的话这次部署仍会用旧依赖构建、照样失败。",
-                        en: "⚠ Version mismatch:\n  Plugin (local): {local}\n  Deployed: {deployed}\n\nYou upgraded the plugin but haven't redeployed; the cloud runs old code.\n\nOK to open the deploy dialog.\n\n💡 If you ALSO changed a private node's requirements, first click \"Sync local private nodes\" at the bottom of the deploy dialog — the cloud builds from the manifest on the Volume, so without pushing it first this redeploy would still use the stale dependencies and fail the same way." },
+  "ver.mismatch_msg": { zh: "⚠ 版本不一致:\n  插件(本地):{local}\n  云端部署:{deployed}\n\n你升级了插件但还没把新版本推上去,云端跑的是旧代码,会出问题。\n\n点「确定」打开推送窗口。\n\n(「推送到云端」会自动比对差异:有改动的私有节点先推上去,依赖变了才重建镜像 —— 不必自己判断这次改的是代码还是依赖。)",
+                        en: "⚠ Version mismatch:\n  Plugin (local): {local}\n  Deployed: {deployed}\n\nYou upgraded the plugin but haven't pushed it yet; the cloud runs old code.\n\nOK to open the push dialog.\n\n(\"Push to cloud\" diffs your machine against the cloud automatically: changed private nodes are pushed first, and the image is rebuilt only if their dependencies changed.)" },
   "export.done":      { zh: "已导出 {name}_modal.py —— 给别人:让他装 requests、填 KEY、python 跑即可(模型/节点需已同步过)。",
                         en: "Exported {name}_modal.py — share it: recipient installs requests, fills KEY, runs python (models/nodes must be already synced)." },
   "export.fail":      { zh: "导出失败:取当前工作流出错", en: "Export failed: couldn't read the current workflow" },
@@ -219,12 +222,6 @@ const I18N = {
                         en: "✗ Failed to remove these local packs (they will load again on next cold start): {list}" },
   "mn.load_fail":     { zh: "✗ 加载失败:{e}", en: "✗ Load failed: {e}" },
   "mn.none_checked":  { zh: "没勾选任何节点", en: "Nothing selected" },
-  "mn.resync":        { zh: "同步本机私有节点", en: "Sync local private nodes" },
-  "mn.resync_none":   { zh: "云端没有私有节点包,无需同步", en: "No private node packages in the cloud — nothing to sync." },
-  "mn.resync_running":{ zh: "正在把 {n} 个私有节点推上云端…(依赖变了会自动重建镜像,可能要几分钟)",
-                        en: "Pushing {n} private node(s) to the cloud… (a dependency change triggers an image rebuild; may take minutes)" },
-  "mn.resync_ok":     { zh: "✓ 已同步 —— 依赖有变化的话镜像也重建了", en: "✓ Synced — the image was rebuilt too if dependencies changed" },
-  "mn.resync_fail":   { zh: "✗ 同步失败,看上面的日志", en: "✗ Sync failed — see the log above" },
   "mn.confirm":       { zh: "确定从云端镜像移除这 {n} 个节点并重部署?\n\n{list}\n\n⚠ 别的电脑若用到这些节点会失败,需要时重新加。",
                         en: "Remove these {n} nodes from the cloud image & redeploy?\n\n{list}\n\n⚠ Other machines using them will fail and need re-add." },
   "mn.removed":       { zh: "✓ 已移除 {n} 个,镜像现 {keep} 个", en: "✓ Removed {n}, image now has {keep}" },
@@ -2022,10 +2019,7 @@ async function openDeployDialog() {
     <div style="margin-top:20px;border-top:1px solid #333;padding-top:14px;">
       <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;">
         <span style="font-weight:600;">${t("dlg.nodes.title")}</span>
-        <span style="display:flex;gap:8px;">
-          <button id="mb-nodes-resync" style="${btnGhostCss}padding:5px 12px;font-size:12px;">${t("mn.resync")}</button>
-          <button id="mb-nodes-load" style="${btnGhostCss}padding:5px 12px;font-size:12px;">${t("dlg.nodes.load")}</button>
-        </span>
+        <button id="mb-nodes-load" style="${btnGhostCss}padding:5px 12px;font-size:12px;">${t("dlg.nodes.load")}</button>
       </div>
       <div style="${noteCss}margin:6px 0 0;">${t("dlg.nodes.warn")}</div>
       <div id="mb-nodes-list" style="margin-top:8px;max-height:200px;overflow:auto;"></div>
@@ -2095,56 +2089,6 @@ async function openDeployDialog() {
   const nodesStatusEl = panel.querySelector("#mb-nodes-status");
   const nodesLogEl = panel.querySelector("#mb-nodes-log");
   let loadedNodes = [];  // [{name,url,commit}]
-
-  // 「同步本机私有节点」——把本机的私有节点代码 + 依赖 manifest 重新推上 Volume。
-  //
-  // ⚠ 为什么必须有这个入口(2026-08-31 由 skybox-ai 会话报告的互锁):
-  //   依赖清单以 Volume 的 manifest 为唯一真相源(多机场景下这是对的),而全项目**只有**
-  //   ensureNodesAvailable 那一条路径会刷新它 —— 偏偏那条路径在提交前先过版本检查。
-  //   于是「本地改了私有节点依赖」+「插件版本也变了」同时发生时会互锁:
-  //     版本不一致 → 拦提交、让你去 Setup 重新部署
-  //       → 部署从 Volume 读到的还是**旧** manifest → 构建照样失败 → 版本永远升不上去
-  //       → 而唯一能刷新 manifest 的路径被第一步拦着
-  //   这个按钮从「本机 → Volume」方向单独走一趟,同时解开两端:manifest 刷新了,
-  //   后端发现依赖指纹变化会自动重建镜像,deployed_version 也跟着升上去。
-  const nodesResyncBtn = panel.querySelector("#mb-nodes-resync");
-  nodesResyncBtn.onclick = async () => {
-    nodesResyncBtn.disabled = true;
-    nodesLoadBtn.disabled = true;
-    nodesLogEl.style.display = "block";
-    nodesLogEl.textContent = "";
-    nodesStatusEl.style.color = "#9aa";
-    try {
-      const lr = await bridgeFetch("/modal_bridge/list_local_nodes");
-      const folders = (await lr.json()).nodes || [];
-      if (!folders.length) {
-        nodesStatusEl.textContent = t("mn.resync_none");
-        return;
-      }
-      nodesStatusEl.textContent = t("mn.resync_running", { n: folders.length });
-      const rc = await streamPost("/modal_bridge/sync_local_nodes", { folders }, (line) => {
-        if (/^__LOCAL_DIGESTS__ /.test(line)) return;   // 版本契约行，不给人看
-        nodesLogEl.textContent += line;
-        nodesLogEl.scrollTop = nodesLogEl.scrollHeight;
-      });
-      if (rc === 0) {
-        nodesStatusEl.style.color = "#34d399";
-        nodesStatusEl.textContent = t("mn.resync_ok");
-        refreshVerBanner(panel);   // 依赖变了会顺带重部署，版本徽标要跟着刷新
-      } else {
-        nodesStatusEl.style.color = "#ef4444";
-        nodesStatusEl.textContent = t("mn.resync_fail");
-      }
-    } catch (e) {
-      nodesStatusEl.style.color = "#ef4444";
-      nodesStatusEl.textContent = t("mn.resync_fail");
-      nodesLogEl.textContent += `\n${e}\n`;
-      err("resync local nodes failed", e);
-    } finally {
-      nodesResyncBtn.disabled = false;
-      nodesLoadBtn.disabled = false;
-    }
-  };
 
   nodesLoadBtn.onclick = async () => {
     nodesLoadBtn.disabled = true;
