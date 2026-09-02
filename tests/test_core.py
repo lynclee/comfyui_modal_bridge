@@ -24,6 +24,38 @@ import config  # noqa: E402
 import workflow_check  # noqa: E402
 
 
+def code_only(text: str) -> str:
+    """把 Python 注释挖成空格,**保持字符偏移不变**。
+
+    为什么需要:源码字符串断言里,如果同一个串在注释里也出现过,**删掉真代码测试照样绿**
+    —— 注释兜住了它。2026-09-02 实测:把真代码里的串改名、注释原样保留,本文件有 4 条
+    测试仍然全绿(cpu_tier_when_no_model / plan_local_uploads ×2 / setuptools<81)。
+    静态扫描发现不了这类:真代码在的时候,串在代码里也在注释里,两边都成立。
+
+    偏移不变是刻意的 —— 于是可以**用原文 index 出来的位置去切挖空后的文本**:
+    定位仍可用注释当锚点(改注释会响,是 fail-loud),断言只看真代码。
+    """
+    import io
+    import tokenize
+
+    off, acc = [], 0
+    for line in text.splitlines(True):
+        off.append(acc)
+        acc += len(line)
+    buf = list(text)
+    try:
+        for tok in tokenize.generate_tokens(io.StringIO(text).readline):
+            if tok.type == tokenize.COMMENT:
+                a = off[tok.start[0] - 1] + tok.start[1]
+                b = off[tok.end[0] - 1] + tok.end[1]
+                for i in range(a, min(b, len(buf))):
+                    if buf[i] != "\n":
+                        buf[i] = " "
+    except Exception:
+        return text          # 剥不动就退回原文(宁可弱一点,不要假失败)
+    return "".join(buf)
+
+
 # ============================================================================
 # node_sync.plan_node_sync — 双向同步(加/改/删)规划
 # ============================================================================
@@ -2319,7 +2351,9 @@ def test_explicit_tier_never_routed_to_cpu():
     节点内部下载权重、无模型文件的 CUDA/Triton 图像处理与 3D/光流节点、模型参数不是
     文件名字符串的节点,都扫不到却真要 GPU。给错 CPU = 跑不动耗到超时、白烧钱零产出。
     """
-    src = (ROOT / "routes.py").read_text(encoding="utf-8")
+    # 断言全部只看真代码:注释里也讲了 cpu_tier_when_no_model,不挖空的话
+    # 把判据从代码里删掉、只留注释,这条测试照样绿(2026-09-02 变异实测)。
+    src = code_only((ROOT / "routes.py").read_text(encoding="utf-8"))
     i = src.index("needs_gpu = (")
     expr = src[i:src.index(")", src.index("cpu_tier_when_no_model", i))]
 
@@ -2507,8 +2541,8 @@ def test_single_push_entry_point():
 
     # 而它真的会分流：推节点 + 按需重建（后端顺序由 test_deploy_syncs_... 钉死）
     py = (ROOT / "routes.py").read_text(encoding="utf-8")
-    i = py.index("# 3) 部署 app")
-    seg = py[i:i + 3000]
+    i = py.index("# 3) 部署 app")          # 锚点用原文(注释;改了会响,fail-loud)
+    seg = code_only(py)[i:i + 3000]        # 断言用挖空版(偏移相同)
     assert "plan_local_uploads" in seg, "主流程没有自动比对本机 digest"
     assert "await asyncio.to_thread(local_nodes.upload_local_nodes" in seg, \
         "主流程没有自动推送有改动的私有节点"
@@ -2556,9 +2590,9 @@ def test_deploy_syncs_local_nodes_before_reading_manifest():
     白等了一轮构建 —— 入口存在 ≠ 用户知道要用它。
     """
     src = (ROOT / "routes.py").read_text(encoding="utf-8")
-    i = src.index("# 3) 部署 app")
+    i = src.index("# 3) 部署 app")          # 锚点用原文(注释)
     # 窗口要够大：这一段随着 fail-closed 分支的加入长了不少，切太短会把锚点切掉
-    seg = src[i:i + 6000]
+    seg = code_only(src)[i:i + 6000]       # 断言用挖空版(偏移相同)
 
     # ⚠ 锚点要用真实调用而不是裸名字:注释里也提到了 _refresh_local_node_reqs,
     # 用裸名字会匹配到那句注释、把顺序判反(这个坑本会话踩过三次)。
@@ -2611,9 +2645,37 @@ def test_image_pins_setuptools_for_pkg_resources():
     —— 和 basicsr 那次同构:本地"缺了也能跑",上云是全有或全无。
 
     不怕拖累构建:pip 默认开 build isolation,构建别的包用的是隔离环境里的新 setuptools。
+
+    ⚠ 这条原来写的是 `assert "setuptools<81" in src`,**是恒真的**(2026-09-02 变异实测):
+      · 把整行钉法删掉 → 仍然绿,因为同文件的注释里也有 "setuptools<81";
+      · 把它改成坏钉法 `setuptools<811`(放行 84+,正是本条要防的)→ 也仍然绿,
+        因为原串是它的前缀。
+      字符串包含关系既证明不了"存在于代码",也证明不了"值是对的"。
+      现在改成从 ast 里取 pip_install 的真实参数、并解析版本上界。
     """
-    src = (ROOT / "modal_app" / "modal_image.py").read_text(encoding="utf-8")
-    assert "setuptools<81" in src, "镜像没钉 setuptools —— 老节点会因缺 pkg_resources 整包挂掉"
+    import ast
+    import re
+
+    tree = ast.parse((ROOT / "modal_app" / "modal_image.py").read_text(encoding="utf-8"))
+    args = [
+        a.value
+        for n in ast.walk(tree)
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+        and n.func.attr == "pip_install"
+        for a in n.args
+        if isinstance(a, ast.Constant) and isinstance(a.value, str)
+    ]
+    pins = [a for a in args if a.replace(" ", "").lower().startswith("setuptools")]
+    assert pins, "镜像的 pip_install 里根本没有 setuptools —— 老节点会因缺 pkg_resources 整包挂掉"
+
+    bounds = []
+    for pin in pins:
+        m = re.search(r"setuptools\s*<\s*(\d+)", pin.replace(" ", ""))
+        assert m, f"setuptools 依赖写成了 {pin!r},没有上界 —— 会装到移除了 pkg_resources 的版本"
+        bounds.append(int(m.group(1)))
+    assert max(bounds) <= 81, (
+        f"setuptools 上界是 {max(bounds)},但 84.0.0 起 pkg_resources 已被整个移除"
+        f"(实测 80.9.0 的 wheel 里 19 个文件、84.0.0 里 0 个)—— 上界必须 ≤ 81")
 
 
 def test_image_python_version_is_consistent_everywhere():
