@@ -2226,7 +2226,7 @@ def test_command_failure_reaches_comfyui_log_and_frontend():
 
     2026-08-31 实测报告:用户点 RunModal 后只看到「本地节点上传失败」,而
     **宿主机 ComfyUI 日志里一行痕迹都没有** —— 必须自己去 `modal app logs` 才看得到
-    真错误(basicsr 在 Python 3.13 下 setup.py 取版本号失败)。
+    真错误(当时是 basicsr 在 Python 3.13 下 setup.py 取版本号失败)。
 
     两处缺口:
       1. _run_streamed 的输出只写进 HTTP 流,没有 print 到 ComfyUI 控制台;
@@ -2379,6 +2379,38 @@ def test_image_pins_setuptools_for_pkg_resources():
     """
     src = (ROOT / "modal_app" / "modal_image.py").read_text(encoding="utf-8")
     assert "setuptools<81" in src, "镜像没钉 setuptools —— 老节点会因缺 pkg_resources 整包挂掉"
+
+
+def test_image_python_version_is_consistent_everywhere():
+    """镜像的 Python 版本在三处出现,任何一处走散都是**部署直接失败**或**诊断说瞎话**。
+
+      ① modal_image.py 的 add_python=      —— 镜像装哪个解释器
+      ② 同文件里 SageAttention wheel 的 ABI tag(cpXY)—— 那个 wheel 带 C 扩展,
+         ABI 锁死在某个 CPython;和 ① 对不上时 pip 判 not supported、镜像构建失败。
+         这是**成对的**,历史上正是它把 3.13→3.12 卡住了(得先重编一份 cp312 wheel)。
+      ③ node_sync.IMAGE_PYTHON_VERSION —— 构建失败时那句"当前 X.Y"提示。写死版本号
+         而不是 import modal_image,是因为后者 `import modal`,而宿主机不保证装了 modal。
+
+    ①② 走散会在部署时炸(响);③ 走散只会让提示悄悄说错版本(不响)—— 后者更该测。
+    """
+    import re
+
+    src = (ROOT / "modal_app" / "modal_image.py").read_text(encoding="utf-8")
+
+    m = re.search(r'add_python="(\d+\.\d+)"', src)
+    assert m, "modal_image.py 里找不到 add_python="
+    pyver = m.group(1)
+
+    abis = set(re.findall(r"sageattention-[\d.]+-(cp\d+)-cp\d+-", src))
+    assert len(abis) == 1, f"wheel 的 ABI tag 不唯一: {abis}"
+    want_abi = "cp" + pyver.replace(".", "")
+    assert abis == {want_abi}, (
+        f"add_python={pyver} 但 sage wheel 是 {abis.pop()} —— pip 会判 not supported,"
+        f"镜像构建直接失败。换 Python 版本必须连着换 wheel(两个 ABI 都挂在同一个 Release 下)")
+
+    assert node_sync.IMAGE_PYTHON_VERSION == pyver, (
+        f"node_sync.IMAGE_PYTHON_VERSION={node_sync.IMAGE_PYTHON_VERSION} "
+        f"与镜像实际的 {pyver} 不一致 —— 构建失败提示会报错版本号,把人往错方向带")
 
 
 def test_no_copy_points_at_removed_ui():

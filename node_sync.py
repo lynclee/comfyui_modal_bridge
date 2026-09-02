@@ -649,6 +649,12 @@ def modal_available() -> bool:
         return False
 
 
+# 镜像解释器版本。**这是 modal_app/modal_image.py 里 add_python= 的副本** ——
+# 不 import 那个模块是因为它 `import modal`,而宿主机不保证装了 modal
+# (整个 _ensure_modal 流程就是为此存在)。两处走散会让诊断说瞎话,
+# test_core 有一条测试盯着它们一致。
+IMAGE_PYTHON_VERSION = "3.12"
+
 # pip 装包失败时的形态。现代 pip 会先打 `Collecting <pkg>`,再在该包的构建段落里报错;
 # 末尾往往还有一句 `Failed building wheel for <pkg>` / `Failed to build <pkg>`。
 # 两头都认,取到就够给一句人话 —— 用户面对的原始信息是几十行 traceback,里面
@@ -664,8 +670,10 @@ def diagnose_build_failure(text: str) -> str:
     """从命令输出里认出常见的构建失败形态,返回一句可操作的中文提示;认不出返回空串。
 
     纯函数,可单测。目前只认 pip 装包失败这一种 —— 它是私有节点上云最常见的坑
-    (2026-08-31 实测:basicsr 1.4.2 停更于 2022,镜像的 Python 3.13 + 新 setuptools
-    隔离构建下 setup.py 取版本号抛 KeyError)。认不出就别硬猜,原始日志已经在上面。
+    (2026-08-31 实测:basicsr 1.4.2 停更于 2022,当时镜像是 Python 3.13,
+    隔离构建下 setup.py 取版本号抛 KeyError;2026-09-02 镜像已降到 3.12,
+    这一类构建失败随之消失,但别的包仍可能因别的原因装不上)。
+    认不出就别硬猜,原始日志已经在上面。
     """
     if not text:
         return ""
@@ -681,7 +689,7 @@ def diagnose_build_failure(text: str) -> str:
     if not pkg:
         return ""
     return (f"💡 看起来是云端安装 `{pkg}` 失败。常见原因:这个包已停止维护、或不兼容"
-            f"镜像里的 Python 版本(当前 3.13),setup.py 在隔离构建下跑不起来。\n"
+            f"镜像里的 Python 版本(当前 {IMAGE_PYTHON_VERSION}),setup.py 在隔离构建下跑不起来。\n"
             f"   处理办法:在用到它的那个私有节点的 requirements.txt 里把 `{pkg}` 去掉"
             f"(先确认代码是否真的 import 了它)、换一个仍在维护的版本,或改用不依赖它的实现;\n"
             f"   改完在 Setup 里点「推送到云端」即可 —— 它会自动比对差异,"

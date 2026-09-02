@@ -100,7 +100,7 @@ _INSTALL_REQS_CMD = " && ".join(
 cuda_image = (
     modal.Image.from_registry(
         "nvidia/cuda:13.0.0-cudnn-runtime-ubuntu24.04",
-        # ⚠ 3.12 而不是 3.13,而且这不是"求稳"那么简单 —— **3.13 会让一整类老包装不上**。
+        # ⚠ 钉 3.12 而不是更新的 3.13,不是"求稳" —— **3.13 会让一整类老包装不上**。
         # Python 3.13 实装了 PEP 667(Consistent views of namespaces):函数作用域的
         # locals() 改为返回**独立快照**,exec() 往里写的东西在后续 locals() 里看不到。
         # 而"用 exec() 执行 version.py、再从 locals() 取 __version__"是 2020 年前
@@ -108,22 +108,33 @@ cuda_image = (
         #     def get_version():
         #         with open(version_file) as f: exec(compile(f.read(), version_file, 'exec'))
         #         return locals()['__version__']          # 3.13 上 KeyError
-        # 于是 basicsr 之类的包在云端直接构建失败,而本地(3.12)装得好好的。
-        # 实测:容器 py3.11 跑同样写法返回 1.4.2,云端 py3.13 抛 KeyError '__version__'。
+        #
+        # 2026-09-02 Modal 上 3.12/3.13 同条命令对照实测:
+        #     3.13.3  → pip install basicsr==1.4.2 失败,栈底 KeyError: '__version__'
+        #     3.12.10 → 成功建出 wheel
+        # 受影响的远不止 basicsr:facexlib / gfpgan / realesrgan 的 setup.py 是**逐字节
+        # 相同**的模板(都在第 69-72 行),而这几个正是人脸修复 / 放大类节点的标配依赖。
         #
         # ⚠ 钉 setuptools<81 救不了这条:失败发生在 pip 的隔离构建环境
         # (/tmp/pip-build-env-*/overlay),那里用的是临时装的最新 setuptools,
         # 镜像里这份够不着 —— 与"钉版本不拖累构建"是同一枚硬币的两面。
         #
+        # ⚠ 修掉的是**构建期**这一类,不等于"老包全好了"。basicsr 另有一个独立的坑:
+        # basicsr/data/degradations.py 从 torchvision.transforms.functional_tensor 取
+        # rgb_to_grayscale,而 torchvision 0.17 删了这个模块 → 3.12 上装得上、import
+        # 时才抛 ModuleNotFoundError(实测 torchvision 0.29 确无该模块)。净效果仍是
+        # 改善:此前整个镜像构建就挂、根本部署不了;现在只有那一个包 import 失败,
+        # 且 import_failure_hint() 会把真实 ImportError 原样报给用户。facexlib 不碰
+        # functional_tensor,3.12 下干净;gfpgan / realesrgan 依赖 basicsr,会跟着中招。
+        #
         # 用户的诉求是"本地能跑,推上云端就能跑",而本地是历史累积的环境、云端是从零按
         # requirements.txt 全新安装,差异天然存在;对齐 Python 版本能消掉其中最大的一块。
         # 后续可考虑像 MODAL_BRIDGE_COMFYUI_TAG 那样**跟随本机**版本,而不是写死。
-        # ⚠⚠ **暂时仍是 3.13,因为改不动**:本仓库自托管的 SageAttention wheel 是
-        #     sageattention-2.2.0-**cp313**-cp313-linux_x86_64.whl —— 带 C 扩展,ABI 锁死
-        #     在 CPython 3.13,pip 在 3.12 上会判定 not supported,直接让镜像构建失败。
-        #     要改 3.12 必须先重编一份 cp312 的 wheel(配方与构建脚本挂在该 Release 下,
-        #     参考成本 $0.09),否则这一行改了等于部署不了。
-        add_python="3.13",
+        #
+        # ⚠⚠ **改这一行必须同时换下面 SageAttention wheel 的 ABI tag**(cp313 ↔ cp312):
+        #     那个 wheel 带 C 扩展,ABI 锁死在某个 CPython,错版本 pip 直接判 not supported、
+        #     镜像构建失败。两者是成对的,test_core 里有一条测试盯着不让它们走散。
+        add_python="3.12",
     )
     .apt_install("git", "wget", "libgl1", "libglib2.0-0", "libsm6", "libxext6", "libxrender1", "ffmpeg")
     .run_commands(
@@ -152,6 +163,8 @@ cuda_image = (
     #   - 全网没有可用的 Linux 二进制(2026-08-06 复查):官方 thu-ml Releases 零资产、PyPI 只到
     #     1.0.6(纯 Triton)、woct0rdho 全 win_amd64;有 Linux wheel 的社区仓全是 cp312/torch≤2.12,
     #     唯一 cp313+cu13 的(snw35)从坏的 v2.2.0 tag 编 —— 只能自己发。
+    #     同一份源码 / 同一套补丁,cp312 与 cp313 两个 ABI 的 wheel 都挂在那个 Release 下,
+    #     换 add_python 时连着换 URL 即可(cp313 那份留作回滚)。
     #   - ⚠ 不能用上游 v2.2.0 tag:它带 PR #218 引入的 sm90 wrapper bug(custom op 写 output
     #     没声明 mutates_args → torch 当纯函数把写入丢弃 → kernel "成功"返回垃圾,H100 上
     #     输出全花且无异常无回退)。上游 issue #288/#320,2025-12-22 起 main 已修,
@@ -165,7 +178,7 @@ cuda_image = (
     #     compute_cap 门控(见 modal_app.py)。
     .pip_install(
         "sageattention @ https://github.com/lynclee/comfyui_modal_bridge/releases/download/"
-        "sage-2.2.0-d1a57a5-multiarch/sageattention-2.2.0-cp313-cp313-linux_x86_64.whl"
+        "sage-2.2.0-d1a57a5-multiarch/sageattention-2.2.0-cp312-cp312-linux_x86_64.whl"
     )
     .run_commands("cd /comfyui && pip install -r requirements.txt")
     .run_commands(_CLONE_CMD)
