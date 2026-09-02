@@ -1679,15 +1679,18 @@ if __name__ == "__main__":
 def test_modal_image_has_sage_patches():
     """镜像必须带 SageAttention 的两个上游缺陷补丁,且校验是 fail-closed 的。
 
-    ① int32 行偏移溢出:H3 的 fused QKV(seq-stride=21504)下行号 > 2^31/21504 ≈ 99865
-       即 wrap 成负 → 尾几帧塌灰噪 / 偶发 illegal memory access。
-    ② V strided 进 CUDA 扩展:core.py 只在 kv_len%128!=0 时 cat(顺带变 contiguous),
-       整除时 V 以 strided 视图直进 per_channel_fp8 → 越界 crash。
+    ① int32 行偏移溢出(**已致尾帧塌坏**):H3 的 fused QKV(seq-stride=21504)下
+       行号 ≥ 2^31/21504 ≈ 99865 即 wrap 成负 → 尾几帧塌灰噪 / 偶发 illegal memory access。
+    ② V 走 strided 视图时 kernel 地址算术在 uint32 域回绕(**当前打不着,前瞻防护**):
+       TransposePadPermuteKernel 的 stride 与 thread_base_token 全是 uint32_t,
+       回绕点 = 2^32/stride_seq = 199,729;还要 kv_len % 128 == 0(否则 core.py:976
+       的 cat 把 V 物化成连续、stride 降到 128)。详见 modal_image.py 的长注释。
 
     两个上游都未修。这层删了不会有任何报错,只会在特定配置下静默出坏帧或崩掉,
     所以这里静态钉死它还在、且保留了全部校验闸。
     """
     import ast
+    import re
 
     src = (ROOT / "modal_app" / "modal_image.py").read_text(encoding="utf-8")
     cmds = [
@@ -1707,13 +1710,27 @@ def test_modal_image_has_sage_patches():
     # ① int64
     assert "sed -i -E" in cmd and "offs_n" in cmd and "stride_" in cmd
     assert '" = 0' in cmd, "缺少『脆弱写法清零』断言"
-    assert "-ge 4" in cmd, "缺少『int64 转换够数』断言"
+
+    # 必须打**整个 triton/ 目录**,不能退回单文件。同一条正则在 quant_per_block.py 与
+    # quant_per_block_varlen.py 也逐字命中,而那两个文件一处 int64 都没有。它们只在
+    # sm86 走到,当前被 _worker_boot 的 compute_cap {8.9, 9.0} 门控挡住 —— 但那是
+    # 两个独立决定之间的隐式耦合:白名单一放宽到 8.6(A10G)就无声打开同一个 bug。
+    assert '"$T"/*.py' in cmd, "① 必须对整个 triton/ 目录打补丁,退回单文件会漏 quant_per_block*"
+    assert "'triton'" in cmd, "取的应该是 triton 目录,不是某个具体文件"
+
+    m = re.search(r"-ge (\d+)", cmd)
+    assert m, "缺少『int64 转换够数』断言"
+    assert int(m.group(1)) >= 16, (
+        f"int64 下限只有 {m.group(1)},但全目录实际应命中 16 处"
+        "(quant_per_thread 12 + quant_per_block 2 + quant_per_block_varlen 2)——"
+        "下限设低了,漏打文件也能过闸")
     # ② v.contiguous()
     assert "v = v.contiguous()" in cmd, "缺少 V strided 补丁"
     assert "transpose_pad_permute_cuda" in cmd, "V 补丁锚点丢失"
     assert "grep -q 'v = v.contiguous()'" in cmd, "V 补丁缺少幂等判断"
-    # ③ 两文件语法校验
+    # ③ 语法校验(目录级)
     assert "ast.parse" in cmd, "缺少补丁后语法校验"
+    assert "glob.glob" in cmd, "语法校验必须覆盖整个目录,不能只查单个文件"
 
 
 def test_no_api_key_in_query_string():

@@ -260,6 +260,26 @@ cuda_image = (
     #    而 sageattn_qk_int8_pv_fp8_cuda_sm90 的 qk_quant_gran 默认就是 "per_thread"、
     #    core.py 的 dispatch 也没覆盖它 —— H100 必然走到这条含 bug 的路径。
     #
+    #    ⚠ **为什么打整个 triton/ 目录而不只 quant_per_thread.py**(2026-09-02 补):
+    #    同一条正则在 quant_per_block.py:35-36 与 quant_per_block_varlen.py 也逐字命中,
+    #    而那两个文件一处 int64 都没有。按 core.py 的架构分派,它们只在 sm86 走到
+    #    (sm86 → sageattn_qk_int8_pv_fp16_triton → per_block_int8_triton),而
+    #    _worker_boot 把 sage 门控在 compute_cap {8.9, 9.0},当前够不到 ——
+    #    **但那是两个独立决定之间的隐式耦合**:谁把白名单放宽到 8.6(A10G 就是),
+    #    就无声打开同一个 bug,而这正是尾帧塌坏的那个 bug。
+    #    改成全目录后耦合消失:门控怎么调都不会漏。命中 16 处(12+2+2),
+    #    残留断言与 ast 校验也都改成目录级。
+    #
+    #    ⚠ **为什么 sed 只认 stride_in / stride_on,不认 stride_vn**(别"顺手改宽"):
+    #    attn_qk_int8_*.py 里还有 4 处 `offs_n[:, None] * stride_vn` 长得一模一样,
+    #    但那里 `offs_n = tl.arange(0, BLOCK_N)`(BLOCK_N=64)—— **最大 63,溢不出**;
+    #    跨序列的那部分靠 `V_ptrs += BLOCK_N * stride_vn` 在指针上累加,而上游已把
+    #    off_z / off_h 转成 int64(attn_qk_int8_per_block.py:91-92),基址是 int64。
+    #    真正有洞的是量化 kernel:那里 `offs_n = off_blk * BLK + ...`、off_blk 是
+    #    program_id(0),**跨整个序列**。stride_(in|on) 这个限定恰好精确选中它们。
+    #    第一版把残留断言写成宽松的 `stride_` 任意后缀,于是把这 4 处安全代码算成残留
+    #    → 镜像构建失败(fail-closed 生效)。断言的范围必须和 sed 的范围一致。
+    #
     # ② V 走 strided 视图时 kernel 地址算术在 uint32 域回绕(**当前打不着,留作前瞻防护**):
     #    TransposePadPermuteKernel 的 stride 参数与 thread_base_token 全是 uint32_t
     #    (fused.cu:263),`thread_base_token * stride_seq_input` 是无符号 32 位乘法 →
@@ -298,18 +318,20 @@ cuda_image = (
     # 定论与真机复现来自同机 comfyagent 会话(RunPod,2026-08-20);① 与其
     # scripts/patch_sage_int64.py 输出逐字节一致。
     .run_commands(
-        r"""P=$(python -c "import sageattention,os;print(os.path.join(os.path.dirname(sageattention.__file__),'triton','quant_per_thread.py'))") && """
+        r"""T=$(python -c "import sageattention,os;print(os.path.join(os.path.dirname(sageattention.__file__),'triton'))") && """
         r"""Q=$(python -c "import sageattention,os;print(os.path.join(os.path.dirname(sageattention.__file__),'quant.py'))") && """
-        # ① int32 → int64
-        r"""sed -i -E 's/offs_n([0-9]?)\[:, None\] \* stride_(in|on)/offs_n\1.to(tl.int64)[:, None] * stride_\2/g' "$P" && """
-        r"""test "$(grep -c 'offs_n[0-9]*\[:, None\] \* stride_' "$P")" = 0 && """
-        r"""test "$(grep -c 'to(tl.int64)' "$P")" -ge 4 && """
+        # ① int32 → int64。**整个 triton/ 目录一起打**,不只 quant_per_thread.py ——
+        #    同一条正则在 quant_per_block.py(2 处)与 quant_per_block_varlen.py(2 处)
+        #    也逐字命中,而它们一处 int64 都没有(详见下方注释)。
+        r"""sed -i -E 's/offs_n([0-9]?)\[:, None\] \* stride_(in|on)/offs_n\1.to(tl.int64)[:, None] * stride_\2/g' "$T"/*.py && """
+        r"""test "$(grep -hoE 'offs_n[0-9]*\[:, None\] \* stride_(in|on)' "$T"/*.py | wc -l)" = 0 && """
+        r"""test "$(grep -ho 'to(tl.int64)' "$T"/*.py | wc -l)" -ge 16 && """
         # ② V 强制 contiguous(幂等：已打过就跳过 sed)
         r"""if ! grep -q 'v = v.contiguous()' "$Q"; then """
         r"""sed -i 's|^    _fused\.transpose_pad_permute_cuda(v, |    v = v.contiguous()  # bridge patch\n    _fused.transpose_pad_permute_cuda(v, |' "$Q"; fi && """
         r"""test "$(grep -c 'v = v.contiguous()' "$Q")" = 1 && """
         # ③ 两个文件都必须仍是合法 Python
-        r"""python -c "import ast,sys;[ast.parse(open(f).read()) for f in sys.argv[1:]]" "$P" "$Q" && """
+        r"""python -c "import ast,glob,sys;[ast.parse(open(f).read()) for f in glob.glob(sys.argv[1]+'/*.py')+[sys.argv[2]]]" "$T" "$Q" && """
         r"""echo '[bridge] sage patches OK (int64 + v-contiguous)'"""
     )
     # 单独一层而不是并进上面那条:失败策略相反(那条 fail-closed、这条 skip-if-absent),
