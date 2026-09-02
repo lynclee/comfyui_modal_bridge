@@ -2459,6 +2459,89 @@ def test_image_python_version_is_consistent_everywhere():
         f"与镜像实际的 {pyver} 不一致 —— 构建失败提示会报错版本号,把人往错方向带")
 
 
+def _basicsr_shim_cmd() -> str:
+    """从 modal_image.py 源码里抽出 shim 的 shell 文本。
+
+    用 ast 而不是 import —— modal_image 顶层 `import modal`,而 CI 与宿主机都不保证装了。
+    """
+    import ast
+
+    src = (ROOT / "modal_app" / "modal_image.py").read_text(encoding="utf-8")
+    for node in ast.parse(src).body:
+        if isinstance(node, ast.Assign) and getattr(node.targets[0], "id", "") == "_BASICSR_SHIM_CMD":
+            return node.value.value
+    raise AssertionError("modal_image.py 里找不到 _BASICSR_SHIM_CMD")
+
+
+def test_basicsr_shim_three_paths():
+    """basicsr 的 functional_tensor shim —— **真跑那段 shell**,不是检查源码字符串。
+
+    torchvision 0.17 删了 transforms.functional_tensor,而 basicsr 1.4.2 的
+    data/degradations.py 还从那里取 rgb_to_grayscale。函数本体挪到了公开的
+    transforms.functional,签名与数值都没变(2026-09-02 实测最大绝对误差 0.0)。
+
+    三条路径都必须走对,尤其第一条:
+      ① basicsr 没装 → 跳过并 exit 0。**这是最重要的一条** —— basicsr 是用户依赖,
+         绝大多数用户根本没装;这里要是跟 sage 那层一样 fail-closed,等于让他们
+         全都部署不了。
+      ② 有旧写法 → 改写、校验、exit 0
+      ③ 再跑一次 → 幂等,不重复改也不报错
+
+    ⚠ 第一版在 ② 上炸过:残留检查 `grep -q functional_tensor` 匹配到了 sed 自己
+    追加的那句注释,把成功判成失败。所以这条测试必须真执行,源码字符串检查看不出来。
+    """
+    import ast
+    import os
+    import shutil
+    import subprocess
+    import tempfile
+
+    cmd = _basicsr_shim_cmd()
+
+    # ⚠ 必须是单行。Modal 把每条 run_commands 原样变成 Dockerfile 的一行 RUN,
+    # 多行 shell 会让 Dockerfile 解析器报 "expected any_breakable" —— 镜像当场构建不出来,
+    # 而这段 shell 在 bash 里单独跑是完全正常的,所以只测行为发现不了。
+    assert "\n" not in cmd.strip(), "shim 必须写成单行,否则 Dockerfile 解析失败"
+
+    # shim 里写的是 `python`,而不少环境只有 `python3` —— 造一个给它
+    binhome = tempfile.mkdtemp(prefix="mb-shim-bin-")
+    real_py = shutil.which("python") or shutil.which("python3")
+    assert real_py, "环境里既没有 python 也没有 python3"
+    os.symlink(real_py, os.path.join(binhome, "python"))
+    env = dict(os.environ, PATH=binhome + os.pathsep + os.environ.get("PATH", ""))
+
+    def run(path):
+        e = dict(env, MB_BASICSR_DEGRADATIONS=path)
+        r = subprocess.run(["bash", "-c", cmd], capture_output=True, text=True, env=e)
+        return r.returncode, (r.stdout + r.stderr)
+
+    work = tempfile.mkdtemp(prefix="mb-shim-")
+
+    rc, out = run(os.path.join(work, "does-not-exist.py"))
+    assert rc == 0, f"basicsr 没装时不该失败(会让绝大多数用户部署不了): {out}"
+    assert "跳过" in out, out
+
+    f = os.path.join(work, "degradations.py")
+    with open(f, "w", encoding="utf-8") as fh:
+        fh.write("import math\n"
+                 "from torchvision.transforms.functional_tensor import rgb_to_grayscale\n"
+                 "\n"
+                 "def noop():\n"
+                 "    return math.pi\n")
+    rc, out = run(f)
+    assert rc == 0, f"有旧写法时改写失败: {out}"
+    assert "applied" in out, out
+
+    txt = open(f, encoding="utf-8").read()
+    assert "from torchvision.transforms.functional import rgb_to_grayscale" in txt
+    assert "functional_tensor" not in txt, "改完仍有残留(含补丁自己写下的注释)"
+    ast.parse(txt)  # 改完必须仍是合法 Python
+
+    rc, out = run(f)
+    assert rc == 0, f"幂等路径失败: {out}"
+    assert "applied" not in out, "已修过的文件不该再改一次"
+
+
 def test_no_copy_points_at_removed_ui():
     """面向用户的文案不许指向已经不存在的按钮 —— JS、Python 字符串、文档三处都要查。
 

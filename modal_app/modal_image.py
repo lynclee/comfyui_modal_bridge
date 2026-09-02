@@ -94,6 +94,48 @@ _INSTALL_REQS_CMD = " && ".join(
     _install_reqs_one(n) for n in CUSTOM_NODES
 ) or "echo 'no custom_nodes — skip requirements'"
 
+# basicsr 兼容性 shim(2026-09-02)。**与 PEP 667 那条无关的第二个坑**:
+# basicsr/data/degradations.py 从 torchvision.transforms.functional_tensor 取
+# rgb_to_grayscale,而 torchvision 0.17 把这个模块删了 —— 函数本体挪到了公开的
+# transforms.functional,签名不变。实测(2026-09-02,torchvision 0.29):换完
+# basicsr / data.degradations / archs.rrdbnet_arch / utils.download_util 四个子模块
+# 全部 import 通过,且 rgb_to_grayscale 与旧实现(ITU-R 601-2 亮度公式)在张量上
+# 最大绝对误差 0.0。
+#
+# ⚠ 与上面 sage 那层刻意采用**相反**的失败策略:sage 是本镜像必装、打不上就意味着
+# 静默数值损坏,所以 fail-closed;basicsr 是**用户依赖**,绝大多数用户根本没装,
+# 找不到就跳过才是对的 —— 无条件 fail-closed 会让没装 basicsr 的人直接部署不了。
+# 只有"确实找到了、也确实改了"这条路径才校验改对没有。三条路径都幂等。
+#
+# MB_BASICSR_DEGRADATIONS 是留给测试注入路径的口子(测试真跑这段 shell,而不是
+# 检查源码字符串);构建时不会设,走 find_spec 那条。
+_BASICSR_SHIM_CMD = (
+    # ⚠ **必须是一条单行命令**:Modal 把每条 run_commands 原样变成 Dockerfile 的一行
+    #    `RUN`,多行 shell 会让 Dockerfile 解析器直接报 "expected any_breakable"
+    #    (2026-09-02 踩到,第一版写成 if/elif/else 多行,镜像构建当场失败)。
+    #    上面 sage 那条写成超长单行也是同一个原因。test_core 有一条测试盯着。
+    r"""D="${MB_BASICSR_DEGRADATIONS:-}"; """
+    r"""[ -n "$D" ] || D=$(python -c "import importlib.util as u,os;s=u.find_spec('basicsr');"""
+    r"""print(os.path.join(os.path.dirname(s.origin),'data','degradations.py') if s and s.origin else '')" 2>/dev/null); """
+    # ① 没装 / 找不到 → 跳过(**不能 fail**:basicsr 是用户依赖,多数用户根本没装)
+    r"""if [ -z "$D" ] || [ ! -f "$D" ]; then echo '[bridge] basicsr 未安装 - 跳过 shim'; """
+    # ② 已修或写法已变 → 跳过(幂等)
+    r"""elif ! grep -q 'transforms\.functional_tensor import rgb_to_grayscale' "$D"; then """
+    r"""echo '[bridge] basicsr 无需 shim(已修或写法已变)- 跳过'; """
+    # ③ 确实要改 → 改完才校验
+    r"""else sed -i 's/from torchvision\.transforms\.functional_tensor import rgb_to_grayscale/"""
+    r"""from torchvision.transforms.functional import rgb_to_grayscale  """
+    r"""# bridge patch: 旧模块在 torchvision>=0.17 已移除/' "$D"; """
+    r"""if ! grep -q 'from torchvision\.transforms\.functional import rgb_to_grayscale' "$D"; then """
+    r"""echo '[bridge] basicsr shim 改写失败'; exit 1; fi; """
+    # 残留检查故意用最宽的词。⚠ 所以上面 sed 追加的注释**不能包含该词**,
+    # 否则会匹配到补丁自己写下的注释、把成功判成失败(第一版就这么炸的)。
+    r"""if grep -q 'functional_tensor' "$D"; then echo '[bridge] basicsr shim 有残留'; exit 1; fi; """
+    r"""if ! python -c "import ast,sys;ast.parse(open(sys.argv[1]).read())" "$D"; then """
+    r"""echo '[bridge] basicsr shim 改完不是合法 Python'; exit 1; fi; """
+    r"""echo '[bridge] basicsr functional_tensor shim applied'; fi"""
+)
+
 # ⚠ cuda_image 不止 modal_app.py 用 —— snapshot_bench.py / node_compat_check.py 两个旁路
 # app 也 import 它。往里加的东西(编译工具链、sageattention 等约 +2GB)三处一起承担;
 # 将来要回退 sage 时,删这里一处即全部生效,不用去动那两个文件。
@@ -249,6 +291,9 @@ cuda_image = (
         r"""python -c "import ast,sys;[ast.parse(open(f).read()) for f in sys.argv[1:]]" "$P" "$Q" && """
         r"""echo '[bridge] sage patches OK (int64 + v-contiguous)'"""
     )
+    # 单独一层而不是并进上面那条:失败策略相反(那条 fail-closed、这条 skip-if-absent),
+    # 混在一起读的人容易把两者的语义搞混。层本身很轻,不值得为省一层牺牲可读性。
+    .run_commands(_BASICSR_SHIM_CMD)
     .run_commands("mkdir -p /comfy-volume")
     # 把部署时的 MODAL_BRIDGE_* 配置烤进镜像环境 → 容器运行时能读到真实值。
     # ⚠ 关键:modal deploy 子进程的 env(node_sync.deploy_env 注入)只在"部署解析期"可见,
