@@ -28,6 +28,21 @@ _CANNOT_IMPORT = re.compile(
     r"Cannot import\s+(?P<path>.+?)\s+module for custom nodes:\s*(?P<err>.+?)\s*$"
 )
 
+# ⚠ ComfyUI 从某个版本起给每行加了带 ANSI 色码的日志级别前缀,实际字节是:
+#     "\x1b[32m[INFO]\x1b[0m    0.0 seconds: /comfyui/custom_nodes/foo"
+# 而上面两条正则一条从行首锚定、一条依赖行尾,前缀一来就全部失配。
+# **失配的表现不是报错,是"解析到 0 个节点"** —— node_compat_check 照样打
+# 「全部导入成功 ✓」(假绿),import_failure_hint() 则永远返回空串,那条专门用来
+# 止住用户"反复点同步"的提示直接变哑巴。2026-09-02 在 ComfyUI v0.34.2 上实测踩到。
+# 所以匹配前先把前缀剥掉。
+_ANSI = re.compile(r"\x1b\[[0-9;]*m")
+_LEVEL = re.compile(r"^\s*\[(?:INFO|WARNING|ERROR|DEBUG|CRITICAL)\]\s?")
+
+
+def _strip_log_prefix(line: str) -> str:
+    """剥掉 ANSI 色码与行首的 [LEVEL] 前缀;没有前缀的旧格式原样返回。"""
+    return _LEVEL.sub("", _ANSI.sub("", line))
+
 
 def _node_name(path: str) -> str:
     """从导入行的路径取节点名(目录名;单文件节点去掉 .py)。"""
@@ -47,7 +62,8 @@ def parse_import_failures(text: str) -> dict:
     """
     # 1) 先收集每个失败节点的错误原因(全局扫,不限块内)
     errors: dict[str, str] = {}
-    for line in text.splitlines():
+    for raw in text.splitlines():
+        line = _strip_log_prefix(raw)
         m = _CANNOT_IMPORT.search(line)
         if m:
             errors[_node_name(m.group("path"))] = m.group("err")
@@ -57,7 +73,8 @@ def parse_import_failures(text: str) -> dict:
     failed: list[dict] = []
     seen: set[str] = set()
     in_block = False
-    for line in text.splitlines():
+    for raw in text.splitlines():
+        line = _strip_log_prefix(raw)
         if "Import times for custom nodes" in line:
             in_block = True
             continue

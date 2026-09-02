@@ -1106,6 +1106,52 @@ def test_parse_import_failures_with_error():
     assert r["failed"][0]["error"] == "No module named 'foo'"
 
 
+def test_parse_import_failures_survives_ansi_log_prefix():
+    """ComfyUI 新版给每行加了带 ANSI 色码的 [INFO] 前缀,解析器必须扛得住。
+
+    2026-09-02 在 ComfyUI v0.34.2 上实测:真实字节是
+        "\x1b[32m[INFO]\x1b[0m    0.0 seconds: /comfyui/custom_nodes/foo"
+    而 _TIME_LINE 从行首锚定,前缀一来第一行就失配 → 循环里那个"块结束就 break"
+    立刻退出 → 返回 {"ok": [], "failed": []}。
+
+    ⚠ **失配的表现不是报错,是静默返回空**,于是:
+      · node_compat_check 打「全部导入成功 ✓」—— 假绿;
+      · import_failure_hint() 永远返回空串 —— 那条专门用来止住用户"反复点同步"
+        的提示直接哑掉,而它存在的全部理由就是 ComfyUI 对"包 import 失败"和
+        "包根本没装"给的是同一句话。
+    上面两条老测试全用无前缀的旧格式,所以一个都没红。
+    """
+    cl = _comfy_log()
+    log = (
+        "\x1b[1m\x1b[33m[WARNING]\x1b[0m Cannot import /comfyui/custom_nodes/ComfyUI-Broken"
+        " module for custom nodes: No module named 'foo'\n"
+        "Import times for custom nodes:\n"
+        "\x1b[32m[INFO]\x1b[0m    0.0 seconds: /comfyui/custom_nodes/websocket_image_save.py\n"
+        "\x1b[32m[INFO]\x1b[0m    0.1 seconds: /comfyui/custom_nodes/rgthree-comfy\n"
+        "\x1b[32m[INFO]\x1b[0m    0.5 seconds (IMPORT FAILED): /comfyui/custom_nodes/ComfyUI-Broken\n"
+        "\x1b[32m[INFO]\x1b[0m \n"
+        "\x1b[32m[INFO]\x1b[0m Starting server\n"
+    )
+    r = cl.parse_import_failures(log)
+    assert r["ok"] == ["websocket_image_save", "rgthree-comfy"], r["ok"]
+    assert [f["name"] for f in r["failed"]] == ["ComfyUI-Broken"]
+    assert r["failed"][0]["error"] == "No module named 'foo'", "带前缀的 Cannot import 行没认出来"
+
+
+def test_node_compat_check_does_not_call_zero_nodes_all_green():
+    """一个节点都没解析到 ≠ 全绿 —— 那是解析器坏了,不是没问题。
+
+    这条正是上面那个 bug 的"第二道门":即便解析器又被 ComfyUI 的日志改动打瘸,
+    检测结果也必须显式说"没解析到",而不是打「全部导入成功 ✓」把人骗过去。
+    """
+    src = (ROOT / "modal_app" / "node_compat_check.py").read_text(encoding="utf-8")
+    i = src.index('print("全部导入成功 ✓")')
+    branch = src[max(0, i - 200):i]
+    assert "elif ok:" in branch, \
+        "「全部导入成功 ✓」没有以「确实解析到了节点」为前提 —— 解析器一坏就报假绿"
+    assert "没有从启动日志里解析到任何节点" in src, "缺少 ok 与 failed 都为空时的显式告警分支"
+
+
 # ============================================================================
 # contract.compute_contract — ComfyUI 版本契约
 # ============================================================================
