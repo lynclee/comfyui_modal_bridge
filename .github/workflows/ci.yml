@@ -37,6 +37,13 @@ jobs:
       - name: Unit tests
         run: python tests/test_core.py
 
+      # 真实 aiohttp 路由测试。需要 aiohttp（本就是插件依赖，见 requirements.txt）——
+      # 纯源码字符串检查验证不了"跑起来会怎样"，两轮 review 的 P1 都从那个缺口漏过。
+      - name: Install runtime deps for route tests
+        run: pip install aiohttp
+      - name: Route tests
+        run: python tests/test_routes.py
+
       - name: Lint (ruff)
         run: ruff check .
 

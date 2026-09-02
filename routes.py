@@ -552,7 +552,6 @@ async def _ensure_modal(resp: web.StreamResponse) -> int:
     await _emit(resp, "       <ComfyUI 的 python> -m pip install -U modal\n\n")
     await _emit(resp, "   装完重启 ComfyUI 再点部署。(也可以在 Manager 里卸载后重装本插件,依赖会自动装上)\n")
     return 1
-    return 0
 
 
 def _setup_routes():
