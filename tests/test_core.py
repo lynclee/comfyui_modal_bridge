@@ -1676,21 +1676,12 @@ if __name__ == "__main__":
     sys.exit(1 if failed else 0)
 
 
-def test_modal_image_has_sage_patches():
-    """镜像必须带 SageAttention 的两个上游缺陷补丁,且校验是 fail-closed 的。
+def _sage_patch_cmd() -> str:
+    """从 modal_image.py 源码里抽出那条 sage 补丁命令。
 
-    ① int32 行偏移溢出(**已致尾帧塌坏**):H3 的 fused QKV(seq-stride=21504)下
-       行号 ≥ 2^31/21504 ≈ 99865 即 wrap 成负 → 尾几帧塌灰噪 / 偶发 illegal memory access。
-    ② V 走 strided 视图时 kernel 地址算术在 uint32 域回绕(**当前打不着,前瞻防护**):
-       TransposePadPermuteKernel 的 stride 与 thread_base_token 全是 uint32_t,
-       回绕点 = 2^32/stride_seq = 199,729;还要 kv_len % 128 == 0(否则 core.py:976
-       的 cat 把 V 物化成连续、stride 降到 128)。详见 modal_image.py 的长注释。
-
-    两个上游都未修。这层删了不会有任何报错,只会在特定配置下静默出坏帧或崩掉,
-    所以这里静态钉死它还在、且保留了全部校验闸。
+    用 ast 而不是 import —— modal_image 顶层 `import modal`,CI 与宿主机都不保证装了。
     """
     import ast
-    import re
 
     src = (ROOT / "modal_app" / "modal_image.py").read_text(encoding="utf-8")
     cmds = [
@@ -1705,7 +1696,25 @@ def test_modal_image_has_sage_patches():
     ]
     patch = [c for c in cmds if "tl.int64" in c]
     assert len(patch) == 1, f"期望恰好一条 sage 补丁命令,实际 {len(patch)} 条"
-    cmd = patch[0]
+    return patch[0]
+
+
+def test_modal_image_has_sage_patches():
+    """镜像必须带 SageAttention 的两个上游缺陷补丁,且校验是 fail-closed 的。
+
+    ① int32 行偏移溢出(**已致尾帧塌坏**):H3 的 fused QKV(seq-stride=21504)下
+       行号 ≥ 2^31/21504 ≈ 99865 即 wrap 成负 → 尾几帧塌灰噪 / 偶发 illegal memory access。
+    ② V 走 strided 视图时 kernel 地址算术在 uint32 域回绕(**当前打不着,前瞻防护**):
+       TransposePadPermuteKernel 的 stride 与 thread_base_token 全是 uint32_t,
+       回绕点 = 2^32/stride_seq = 199,729;还要 kv_len % 128 == 0(否则 core.py:976
+       的 cat 把 V 物化成连续、stride 降到 128)。详见 modal_image.py 的长注释。
+
+    两个上游都未修。这层删了不会有任何报错,只会在特定配置下静默出坏帧或崩掉,
+    所以这里静态钉死它还在、且保留了全部校验闸。
+    """
+    import re
+
+    cmd = _sage_patch_cmd()
 
     # ① int64
     assert "sed -i -E" in cmd and "offs_n" in cmd and "stride_" in cmd
@@ -1731,6 +1740,169 @@ def test_modal_image_has_sage_patches():
     # ③ 语法校验(目录级)
     assert "ast.parse" in cmd, "缺少补丁后语法校验"
     assert "glob.glob" in cmd, "语法校验必须覆盖整个目录,不能只查单个文件"
+
+
+def _fake_sage_tree(tmp, *, with_per_block=True):
+    """造一棵最小的 sageattention 包树,行形态取自 d1a57a5 真源码。
+
+    返回值可直接用 PYTHONPATH 指过去 —— 补丁命令里那两句
+    `python -c "import sageattention..."` 就能原样跑,不必改命令。
+    """
+    import os
+
+    pkg = os.path.join(tmp, "sageattention")
+    trt = os.path.join(pkg, "triton")
+    os.makedirs(trt, exist_ok=True)
+    open(os.path.join(pkg, "__init__.py"), "w").close()
+    open(os.path.join(trt, "__init__.py"), "w").close()
+
+    # ① 量化 kernel:offs_n 跨整个序列(off_blk = program_id(0))→ 真有洞,必须被打
+    # 计数照实反映 d1a57a5 真源码:quant_per_thread 共 12 处
+    # (plain offs_n ×8、offs_n0 ×2、offs_n1 ×2),per_block 两个文件各 2 处 —— 合计 16。
+    # 假树造瘦了会被 `-ge 16` 闸拦下(第一版就是这么炸的,闸本身是对的)。
+    per_thread = (
+        "import triton.language as tl\n"
+        "def kern():\n"
+        "    offs_n = off_blk * BLK + tl.arange(0, BLK // 8) * 8 + off_tld\n"
+        + "".join(
+            f"    p{i} = P + offs_n[:, None] * stride_in + offs_k[None, :]\n"
+            f"    q{i} = Q + offs_n[:, None] * stride_on + offs_k[None, :]\n"
+            for i in range(4)
+        )
+        + "    a = A + offs_n0[:, None] * stride_in\n"
+        "    b = B + offs_n0[:, None] * stride_on\n"
+        "    c = C + offs_n1[:, None] * stride_in\n"
+        "    d = D + offs_n1[:, None] * stride_on\n"
+    )
+    open(os.path.join(trt, "quant_per_thread.py"), "w").write(per_thread)
+
+    if with_per_block:
+        per_block = (
+            "import triton.language as tl\n"
+            "def kern():\n"
+            "    offs_n = off_blk * BLK + tl.arange(0, BLK)\n"
+            "    input_ptrs = Input + offs_n[:, None] * stride_in + offs_k[None, :]\n"
+            "    output_ptrs = Output + offs_n[:, None] * stride_on + offs_k[None, :]\n"
+        )
+        open(os.path.join(trt, "quant_per_block.py"), "w").write(per_block)
+        open(os.path.join(trt, "quant_per_block_varlen.py"), "w").write(per_block)
+
+    # ② attention kernel:offs_n = tl.arange(0, BLOCK_N),BLOCK_N=64 → 最大 63,溢不出。
+    #    形态与上面一模一样,只有 stride 名不同 —— **必须原样不动**。
+    attn = (
+        "import triton.language as tl\n"
+        "def kern():\n"
+        "    off_z = tl.program_id(2).to(tl.int64)\n"
+        "    off_h = tl.program_id(1).to(tl.int64)\n"
+        "    offs_n = tl.arange(0, BLOCK_N)\n"
+        "    V_ptrs = V + offs_n[:, None] * stride_vn + offs_k[None, :]\n"
+    )
+    open(os.path.join(trt, "attn_qk_int8_per_block.py"), "w").write(attn)
+
+    open(os.path.join(pkg, "quant.py"), "w").write(
+        "def per_channel_fp8(v):\n"
+        "    _fused.transpose_pad_permute_cuda(v, v_transposed_permutted, _tensor_layout)\n"
+        "    return v\n"
+    )
+    return pkg
+
+
+def _run_sage_patch(cmd, tmp):
+    """在 tmp 这棵假树上真跑补丁命令,返回 (rc, output)。"""
+    import os
+    import shutil
+    import subprocess
+    import tempfile
+
+    binhome = tempfile.mkdtemp(prefix="mb-sage-bin-")
+    real_py = shutil.which("python") or shutil.which("python3")
+    link = os.path.join(binhome, "python")
+    if not os.path.exists(link):
+        os.symlink(real_py, link)
+    env = dict(os.environ,
+               PATH=binhome + os.pathsep + os.environ.get("PATH", ""),
+               PYTHONPATH=tmp)
+    r = subprocess.run(["bash", "-c", cmd], capture_output=True, text=True, env=env)
+    return r.returncode, r.stdout + r.stderr
+
+
+def test_sage_patch_actually_runs_and_hits_exactly_the_right_lines():
+    """**真跑那条 sage 补丁命令**,把两条边界都锁住 —— 不是检查源码字符串。
+
+    为什么必须真跑:同文件里那条 test_modal_image_has_sage_patches 是字符串检查,
+    而 2026-09-02 这一轮它对一个真 bug **毫无反应** —— 当时残留断言被写成宽松的
+    `stride_` 任意后缀,把 attn_qk_int8_*.py 里 4 处安全代码算成残留,144 条测试
+    全绿,是**镜像构建炸了**才发现。字符串检查看不出范围对不对。
+
+    两条边界(缺一不可):
+      · 范围要够宽 —— quant_per_block* 必须被打(它们和 quant_per_thread 同样是
+        `offs_n = off_blk * BLK + ...`,off_blk 是 program_id(0),跨整个序列);
+      · 范围不能更宽 —— attn_qk_int8_* 里的 `stride_vn` 必须**原样不动**
+        (那里 `offs_n = tl.arange(0, BLOCK_N)`,BLOCK_N=64,最大 63,溢不出;
+        跨序列部分靠指针累加,而上游已把 off_z/off_h 转成 int64)。
+    """
+    import os
+    import tempfile
+
+    cmd = _sage_patch_cmd()
+    tmp = tempfile.mkdtemp(prefix="mb-sage-")
+    pkg = _fake_sage_tree(tmp)
+
+    rc, out = _run_sage_patch(cmd, tmp)
+    assert rc == 0, f"补丁命令在正常树上失败了: {out}"
+    assert "sage patches OK" in out, out
+
+    trt = os.path.join(pkg, "triton")
+
+    def read(name):
+        return open(os.path.join(trt, name), encoding="utf-8").read()
+
+    # 范围够宽:三个量化文件都打上,且不留脆弱写法
+    for name, want in (("quant_per_thread.py", 12), ("quant_per_block.py", 2),
+                       ("quant_per_block_varlen.py", 2)):
+        src = read(name)
+        assert src.count("to(tl.int64)") == want, f"{name} 期望 {want} 处 int64,实际 {src.count('to(tl.int64)')}"
+        assert "offs_n[:, None] * stride_in" not in src, f"{name} 仍有脆弱写法"
+        assert "offs_n[:, None] * stride_on" not in src, f"{name} 仍有脆弱写法"
+
+    # 范围不更宽:attention kernel 的 stride_vn 一个字节都不许动
+    attn = read("attn_qk_int8_per_block.py")
+    assert "offs_n[:, None] * stride_vn" in attn, \
+        "stride_vn 被改了 —— 那里 offs_n 最大 63,不该动;改了会让『哪里真有洞』失真"
+    assert attn.count("to(tl.int64)") == 2, "attention kernel 里只该有上游自带的两处 int64"
+
+    # ② V contiguous:恰好一处,且在调用之前
+    q = open(os.path.join(pkg, "quant.py"), encoding="utf-8").read()
+    assert q.count("v = v.contiguous()") == 1, q
+    assert q.index("v = v.contiguous()") < q.index("_fused.transpose_pad_permute_cuda"), \
+        "contiguous 必须在调用之前"
+
+    # 幂等:再跑一次不重复改、也不报错
+    rc2, out2 = _run_sage_patch(cmd, tmp)
+    assert rc2 == 0, f"幂等路径失败: {out2}"
+    q2 = open(os.path.join(pkg, "quant.py"), encoding="utf-8").read()
+    assert q2.count("v = v.contiguous()") == 1, "第二次跑重复插入了"
+
+
+def test_sage_patch_fails_closed_when_a_file_is_missing():
+    """少打一个文件必须让**构建失败**,而不是悄悄少覆盖。
+
+    这正是 2026-09-02 之前的状态:补丁只打 quant_per_thread.py,quant_per_block*
+    漏着;而当时的断言是 `to(tl.int64) >= 4` —— **计数只能证明「打过」,证明不了
+    「打全了」**,于是漏打一直没被发现。现在的 int64 下限 16 就是为了挡住这个。
+
+    副作用是上游若删掉 quant_per_block* 会让构建失败 —— 这是刻意的:那种结构变更
+    必须由人重新核一遍分派,不能默认放行。
+    """
+    import tempfile
+
+    cmd = _sage_patch_cmd()
+    tmp = tempfile.mkdtemp(prefix="mb-sage-short-")
+    _fake_sage_tree(tmp, with_per_block=False)   # 只有 quant_per_thread(6 处)
+
+    rc, out = _run_sage_patch(cmd, tmp)
+    assert rc != 0, f"少了 quant_per_block* 却通过了闸 —— 漏打会被静默放行: {out}"
+    assert "sage patches OK" not in out, out
 
 
 def test_no_api_key_in_query_string():
