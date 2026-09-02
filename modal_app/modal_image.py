@@ -260,13 +260,34 @@ cuda_image = (
     #    而 sageattn_qk_int8_pv_fp8_cuda_sm90 的 qk_quant_gran 默认就是 "per_thread"、
     #    core.py 的 dispatch 也没覆盖它 —— H100 必然走到这条含 bug 的路径。
     #
-    # ② V 以 strided 视图进 CUDA 扩展(**crash,尚未踩到但只差一个配置**):
-    #    core.py 只在 kv_len % 128 != 0 时用 torch.cat 给 V 补 pad,而 cat 的副作用正是
-    #    把 V 变成 contiguous。于是 **kv_len % 128 == 0 时不 pad,V 保持 strided 视图**
-    #    直接进 per_channel_fp8 → _fused.transpose_pad_permute_cuda 按 contiguous 假设
-    #    算地址 → 越界。当前 L=90720 除 128 余 96 侥幸躲过,换片长/分辨率就是抽签。
-    #    修在 quant.py 一处即同时覆盖 sm89(core.py:808)和 sm90(core.py:982)两个调用点;
-    #    .contiguous() 对已连续张量是零拷贝 no-op,pad 分支本就要 cat 拷贝一次,故无额外开销。
+    # ② V 走 strided 视图时 kernel 地址算术在 uint32 域回绕(**当前打不着,留作前瞻防护**):
+    #    TransposePadPermuteKernel 的 stride 参数与 thread_base_token 全是 uint32_t
+    #    (fused.cu:263),`thread_base_token * stride_seq_input` 是无符号 32 位乘法 →
+    #    回绕点 = 2^32 / stride_seq。H3 的 fused QKV 布局下 V 的 seq-stride = 21504,
+    #    即 **199,729**(实算:199728×21504 < 2^32 < 199729×21504)。
+    #    触发要**同时**满足两条:
+    #      · kv_len % 128 == 0 —— 否则 core.py:976 会 torch.cat 补 pad,而 cat 的副作用
+    #        正是把 V 物化成连续,seq-stride 从 21504 降到 128、回绕点涨到 3355 万,永远安全;
+    #      · kv_len > 199,729。
+    #    H3 实测 L=90720 / 100691,离阈值差一倍以上,**当前打不着**。
+    #
+    #    ⚠ 这里原先写的是"扩展按 contiguous 假设算裸指针 → 越界",**那个机理是错的**
+    #    (2026-09-02 对着 d1a57a5 源码逐条核实后更正)。上游是**有意支持 strided 输入**的:
+    #    transpose_pad_permute_cuda 对 input 用的是宽松的 CHECK_LASTDIM_CONTIGUOUS
+    #    (output 才是严格的 CHECK_CONTIGUOUS),并显式读 input.stride(1/2) 传进 kernel。
+    #    V 作为 fused QKV 切片视图最后一维 stride=1,合法通过。理由写错比不写更糟 ——
+    #    会被后来的人拿去推别的结论。
+    #
+    #    ⚠ 也**不是零开销**(同上更正)。补丁真正生效的恰恰是不 pad 那条路径
+    #    (kv_len % 128 == 0),而那条路径本来一次拷贝都没有;pad 分支的 V 已被 cat 弄连续,
+    #    .contiguous() 在那里才是 no-op。H3 的 V 是 (1,56,L,128) bf16,L≈100k 时约 1.44 GB,
+    #    H100 上读+写 ~1ms,再乘 DiT 层数与采样步数。只在 1/128 的序列长度上撞到,
+    #    相对一次几十秒的采样可以忽略,但不是零。
+    #
+    #    为什么明知当前打不着还留着:这是**通用 bridge**,阈值 2^32/stride_seq 由模型决定
+    #    (头数或 head_dim 更大 → stride 更大 → 阈值更低),我们不掌握用户跑什么模型,
+    #    没有"H3 安全所以都安全"这一步。修在 quant.py 一处即同时覆盖
+    #    sm89(core.py:809)和 sm90(core.py:983)两个调用点。
     #
     # 为什么改 .py 就够:Triton kernel 是运行时 JIT 的 Python 源码、CUDA 扩展的调用方也是
     # Python,两个补丁都不进 .so —— 不必重编译 wheel,也不必重发 Release。
