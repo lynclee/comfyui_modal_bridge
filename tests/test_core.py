@@ -2904,7 +2904,10 @@ def test_submit_asks_before_pushing_private_nodes():
     # 否则只要工作流含自写节点就每次都弹确认(codex review 抓到)。
     diff_at = seg.find("/modal_bridge/local_nodes_diff")
     assert diff_at > 0, "弹确认前没有先比对真实差异,会变成每次运行都打扰用户"
-    assert "_changed.length === 0" in seg, "全都一致时没有跳过确认"
+    # ⚠ 带上闭括号与花括号。只写 `_changed.length === 0` 是恒真的:放宽成
+    #    `_changed.length === 0 || true`(永远跳过确认)子串原样还在(2026-09-02 变异实测)。
+    assert "if (_changed.length === 0) {" in seg, \
+        "全都一致时没有跳过确认,或条件被放宽(必须是恰好的 `if (_changed.length === 0) {`)"
 
     confirm_at = seg.find('confirm(t("node.local_push_confirm"')
     assert diff_at < confirm_at, "差异预检必须在确认之前"
@@ -2934,10 +2937,17 @@ def test_partial_output_loss_is_a_failure():
     一条记录、要么记一条 error 后 continue,所以数量对不上就是真丢了东西。
     """
     src = (ROOT / "modal_app" / "_comfy_ws.py").read_text(encoding="utf-8")
-    i = src.index("images, mat_errors = materialize_desktop_outputs(")
-    seg = src[i:i + 1500]
-    assert "len(images) < len(refs)" in seg, "没有按数量比对,部分丢失会被当成成功"
-    assert "raise ValueError" in seg[seg.index("len(images) < len(refs)"):], "数量对不上没有抛错"
+    # ⚠ 这里不能用 `"len(images) < len(refs)" in seg` —— 那是**恒真**的:把条件放宽成
+    #    `len(images) < len(refs) - 1`(静默容忍丢一个产物,恰是本条要防的)子串原样还在,
+    #    测试照样绿(2026-09-02 变异实测)。用 ast 比对**整个条件表达式**才挡得住。
+    import ast as _ast
+
+    guard = [
+        n for n in _ast.walk(_ast.parse(src))
+        if isinstance(n, _ast.If) and _ast.unparse(n.test) == "len(images) < len(refs)"
+    ]
+    assert guard, "没有按数量严格比对(条件必须恰好是 len(images) < len(refs)),部分丢失会被当成功"
+    assert any(isinstance(x, _ast.Raise) for x in _ast.walk(guard[0])), "数量对不上没有抛错"
 
     # worker 侧即使成功也要留痕，便于事后追溯
     # ⚠ 锚点要精确:文件里有多处 "status": "completed"（aigc-r2 交付分支也有一处），
