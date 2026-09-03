@@ -151,15 +151,27 @@ def save_config(new_data: dict) -> None:
          没配置过",没有任何报错指向真实原因。
       2) 默认 0644 —— 同机任意用户可读凭据。
     tmp + os.replace 保证读者要么看到完整的旧的、要么看到完整的新的。
+
+    ⚠ 权限用 **os.open(..., 0o600) 直接创建**,不是"先写再 chmod"(2026-09-02 codex
+    抓到:此前正是后者)。先写后 chmod 有两个洞 —— 默认 umask 022 下临时文件会先以
+    0644 落地,chmod 之前同机其他用户可读;进程在 chmod 前崩掉则明文凭据就那样留着。
+    0o600 不含 group/other 位,umask 只会去位不会加位,所以创建出来必定是 0600。
+    fchmod 是给"上次崩溃残留的旧 tmp"兜底(O_CREAT 不改已有文件的模式),且失败必须抛。
     """
     p = _config_path()
     p.parent.mkdir(parents=True, exist_ok=True)
     tmp = p.with_name(p.name + ".tmp")
-    tmp.write_text(json.dumps(new_data, indent=2, ensure_ascii=False), encoding="utf-8")
+    fd = os.open(tmp, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
     try:
-        os.chmod(tmp, 0o600)   # Windows 上是 no-op,无害
-    except Exception:
-        pass
+        # tmp 可能是上次崩溃留下的、权限已经不对的旧文件 —— O_CREAT 不会改已有文件的模式,
+        # 所以在**写入任何内容之前**再收一次。失败必须抛,不能吞:吞掉等于权限没设上却无人知晓。
+        os.fchmod(fd, 0o600)
+        f = os.fdopen(fd, "w", encoding="utf-8")
+    except BaseException:
+        os.close(fd)          # fdopen 没接管成 fd,得自己关
+        raise
+    with f:
+        f.write(json.dumps(new_data, indent=2, ensure_ascii=False))
     os.replace(tmp, p)
 
 

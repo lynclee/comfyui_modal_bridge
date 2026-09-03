@@ -477,19 +477,20 @@ def _admin_only(handler):
     return guarded
 
 
-def _refresh_local_node_reqs(cfg: dict) -> list[str]:
-    """从 Volume 每个私有节点的 manifest 重建镜像依赖清单。
+def _compute_local_node_reqs(cfg: dict) -> list[str]:
+    """从 Volume 每个私有节点的 manifest 算出镜像依赖清单。**纯读,不落盘。**
 
     多机环境不能只扫当前机器目录。旧 zip 没有 manifest 时保留已有 flat 清单；该节点
-    下次参与同步会被强制重传并完成迁移。调用方须在 _DEPLOY_LOCK 内写文件。
+    下次参与同步会被强制重传并完成迁移。
+
+    与 _refresh_local_node_reqs 拆开,是因为 /local_nodes_diff 这种只读预检也要算这个
+    指纹(判断"依赖镜像是否还欠一次重建"),而它不该写文件、也不该去抢 _DEPLOY_LOCK。
     """
     folders = local_nodes.list_volume_local_nodes(cfg, max_age=0)
     if not folders:
         # 空可能是真空,也可能是 Modal/网络瞬断；保留旧依赖只会多装几个包，清空却会
         # 让仍在 Volume 的私有节点全部 import 失败。取安全的一侧。
-        reqs = node_sync.read_local_node_reqs()
-        node_sync.write_local_node_reqs(reqs)
-        return reqs
+        return node_sync.read_local_node_reqs()
     manifests = local_nodes.volume_local_node_requirements(cfg, folders)
     reqs: list[str] = []
     seen: set[str] = set()
@@ -503,6 +504,12 @@ def _refresh_local_node_reqs(cfg: dict) -> list[str]:
             if req not in seen:
                 seen.add(req)
                 reqs.append(req)
+    return reqs
+
+
+def _refresh_local_node_reqs(cfg: dict) -> list[str]:
+    """算依赖清单并落盘。调用方须在 _DEPLOY_LOCK 内调用(它写 _local_nodes_data.py)。"""
+    reqs = _compute_local_node_reqs(cfg)
     node_sync.write_local_node_reqs(reqs)
     return reqs
 
@@ -1112,10 +1119,25 @@ def _setup_routes():
             # 查不出来就别拦路:退化成"当作有改动",最坏是多问一次
             return web.json_response({"upload": folders, "uptodate": [], "failed": [],
                                       "degraded": str(e)})
+        # ⚠ 光比 Volume 内容不够(2026-09-02 codex 抓到):上次依赖镜像重建失败时,
+        #    local_node_reqs_deployed_hash 没有推进,而 zip 内容是一致的 —— 于是这里报
+        #    "全部一致"、前端不弹确认,可随后 sync_local_nodes 仍然满足
+        #    target_hash != deployed_hash,**无确认地触发几分钟的镜像重建**。
+        #    确认框存在的全部理由就是"别让一次点击悄悄变成几分钟",所以这个状态必须回报。
+        try:
+            _reqs = await asyncio.to_thread(_compute_local_node_reqs, cfg)   # 纯读,不落盘
+            _target = node_sync.local_node_reqs_hash(_reqs)
+            _deployed = cfg.get("local_node_reqs_deployed_hash", "")
+            reqs_pending = _target != _deployed and bool(_reqs or _deployed)
+        except Exception as e:
+            # 同上:查不出来就别拦路,当作"要重建"多问一次,不会漏
+            print(f"[modal_bridge] reqs pending 预检失败,按需重建处理: {e}")
+            reqs_pending = True
         return web.json_response({
             "upload": [u["folder"] for u in plan.get("upload", [])],
             "uptodate": [u["folder"] for u in plan.get("uptodate", [])],
             "failed": plan.get("failed", []),
+            "reqs_redeploy_pending": reqs_pending,
         })
 
     @routes.get("/modal_bridge/list_local_nodes")
@@ -1328,6 +1350,11 @@ def _setup_routes():
         else:
             aigc_base_url = cfg.get("aigc_studio_base_url", "")
         aigc_bypass = (body.get("aigc_bypass_secret") or "").strip() or cfg.get("aigc_bypass_secret", "")
+        # 没有 URL 就没有用它的地方 —— 别把它烤进 Modal Secret、也别继续留在本地 config。
+        # 这条同时兜住 0.8.30 之前遗留的残留:那时密钥只能更新、无法清除(codex 抓到),
+        # 停用集成后它会一直躺在 config.json 里并进入每一次新建的 Secret。
+        if not aigc_base_url:
+            aigc_bypass = ""
         endpoint_base = f"https://{workspace}--{app_name}"
         # 私有鉴权 key:已有就复用(不让旧 config 失效),否则新生成
         bridge_key = cfg.get("bridge_api_key") or node_sync.gen_bridge_key()

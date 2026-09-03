@@ -6,6 +6,7 @@
 
 只测不碰真实环境的纯逻辑;对依赖 ComfyUI(`import nodes`)/ 文件系统 / Modal 的点,用桩替换。
 """
+import contextlib
 import sys
 import subprocess
 import types
@@ -1682,30 +1683,137 @@ def test_write_baked_nodes_drops_empty_url(tmp_path):
 # ============================================================================
 # 无 pytest 时的简易运行器
 # ============================================================================
-if __name__ == "__main__":
-    import inspect
-    import tempfile
 
-    fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
-    passed = failed = 0
-    for fn in fns:
-        try:
-            # 极简 fixture:签名带 tmp_path 的给一个独立临时目录(与 pytest 语义对齐)
-            if "tmp_path" in inspect.signature(fn).parameters:
-                with tempfile.TemporaryDirectory() as td:
-                    fn(Path(td))
-            else:
-                fn()
-            print(f"  ✓ {fn.__name__}")
-            passed += 1
-        except AssertionError as e:
-            print(f"  ✗ {fn.__name__}  — {e}")
-            failed += 1
-        except Exception as e:
-            print(f"  ✗ {fn.__name__}  — ERROR {type(e).__name__}: {e}")
-            failed += 1
-    print(f"\n{passed} passed, {failed} failed")
-    sys.exit(1 if failed else 0)
+
+def test_selfrun_entrypoint_is_last_so_no_test_is_skipped():
+    """`if __name__ == "__main__":` 必须是文件里**最后一个**顶层语句。
+
+    2026-09-02 codex 抓到:它当时在 2957 行文件的第 1685 行。`python tests/test_core.py`
+    从上往下执行,跑到那儿就 `sys.exit()` —— 后面 1272 行的 **36 条测试连定义都没执行到**。
+    而 CI 用的正是这条路径,于是这些从来没在 CI 里跑过:
+      路径囚笼(test_output_path_jail ×3)、admin 守卫、`test_no_api_key_in_query_string`、
+      `test_no_runtime_pip_install_anywhere`(Registry 合规)、全部 sage 与 basicsr 补丁测试。
+    **CI 一直是绿的** —— 漏跑和全过在报告里长得一模一样。
+
+    所以这条不测行为,测的是"门禁自己有没有被绕过"。
+    """
+    import ast
+
+    src = (HERE / "test_core.py").read_text(encoding="utf-8")
+    body = ast.parse(src).body
+    idx = [i for i, n in enumerate(body)
+           if isinstance(n, ast.If) and ast.unparse(n.test) == "__name__ == '__main__'"]
+    assert len(idx) == 1, f"期望恰好一个 __main__ 块,实际 {len(idx)} 个"
+    after = [n for n in body[idx[0] + 1:]]
+    names = [getattr(n, "name", type(n).__name__) for n in after]
+    assert not after, (
+        f"__main__ 块后面还有 {len(after)} 个顶层语句:{names[:8]} —— "
+        f"`python tests/test_core.py` 执行到 sys.exit() 就停,它们永远不会被定义、更不会被跑。"
+        f"把 __main__ 块移到文件最末尾。")
+
+
+def test_config_written_without_any_0644_window(tmp_path, monkeypatch):
+    """写 config 必须**直接以 0600 创建**,不能"先落地再 chmod"。
+
+    2026-09-02 codex 抓到:save_config 的 docstring 明写"不能先 write_text 再 chmod"
+    (会有 0644 窗口、崩在 chmod 前会留下明文凭据、还吞掉 chmod 失败),而实现正是那三条。
+    这条不看源码字符串 —— 钩住 os.open 抓它实际传的创建模式,再核最终文件权限。
+    """
+    import os
+    import stat
+
+    modes = []
+    real_open = os.open
+
+    def spy(path, flags, mode=0o777, **kw):
+        if flags & os.O_CREAT:
+            modes.append(mode)
+        return real_open(path, flags, mode, **kw)
+
+    monkeypatch.setattr(os, "open", spy)
+    monkeypatch.setattr(config, "_config_path", lambda: tmp_path / "config.json")
+
+    config.save_config({"endpoint": "https://example.invalid", "bridge_api_key": "bk-x"})
+
+    assert modes, "没有用 os.open 创建 —— 说明还是 write_text 那条路径,存在 0644 窗口"
+    for m in modes:
+        assert m & 0o077 == 0, f"创建模式 {oct(m)} 带了 group/other 位,窗口期同机可读凭据"
+
+    got = stat.S_IMODE((tmp_path / "config.json").stat().st_mode)
+    assert got == 0o600, f"最终权限 {oct(got)},应为 0600"
+
+
+def test_config_write_does_not_swallow_permission_failure(tmp_path, monkeypatch):
+    """收权限失败必须抛出来 —— 吞掉等于"权限没设上却无人知晓"。"""
+    import os
+
+    monkeypatch.setattr(config, "_config_path", lambda: tmp_path / "config.json")
+
+    def boom(*a, **kw):
+        raise OSError("fchmod denied")
+
+    monkeypatch.setattr(os, "fchmod", boom)
+    with raises(OSError):
+        config.save_config({"endpoint": "x"})
+
+
+@contextlib.contextmanager
+def raises(exc):
+    """`pytest.raises` 的最小替身。
+
+    ⚠ 不能在测试里直接 `import pytest`:README 给了"不装 pytest 就 `python tests/test_core.py`"
+    这条备选跑法,而那条路径下 import 会直接挂。2026-09-02 把自跑入口挪到文件末尾后,
+    原本落在被跳过区段里的 `import pytest` 才第一次真正生效 —— 在装了 pytest 的机器上
+    看不出问题,正是"漏跑和全过长得一样"的又一例。
+    """
+    try:
+        yield
+    except exc:
+        return
+    except Exception as e:                       # noqa: BLE001
+        raise AssertionError(f"期望 {exc.__name__},实际 {type(e).__name__}: {e}") from e
+    raise AssertionError(f"期望抛 {exc.__name__},但什么都没抛")
+
+
+def test_aigc_secret_can_actually_be_cleared():
+    """停用 AIGC 集成必须能把旁路密钥**清掉**,不能只允许更新。
+
+    2026-09-02 codex 抓到:密码框留空 = 沿用已存(密码框的标准语义),而后端也是
+    `new or stored` —— 于是密钥**只能被更新、无法被删除**。用户清掉 URL 停用集成后,
+    密钥仍躺在本地 config.json 里,并被烤进下一次创建的 Modal Secret。
+
+    密钥不在 PUBLIC_CONFIG_WRITE_FIELDS 里(那道闸挡的是"改配置再取密钥"的两步绕过),
+    所以清除入口只能挂在"显式把 URL 置空"这个动作上 —— 只清、不读、不回吐,不构成绕过。
+    """
+    cur = {"aigc_studio_base_url": "https://x.example", "aigc_bypass_secret": "byp-1",
+           "gpu_tier": "auto"}
+
+    # ① 显式停用 → 密钥必须跟着没
+    out = contract.merge_public_config(cur, {"aigc_studio_base_url": ""})
+    assert out["aigc_studio_base_url"] == ""
+    assert out["aigc_bypass_secret"] == "", "停用了集成,密钥却还留在 config 里"
+
+    # ② 改别的字段不能有副作用 —— 用户可能先填了密钥还没填 URL
+    cur2 = {"aigc_studio_base_url": "", "aigc_bypass_secret": "byp-1", "gpu_tier": "auto"}
+    out2 = contract.merge_public_config(cur2, {"gpu_tier": "top"})
+    assert out2["aigc_bypass_secret"] == "byp-1", "改无关字段把密钥无声抹掉了"
+
+    # ③ 密钥本身仍然不能经这个 API 写入(原有的两步绕过闸不许被这次改动打开)
+    try:
+        contract.merge_public_config(cur, {"aigc_bypass_secret": "byp-2"})
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("aigc_bypass_secret 竟然能经通用 config API 写入")
+
+
+def test_deploy_drops_orphan_aigc_secret():
+    """部署时 URL 为空 → 不把旁路密钥烤进 Modal Secret(顺带清理 0.8.30 前的遗留残留)。"""
+    src = code_only((ROOT / "routes.py").read_text(encoding="utf-8"))
+    i = src.index("aigc_bypass = ")
+    seg = src[i:i + 400]
+    assert "if not aigc_base_url:" in seg, "没有在 URL 为空时丢弃密钥"
+    assert 'aigc_bypass = ""' in seg.split("if not aigc_base_url:")[1], "分支里没有真的清掉"
 
 
 def _sage_patch_cmd() -> str:
@@ -2390,7 +2498,6 @@ def test_cli_deploy_keeps_secret_fields_and_atomic_config():
 
 def test_admin_capability_closes_bridge_key_and_config_bypass():
     """本机免配置；远程/反代必须 capability，且通用 config 不能改安全字段。"""
-    import pytest
     from contract import is_direct_loopback_request, merge_public_config
 
     assert is_direct_loopback_request("127.0.0.1", "127.0.0.1:8188")
@@ -2406,7 +2513,7 @@ def test_admin_capability_closes_bridge_key_and_config_bypass():
            "bridge_api_key": "bk-secret"}
     assert merge_public_config(cur, {"gpu_tier": "top"})["gpu_tier"] == "top"
     for forbidden in ("local_api_capability", "bridge_api_key", "allow_remote_bridge_key"):
-        with pytest.raises(ValueError):
+        with raises(ValueError):
             merge_public_config(cur, {forbidden: "attacker"})
 
     src = (ROOT / "routes.py").read_text(encoding="utf-8")
@@ -2904,10 +3011,21 @@ def test_submit_asks_before_pushing_private_nodes():
     # 否则只要工作流含自写节点就每次都弹确认(codex review 抓到)。
     diff_at = seg.find("/modal_bridge/local_nodes_diff")
     assert diff_at > 0, "弹确认前没有先比对真实差异,会变成每次运行都打扰用户"
-    # ⚠ 带上闭括号与花括号。只写 `_changed.length === 0` 是恒真的:放宽成
-    #    `_changed.length === 0 || true`(永远跳过确认)子串原样还在(2026-09-02 变异实测)。
-    assert "if (_changed.length === 0) {" in seg, \
-        "全都一致时没有跳过确认,或条件被放宽(必须是恰好的 `if (_changed.length === 0) {`)"
+    # ⚠ 这里不能用子串包含,**两个方向的边界都要**(2026-09-02 当场踩到):
+    #    · 只写 `_changed.length === 0` → 放宽成 `... || true` 仍含原串,恒真;
+    #    · 补上闭括号写成 `if (_changed.length === 0) {` → 仍然恒真!因为
+    #      `} else if (_changed.length === 0) {` **原样包含它**。我按这个写法改完之后
+    #      把跳过条件的语义改掉了,这条测试一声没吭。
+    #    所以改成:把所有相关的 guard 行整行取出来,和预期逐字比对。任何一条被改写、
+    #    被 else-if 包一层、或加一个 `|| ...`,都会立刻不等。
+    guards = [ln.strip() for ln in seg.splitlines() if "_changed.length === 0" in ln]
+    assert guards == [
+        "if (_changed.length === 0 && !_reqsPending) {",
+        "} else if (_changed.length === 0) {",
+    ], (
+        "私有节点的跳过判定变了。它必须是两段:内容一致**且**不欠镜像重建才静默跳过;"
+        f"内容一致但欠重建要单独确认(那条路径以前完全不问,点一次运行会毫无征兆卡几分钟)。"
+        f"实际读到:{guards}")
 
     confirm_at = seg.find('confirm(t("node.local_push_confirm"')
     assert diff_at < confirm_at, "差异预检必须在确认之前"
@@ -2955,3 +3073,55 @@ def test_partial_output_loss_is_a_failure():
     worker = (ROOT / "modal_app" / "modal_app.py").read_text(encoding="utf-8")
     j = worker.index('done = {**job_state.get(job_id, {}), "status": "completed"')
     assert "warnings" in worker[j:j + 700], "worker 把 result['errors'] 丢掉了,出问题无从追溯"
+
+
+if __name__ == "__main__":
+    import inspect
+    import tempfile
+
+    class _MonkeyPatch:
+        """pytest monkeypatch 的最小替身:只实现本文件用到的 setattr + 自动回滚。
+
+        ⚠ 2026-09-02 之前这个自跑入口**放在文件中段**,`sys.exit()` 一执行,后面
+        1272 行里的 36 条测试连定义都没跑到 —— 而 CI 用的正是这条路径,于是
+        路径囚笼、admin 守卫、Registry 合规、sage 补丁那些测试**从来没在 CI 里跑过**,
+        CI 却一直是绿的。挪到文件末尾后才暴露出这三条依赖 monkeypatch 的测试跑不了。
+        """
+
+        def __init__(self):
+            self._undo = []
+
+        def setattr(self, target, name, value):
+            self._undo.append((target, name, getattr(target, name)))
+            setattr(target, name, value)
+
+        def undo(self):
+            for target, name, old in reversed(self._undo):
+                setattr(target, name, old)
+            self._undo.clear()
+
+    fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
+    passed = failed = 0
+    for fn in fns:
+        mp = _MonkeyPatch()
+        try:
+            # 极简 fixture:按签名注入 tmp_path / monkeypatch(与 pytest 语义对齐)
+            params = inspect.signature(fn).parameters
+            kw = {"monkeypatch": mp} if "monkeypatch" in params else {}
+            if "tmp_path" in params:
+                with tempfile.TemporaryDirectory() as td:
+                    fn(Path(td), **kw)
+            else:
+                fn(**kw)
+            print(f"  ✓ {fn.__name__}")
+            passed += 1
+        except AssertionError as e:
+            print(f"  ✗ {fn.__name__}  — {e}")
+            failed += 1
+        except Exception as e:
+            print(f"  ✗ {fn.__name__}  — ERROR {type(e).__name__}: {e}")
+            failed += 1
+        finally:
+            mp.undo()
+    print(f"\n{passed} passed, {failed} failed")
+    sys.exit(1 if failed else 0)

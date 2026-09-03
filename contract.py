@@ -92,6 +92,15 @@ def merge_public_config(current: dict, body: dict) -> dict:
         body = {**body, "aigc_studio_base_url": v.rstrip("/")}
     out = dict(current)
     out.update({k: body[k] for k in PUBLIC_CONFIG_WRITE_FIELDS if k in body})
+    # 清空 URL = 停用这个集成 → 旁路密钥一并清掉。
+    # ⚠ 密钥不在 PUBLIC_CONFIG_WRITE_FIELDS 里(那道闸挡的是"改配置再取密钥"的两步绕过),
+    #   所以它此前**只能被更新、无法被清除**:密码框留空按"沿用已存"处理,后端也没有删除入口。
+    #   结果是停用集成之后,密钥仍留在本地 config、并被烤进下一次创建的 Modal Secret
+    #   (2026-09-02 codex 抓到)。这里是清除的唯一入口 —— 只清、不读、不回吐,不构成绕过。
+    # 只认**显式置空**这个动作,不能写成"URL 为空就清":用户可能先填了密钥还没填 URL,
+    # 那时改个 gpu_tier 就会把密钥无声抹掉。遗留残留由 /setup 那条路径在部署时清理。
+    if body.get("aigc_studio_base_url", None) == "" and current.get("aigc_bypass_secret"):
+        out["aigc_bypass_secret"] = ""
     return out
 
 

@@ -33,9 +33,22 @@ jobs:
       - name: Compile all modules
         run: python -m compileall -q .
 
-      # 核心纯函数单测:自带 modal / nodes / folder_paths 桩,无需真实依赖。
-      - name: Unit tests
+      # ⚠ 权威门禁是 pytest。2026-09-02 codex 抓到:此前 CI 只跑
+      # `python tests/test_core.py`,而那个自跑入口当时在 2957 行文件的第 1685 行 ——
+      # 执行到 sys.exit() 就停,后面 36 条测试**连定义都没跑到**,其中包括路径囚笼、
+      # admin 守卫、Registry 合规、sage 与 basicsr 补丁的全部测试。**CI 一直是绿的**:
+      # 漏跑和全过在报告里长得一模一样。现已把入口挪到文件末尾,并有
+      # test_selfrun_entrypoint_is_last_so_no_test_is_skipped 盯着不让它挪回去。
+      # ⚠ 这一步必须排在 `pip install pytest` **之前**:它验的就是"没装 pytest 时能不能跑",
+      # 放在后面等于在装了 pytest 的环境里跑,`import pytest` 这类硬依赖照样看不出来
+      # (2026-09-02 第一版就放在了后面)。
+      - name: Unit tests (无 pytest 的自跑路径)
         run: python tests/test_core.py
+
+      - name: Install pytest
+        run: pip install pytest
+      - name: Unit tests (pytest — 权威)
+        run: python -m pytest tests/ -q
 
       # 真实 aiohttp 路由测试。需要 aiohttp（本就是插件依赖，见 requirements.txt）——
       # 纯源码字符串检查验证不了"跑起来会怎样"，两轮 review 的 P1 都从那个缺口漏过。

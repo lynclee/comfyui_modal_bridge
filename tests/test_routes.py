@@ -140,6 +140,48 @@ def test_post_config_rejects_credential_fields():
     assert cfg_mod.load_config()["aigc_studio_base_url"] == "https://site.app", "URL 没有真正落盘"
 
 
+def test_local_nodes_diff_reports_pending_image_rebuild():
+    """内容一致但依赖镜像还欠一次重建时,预检必须如实回报 —— 否则前端会说"无需推送"。
+
+    2026-09-02 codex 抓到:/local_nodes_diff 当时只比 Volume 内容。上次依赖重建失败后
+    `local_node_reqs_deployed_hash` 没有推进,而 zip 是一致的 → 预检报"全部一致" →
+    前端不弹确认 → 随后 sync_local_nodes 仍满足 target != deployed,**无确认地触发
+    几分钟镜像重建 + 云账单**。确认框存在的全部理由就是"别让一次点击悄悄变成几分钟"。
+
+    这条真发请求。只验源码里有那个字段是不够的:字段在、值算错照样过。
+    """
+    import comfyui_modal_bridge.node_sync as ns
+    import comfyui_modal_bridge.routes as rt
+
+    reqs = ["pandas", "kornia"]
+    matching = ns.local_node_reqs_hash(reqs)
+
+    rt.local_nodes.plan_local_uploads = lambda cfg, folders, root: {
+        "upload": [], "uptodate": [{"folder": f} for f in folders], "failed": [],
+    }
+    rt._compute_local_node_reqs = lambda cfg: reqs
+
+    async def ask(c):
+        r = await c.post("/modal_bridge/local_nodes_diff", json={"folders": ["my_node"]})
+        return r.status, await r.json()
+
+    # ① 指纹一致 = 镜像是最新的 → 不该打扰用户
+    _set_cfg(local_node_reqs_deployed_hash=matching)
+    st, body = _run(ask)
+    assert st == 200, body
+    assert body["upload"] == [] and body["uptodate"] == ["my_node"]
+    assert body["reqs_redeploy_pending"] is False, \
+        f"指纹一致却说还要重建,会每次都多问一次: {body}"
+
+    # ② 指纹不一致(典型:上次重建失败)= 内容虽一致,但点下去仍会重建几分钟
+    _set_cfg(local_node_reqs_deployed_hash="stale-hash")
+    st, body = _run(ask)
+    assert st == 200, body
+    assert body["uptodate"] == ["my_node"], "内容明明一致,不该报成有改动"
+    assert body["reqs_redeploy_pending"] is True, \
+        f"依赖镜像欠重建却没回报 —— 前端会说「无需推送」然后静默卡几分钟: {body}"
+
+
 def test_bridge_key_rejects_non_loopback():
     """/bridge_key 只能本机取。TestClient 走的是 127.0.0.1,所以正常应放行;
     伪造成外部 Host 时必须拒 —— 反向代理后面 TCP peer 恒为 loopback,只看它会漏。"""

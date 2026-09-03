@@ -121,6 +121,7 @@ const I18N = {
                         en: "Packing {n} local node(s) (auto-deploys only if dependencies changed)..." },
   "node.local_fail_detail":{ zh: "私有节点同步失败,已停止提交(避免云端静默跑旧代码):\n\n{msg}\n\n完整日志见 ComfyUI 控制台(失败时会打印命令输出尾部)。常见原因是某个节点的 requirements 在云端装不上。",
                         en: "Private node sync failed; submission stopped to avoid running stale code in the cloud:\n\n{msg}\n\nFull log is in the ComfyUI console (the tail of the command output is printed on failure). A common cause is a node's requirements failing to install in the cloud." },
+  "node.reqs_redeploy_confirm":{ zh: "私有节点的代码和云端一致,但它们的依赖还欠一次镜像重建(通常是上一次重建失败或被中断)。\n\n继续会先重建镜像,约 3-5 分钟,并产生一次构建费用。\n\n点「确定」现在重建并继续提交。\n点「取消」中止本次提交。", en: "Your private nodes' code matches the cloud, but their dependencies still need one image rebuild (usually the previous rebuild failed or was interrupted).\n\nContinuing will rebuild the image first — about 3-5 minutes, and it costs a build.\n\nOK: rebuild now and continue.\nCancel: abort this submission." },
   "node.local_push_confirm":{ zh: "检测到 {n} 个私有节点有改动,需要先推送到云端:\n\n  {list}\n\n代码推上去是秒级的;但如果这些节点的 requirements.txt 也改了,还要重建镜像(约 3-5 分钟)。\n\n点「确定」现在推送并继续提交。\n点「取消」中止本次提交 —— 不推就跑的话,云端用的是旧代码,出来的结果和你改的不一样,而且不会有任何报错。",
                         en: "{n} private node(s) changed and must be pushed to the cloud first:\n\n  {list}\n\nPushing the code is instant; but if their requirements.txt also changed, the image has to be rebuilt (~3-5 min).\n\nOK: push now and continue submitting.\nCancel: abort this submission — running without pushing means the cloud uses stale code, producing results that differ from your edits with no error at all." },
   "node.local_push_cancelled":{ zh: "已取消 —— 未推送私有节点,本次提交中止(避免云端静默跑旧代码)",
@@ -685,6 +686,8 @@ async function ensureNodesAvailable(prompt, ctx) {
     // 一致。先问一次后端:哪些 digest 真的不一样。查不出来时后端退化成"当作有改动",
     // 最坏是多问一次,不会漏推。
     let _changed = local_pack.map((p) => p.folder);
+    // 预检拿不到就保守当成"要重建" —— 宁可多问一次,也不要让一次点击悄悄变成几分钟
+    let _reqsPending = true;
     try {
       const dr = await bridgeFetch("/modal_bridge/local_nodes_diff", {
         method: "POST", headers: { "Content-Type": "application/json" },
@@ -693,13 +696,23 @@ async function ensureNodesAvailable(prompt, ctx) {
       if (dr.ok) {
         const dj = await dr.json();
         if (Array.isArray(dj.upload)) _changed = dj.upload;
+        // 依赖镜像还欠一次重建(典型:上次重建失败,deployed_hash 没推进)。
+        // 此时 zip 内容是一致的,_changed 会是空 —— 但后端仍会重建镜像,几分钟。
+        _reqsPending = dj.reqs_redeploy_pending !== false;
         if (dj.degraded) log("local_nodes_diff degraded:", dj.degraded);
       }
     } catch (e) { log("local_nodes_diff failed, 当作有改动:", e); }
 
-    if (_changed.length === 0) {
-      // 全都和云端一致 —— 不打扰用户,直接往下走
+    if (_changed.length === 0 && !_reqsPending) {
+      // 内容一致、也不欠一次镜像重建 —— 不打扰用户,直接往下走
       log("private nodes: 与云端一致,无需推送");
+    } else if (_changed.length === 0) {
+      // 内容一致但依赖镜像还欠一次重建(上次重建失败等)。这条路径以前**完全不问**,
+      // 于是点「运行」会毫无征兆地卡几分钟并产生云账单(2026-09-02 codex 抓到)。
+      if (!confirm(t("node.reqs_redeploy_confirm"))) {
+        notify(t("node.local_push_cancelled"), "warn");
+        return false;
+      }
     } else {
     const _names = _changed.join("、");
     if (!confirm(t("node.local_push_confirm", { n: _changed.length, list: _names }))) {
@@ -1820,11 +1833,15 @@ const SETTINGS = [
     tooltip: t("set.cpu_guess"),
     onChange: (v) => syncCpuGuessToConfig(v),
   },
-  // AIGC Studio 交付(自建网站 aigc-r2 模式)。两个字段都在这里填,Setup 面板不再有这一栏。
-  // ⚠ 已知代价(用户 2026-08-31 明确选择接受):设置值会明文持久化进 comfy.settings.json,
-  // 那个文件是 0644、且前端 getSetting 能直接读出明文;而真实存储 config.json 是 0600、
-  // /config 端点还会显式抹掉密钥不回吐。password 类型只遮显示(挡截图/录屏),不改存储。
-  // 换来的是配置集中在一处,不必在设置页和部署面板之间来回跳。
+  // AIGC Studio 交付(自建网站 aigc-r2 模式)。**只有 URL 在这里**;旁路密钥在部署面板的
+  // 专用密码框里(2026-08-31 一度两个都放这儿,当天就搬回去了 —— 注释此前没跟着改,
+  // 2026-09-02 codex 抓到)。
+  // 为什么分开:设置项会**明文持久化进 comfy.settings.json**,那个文件 0644、前端
+  // getSetting 能直接读出明文,任何第三方节点的 JS 都读得到。URL 不是凭据,放这里换来
+  // 配置可见、可直接改;密钥是凭据,只能走部署面板 → config.json(0600),而且 /config
+  // 端点显式抹掉它不回吐、PUBLIC_CONFIG_WRITE_FIELDS 也不收它(挡"改配置再取密钥"的
+  // 两步绕过)。password 输入类型只遮显示(挡截图/录屏),不改存储 —— 别拿它当保护。
+  // ⚠ 清空这个 URL = 停用集成,后端会**连带清掉已存的密钥**(那是密钥唯一的删除入口)。
   {
     id: "ModalBridge.aigcStudioUrl",
     name: "AIGC Studio URL",
