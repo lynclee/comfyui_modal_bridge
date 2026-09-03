@@ -4,6 +4,7 @@ routes.py — 本地 ComfyUI 服务器上的 HTTP 路由
 """
 import asyncio
 import base64
+import contextlib
 import functools
 import secrets
 import subprocess
@@ -231,6 +232,70 @@ def _output_dir() -> Path:
     return Path(__file__).resolve().parents[2] / "output"
 
 
+# 取回进度(给 /fetch_result 那一次阻塞 POST 提供可观测性)。
+# 2026-09-03 用户反馈:8K 全景图工作流"卡在 Downloading result"一小时。实际没卡 ——
+# 大产物走 Volume 直连下载,而 modal 的 read_file_into_fileobj 是一次阻塞调用、没有进度
+# 回调,前端那句文案又是**无条件**写死的「Decoding base64...」,于是几十分钟的下载被显示成
+# 一句静态的、还说错了路径的提示。一小时静态文案与真卡住无法区分,用户只能猜。
+# 这里靠采样 .part 文件大小报进度;分母来自 modal_volume.volume_file_size(拿不到就只报已下载量)。
+_FETCH_PROGRESS: dict = {}
+_FETCH_PROGRESS_MAX = 32
+
+
+def _fetch_progress_set(job_id: str, **kw) -> None:
+    if job_id not in _FETCH_PROGRESS and len(_FETCH_PROGRESS) >= _FETCH_PROGRESS_MAX:
+        for _old in list(_FETCH_PROGRESS)[: _FETCH_PROGRESS_MAX // 4]:  # dict 有序,清最早的
+            _FETCH_PROGRESS.pop(_old, None)
+    _FETCH_PROGRESS.setdefault(job_id, {}).update(kw)
+
+
+async def _sample_part_size(job_id: str, part: Path, total: int, label: str,
+                            interval: float = 0.5, window_s: float = 10.0):
+    """每 0.5s 采一次 .part 大小,算出速率与停滞时长,写进 _FETCH_PROGRESS。被 cancel 即停。
+
+    ⚠ 速率在这里算、不在前端算:这边采样间隔固定 0.5s,前端轮询会被标签页节流
+    (后台 tab 的 setInterval 被压到 ≥1s、甚至暂停),用它的时间差算速率会跳得没法看。
+
+    stalled_s 是这里最要紧的一个数 —— 用户问的其实不是"多快",是"到底卡没卡"。
+    速度慢和真挂住在一句静态文案下完全一样;而"已 45s 没有任何增长"是个能直接回答
+    那个问题的观测值(2026-09-03 用户反馈:download 很慢感觉也像卡死)。
+    """
+    # interval / window_s 是留给测试压缩时间的口子(真跑 0.5s / 10s;测试用 0.02s / 0.4s,
+    # 否则一条测试要 5 秒)。生产调用不传这两个参数。
+    window: list[tuple[float, int]] = []          # (时刻, 已下载) 滑动窗口
+    last_grow = asyncio.get_running_loop().time()
+    last_size = -1
+    try:
+        while True:
+            now = asyncio.get_running_loop().time()
+            try:
+                done = part.stat().st_size
+            except OSError:
+                done = 0                          # 文件还没建 / 已 rename 成正式名
+            if done > last_size:
+                last_grow, last_size = now, done
+            window.append((now, done))
+            while len(window) > 1 and now - window[0][0] > window_s:
+                window.pop(0)
+            bps = 0
+            if len(window) > 1:
+                dt = window[-1][0] - window[0][0]
+                db = window[-1][1] - window[0][1]
+                if dt > 0 and db > 0:
+                    bps = int(db / dt)
+            _fetch_progress_set(
+                job_id, stage="volume", label=label, done=done, total=total,
+                bps=bps, stalled_s=int(now - last_grow),
+                # 分母已知且在动才给 ETA;不给"∞"这种没用的显示
+                # max(1, ...):不足 1 秒的 ETA 被 int() 截成 0,而 0 在前端表示"未知" ——
+                # 于是"马上就好"会显示成"算不出来"(测试抓到)。
+                eta_s=max(1, int((total - done) / bps)) if (bps and total and total > done) else 0,
+            )
+            await asyncio.sleep(interval)
+    except asyncio.CancelledError:
+        raise
+
+
 async def _write_results(final: dict, job_id: str, subfolder: str, cfg: dict) -> list:
     """把 Modal 返回的产物写到 output/<subfolder>/<job_id>/,返回 outputs 列表。
     每个产物二选一:小文件 data_base64(解码落盘);大文件 volume_path(从 Volume 直连下载落盘)。
@@ -283,13 +348,23 @@ async def _write_results(final: dict, job_id: str, subfolder: str, cfg: dict) ->
                 if not contract.is_safe_output_path(job_id, vp):
                     raise RuntimeError(f"volume_path 越界(必须在 _outputs/{job_id}/ 内): {vp!r}")
                 # 大文件:从 Volume 直连下载(不走 base64/Dict),下完删 Volume 上的副本
+                total = await asyncio.to_thread(modal_volume.volume_file_size, cfg, vp)
+                sampler = asyncio.create_task(
+                    _sample_part_size(job_id, local.with_name(local.name + ".part"), total, fn))
                 try:
                     size = await asyncio.to_thread(modal_volume.download_volume_file, cfg, vp, str(local))
                 except Exception as e:
                     raise RuntimeError(f"volume download {vp} failed: {e}")
+                finally:
+                    sampler.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await sampler
                 await asyncio.to_thread(modal_volume.remove_volume_path, cfg, vp)
             else:
-                size = _atomic_write(local, base64.b64decode(b64))
+                _fetch_progress_set(job_id, stage="decode", label=fn,
+                                    done=0, total=len(b64) * 3 // 4)
+                size = await asyncio.to_thread(_atomic_write, local, base64.b64decode(b64))
+                _fetch_progress_set(job_id, stage="decode", label=fn, done=size, total=size)
             outputs.append({"filename": fn, "subfolder": f"{subfolder}/{job_id}",
                             "type": "output", "size_bytes": size,
                             "node_id": img.get("node_id"),  # 来源节点 → 前端按节点回填
@@ -760,6 +835,17 @@ def _setup_routes():
         return web.json_response({"ok": True})
 
     # -------- 拉结果(完成后调,写文件 + 返回 outputs)--------
+    @routes.get("/modal_bridge/fetch_progress")
+    @_admin_only
+    async def _fetch_progress(request: web.Request):
+        """取回进度。/fetch_result 是一次阻塞 POST,大产物下载几十分钟期间前端只能靠它
+        知道"在动"。没有记录就回 {ok:false} —— 前端据此显示静态文案,不当错误。"""
+        job_id = request.query.get("job_id") or ""
+        rec = _FETCH_PROGRESS.get(job_id)
+        if not rec:
+            return web.json_response({"ok": False})
+        return web.json_response({"ok": True, **rec})
+
     @routes.post("/modal_bridge/fetch_result")
     @_admin_only
     async def _fetch_result(request: web.Request):
@@ -776,10 +862,12 @@ def _setup_routes():
         try:
             outputs = await _write_results(final, job_id, subfolder, cfg)
         except Exception as e:
+            _FETCH_PROGRESS.pop(job_id, None)
             return web.json_response({"error": f"write result failed: {e}"}, status=502)
         if not outputs:
             return web.json_response({"error": "no image in modal_state"}, status=502)
 
+        _FETCH_PROGRESS.pop(job_id, None)
         print(f"[modal_bridge] ✓ job {job_id} fetched {len(outputs)} img → {subfolder}/{job_id}/")
         return web.json_response({"ok": True, "job_id": job_id, "outputs": outputs})
 

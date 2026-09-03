@@ -121,6 +121,11 @@ const I18N = {
                         en: "Packing {n} local node(s) (auto-deploys only if dependencies changed)..." },
   "node.local_fail_detail":{ zh: "私有节点同步失败,已停止提交(避免云端静默跑旧代码):\n\n{msg}\n\n完整日志见 ComfyUI 控制台(失败时会打印命令输出尾部)。常见原因是某个节点的 requirements 在云端装不上。",
                         en: "Private node sync failed; submission stopped to avoid running stale code in the cloud:\n\n{msg}\n\nFull log is in the ComfyUI console (the tail of the command output is printed on failure). A common cause is a node's requirements failing to install in the cloud." },
+  "run.fetch_volume":{ zh: "{prefix}从 Volume 下载 {n} 个大产物…(几十 MB 的图可能要几分钟到几十分钟)", en: "{prefix}Downloading {n} large output(s) from Volume — tens of MB can take minutes" },
+  "run.fetch_decode":{ zh: "{prefix}解码并写盘({mb} MB)…", en: "{prefix}Decoding and writing ({mb} MB)…" },
+  "run.fetch_progress":{ zh: "{prefix}下载 {name} {done}/{total} MB({pct}%) · {spd} · 剩 {eta}", en: "{prefix}Downloading {name} {done}/{total} MB ({pct}%) · {spd} · {eta} left" },
+  "run.fetch_progress_nototal":{ zh: "{prefix}下载 {name} 已 {done} MB · {spd}", en: "{prefix}Downloading {name} — {done} MB so far · {spd}" },
+  "run.fetch_stalled":{ zh: "{prefix}⚠ 下载 {name} 已 {done} MB,但 {secs}s 没有任何进展 —— 链路可能断了,可以取消重试", en: "{prefix}⚠ Downloading {name}: {done} MB, no progress for {secs}s — the connection may be dead; cancelling and retrying is reasonable" },
   "node.reqs_redeploy_confirm":{ zh: "私有节点的代码和云端一致,但它们的依赖还欠一次镜像重建(通常是上一次重建失败或被中断)。\n\n继续会先重建镜像,约 3-5 分钟,并产生一次构建费用。\n\n点「确定」现在重建并继续提交。\n点「取消」中止本次提交。", en: "Your private nodes' code matches the cloud, but their dependencies still need one image rebuild (usually the previous rebuild failed or was interrupted).\n\nContinuing will rebuild the image first — about 3-5 minutes, and it costs a build.\n\nOK: rebuild now and continue.\nCancel: abort this submission." },
   "node.local_push_confirm":{ zh: "检测到 {n} 个私有节点有改动,需要先推送到云端:\n\n  {list}\n\n代码推上去是秒级的;但如果这些节点的 requirements.txt 也改了,还要重建镜像(约 3-5 分钟)。\n\n点「确定」现在推送并继续提交。\n点「取消」中止本次提交 —— 不推就跑的话,云端用的是旧代码,出来的结果和你改的不一样,而且不会有任何报错。",
                         en: "{n} private node(s) changed and must be pushed to the cloud first:\n\n  {list}\n\nPushing the code is instant; but if their requirements.txt also changed, the image has to be rebuilt (~3-5 min).\n\nOK: push now and continue submitting.\nCancel: abort this submission — running without pushing means the cloud uses stale code, producing results that differ from your edits with no error at all." },
@@ -289,6 +294,18 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 // 不进 ComfyUI settings(可能同步)、工作流或日志。请求体都是可重放的 JSON 字符串,
 // 所以配对成功后安全重试一次即可。
 const LOCAL_CAP_KEY = "modal_bridge.local_api_capability";
+function fmtRate(bps) {
+  if (bps >= 1048576) return `${(bps / 1048576).toFixed(1)} MB/s`;
+  if (bps >= 1024) return `${Math.round(bps / 1024)} KB/s`;
+  return `${bps} B/s`;
+}
+
+function fmtDur(sec) {
+  if (sec < 60) return `${sec}s`;
+  if (sec < 3600) return `${Math.floor(sec / 60)}m${String(sec % 60).padStart(2, "0")}s`;
+  return `${Math.floor(sec / 3600)}h${String(Math.floor((sec % 3600) / 60)).padStart(2, "0")}m`;
+}
+
 async function bridgeFetch(path, options = {}) {
   const call = async (allowPair) => {
     const headers = new Headers(options.headers || {});
@@ -1234,13 +1251,66 @@ async function runOnceOnModal(workflowPrompt, outputNodeIds, ctx, submitGuard, b
     throw new Error(`[job ${jobId}] ${final.error || "Modal worker failed"}`);
   }
 
-  ctx.stage("downloading", `${batchSuffix}Decoding base64...`, false);
-  const fetchRes = await bridgeFetch("/modal_bridge/fetch_result", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ job_id: jobId, modal_state: final }),
-  });
-  const fetched = await fetchRes.json();
+  // ⚠ 这句文案以前**无条件**写死「Decoding base64...」,而大产物走的是 Volume 直连下载,
+  //   根本不解码。2026-09-03 用户反馈 8K 全景图"卡在 Downloading result"一小时 ——
+  //   实际是在下载,没有卡:一句说错了路径的静态文案挂一小时,和真卡住无法区分。
+  //   分流规则在云端 _comfy_ws:>volume_threshold_mb(默认 8MB)写 Volume,否则 base64。
+  const _imgs = Array.isArray(final.images) ? final.images : [];
+  const _volN = _imgs.filter((i) => i && i.volume_path).length;
+  const _b64MB = _imgs.reduce(
+    (a, i) => a + (i && i.data_base64 ? i.data_base64.length * 0.75 : 0), 0) / 1048576;
+  ctx.stage("downloading", _volN
+    ? t("run.fetch_volume", { prefix: batchSuffix, n: _volN })
+    : t("run.fetch_decode", { prefix: batchSuffix, mb: _b64MB.toFixed(1) }), false);
+
+  // 取回进度。/fetch_result 是一次阻塞 POST,几十 MB 的 Volume 下载期间前端拿不到任何
+  // 信号,所以另开一路轮询后端采样出来的 .part 大小。查不到进度不算错误(后端可能还没
+  // 开始写、或这一版没有该端点)—— 那时就保持上面那句静态文案。
+  let _progTimer = null;
+  if (_volN) {
+    _progTimer = setInterval(async () => {
+      try {
+        const r = await bridgeFetch(`/modal_bridge/fetch_progress?job_id=${encodeURIComponent(jobId)}`);
+        if (!r.ok) return;
+        const j = await r.json();
+        if (!j.ok || !j.done) return;
+        const done = (j.done / 1048576).toFixed(1);
+        // 速率与 ETA 由后端算(它按固定 0.5s 采样;后台 tab 会节流 setInterval,
+        // 用前端时间差算速率会跳得没法看)。
+        const spd = j.bps ? fmtRate(j.bps) : "";
+        const eta = j.eta_s ? fmtDur(j.eta_s) : "";
+        // ⚠ 停滞时长是这里最要紧的一条:用户问的其实是"到底卡没卡",而"慢"和"挂住"
+        //   在一句静态文案下完全一样。超过 20s 没增长就直接说出来。
+        if (j.stalled_s >= 20) {
+          ctx.stage("downloading", t("run.fetch_stalled", {
+            prefix: batchSuffix, done, secs: j.stalled_s, name: j.label || "",
+          }), false);
+          return;
+        }
+        ctx.stage("downloading", j.total
+          ? t("run.fetch_progress", {
+              prefix: batchSuffix, done, total: (j.total / 1048576).toFixed(1),
+              pct: Math.min(99, Math.floor((j.done / j.total) * 100)),
+              spd, eta, name: j.label || "",
+            })
+          : t("run.fetch_progress_nototal", {
+              prefix: batchSuffix, done, spd, name: j.label || "" }),
+          false);
+      } catch (e) { /* 进度查不到不影响取回 */ }
+    }, 1000);
+  }
+
+  let fetchRes, fetched;
+  try {
+    fetchRes = await bridgeFetch("/modal_bridge/fetch_result", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ job_id: jobId, modal_state: final }),
+    });
+    fetched = await fetchRes.json();
+  } finally {
+    if (_progTimer) clearInterval(_progTimer);
+  }
   if (!fetchRes.ok || !fetched.ok) {
     throw new Error(`[job ${jobId}] ${fetched.error || `fetch HTTP ${fetchRes.status}`}`);
   }

@@ -275,6 +275,25 @@ def upload_models(cfg: dict, items: list, on_progress=None) -> dict:
     return {"uploaded": uploaded, "skipped": skipped, "total_mb": total_mb}
 
 
+def volume_file_size(cfg: dict, vol_path: str) -> int:
+    """Volume 上 vol_path 的字节数;拿不到返回 0(调用方按"总量未知"处理)。
+
+    只用于给下载进度提供分母 —— 一个 8K 全景图产物可能几十 MB,在慢链路上要几十分钟,
+    而 /fetch_result 是一次阻塞 POST:没有分母的话界面只能显示一句静态文案,
+    用户看到的就是"卡住了"(2026-09-03 用户反馈:8K 工作流卡在 Downloading result
+    一小时,实际是在下载,并没有卡)。拿不到分母也不该让取回失败,所以一律吞异常。
+    """
+    try:
+        vol = get_volume(cfg)
+        for e in vol.listdir(vol_path):
+            n = getattr(e, "size", 0) or 0
+            if n:
+                return int(n)
+    except Exception:
+        pass
+    return 0
+
+
 def download_volume_file(cfg: dict, vol_path: str, local_path: str) -> int:
     """从 Volume 把 vol_path 直连下载到本地 local_path(同步阻塞)。返回字节数。
     大产物(视频/3D)走这条,避开 base64+modal.Dict 上限 + 省一道浏览器中转。"""

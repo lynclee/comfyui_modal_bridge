@@ -140,6 +140,75 @@ def test_post_config_rejects_credential_fields():
     assert cfg_mod.load_config()["aigc_studio_base_url"] == "https://site.app", "URL 没有真正落盘"
 
 
+def test_fetch_progress_reports_rate_eta_and_stall():
+    """取回进度必须给出**速率、ETA 和停滞时长** —— 这三个才回答得了"到底卡没卡"。
+
+    2026-09-03 用户反馈:8K 全景图工作流"卡在 Downloading result"一小时,后来成功了。
+    实际没卡 —— 大产物走 Volume 直连下载,而 modal 的 read_file_into_fileobj 是一次
+    阻塞调用没有进度回调,前端那句文案还**无条件**写死「Decoding base64...」(走 Volume
+    时根本不解码)。一句说错了路径的静态文案挂一小时,和真挂住无法区分。
+    追问也很直接:"download 很慢感觉也像卡死一样,能加个下载速度么"。
+
+    速率在后端算而不是前端:后端固定 0.5s 采样,而前端 setInterval 在后台标签页会被
+    节流(≥1s、甚至暂停),用它的时间差算速率会跳得没法看。
+    """
+    import comfyui_modal_bridge.routes as rt
+
+    tmp = Path(tempfile.mkdtemp(prefix="mb-fetchprog-"))
+    part = tmp / "big.png.part"
+    total = 4 * 1024 * 1024                      # 分母:4 MB
+
+    async def body(c):
+        # ① 没有记录时不能报错,前端据此保留静态文案
+        r = await c.get("/modal_bridge/fetch_progress?job_id=nosuchjob")
+        assert r.status == 200
+        assert (await r.json())["ok"] is False
+
+        # ② 边长边采:间隔压到 20ms,窗口 0.4s(生产是 0.5s / 10s)
+        task = asyncio.create_task(
+            rt._sample_part_size("j-prog", part, total, "big.png",
+                                 interval=0.02, window_s=0.4))
+        try:
+            n = 0
+            for _ in range(10):                  # 0.2s 内涨到 1 MB
+                n += 104858
+                part.write_bytes(b"\0" * n)
+                await asyncio.sleep(0.02)
+            await asyncio.sleep(0.05)
+            r = await c.get("/modal_bridge/fetch_progress?job_id=j-prog")
+            moving = await r.json()
+
+            # ③ 停止增长 → 停滞时长必须爬起来。
+            #    stalled_s 是**整秒**(生产阈值 20s,整秒粒度足够),所以这里必须等过 1s ——
+            #    等 0.5s 的话 int(0.5)==0,会误判成"没实现"。
+            await asyncio.sleep(1.2)
+            r = await c.get("/modal_bridge/fetch_progress?job_id=j-prog")
+            stalled = await r.json()
+        finally:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        return moving, stalled
+
+    moving, stalled = _run(body)
+
+    assert moving["ok"] is True and moving["stage"] == "volume"
+    assert moving["label"] == "big.png"
+    assert moving["done"] > 0, f"没读到已下载字节: {moving}"
+    assert moving["total"] == total
+    assert moving["bps"] > 0, f"没算出速率 —— 用户问的就是这个: {moving}"
+    assert moving["eta_s"] > 0, f"分母已知且在动,必须给 ETA: {moving}"
+    assert moving["stalled_s"] == 0, f"正在涨却报停滞: {moving}"
+
+    assert stalled["stalled_s"] >= 1, \
+        f"停止增长后 stalled_s 仍是 0 —— 那就无法区分「慢」和「挂住」: {stalled}"
+    assert stalled["done"] == moving["done"] or stalled["done"] >= moving["done"]
+
+    rt._FETCH_PROGRESS.pop("j-prog", None)
+
+
 def test_local_nodes_diff_reports_pending_image_rebuild():
     """内容一致但依赖镜像还欠一次重建时,预检必须如实回报 —— 否则前端会说"无需推送"。
 

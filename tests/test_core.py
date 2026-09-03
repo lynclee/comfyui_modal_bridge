@@ -1816,6 +1816,50 @@ def test_deploy_drops_orphan_aigc_secret():
     assert 'aigc_bypass = ""' in seg.split("if not aigc_base_url:")[1], "分支里没有真的清掉"
 
 
+def test_fetch_stage_label_tells_the_truth_about_which_path():
+    """取回阶段的文案必须按**实际走的通道**分支,不能写死「Decoding base64」。
+
+    2026-09-03 用户反馈:8K 全景图工作流"卡在 Downloading result",下面一行是
+    「Decoding base64...」,前后一小时。实际没卡 —— 大产物 >volume_threshold_mb(默认 8MB)
+    走 Volume 直连下载,**根本不解码**。那句文案是无条件写死的,于是几十分钟的下载被
+    显示成一句既静态、又说错了路径的提示;而"慢"和"挂住"在静态文案下完全一样。
+
+    分流规则在云端 _comfy_ws.materialize_*:>阈值 → rec["volume_path"],否则 rec["data_base64"]。
+    所以前端在调 /fetch_result 之前就能从 final.images 判断走哪条。
+    """
+    js = (ROOT / "web" / "modal_bridge.js").read_text(encoding="utf-8")
+
+    # ⚠ 断言必须盯**代码形态**,不能搜那句散文。写成 `"Decoding base64..." not in js`
+    #   会撞上本次修复在源码里留下的解释性注释 —— 这轮已经第三次踩到"断言匹配到自己
+    #   写的注释",而这次是反方向(否定式断言被注释触发,永远为假)。
+    #   这里锚的是那个模板字面量本身,散文里不会出现。
+    assert "${batchSuffix}Decoding base64" not in js, \
+        "又出现了写死的解码文案 —— 走 Volume 时它是错的,而且一挂一小时"
+
+    i = js.index('ctx.stage("downloading"')
+    seg = js[i - 900:i + 400]
+    assert "volume_path" in seg, "取回文案没有按 volume_path 分支,又变回一句写死的了"
+    assert 't("run.fetch_volume"' in seg and 't("run.fetch_decode"' in seg, \
+        "两条通道必须各有自己的文案"
+
+    # 进度轮询必须存在:/fetch_result 是一次阻塞 POST,没有它大文件下载期间前端零信号
+    assert "/modal_bridge/fetch_progress" in js, "没有取回进度轮询"
+    # 三个数缺一不可 —— 用户明确要的是速度,而停滞时长才回答"到底卡没卡"
+    for key in ("run.fetch_progress", "run.fetch_stalled"):
+        assert f'"{key}"' in js, f"缺文案 {key}"
+    # ⚠ 不能写 `"j.stalled_s" in js` —— 那只证明**字符串存在**,不证明分支会执行。
+    #   实测:把 `if (j.stalled_s >= 20) {` 改成 `if (false) {`,该串仍留在下面那句
+    #   t("run.fetch_stalled", { secs: j.stalled_s }) 里,断言照样绿(2026-09-03 当场踩到,
+    #   本轮第四次同类)。和 codex 演示的"把校验包进 if false 仍能骗过字符串断言"同源。
+    #   所以取整行逐字比对。
+    guards = [ln.strip() for ln in js.splitlines() if "stalled_s >=" in ln]
+    assert guards == ["if (j.stalled_s >= 20) {"], \
+        f"停滞判据被改写或去掉了 —— 那就无法区分「慢」和「挂住」。实际读到:{guards}"
+    rate = [ln.strip() for ln in js.splitlines() if "fmtRate(" in ln and "function" not in ln]
+    assert rate == ["const spd = j.bps ? fmtRate(j.bps) : \"\";"], \
+        f"下载速度的显示被改了(用户明确要的就是这个)。实际读到:{rate}"
+
+
 def _sage_patch_cmd() -> str:
     """从 modal_image.py 源码里抽出那条 sage 补丁命令。
 
