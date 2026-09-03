@@ -170,10 +170,11 @@ def test_fetch_progress_reports_rate_eta_and_stall():
                                  interval=0.02, window_s=0.4))
         try:
             n = 0
-            for _ in range(10):                  # 0.2s 内涨到 1 MB
+            # 增长期 0.4s、步长 40ms,采样 20ms → 每步至少两次采样,慢 CI 上也够算出速率
+            for _ in range(10):                  # 涨到 1 MB
                 n += 104858
                 part.write_bytes(b"\0" * n)
-                await asyncio.sleep(0.02)
+                await asyncio.sleep(0.04)
             await asyncio.sleep(0.05)
             r = await c.get("/modal_bridge/fetch_progress?job_id=j-prog")
             moving = await r.json()

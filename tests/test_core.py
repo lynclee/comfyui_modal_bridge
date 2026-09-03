@@ -1807,13 +1807,26 @@ def test_aigc_secret_can_actually_be_cleared():
         raise AssertionError("aigc_bypass_secret 竟然能经通用 config API 写入")
 
 
-def test_deploy_drops_orphan_aigc_secret():
-    """部署时 URL 为空 → 不把旁路密钥烤进 Modal Secret(顺带清理 0.8.30 前的遗留残留)。"""
+def test_deploy_aigc_secret_three_states():
+    """/setup 里旁路密钥必须是三态,且顺序固定:显式输入 > URL 存在则沿用 > 否则清掉。
+
+    review 抓到第一版写成"URL 为空就清":用户在部署面板刚输入的密钥也被静默丢掉 ——
+    而 /config 那条路径对"先填密钥、URL 稍后填"这个场景是特意保护过的,两边自相矛盾。
+    这里取三个 guard 行整行逐字比对(子串包含会被 else-if 包一层骗过,本轮已踩四次)。
+    """
     src = code_only((ROOT / "routes.py").read_text(encoding="utf-8"))
-    i = src.index("aigc_bypass = ")
-    seg = src[i:i + 400]
-    assert "if not aigc_base_url:" in seg, "没有在 URL 为空时丢弃密钥"
-    assert 'aigc_bypass = ""' in seg.split("if not aigc_base_url:")[1], "分支里没有真的清掉"
+    i = src.index('_typed = (body.get("aigc_bypass_secret") or "").strip()')
+    seg = src[i:i + 500]
+    lines = [ln.strip() for ln in seg.splitlines() if ln.strip()]
+    assert lines[:6] == [
+        '_typed = (body.get("aigc_bypass_secret") or "").strip()',
+        "if _typed:",
+        "aigc_bypass = _typed",
+        "elif aigc_base_url:",
+        'aigc_bypass = cfg.get("aigc_bypass_secret", "")',
+        "else:",
+    ], f"密钥三态或顺序被改了。实际读到:{lines[:6]}"
+    assert lines[6] == 'aigc_bypass = ""', f"URL 为空时没有真的清掉:{lines[6]!r}"
 
 
 def test_fetch_stage_label_tells_the_truth_about_which_path():
@@ -1858,6 +1871,44 @@ def test_fetch_stage_label_tells_the_truth_about_which_path():
     rate = [ln.strip() for ln in js.splitlines() if "fmtRate(" in ln and "function" not in ln]
     assert rate == ["const spd = j.bps ? fmtRate(j.bps) : \"\";"], \
         f"下载速度的显示被改了(用户明确要的就是这个)。实际读到:{rate}"
+
+
+def test_config_save_works_where_fchmod_is_missing(tmp_path, monkeypatch):
+    """没有 os.fchmod 的平台(Windows + Python ≤3.12)上保存配置必须照常成功。
+
+    os.fchmod 在 Windows 上 **3.13 才有**(python/cpython#113191)。ComfyUI Desktop 大量跑在
+    Windows + 3.12,而 review 抓到第一版无条件调用它 —— 等于让 Windows 上每一次保存配置
+    都 AttributeError,插件直接不可用。这条模拟"属性不存在",不是"调用失败":两者语义不同,
+    前者要跳过,后者仍须抛(见下一条)。
+    """
+    import os
+
+    monkeypatch.setattr(config, "_config_path", lambda: tmp_path / "config.json")
+    monkeypatch.delattr(os, "fchmod", raising=True)
+    config.save_config({"endpoint": "https://example.invalid", "bridge_api_key": "bk-x"})
+    assert (tmp_path / "config.json").exists(), "无 fchmod 的平台上保存失败了"
+    import json
+    assert json.loads((tmp_path / "config.json").read_text())["bridge_api_key"] == "bk-x"
+
+
+def test_download_stall_is_shown_even_at_zero_bytes():
+    """一个字节都没到就挂住,是最坏的那种挂法 —— 停滞提示必须先于"没字节就返回"。
+
+    review 抓到第一版 `if (!j.ok || !j.done) return;` 排在停滞判断之前:恰好让 0 字节的
+    挂住永远显示不出来,而那正是用户最需要被告知的情况。整行按顺序比对。
+    """
+    js = (ROOT / "web" / "modal_bridge.js").read_text(encoding="utf-8")
+    i = js.index("/modal_bridge/fetch_progress?job_id=")
+    seg = js[i:i + 1800]
+    order = [ln.strip() for ln in seg.splitlines()
+             if ln.strip() in ("if (!j.ok) return;",
+                               "if (j.stalled_s >= 20) {",
+                               "if (!j.done) return;   // 还没开始写、且没停滞 → 保持静态文案")]
+    assert order == [
+        "if (!j.ok) return;",
+        "if (j.stalled_s >= 20) {",
+        "if (!j.done) return;   // 还没开始写、且没停滞 → 保持静态文案",
+    ], f"停滞判断与「无字节即返回」的顺序不对,0 字节挂住会显示不出来。实际:{order}"
 
 
 def _sage_patch_cmd() -> str:
@@ -3135,13 +3186,30 @@ if __name__ == "__main__":
         def __init__(self):
             self._undo = []
 
+        _MISSING = object()
+
         def setattr(self, target, name, value):
-            self._undo.append((target, name, getattr(target, name)))
+            self._undo.append((target, name, getattr(target, name, self._MISSING)))
             setattr(target, name, value)
+
+        def delattr(self, target, name, raising=True):
+            # 模拟"属性不存在"(如 Windows + Python ≤3.12 没有 os.fchmod)。
+            # 本文件有测试靠它,而第一版替身只有 setattr —— 于是那条测试在 pytest 下绿、
+            # 自跑路径下红:又一个"两条跑法看到的测试集不一样"。
+            if not hasattr(target, name):
+                if raising:
+                    raise AttributeError(name)
+                return
+            self._undo.append((target, name, getattr(target, name)))
+            delattr(target, name)
 
         def undo(self):
             for target, name, old in reversed(self._undo):
-                setattr(target, name, old)
+                if old is self._MISSING:
+                    if hasattr(target, name):
+                        delattr(target, name)
+                else:
+                    setattr(target, name, old)
             self._undo.clear()
 
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]

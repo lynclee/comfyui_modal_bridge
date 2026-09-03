@@ -1437,11 +1437,19 @@ def _setup_routes():
             aigc_base_url = (body.get("aigc_studio_base_url") or "").strip().rstrip("/")
         else:
             aigc_base_url = cfg.get("aigc_studio_base_url", "")
-        aigc_bypass = (body.get("aigc_bypass_secret") or "").strip() or cfg.get("aigc_bypass_secret", "")
-        # 没有 URL 就没有用它的地方 —— 别把它烤进 Modal Secret、也别继续留在本地 config。
-        # 这条同时兜住 0.8.30 之前遗留的残留:那时密钥只能更新、无法清除(codex 抓到),
-        # 停用集成后它会一直躺在 config.json 里并进入每一次新建的 Secret。
-        if not aigc_base_url:
+        # 密钥三态,顺序不能乱(review 抓到第一版把用户刚输入的也丢了):
+        #   · 这次显式输入了 → 用它,**不管 URL 有没有**(用户可能先填密钥、URL 稍后在设置页填;
+        #     /config 那条路径对同一场景也是这么保护的,两边必须一致);
+        #   · 没输入、URL 存在 → 沿用已存(密码框留空 = 沿用,标准语义);
+        #   · 没输入、URL 为空 → 清掉。没有 URL 就没有用它的地方,别把它烤进 Modal Secret、
+        #     也别继续留在本地 config。这条同时兜住 0.8.30 之前的遗留残留:那时密钥只能更新、
+        #     无法清除(codex 抓到),停用集成后它会一直躺在 config.json 里并进入每次新建的 Secret。
+        _typed = (body.get("aigc_bypass_secret") or "").strip()
+        if _typed:
+            aigc_bypass = _typed
+        elif aigc_base_url:
+            aigc_bypass = cfg.get("aigc_bypass_secret", "")
+        else:
             aigc_bypass = ""
         endpoint_base = f"https://{workspace}--{app_name}"
         # 私有鉴权 key:已有就复用(不让旧 config 失效),否则新生成

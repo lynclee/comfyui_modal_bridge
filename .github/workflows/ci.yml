@@ -45,16 +45,17 @@ jobs:
       - name: Unit tests (无 pytest 的自跑路径)
         run: python tests/test_core.py
 
-      - name: Install pytest
-        run: pip install pytest
-      - name: Unit tests (pytest — 权威)
+      # ⚠ aiohttp 必须在 pytest 步**之前**装:pytest 会收集 tests/test_routes.py,而它顶层
+      #   `from aiohttp import web` —— 装晚了就是 collection error,整步红(review 抓到,
+      #   第一版就把它排在了后面;本地看不出来是因为容器里早就装了 aiohttp)。
+      #   aiohttp 本就是插件依赖(requirements.txt),不是为测试额外引入的。
+      - name: Install pytest + aiohttp
+        run: pip install pytest aiohttp
+      - name: Unit + route tests (pytest — 权威)
         run: python -m pytest tests/ -q
 
-      # 真实 aiohttp 路由测试。需要 aiohttp（本就是插件依赖，见 requirements.txt）——
-      # 纯源码字符串检查验证不了"跑起来会怎样"，两轮 review 的 P1 都从那个缺口漏过。
-      - name: Install runtime deps for route tests
-        run: pip install aiohttp
-      - name: Route tests
+      # 真实 aiohttp 路由测试的无 pytest 跑法(README 备选),单独再跑一次保证它没坏
+      - name: Route tests (自跑路径)
         run: python tests/test_routes.py
 
       - name: Lint (ruff)

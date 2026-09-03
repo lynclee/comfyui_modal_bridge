@@ -1273,20 +1273,23 @@ async function runOnceOnModal(workflowPrompt, outputNodeIds, ctx, submitGuard, b
         const r = await bridgeFetch(`/modal_bridge/fetch_progress?job_id=${encodeURIComponent(jobId)}`);
         if (!r.ok) return;
         const j = await r.json();
-        if (!j.ok || !j.done) return;
-        const done = (j.done / 1048576).toFixed(1);
+        if (!j.ok) return;
+        const done = ((j.done || 0) / 1048576).toFixed(1);
         // 速率与 ETA 由后端算(它按固定 0.5s 采样;后台 tab 会节流 setInterval,
         // 用前端时间差算速率会跳得没法看)。
         const spd = j.bps ? fmtRate(j.bps) : "";
         const eta = j.eta_s ? fmtDur(j.eta_s) : "";
         // ⚠ 停滞时长是这里最要紧的一条:用户问的其实是"到底卡没卡",而"慢"和"挂住"
         //   在一句静态文案下完全一样。超过 20s 没增长就直接说出来。
+        // ⚠ 这个判断必须放在"没下载到字节就返回"之前:一个字节都没到就挂住,是最坏的
+        //   那种挂法,而第一版的 `if (!j.done) return` 恰好让它永远显示不出来(review 抓到)。
         if (j.stalled_s >= 20) {
           ctx.stage("downloading", t("run.fetch_stalled", {
             prefix: batchSuffix, done, secs: j.stalled_s, name: j.label || "",
           }), false);
           return;
         }
+        if (!j.done) return;   // 还没开始写、且没停滞 → 保持静态文案
         ctx.stage("downloading", j.total
           ? t("run.fetch_progress", {
               prefix: batchSuffix, done, total: (j.total / 1048576).toFixed(1),

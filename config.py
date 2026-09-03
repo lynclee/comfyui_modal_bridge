@@ -165,7 +165,13 @@ def save_config(new_data: dict) -> None:
     try:
         # tmp 可能是上次崩溃留下的、权限已经不对的旧文件 —— O_CREAT 不会改已有文件的模式,
         # 所以在**写入任何内容之前**再收一次。失败必须抛,不能吞:吞掉等于权限没设上却无人知晓。
-        os.fchmod(fd, 0o600)
+        # ⚠ os.fchmod 在 Windows 上 **Python 3.13 才有**(gh-113191);ComfyUI Desktop 大量跑在
+        #   Windows + 3.12 上,这里不能无条件调用 —— 第一版就是这么写的,等于让每一次保存配置
+        #   在 Windows 上 AttributeError(review 抓到)。没有 fchmod 的平台本来也没有 group/other
+        #   位可收,os.open(..., 0o600) 已是它能做到的全部,所以"不可用"和"调用失败"要分开:
+        #   前者跳过,后者仍必须抛。
+        if hasattr(os, "fchmod"):
+            os.fchmod(fd, 0o600)
         f = os.fdopen(fd, "w", encoding="utf-8")
     except BaseException:
         os.close(fd)          # fdopen 没接管成 fd,得自己关
