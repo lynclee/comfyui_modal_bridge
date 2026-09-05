@@ -865,6 +865,7 @@ def _setup_routes():
             _FETCH_PROGRESS.pop(job_id, None)
             return web.json_response({"error": f"write result failed: {e}"}, status=502)
         if not outputs:
+            _FETCH_PROGRESS.pop(job_id, None)   # 三条出口都要清,否则残留会让同 id 下次读到旧数
             return web.json_response({"error": "no image in modal_state"}, status=502)
 
         _FETCH_PROGRESS.pop(job_id, None)
