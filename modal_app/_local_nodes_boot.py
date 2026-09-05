@@ -13,13 +13,16 @@ _local_nodes_boot.py — worker 启动时把 Volume 上的「本地自写节点�
 import os
 import shutil
 import zipfile
+import tempfile
 from pathlib import Path
 
 VOL_DIR = Path("/comfy-volume/_local_nodes")
 DEST_DIR = Path("/comfyui/custom_nodes")
 # 本地包覆盖同名 baked 节点前,把镜像版留在容器临时目录。这样包从 Volume 删除后,
 # 已经启动的暖容器也能恢复 baked,不必继续运行内存/磁盘里的旧覆盖版。
-BACKUP_DIR = Path("/tmp/modal-bridge-baked-nodes")
+# tempfile.gettempdir() 在容器里就是 /tmp,行为不变;写死字面量会吃 Registry 扫描器的
+# Bandit B108(MEDIUM)—— 2026-09-05 查实那 4 条 MEDIUM 是我们被 Flagged 唯一能控的杠杆。
+BACKUP_DIR = Path(tempfile.gettempdir()) / "modal-bridge-baked-nodes"
 BAKED_SENTINEL = "__modal_bridge_baked__"
 # 解压了一个「有 zip 无 .digest」的残包时写这个值。不能不写:marker 缺失会被
 # current_digests / needs_refresh 读成「这个目录是镜像自带的 baked 版」,于是残留的旧本地

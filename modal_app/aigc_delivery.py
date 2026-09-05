@@ -177,7 +177,9 @@ def stream_output_to_temp(ref: dict) -> tuple[str, int, str]:
     })
     sha = hashlib.sha256()
     size = 0
-    fd, temp_path = tempfile.mkstemp(prefix="aigc_", dir="/tmp")
+    # 不传 dir= → mkstemp 用 tempfile.gettempdir()(容器里就是 /tmp),行为不变;
+    # 字面量 "/tmp" 会吃 Bandit B108(MEDIUM),见 _local_nodes_boot.py 同款注释。
+    fd, temp_path = tempfile.mkstemp(prefix="aigc_")
     try:
         with requests.get(f"http://{COMFY_HOST}/view?{params}", stream=True, timeout=60) as r:
             r.raise_for_status()

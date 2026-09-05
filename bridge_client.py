@@ -32,6 +32,17 @@ class BridgeError(RuntimeError):
     pass
 
 
+def _assert_http_url(url: str) -> None:
+    """urlopen 前的 scheme 闸:只放行 http/https。
+
+    urllib 会老老实实打开 file:// 与 ftp://;endpoint 来自 config,理论上不会是别的,但
+    "理论上"不是静态分析器能读到的 —— 这一行既是给 Bandit B310 的交代,也是真实防御。
+    """
+    scheme = url.split(":", 1)[0].lower() if ":" in url else ""
+    if scheme not in ("http", "https"):
+        raise ValueError(f"refusing non-http(s) URL: {url[:80]!r}")
+
+
 class BridgeClient:
     def __init__(self, endpoint_base: str, key: str, timeout: int = 60):
         """endpoint_base 形如 https://<workspace>--comfyui-bridge(与 config.modal_endpoint_base 同)。"""
@@ -63,7 +74,12 @@ class BridgeClient:
                 headers["Content-Type"] = "application/json"
             req = urllib.request.Request(url, data=data, headers=headers)
             try:
-                with urllib.request.urlopen(req, timeout=timeout or self.timeout) as r:
+                # Registry 扫描器(Bandit B310)对 urlopen 一律 MEDIUM:它挡的是 file:// 与自定义
+                # scheme。这里 URL 由 endpoint(部署时写进 config 的 https://…modal.run)拼出,
+                # 先断言 scheme 再调,nosec 才站得住。2026-09-05:同一条 B310 让 cinespatial 被
+                # flag,我们 0.8.x 四条 MEDIUM 里有两条就是它。
+                _assert_http_url(req.full_url)
+                with urllib.request.urlopen(req, timeout=timeout or self.timeout) as r:  # nosec B310
                     return json.loads(r.read().decode())
             except urllib.error.HTTPError as e:
                 if e.code == 401:
@@ -216,7 +232,8 @@ class BridgeClient:
         # 中断若直接写终名会留下"看起来完整"的残缺文件。
         part = local.with_name(local.name + ".part")
         try:
-            with urllib.request.urlopen(dl_req, timeout=600) as r, open(part, "wb") as f:
+            _assert_http_url(dl_req.full_url)   # 同上:B310 只认 scheme 已校验的 urlopen
+            with urllib.request.urlopen(dl_req, timeout=600) as r, open(part, "wb") as f:  # nosec B310
                 expected = int(r.headers.get("Content-Length") or 0)
                 size = 0
                 while True:
