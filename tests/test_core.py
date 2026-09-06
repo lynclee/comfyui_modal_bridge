@@ -7,6 +7,7 @@
 只测不碰真实环境的纯逻辑;对依赖 ComfyUI(`import nodes`)/ 文件系统 / Modal 的点,用桩替换。
 """
 import contextlib
+import json
 import sys
 import subprocess
 import types
@@ -1909,6 +1910,44 @@ def test_download_stall_is_shown_even_at_zero_bytes():
         "if (j.stalled_s >= 20) {",
         "if (!j.done) return;   // 还没开始写、且没停滞 → 保持静态文案",
     ], f"停滞判断与「无字节即返回」的顺序不对,0 字节挂住会显示不出来。实际:{order}"
+
+
+def test_read_local_capability_file(tmp_path):
+    """MCP 本地模式从 0600 config.json 读 capability:只读那一个键,其它情况一律空串不抛。
+
+    0.8.36 起管理路由含 localhost 都要 capability;把 token 写进 .mcp.json / env 都会
+    多一处明文落点。让同机的 MCP 进程直接读插件自己的 config.json,值不出文件。
+    """
+    f = tmp_path / "config.json"
+    f.write_text(json.dumps({"local_api_capability": "  cap-xyz  ", "bridge_api_key": "bk"}), encoding="utf-8")
+    assert config.read_local_capability_file(str(f)) == "cap-xyz"
+    f.write_text("{not json", encoding="utf-8")
+    assert config.read_local_capability_file(str(f)) == ""
+    f.write_text(json.dumps({"other": 1}), encoding="utf-8")
+    assert config.read_local_capability_file(str(f)) == ""
+    f.write_text(json.dumps({"local_api_capability": 123}), encoding="utf-8")
+    assert config.read_local_capability_file(str(f)) == ""
+    assert config.read_local_capability_file(str(tmp_path / "missing.json")) == ""
+
+
+def test_mcp_server_reads_capability_from_config_file_and_hints_on_403():
+    """mcp_server 必须接上文件读取,并在 403+capability-required 时给出可操作提示。
+
+    mcp_server 顶层 import mcp 包(不是插件依赖),测试里不 import 它,按源码整行比对
+    (子串包含会被注释/别处引用骗过,本会话已踩多次)。
+    """
+    src = code_only((ROOT / "mcp_server.py").read_text(encoding="utf-8"))
+    lines = [ln.strip() for ln in src.splitlines() if ln.strip()]
+    i = lines.index('_LOCAL_CONFIG = os.environ.get("MODAL_BRIDGE_LOCAL_CONFIG", "").strip()')
+    assert lines[i + 1:i + 5] == [
+        "if not _LOCAL_CAPABILITY and _LOCAL_CONFIG:",
+        "sys.path.insert(0, str(Path(__file__).resolve().parent))",
+        "from config import read_local_capability_file",
+        "_LOCAL_CAPABILITY = read_local_capability_file(_LOCAL_CONFIG)",
+    ], f"文件读取没接上或顺序变了:{lines[i:i + 5]}"
+    assert 'if e.code == 403 and e.headers.get("X-Modal-Bridge-Auth") == "capability-required":' in lines, \
+        "403+capability-required 没有专门处理 —— agent 只会看到裸 403"
+    assert any(ln.startswith('body["hint"] = (') for ln in lines), "403 时没有 hint 字段"
 
 
 def _sage_patch_cmd() -> str:

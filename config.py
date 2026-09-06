@@ -184,6 +184,22 @@ def save_config(new_data: dict) -> None:
 _CAPABILITY_LOCK = threading.Lock()
 
 
+def read_local_capability_file(path: str) -> str:
+    """从插件 config.json 读 local_api_capability;文件不存在 / 不是 JSON / 没这个键 → 返回空串。
+
+    给 MCP 本地模式用(mcp_server.py):0.8.36 起管理路由含 localhost 都要 capability,
+    而 MCP 进程和 ComfyUI 在同一台机器上,让它**直接读 0600 的 config.json**比把 token
+    写进 .mcp.json / 环境变量 / 聊天记录都干净 —— 值不经过任何中间人。
+    只读这一个键,不回吐其它字段。
+    """
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return ""
+    v = data.get("local_api_capability") if isinstance(data, dict) else None
+    return str(v).strip() if isinstance(v, str) else ""
+
+
 def ensure_local_api_capability() -> str:
     """返回持久化的本地管理 capability；缺失时生成一次。
 

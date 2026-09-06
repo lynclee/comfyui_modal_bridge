@@ -7,7 +7,9 @@ Modal Bridge MCP server — 让 Claude Code / Codex 等 agent 把「云端 GPU �
 功能最全:模型/节点自动同步、显存估算、GPU 自动路由都由插件后端完成。
     MODAL_BRIDGE_URL   本地 ComfyUI 地址,默认 http://127.0.0.1:8000(容器内访问宿主机
                        用 http://host.docker.internal:8000)
-    MODAL_BRIDGE_LOCAL_CAPABILITY  本地 HTTP 模式必填(含 localhost)；值来自服务器 config.json
+    MODAL_BRIDGE_LOCAL_CONFIG      推荐:ComfyUI 那份插件 config.json 的路径(0600),MCP 进程
+                                   直接从里面读 local_api_capability,token 不进 env / .mcp.json
+    MODAL_BRIDGE_LOCAL_CAPABILITY  或直接给值(优先级高于上面);本地 HTTP 模式两者必设其一(含 localhost)
 
 **cloud 模式** — 经 bridge_client.py 直连 Modal 云端 endpoint,**不需要本地 ComfyUI**。
 前提:部署者已用完整插件部署过(模型在 Volume、节点在镜像)。适合拿到 endpoint + key 的
@@ -69,6 +71,13 @@ _OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 _OUT_DIR = os.environ.get("MODAL_BRIDGE_OUT_DIR", "./modal_bridge_outputs")
 _INPUT_DIRS = [d for d in os.environ.get("MODAL_BRIDGE_INPUT_DIRS", ".").split(":") if d]
 _LOCAL_CAPABILITY = os.environ.get("MODAL_BRIDGE_LOCAL_CAPABILITY", "").strip()
+# 更推荐的写法:不把 token 放进 env / .mcp.json,而是让 MCP 进程直接读 ComfyUI 那份
+# 0600 的插件 config.json(两者同机)。env 里给路径,不给值。
+_LOCAL_CONFIG = os.environ.get("MODAL_BRIDGE_LOCAL_CONFIG", "").strip()
+if not _LOCAL_CAPABILITY and _LOCAL_CONFIG:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from config import read_local_capability_file  # noqa: E402
+    _LOCAL_CAPABILITY = read_local_capability_file(_LOCAL_CONFIG)
 
 
 def _call(path: str, body: dict | None = None, timeout: int = 120) -> dict:
@@ -83,9 +92,18 @@ def _call(path: str, body: dict | None = None, timeout: int = 120) -> dict:
             return json.loads(r.read().decode())
     except urllib.error.HTTPError as e:
         try:
-            return json.loads(e.read().decode())
+            body = json.loads(e.read().decode())
         except Exception:
-            return {"error": f"HTTP {e.code} {path}"}
+            body = {"error": f"HTTP {e.code} {path}"}
+        if e.code == 403 and e.headers.get("X-Modal-Bridge-Auth") == "capability-required":
+            # 0.8.36 起 localhost 也要 capability。agent 看到裸 403 不知道该配什么,这里把
+            # 两种给法都说清楚;值本身不进日志、不进聊天。
+            body = dict(body)
+            body["hint"] = ("缺少或错误的 X-Modal-Bridge-Capability。给 MCP 进程设 "
+                            "MODAL_BRIDGE_LOCAL_CONFIG=<ComfyUI 的插件 config.json 路径>"
+                            "(推荐,值不出文件),或 MODAL_BRIDGE_LOCAL_CAPABILITY=<值>。"
+                            f"当前:{'已从文件读到值' if _LOCAL_CAPABILITY else '两者都未设置'}。")
+        return body
     except Exception as e:
         return {"error": f"{type(e).__name__}: {e} (ComfyUI 在跑吗? BASE={BASE})"}
 
