@@ -80,5 +80,5 @@ jobs:
           node-version: "20"
       - name: Check JS syntax
         run: node --check web/modal_bridge.js
-      - name: JS recovery regression tests
-        run: node --test tests/test_web_recovery.cjs
+      - name: JS auth + recovery regression tests
+        run: node --test tests/test_web_auth.cjs tests/test_web_recovery.cjs

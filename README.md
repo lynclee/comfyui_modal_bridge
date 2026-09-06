@@ -6,6 +6,10 @@
 
 > Registry: `comfyui_modal_bridge` (publisher `lynclee`) · Search **Modal Bridge** in ComfyUI Manager to install.
 
+0.8.36 security migration: all management requests require browser pairing, including localhost.
+Copy `local_api_capability` from the plugin's user config on the ComfyUI machine; never send it in chat.
+Existing valid pairings keep working. Local HTTP scripts/MCP must supply the token too. See [API.md](./API.md).
+
 ## ✨ Why use it
 
 - 🖥️ **Runs on any machine — zero local GPU required.** Mac, thin laptops, iGPU-only — all fine. VRAM-hungry models like FLUX.2 run **entirely on a cloud GPU** (Auto mode picks L40S/H100/B200 by VRAM to save cost); your machine only serializes the workflow and receives images. Run flux2 on a potato.
@@ -87,6 +91,9 @@ MIT
 **ComfyUI Desktop 插件:一键把当前工作流推到你自己的 Modal Serverless GPU 上跑,图 / 视频 / 3D 回流本地画板。** 本地不用好显卡、不用开终端、不用搭云端 ComfyUI —— 装上、填一次 token、点一下,就跑。
 
 > Registry: `comfyui_modal_bridge`(publisher `lynclee`)· 在 ComfyUI Manager 搜 **Modal Bridge** 即可安装。
+
+0.8.36 安全迁移：本机浏览器也须首次配对。从服务器插件用户配置复制 `local_api_capability`，
+不要发到聊天中；已有有效配对继续使用。本地 HTTP 脚本/MCP 同样必须带 token，见 [API.md](./API.md)。
 
 ## ✨ 核心优势
 

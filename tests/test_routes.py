@@ -80,6 +80,8 @@ async def _client():
     app.add_routes(_ROUTES)
     c = TestClient(TestServer(app))
     await c.start_server()
+    # 业务回归默认使用隔离配置的测试 capability；鉴权测试显式覆盖为空/错误值。
+    c.session.headers["X-Modal-Bridge-Capability"] = "cap-secret-value"
     return c
 
 
@@ -252,15 +254,20 @@ def test_local_nodes_diff_reports_pending_image_rebuild():
         f"依赖镜像欠重建却没回报 —— 前端会说「无需推送」然后静默卡几分钟: {body}"
 
 
-def test_bridge_key_rejects_non_loopback():
-    """/bridge_key 只能本机取。TestClient 走的是 127.0.0.1,所以正常应放行;
-    伪造成外部 Host 时必须拒 —— 反向代理后面 TCP peer 恒为 loopback,只看它会漏。"""
+def test_bridge_key_requires_capability_on_every_host():
+    """本机和外部 Host 都只能持有效 capability 取 key。"""
     _set_cfg()
 
     async def body(c):
         ok = await c.get("/modal_bridge/bridge_key")
         spoofed = await c.get("/modal_bridge/bridge_key",
-                              headers={"Host": "bridge.example.com"})
+                              headers={"Host": "bridge.example.com", "X-Modal-Bridge-Capability": ""})
+        local_anonymous = await c.get("/modal_bridge/bridge_key",
+                                      headers={"X-Modal-Bridge-Capability": ""})
+        assert local_anonymous.status == 403
+        remote_authorized = await c.get("/modal_bridge/bridge_key",
+                                        headers={"Host": "bridge.example.com"})
+        assert remote_authorized.status == 200
         return ok.status, (await ok.json()).get("key"), spoofed.status
 
     ok_status, key, spoofed_status = _run(body)

@@ -187,8 +187,8 @@ _CAPABILITY_LOCK = threading.Lock()
 def ensure_local_api_capability() -> str:
     """返回持久化的本地管理 capability；缺失时生成一次。
 
-    不在模块 import 时生成，避免只读安装/打包流程无故改配置。第一次非本机管理请求
-    才需要它；生成后放在 0600 config 中，调用方从服务器本机读取并在远程浏览器配对。
+    不在模块 import 时生成，避免只读安装/打包流程无故改配置。第一次管理请求
+    才需要它；生成后放在 0600 config 中，调用方从服务器本机读取并在浏览器配对。
     """
     cfg = load_config()
     value = str(cfg.get("local_api_capability") or "").strip()

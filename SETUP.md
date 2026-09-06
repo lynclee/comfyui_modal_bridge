@@ -22,6 +22,10 @@
 
 ## 方式 A:GUI 部署(推荐,零终端)
 
+0.8.36 起，本机/远程浏览器都需首次配对 `local_api_capability`，之后才可管理或运行。
+它在服务器插件用户配置 `config.json` 中，首次管理请求会生成并在日志提示路径；
+用文件管理器打开，复制到配对弹窗即可，不要发送到聊天中。与 Modal Token ID/Secret 是两套凭据。
+
 点右上角 **[⚙️ Modal Setup]** → 填 Workspace / Token ID / Token Secret → **部署**。
 背后:ComfyUI Manager 安装声明依赖 → 建 Secret(随机生成私有鉴权 key `BRIDGE_API_KEY`)→ `modal deploy` → 写 config → 验证 health。手动 clone 需先安装一次 `requirements.txt`;首次拉镜像约 3-5 分钟。
 
@@ -192,6 +196,10 @@ Push the current ComfyUI workflow to a Modal Serverless GPU (H100) with one clic
 3. Note your **workspace name** (the segment in your modal.com profile URL, e.g. `your-workspace`).
 
 ## Option A: GUI deploy (recommended, no terminal)
+
+Since 0.8.36, local and remote browsers must first pair using `local_api_capability` from the plugin's
+user `config.json` on the ComfyUI machine. The first management request generates it and logs its path.
+Open it in a file manager and copy the value into the prompt, not into chat. This is separate from your Modal credentials.
 
 Click **[⚙️ Modal Setup]** → fill Workspace / Token ID / Token Secret → **Deploy**.
 Behind the scenes: dependencies are installed by ComfyUI Manager → create Secret (random `BRIDGE_API_KEY`) → `modal deploy` → write config → verify health. A manual git clone must install `requirements.txt` once. First image pull ~3-5 min.

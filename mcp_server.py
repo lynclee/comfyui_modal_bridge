@@ -7,7 +7,7 @@ Modal Bridge MCP server — 让 Claude Code / Codex 等 agent 把「云端 GPU �
 功能最全:模型/节点自动同步、显存估算、GPU 自动路由都由插件后端完成。
     MODAL_BRIDGE_URL   本地 ComfyUI 地址,默认 http://127.0.0.1:8000(容器内访问宿主机
                        用 http://host.docker.internal:8000)
-    MODAL_BRIDGE_LOCAL_CAPABILITY  BASE 不是 localhost 时必填；值来自服务器 config.json
+    MODAL_BRIDGE_LOCAL_CAPABILITY  本地 HTTP 模式必填(含 localhost)；值来自服务器 config.json
 
 **cloud 模式** — 经 bridge_client.py 直连 Modal 云端 endpoint,**不需要本地 ComfyUI**。
 前提:部署者已用完整插件部署过(模型在 Volume、节点在镜像)。适合拿到 endpoint + key 的
@@ -24,7 +24,8 @@ Modal Bridge MCP server — 让 Claude Code / Codex 等 agent 把「云端 GPU �
   Claude Code(.mcp.json 或 `claude mcp add`):
     {"mcpServers": {"modal-bridge": {
         "command": "python", "args": ["<repo>/mcp_server.py"],
-        "env": {"MODAL_BRIDGE_URL": "http://127.0.0.1:8000"}}}}
+        "env": {"MODAL_BRIDGE_URL": "http://127.0.0.1:8000",
+                "MODAL_BRIDGE_LOCAL_CAPABILITY": "<local_api_capability>"}}}}
   cloud 模式只换 env:
         "env": {"MODAL_BRIDGE_ENDPOINT": "https://<ws>--comfyui-bridge",
                 "MODAL_BRIDGE_KEY": "<bridge_api_key>"}
@@ -32,7 +33,9 @@ Modal Bridge MCP server — 让 Claude Code / Codex 等 agent 把「云端 GPU �
     [mcp_servers.modal_bridge]
     command = "python"
     args = ["<repo>/mcp_server.py"]
-    env = { MODAL_BRIDGE_URL = "http://127.0.0.1:8000" }
+    env = { MODAL_BRIDGE_URL = "http://127.0.0.1:8000", MODAL_BRIDGE_LOCAL_CAPABILITY = "<local_api_capability>" }
+
+    示例值仅占位；真实 capability 只放私有环境/配置，不能提交到仓库或发送给 agent。
 
 代理:local 模式本文件显式绕过系统代理(localhost 流量不该进代理);cloud 模式的外网请求
 由 bridge_client 走系统代理 env —— 两条路互不干扰。

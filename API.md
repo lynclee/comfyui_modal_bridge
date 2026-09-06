@@ -2,15 +2,26 @@
 
 插件在 ComfyUI 本地服务上注册的机器接口——UI 用它,任何脚本 / agent / MCP 也可以直接调。
 
-本机免 capability 仅允许同源浏览器请求或不带 Origin 的本地 CLI；跨源 Origin、
-`Origin: null` 和 `Sec-Fetch-Site: cross-site` 会被拒绝，即使 ComfyUI 开启 CORS。
-远程界面仍使用有效 capability，不依赖反向代理内部连接的 HTTP/HTTPS 协议一致。
+从 0.8.36 起，所有管理请求都必须带 capability，包括 localhost 和无 Origin 的本地 CLI。
+本机浏览器还会校验 Origin，跨源 Origin、`Origin: null` 和 `Sec-Fetch-Site: cross-site`
+会被拒绝，即使 ComfyUI 开启 CORS。远程配对不依赖反向代理内部连接的 HTTP/HTTPS 协议一致。
 
 - **Base URL**:ComfyUI 本地服务地址(Desktop 默认 `http://127.0.0.1:8000`,OSS 默认 `:8188`;容器内访问宿主机用 `host.docker.internal`)
-- **本地管理鉴权**:`localhost/127.0.0.1/::1` 直连免配置；局域网、反向代理、`host.docker.internal` 等非本机 origin 必须带 `X-Modal-Bridge-Capability`。值在服务器 `config.json` 的 `local_api_capability`；首次远程管理请求会自动生成,不会由 API 回吐。反代必须保留外部 `Host`，或正确追加 `X-Forwarded-For`/`X-Real-IP`，不能把请求伪装成无转发头的纯 localhost
+- **本地管理鉴权**:请求头 `X-Modal-Bridge-Capability` 的值来自服务器插件用户配置 `config.json` 的 `local_api_capability`；首次管理请求缺值时自动生成，日志只显示文件路径，API 不回吐 token。浏览器首次手动配对后存入当前 origin 的 localStorage。反代须保留外部 `Host` 或正确追加转发头，以维持 Origin 防护语义
 - **云端鉴权**:云端调用的 `bridge_api_key` 由本地后端自动附加,调用方不用管
 - **密钥**:`/config` 读写永不回吐 `modal_token_secret` / `bridge_api_key` / `comfy_api_key` / `aigc_bypass_secret`,只回 `has_*` 布尔标志
 - **prompt 格式**:均为 ComfyUI **API prompt**(`{node_id: {class_type, inputs}}`,即前端 `graphToPrompt().output`),不是画布 JSON
+
+| 调用方式 | 升级到 0.8.36 后 |
+|---|---|
+| 浏览器(本机/远程) | 首次管理请求提示配对；从服务器本机复制 token，不要发到聊天中。已有有效配对继续使用 |
+| 本地 HTTP 脚本 / MCP | 每次请求携带上述请求头；MCP 设置 `MODAL_BRIDGE_LOCAL_CAPABILITY`，不要提交含真实值的配置 |
+| 直连云端的 standalone CLI / MCP cloud | 不受影响，仍使用 `bridge_api_key` |
+| 公开只读端点 | GET `/config`(脱敏)、`/health`、`/platform_status`、`/version` 不要求 capability |
+
+缺失/错误 token 返回 403 和 `X-Modal-Bridge-Auth: capability-required`，在解析请求体、
+写配置、上传、创建 Secret 或启动部署之前拒绝。本机跨站拒绝不发起配对。
+capability 不是对恶意已安装插件或同源 XSS 的隔离沙箱；不要向不可信用户开放 ComfyUI。
 
 ## 核心链路:提交一个任务
 
@@ -25,6 +36,7 @@ estimate_vram(可选) → submit → poll(循环) → fetch_result
 
 ```bash
 curl -X POST http://127.0.0.1:8000/modal_bridge/submit \
+  -H "X-Modal-Bridge-Capability: ${MODAL_BRIDGE_LOCAL_CAPABILITY}" \
   -H 'Content-Type: application/json' \
   -d '{"prompt": { ...API prompt... }}'
 ```
@@ -99,7 +111,7 @@ curl -X POST http://127.0.0.1:8000/modal_bridge/submit \
 | `/modal_bridge/version` | GET | 版本契约:`{local, deployed, match, reachable}`,不匹配应引导重新部署 |
 | `/modal_bridge/platform_status` | GET | Modal 官方状态页聚合态(`operational/degraded/...`),区分平台故障 vs 未部署 |
 | `/modal_bridge/config` | GET/POST | GET 返回脱敏配置；POST 只接受 GPU/高级设置 allowlist,不能改凭据或管理鉴权字段 |
-| `/modal_bridge/bridge_key` | GET | 取回 bridge_api_key；localhost 或有效 admin capability 才能调用 |
+| `/modal_bridge/bridge_key` | GET | 取回 bridge_api_key；必须持有效 admin capability，含 localhost |
 | `/modal_bridge/job_event` | POST | 前端/调用方上报客户端侧结局(`{job_id, event, detail}`)进后端日志留痕 |
 
 ## 无 ComfyUI 直连云端(standalone)

@@ -2592,7 +2592,7 @@ def test_cli_deploy_keeps_secret_fields_and_atomic_config():
 
 
 def test_admin_capability_closes_bridge_key_and_config_bypass():
-    """本机免配置；远程/反代必须 capability，且通用 config 不能改安全字段。"""
+    """本机 Origin 边界识别；管理路由必须 capability，且通用 config 不能改安全字段。"""
     from contract import is_direct_loopback_request, merge_public_config
 
     assert is_direct_loopback_request("127.0.0.1", "127.0.0.1:8188")

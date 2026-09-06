@@ -555,7 +555,7 @@ _ADMIN_REQUIRED_HEADER = "X-Modal-Bridge-Auth"
 
 
 def _admin_denial(request: web.Request) -> web.Response | None:
-    """本机直连免配置；其它访问必须带持久 capability。
+    """所有管理请求均须持久 capability，包括本机直连。
 
     peer+Host 双判避免反向代理把远程访客伪装成 127.0.0.1。capability 只存在本机
     0600 config 和调用方浏览器 localStorage 中,绝不从匿名端点回吐。
@@ -569,15 +569,15 @@ def _admin_denial(request: web.Request) -> web.Response | None:
         request.headers.get("X-Real-IP", ""),
     ) if x)
     if contract.is_direct_loopback_request(request.remote, host, forwarded):
-        # ComfyUI 开启 CORS 时会替换默认 Origin 中间件；插件必须自己守住本机例外。
+        # ComfyUI 开启 CORS 时会替换默认 Origin 中间件；保留独立的本机跨站防护。
         if not contract.is_safe_local_origin(
                 request.headers.get("Origin"), request.scheme, host,
                 request.headers.get("Sec-Fetch-Site", "")):
             return web.json_response({"error": "cross-origin local request rejected"}, status=403)
-        return None
     expected = cfg_mod.ensure_local_api_capability()
     supplied = (request.headers.get(_ADMIN_HEADER) or "").strip()
-    if supplied and secrets.compare_digest(supplied, expected):
+    # token_urlsafe 生成 ASCII；误粘中文等输入应返回 403，不让 compare_digest 抛 500。
+    if supplied and supplied.isascii() and expected.isascii() and secrets.compare_digest(supplied, expected):
         return None
     return web.json_response(
         {"error": "admin capability required",
@@ -710,7 +710,7 @@ def _setup_routes():
     async def _bridge_key(request: web.Request):
         """导出脚本「嵌入 KEY」时取回自己的 bridge_api_key。
 
-        localhost 直连可用；远程访问必须通过统一 admin capability。不存在可由匿名
+        包括 localhost 在内均须通过统一 admin capability。不存在可由匿名
         /config 打开的逃生开关,反向代理也要同时满足外部 Host 校验。
         """
         cfg = cfg_mod.load_config()

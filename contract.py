@@ -39,6 +39,7 @@ def is_direct_loopback_request(remote: str | None, host: str | None,
                                forwarded_for: str | None = None) -> bool:
     """请求是否真的是通过 localhost/127.0.0.1/::1 访问。
 
+    只决定是否附加本机 Origin 校验，不授予权限；管理路由一律要求 capability。
     只看 TCP peer 会把本机反向代理后的所有远程访客都认成 127.0.0.1；因此 peer 和
     浏览器实际访问的 Host 必须同时是 loopback。Host 头本身可伪造,但远程攻击者仍需
     先让 TCP peer 变成 loopback；常规浏览器经过反代时 Host 是外部域名,会被拒绝。
@@ -65,7 +66,7 @@ def is_direct_loopback_request(remote: str | None, host: str | None,
     if not (_loopback(remote) and _loopback(host, host_value=True)):
         return False
     # 常见反代会把 Host 重写成上游 127.0.0.1，但同时带 X-Forwarded-For/X-Real-IP。
-    # 链里出现任意非 loopback 就不能享受本机免鉴权。没带转发信息的反代无法从应用层
+    # 链里出现任意非 loopback 就按远程访问处理。没带转发信息的反代无法从应用层
     # 与真本机区分，部署文档要求它保留外部 Host 或传该头。
     if forwarded_for:
         return all(_loopback(x.strip()) for x in forwarded_for.split(",") if x.strip())
@@ -74,7 +75,7 @@ def is_direct_loopback_request(remote: str | None, host: str | None,
 
 def is_safe_local_origin(origin: str | None, scheme: str, host: str,
                          fetch_site: str = "") -> bool:
-    """本机免 capability 的浏览器边界；无 Origin 的本地 CLI 仍可用。"""
+    """本机浏览器跨站防护；无 Origin 的 CLI 仍须通过路由的 capability 校验。"""
     if fetch_site.lower() == "cross-site":
         return False
     if origin is None:

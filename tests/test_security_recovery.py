@@ -17,6 +17,66 @@ from bridge_client import _SameOriginRedirect
 from comfyui_modal_bridge.result_receipts import ResultReceipts
 
 
+def test_loopback_requires_capability_before_parsing_request():
+    harness._set_cfg()
+
+    async def body(c):
+        for route in harness._ROUTES:
+            if not hasattr(route.handler, "__wrapped__"):
+                continue
+            for token in ("", "wrong-capability", "错误-token"):
+                r = await c.request(route.method, route.path, headers={
+                    "X-Modal-Bridge-Capability": token, "Content-Type": "text/plain",
+                }, data="invalid-json")
+                assert r.status == 403, (route.path, token, r.status)
+                assert r.headers.get("X-Modal-Bridge-Auth") == "capability-required"
+        assert harness.cfg_mod.load_config()["gpu_tier"] == "auto"
+
+    harness._run(body)
+
+
+def test_first_pairing_generates_private_capability_without_returning_it():
+    harness._set_cfg(local_api_capability="")
+
+    async def body(c):
+        headers = {"X-Modal-Bridge-Capability": ""}
+        public = await c.get("/modal_bridge/config", headers=headers)
+        assert public.status == 200
+        assert not (await public.json())["has_local_api_capability"]
+        denied = await c.post("/modal_bridge/deploy", headers=headers, data="invalid-json")
+        assert denied.status == 403
+        cap = harness.cfg_mod.load_config()["local_api_capability"]
+        assert cap.startswith("lc-")
+        assert cap not in await denied.text()
+        public = await c.get("/modal_bridge/config", headers=headers)
+        assert cap not in await public.text()
+        assert "local_api_capability" not in await public.json()
+        # 只在测试内读取假配置；相同 token 在 localhost 和正确反代 Host 下均可用。
+        for host in (str(c.make_url("/")).split("//", 1)[1].rstrip("/"), "bridge.example"):
+            allowed = await c.post("/modal_bridge/config", headers={
+                "Host": host, "X-Modal-Bridge-Capability": cap,
+            }, json={"gpu_tier": "cheap"})
+            assert allowed.status == 200
+
+    harness._run(body)
+
+
+def test_loopback_same_origin_also_requires_capability():
+    harness._set_cfg()
+
+    async def body(c):
+        headers = {"Origin": str(c.make_url("/")).rstrip("/"),
+                   "X-Modal-Bridge-Capability": ""}
+        r = await c.post("/modal_bridge/config", headers=headers, json={"gpu_tier": "cheap"})
+        assert r.status == 403
+        assert harness.cfg_mod.load_config()["gpu_tier"] == "auto"
+        headers["X-Modal-Bridge-Capability"] = "cap-secret-value"
+        r = await c.post("/modal_bridge/config", headers=headers, json={"gpu_tier": "cheap"})
+        assert r.status == 200
+
+    harness._run(body)
+
+
 def test_local_browser_origin_guard():
     harness._set_cfg()
 

@@ -259,8 +259,10 @@ const I18N = {
   "set.save_failed":  { zh: "✗ 设置没保存成功:{msg} —— 请重试(改动未写入 config)", en: "✗ Setting not saved: {msg} — please retry (config unchanged)" },
   "set.cpu_guess":    { zh: "Auto 档下,仅凭‘没扫描到本地模型’把任务送进 CPU。只适合确定是纯 API 的工作流；节点内部下载权重、CUDA/Triton 图像处理、3D/光流可能被误判。关掉后,扫不到模型也走 GPU 梯子。改完立即生效。",
                         en: "In Auto tier, route to CPU solely when no local model is detected. Suitable only for known pure-API workflows; nodes downloading weights internally or using CUDA/Triton, 3D, or optical flow can be misclassified. Turn off to keep model-less workflows on the GPU ladder. Takes effect immediately." },
-  "auth.capability":  { zh: "这是远程 ComfyUI。请输入服务器 config.json 里的 local_api_capability；它只保存在当前浏览器,不会写入工作流。",
-                        en: "This is a remote ComfyUI. Enter local_api_capability from the server's config.json. It is stored only in this browser, never in the workflow." },
+  "auth.capability":  { zh: "Modal Bridge 管理操作需要配对(本机也一样)。请从运行 ComfyUI 的机器上打开插件用户配置 config.json，复制 local_api_capability；后端日志会显示文件路径。它只保存在当前浏览器，不写入工作流，也不要发到聊天中。",
+                        en: "Modal Bridge management requires pairing, including localhost. Open the plugin's user config.json on the ComfyUI machine and copy local_api_capability; the backend log shows the file path. It stays in this browser, never in workflows. Do not send it in chat." },
+  "auth.invalid":     { zh: "配对值含无效字符。请只复制 local_api_capability 的值，不含字段名、空格或换行。",
+                        en: "Invalid pairing characters. Copy only the local_api_capability value, without the field name, spaces or line breaks." },
   "set.sage.on":      { zh: "已开启 SageAttention —— 去 Setup 点「部署」才生效(有损加速,建议同 seed 对比过再常开)", en: "SageAttention ON — redeploy in Setup to take effect (lossy; A/B before leaving it on)" },
   "set.sage.off":     { zh: "已关闭 SageAttention —— 去 Setup 点「部署」生效", en: "SageAttention OFF — redeploy in Setup to take effect" },
   "dlg.aigc.bypass_hint":{ zh: "(可选,站点开了 Vercel Protection 才需要)", en: "(optional; only if the site has Vercel Protection)" },
@@ -289,11 +291,12 @@ function t(key, vars) {
 // =====================================================================
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-// 本机 localhost 直连无需 capability；局域网/反向代理/host.docker.internal 访问时,
-// 后端以 403 + 专用响应头发起配对。capability 只留在当前 origin 的 localStorage,
+// 管理请求统一要求 capability(含 localhost)，403 + 专用响应头发起配对。
+// capability 只留在当前 origin 的 localStorage,
 // 不进 ComfyUI settings(可能同步)、工作流或日志。请求体都是可重放的 JSON 字符串,
 // 所以配对成功后安全重试一次即可。
 const LOCAL_CAP_KEY = "modal_bridge.local_api_capability";
+let _capabilityPairing = null;
 function fmtRate(bps) {
   if (bps >= 1048576) return `${(bps / 1048576).toFixed(1)} MB/s`;
   if (bps >= 1024) return `${Math.round(bps / 1024)} KB/s`;
@@ -307,17 +310,38 @@ function fmtDur(sec) {
 }
 
 async function bridgeFetch(path, options = {}) {
+  const pairingAtStart = _capabilityPairing;
   const call = async (allowPair) => {
     const headers = new Headers(options.headers || {});
-    const saved = (localStorage.getItem(LOCAL_CAP_KEY) || "").trim();
+    let saved = (localStorage.getItem(LOCAL_CAP_KEY) || "").trim();
+    if (saved && !/^[\x21-\x7e]+$/.test(saved)) {
+      localStorage.removeItem(LOCAL_CAP_KEY);  // 旧的误粘值不能让 Headers.set 永久抛错。
+      saved = "";
+    }
     if (saved) headers.set("X-Modal-Bridge-Capability", saved);
     const res = await api.fetchApi(path, { ...options, headers });
     if (allowPair && res.status === 403 &&
         res.headers.get("X-Modal-Bridge-Auth") === "capability-required") {
-      localStorage.removeItem(LOCAL_CAP_KEY);  // 已存值失效时也允许重新配对
-      const entered = (window.prompt(t("auth.capability")) || "").trim();
+      // 旧请求的 403 不能删掉另一个请求刚配好的 token。
+      const current = (localStorage.getItem(LOCAL_CAP_KEY) || "").trim();
+      if (current && current !== saved) return call(false);
+      // 同一批在途请求只配对一次；取消/输错后也不连环弹窗。
+      if (!_capabilityPairing || (!_capabilityPairing.pending && _capabilityPairing === pairingAtStart)) {
+        const pairing = { pending: true, promise: null };
+        _capabilityPairing = pairing;
+        pairing.promise = Promise.resolve().then(() => {
+          localStorage.removeItem(LOCAL_CAP_KEY);
+          const value = (window.prompt(t("auth.capability")) || "").trim();
+          if (value && !/^[\x21-\x7e]+$/.test(value)) {
+            alert(t("auth.invalid"));
+            return "";
+          }
+          if (value) localStorage.setItem(LOCAL_CAP_KEY, value);
+          return value;
+        }).finally(() => { pairing.pending = false; });
+      }
+      const entered = await _capabilityPairing.promise;
       if (!entered) return res;
-      localStorage.setItem(LOCAL_CAP_KEY, entered);
       return call(false);
     }
     return res;

@@ -12,6 +12,10 @@
 
 ## 2. 部署 Modal endpoint
 
+0.8.36 起，本机浏览器也须首次配对：从运行 ComfyUI 的机器上打开插件用户配置 `config.json`，
+复制 `local_api_capability` 到配对弹窗。首次管理请求会生成它，后端日志显示文件路径。
+不要把 token 发到聊天中；有效配对只保存在当前浏览器。HTTP 脚本/MCP 的迁移见 [API.md](./API.md)。
+
 点右上角 **[⚙️ Modal Setup]**:填 Workspace + Token ID/Secret → 部署(零终端,自动建 Secret + `modal deploy` + 写 config)。
 简化命令行路径:`python deploy.py --workspace <ws> --token-id ak-xxx --token-secret as-xxx`。它不做 GUI 的 ComfyUI tag、额外模型目录和节点依赖同步,差异见 [SETUP.md](./SETUP.md)。
 
@@ -46,6 +50,11 @@ The plugin auto-registers the frontend buttons (`☁️ Modal` / `⚙️ Modal S
 Deps: `aiohttp`, `pyyaml` (usually already bundled with ComfyUI).
 
 ## 2. Deploy the Modal endpoint
+
+Since 0.8.36, pair your browser once, including localhost: open the plugin's user `config.json`
+on the ComfyUI machine and copy `local_api_capability` into the pairing prompt. The first management
+request generates it and logs the file path, never the token. Do not send it in chat. Existing valid
+pairings keep working. HTTP scripts/MCP must also supply it; see [API.md](./API.md).
 
 Click **[⚙️ Modal Setup]**: enter Workspace + Token ID/Secret → Deploy (no terminal; auto-creates Secret, runs `modal deploy`, writes config).
 Simplified CLI path: `python deploy.py --workspace <ws> --token-id ak-xxx --token-secret as-xxx`. It omits the GUI's ComfyUI-tag, extra-model-path, and node-dependency sync; see [SETUP.md](./SETUP.md).
