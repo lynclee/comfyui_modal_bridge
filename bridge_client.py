@@ -33,14 +33,30 @@ class BridgeError(RuntimeError):
 
 
 def _assert_http_url(url: str) -> None:
-    """urlopen 前的 scheme 闸:只放行 http/https。
-
-    urllib 会老老实实打开 file:// 与 ftp://;endpoint 来自 config,理论上不会是别的,但
-    "理论上"不是静态分析器能读到的 —— 这一行既是给 Bandit B310 的交代,也是真实防御。
-    """
-    scheme = url.split(":", 1)[0].lower() if ":" in url else ""
-    if scheme not in ("http", "https"):
+    """初始 URL 和每次重定向都必须经过校验。"""
+    parsed = urllib.parse.urlsplit(url)
+    if (parsed.scheme not in ("http", "https") or not parsed.hostname
+            or parsed.username is not None or parsed.password is not None):
         raise ValueError(f"refusing non-http(s) URL: {url[:80]!r}")
+    parsed.port  # 同时拒绝非法端口
+
+
+class _SameOriginRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        def origin(url):
+            _assert_http_url(url)
+            u = urllib.parse.urlsplit(url)
+            return u.scheme, u.hostname, u.port if u.port is not None else (443 if u.scheme == "https" else 80)
+
+        if origin(req.full_url) != origin(newurl):
+            raise ValueError("refusing cross-origin or HTTPS-downgrade redirect")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def _open_http(req, timeout):
+    _assert_http_url(req.full_url)
+    # 保留默认 ProxyHandler(继承系统代理)，不修改进程全局 opener。
+    return urllib.request.build_opener(_SameOriginRedirect()).open(req, timeout=timeout)
 
 
 class BridgeClient:
@@ -74,12 +90,7 @@ class BridgeClient:
                 headers["Content-Type"] = "application/json"
             req = urllib.request.Request(url, data=data, headers=headers)
             try:
-                # Registry 扫描器(Bandit B310)对 urlopen 一律 MEDIUM:它挡的是 file:// 与自定义
-                # scheme。这里 URL 由 endpoint(部署时写进 config 的 https://…modal.run)拼出,
-                # 先断言 scheme 再调,nosec 才站得住。2026-09-05:同一条 B310 让 cinespatial 被
-                # flag,我们 0.8.x 四条 MEDIUM 里有两条就是它。
-                _assert_http_url(req.full_url)
-                with urllib.request.urlopen(req, timeout=timeout or self.timeout) as r:  # nosec B310
+                with _open_http(req, timeout=timeout or self.timeout) as r:
                     return json.loads(r.read().decode())
             except urllib.error.HTTPError as e:
                 if e.code == 401:
@@ -232,8 +243,7 @@ class BridgeClient:
         # 中断若直接写终名会留下"看起来完整"的残缺文件。
         part = local.with_name(local.name + ".part")
         try:
-            _assert_http_url(dl_req.full_url)   # 同上:B310 只认 scheme 已校验的 urlopen
-            with urllib.request.urlopen(dl_req, timeout=600) as r, open(part, "wb") as f:  # nosec B310
+            with _open_http(dl_req, timeout=600) as r, open(part, "wb") as f:
                 expected = int(r.headers.get("Content-Length") or 0)
                 size = 0
                 while True:

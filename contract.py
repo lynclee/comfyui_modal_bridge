@@ -72,6 +72,27 @@ def is_direct_loopback_request(remote: str | None, host: str | None,
     return True
 
 
+def is_safe_local_origin(origin: str | None, scheme: str, host: str,
+                         fetch_site: str = "") -> bool:
+    """本机免 capability 的浏览器边界；无 Origin 的本地 CLI 仍可用。"""
+    if fetch_site.lower() == "cross-site":
+        return False
+    if origin is None:
+        return True
+
+    def identity(value):
+        u = urlsplit(value)
+        if (u.scheme not in ("http", "https") or not u.hostname or u.username is not None
+                or u.password is not None or u.path or u.query or u.fragment):
+            raise ValueError("invalid origin")
+        return u.scheme, u.hostname, u.port if u.port is not None else (443 if u.scheme == "https" else 80)
+
+    try:
+        return identity(origin) == identity(f"{scheme}://{host}")
+    except ValueError:
+        return False
+
+
 def merge_public_config(current: dict, body: dict) -> dict:
     """应用设置页可写字段；凭据、部署状态和未知字段一律拒绝。"""
     unknown = sorted(set(body) - PUBLIC_CONFIG_WRITE_FIELDS)

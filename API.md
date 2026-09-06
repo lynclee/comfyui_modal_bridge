@@ -2,6 +2,10 @@
 
 插件在 ComfyUI 本地服务上注册的机器接口——UI 用它,任何脚本 / agent / MCP 也可以直接调。
 
+本机免 capability 仅允许同源浏览器请求或不带 Origin 的本地 CLI；跨源 Origin、
+`Origin: null` 和 `Sec-Fetch-Site: cross-site` 会被拒绝，即使 ComfyUI 开启 CORS。
+远程界面仍使用有效 capability，不依赖反向代理内部连接的 HTTP/HTTPS 协议一致。
+
 - **Base URL**:ComfyUI 本地服务地址(Desktop 默认 `http://127.0.0.1:8000`,OSS 默认 `:8188`;容器内访问宿主机用 `host.docker.internal`)
 - **本地管理鉴权**:`localhost/127.0.0.1/::1` 直连免配置；局域网、反向代理、`host.docker.internal` 等非本机 origin 必须带 `X-Modal-Bridge-Capability`。值在服务器 `config.json` 的 `local_api_capability`；首次远程管理请求会自动生成,不会由 API 回吐。反代必须保留外部 `Host`，或正确追加 `X-Forwarded-For`/`X-Real-IP`，不能把请求伪装成无转发头的纯 localhost
 - **云端鉴权**:云端调用的 `bridge_api_key` 由本地后端自动附加,调用方不用管
@@ -46,6 +50,21 @@ curl -X POST http://127.0.0.1:8000/modal_bridge/submit \
 `{"job_id": "...", "modal_state": {poll 拿到的 completed 对象}}` → 把产物写进
 `ComfyUI/output/<output_subfolder>/<job_id>/`,返回 `{ok, outputs:[{filename, subfolder, type}]}`。
 大文件自动走 Volume 直连,小文件 base64,调用方无感。
+
+| 情况 | 行为 |
+|---|---|
+| 同一 job 同参数并发取回 | 复用同一后台任务；HTTP 断开不会取消下载 |
+| 同一 job 取回中改变参数 | 返回 409；同时最多 32 个不同 job，超限返回 429 |
+| 某个文件下载失败 | 本次取回不删除任何云端副本；重试复用有完成回执且未被修改的本地文件 |
+| 全部文件完成 | 才清理云端副本；清理失败不影响本地成功结果 |
+| 成功响应丢失 | 重试通过本地回执复用文件，不再读取已删除的云端副本 |
+
+回执保存在插件 `config.json` 同级的 `download_receipts/`，不含凭据和图像内容。
+修改、移动或删除本地文件会使对应回执失效；若云端副本已删除，无法据此恢复文件。
+前端仅在取回成功后删除恢复记录；首次取回后保留至少 1 小时的恢复窗口，刷新不续期，
+实际恢复仍受云端任务状态保留期限制。下载停滞时刷新会接管仍在运行的下载，并不会中止底层传输。
+
+`GET /modal_bridge/fetch_progress?job_id=…` 返回采样进度；无活跃采样时返回 `{ok:false}`。
 
 ### POST /modal_bridge/cancel
 

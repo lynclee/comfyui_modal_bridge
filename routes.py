@@ -6,6 +6,8 @@ import asyncio
 import base64
 import contextlib
 import functools
+import hashlib
+import json
 import secrets
 import subprocess
 from pathlib import Path
@@ -22,6 +24,7 @@ from . import modal_volume
 from . import model_deps
 from . import node_sync
 from . import workflow_check
+from .result_receipts import ResultReceipts
 
 
 # folder_paths 是 ComfyUI 全局模块
@@ -240,6 +243,7 @@ def _output_dir() -> Path:
 # 这里靠采样 .part 文件大小报进度;分母来自 modal_volume.volume_file_size(拿不到就只报已下载量)。
 _FETCH_PROGRESS: dict = {}
 _FETCH_PROGRESS_MAX = 32
+_FETCH_TASKS: dict = {}
 
 
 def _fetch_progress_set(job_id: str, **kw) -> None:
@@ -312,12 +316,18 @@ async def _write_results(final: dict, job_id: str, subfolder: str, cfg: dict) ->
         raise ValueError(f"unsafe output path: subfolder={subfolder!r} job_id={job_id!r}")
     out_dir.mkdir(parents=True, exist_ok=True)
     outputs, seen = [], set()
+    pending_cleanup = set()
+    receipts = ResultReceipts(cfg_mod._config_path().parent / "download_receipts", [
+        cfg.get("modal_endpoint_base"), cfg.get("modal_volume_name"),
+        job_id, final.get("completed_at"),
+    ])
 
     def _atomic_write(dst: Path, data: bytes) -> int:
         """先写 .part 再 rename —— 半截文件不能以正式名出现在 output/ 里。
         ComfyUI 的画廊/前端会直接读这个目录,写到一半被读到就是一张坏图;
         Volume 下载那条路径(bridge_client / modal_volume)早就是 .part+rename 了,这边补齐。"""
         tmp = dst.with_suffix(dst.suffix + ".part")
+        tmp.resolve().relative_to(out_root)
         tmp.write_bytes(data)
         tmp.replace(dst)
         return len(data)
@@ -327,7 +337,11 @@ async def _write_results(final: dict, job_id: str, subfolder: str, cfg: dict) ->
             seen.add(fn)
             return fn
         stem, _, ext = fn.rpartition(".")
-        fn2 = f"{stem}_{len(seen)}.{ext}" if ext else f"{fn}_{len(seen)}"
+        index = len(seen)
+        fn2 = f"{stem}_{index}.{ext}" if ext else f"{fn}_{index}"
+        while fn2 in seen:
+            index += 1
+            fn2 = f"{stem}_{index}.{ext}" if ext else f"{fn}_{index}"
         seen.add(fn2)
         return fn2
 
@@ -340,6 +354,8 @@ async def _write_results(final: dict, job_id: str, subfolder: str, cfg: dict) ->
                 continue
             fn = _dedup(Path(img.get("filename") or "output.png").name)  # basename 防路径逃逸
             local = out_dir / fn
+            local.resolve().relative_to(out_root)
+            local.with_name(local.name + ".part").resolve().relative_to(out_root)
             if vp:
                 # ⚠ vp 整个来自浏览器提交的 modal_state,没人替我们验过 —— 而这条路
                 # **绕过云端 fetch_endpoint、直连 Volume SDK**,云端那道囚笼管不到。
@@ -347,19 +363,23 @@ async def _write_results(final: dict, job_id: str, subfolder: str, cfg: dict) ->
                 # 删除不可逆。所以本地必须自己囚一次(规则与云端逐字相同)。
                 if not contract.is_safe_output_path(job_id, vp):
                     raise RuntimeError(f"volume_path 越界(必须在 _outputs/{job_id}/ 内): {vp!r}")
-                # 大文件:从 Volume 直连下载(不走 base64/Dict),下完删 Volume 上的副本
-                total = await asyncio.to_thread(modal_volume.volume_file_size, cfg, vp)
-                sampler = asyncio.create_task(
-                    _sample_part_size(job_id, local.with_name(local.name + ".part"), total, fn))
-                try:
-                    size = await asyncio.to_thread(modal_volume.download_volume_file, cfg, vp, str(local))
-                except Exception as e:
-                    raise RuntimeError(f"volume download {vp} failed: {e}")
-                finally:
-                    sampler.cancel()
-                    with contextlib.suppress(asyncio.CancelledError):
-                        await sampler
-                await asyncio.to_thread(modal_volume.remove_volume_path, cfg, vp)
+                size = receipts.completed_size(vp, local)
+                if size is None:
+                    total = await asyncio.to_thread(modal_volume.volume_file_size, cfg, vp)
+                    sampler = asyncio.create_task(
+                        _sample_part_size(job_id, local.with_name(local.name + ".part"), total, fn))
+                    try:
+                        size = await asyncio.to_thread(modal_volume.download_volume_file, cfg, vp, str(local))
+                        if total and local.stat().st_size != total:
+                            raise RuntimeError(f"incomplete output: {local.stat().st_size}/{total} bytes")
+                        receipts.record(vp, local)
+                    except Exception as e:
+                        raise RuntimeError(f"volume download {vp} failed: {e}")
+                    finally:
+                        sampler.cancel()
+                        with contextlib.suppress(asyncio.CancelledError):
+                            await sampler
+                pending_cleanup.add(vp)
             else:
                 _fetch_progress_set(job_id, stage="decode", label=fn,
                                     done=0, total=len(b64) * 3 // 4)
@@ -369,6 +389,12 @@ async def _write_results(final: dict, job_id: str, subfolder: str, cfg: dict) ->
                             "type": "output", "size_bytes": size,
                             "node_id": img.get("node_id"),  # 来源节点 → 前端按节点回填
                             "key": img.get("key")})          # 原始输出键 → 前端按键派发渲染
+        # 全部落盘后才删除；回执保留，以便成功响应丢失／进程重启后再次取回。
+        for vp in pending_cleanup:
+            try:
+                await asyncio.to_thread(modal_volume.remove_volume_path, cfg, vp)
+            except Exception as e:
+                print(f"[modal_bridge] output cleanup deferred: {e}")
         return outputs
 
     # 单图回退
@@ -389,6 +415,20 @@ async def _write_results(final: dict, job_id: str, subfolder: str, cfg: dict) ->
         outputs.append({"filename": fn, "subfolder": f"{subfolder}/{job_id}",
                         "type": "output", "size_bytes": size, "source_url": image_url})
     return outputs
+
+
+async def _fetch_job(final: dict, job_id: str, subfolder: str, cfg: dict) -> list:
+    try:
+        return await _write_results(final, job_id, subfolder, cfg)
+    finally:
+        _FETCH_PROGRESS.pop(job_id, None)
+
+
+def _fetch_finished(job_id: str, task: asyncio.Task) -> None:
+    if _FETCH_TASKS.get(job_id, (None, None))[1] is task:
+        _FETCH_TASKS.pop(job_id, None)
+    if not task.cancelled():
+        task.exception()  # 请求断开时也收走异常，避免无人消费的 Task 警告
 
 
 def _extract_input_image_names(prompt: dict) -> list[str]:
@@ -529,6 +569,11 @@ def _admin_denial(request: web.Request) -> web.Response | None:
         request.headers.get("X-Real-IP", ""),
     ) if x)
     if contract.is_direct_loopback_request(request.remote, host, forwarded):
+        # ComfyUI 开启 CORS 时会替换默认 Origin 中间件；插件必须自己守住本机例外。
+        if not contract.is_safe_local_origin(
+                request.headers.get("Origin"), request.scheme, host,
+                request.headers.get("Sec-Fetch-Site", "")):
+            return web.json_response({"error": "cross-origin local request rejected"}, status=403)
         return None
     expected = cfg_mod.ensure_local_api_capability()
     supplied = (request.headers.get(_ADMIN_HEADER) or "").strip()
@@ -859,16 +904,28 @@ def _setup_routes():
 
         cfg = cfg_mod.load_config()
         subfolder = cfg.get("output_subfolder", "modal_results")
+        signature = hashlib.sha256(json.dumps([
+            final, subfolder, cfg.get("modal_endpoint_base"), cfg.get("modal_volume_name"),
+        ], sort_keys=True).encode()).hexdigest()
+        existing = _FETCH_TASKS.get(job_id)
+        if existing and existing[0] != signature:
+            return web.json_response({"error": "job is being fetched with different parameters"}, status=409)
+        if existing:
+            task = existing[1]
+        else:
+            if len(_FETCH_TASKS) >= _FETCH_PROGRESS_MAX:
+                return web.json_response({"error": "too many active downloads"}, status=429)
+            task = asyncio.create_task(_fetch_job(final, job_id, subfolder, cfg))
+            _FETCH_TASKS[job_id] = (signature, task)
+            task.add_done_callback(functools.partial(_fetch_finished, job_id))
         try:
-            outputs = await _write_results(final, job_id, subfolder, cfg)
+            # 浏览器刷新不取消底层线程；下一请求复用同一任务，不并发改写 .part。
+            outputs = await asyncio.shield(task)
         except Exception as e:
-            _FETCH_PROGRESS.pop(job_id, None)
             return web.json_response({"error": f"write result failed: {e}"}, status=502)
         if not outputs:
-            _FETCH_PROGRESS.pop(job_id, None)   # 三条出口都要清,否则残留会让同 id 下次读到旧数
             return web.json_response({"error": "no image in modal_state"}, status=502)
 
-        _FETCH_PROGRESS.pop(job_id, None)
         print(f"[modal_bridge] ✓ job {job_id} fetched {len(outputs)} img → {subfolder}/{job_id}/")
         return web.json_response({"ok": True, "job_id": job_id, "outputs": outputs})
 

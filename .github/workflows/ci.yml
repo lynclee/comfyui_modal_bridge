@@ -66,11 +66,8 @@ jobs:
       - name: Registry security rules (no exec / no inline semicolons)
         run: ruff check --select S102,E702 .
 
-      # ⚠ Registry 服务端扫描器是 Bandit,不是 ruff(2026-09-05 查实:comfy-cli 本地那句
-      #   「✓ All validation checks passed」只跑 ruff S102/S307/E702,与 Flagged 无关)。
-      #   实测同期包:MEDIUM=0 → Active,1 条 B310 → Flagged;我们 0.8.x 有 4 条 MEDIUM
-      #   (B310 ×2 / B108 ×2)。-ll = MEDIUM 及以上即失败;-x 排除的正是 .comfyignore 不打包的。
-      - name: Registry security rules (Bandit MEDIUM+, 与服务端扫描器同源)
+      # 本地补充检查，不代表 Registry 审核通过：线上还有 YARA 和 policy review。
+      - name: Security lint (Bandit MEDIUM+)
         run: pip install bandit && bandit -r . -x ./tests,./.github,./.venv -ll -q
 
   lint-js:
@@ -83,3 +80,5 @@ jobs:
           node-version: "20"
       - name: Check JS syntax
         run: node --check web/modal_bridge.js
+      - name: JS recovery regression tests
+        run: node --test tests/test_web_recovery.cjs

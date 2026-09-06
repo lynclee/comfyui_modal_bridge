@@ -125,7 +125,7 @@ const I18N = {
   "run.fetch_decode":{ zh: "{prefix}解码并写盘({mb} MB)…", en: "{prefix}Decoding and writing ({mb} MB)…" },
   "run.fetch_progress":{ zh: "{prefix}下载 {name} {done}/{total} MB({pct}%) · {spd} · 剩 {eta}", en: "{prefix}Downloading {name} {done}/{total} MB ({pct}%) · {spd} · {eta} left" },
   "run.fetch_progress_nototal":{ zh: "{prefix}下载 {name} 已 {done} MB · {spd}", en: "{prefix}Downloading {name} — {done} MB so far · {spd}" },
-  "run.fetch_stalled":{ zh: "{prefix}⚠ 下载 {name} 已 {done} MB,但 {secs}s 没有任何进展 —— 链路可能断了,可以取消重试", en: "{prefix}⚠ Downloading {name}: {done} MB, no progress for {secs}s — the connection may be dead; cancelling and retrying is reasonable" },
+  "run.fetch_stalled":{ zh: "{prefix}⚠ 下载 {name} 已 {done} MB,但 {secs}s 没有进展。可刷新页面恢复取回；后台下载可能仍在继续，已完成文件会保留。", en: "{prefix}⚠ Downloading {name}: {done} MB, no progress for {secs}s. Reload to resume retrieval; the server may still be downloading. Completed files are retained." },
   "node.reqs_redeploy_confirm":{ zh: "私有节点的代码和云端一致,但它们的依赖还欠一次镜像重建(通常是上一次重建失败或被中断)。\n\n继续会先重建镜像,约 3-5 分钟,并产生一次构建费用。\n\n点「确定」现在重建并继续提交。\n点「取消」中止本次提交。", en: "Your private nodes' code matches the cloud, but their dependencies still need one image rebuild (usually the previous rebuild failed or was interrupted).\n\nContinuing will rebuild the image first — about 3-5 minutes, and it costs a build.\n\nOK: rebuild now and continue.\nCancel: abort this submission." },
   "node.local_push_confirm":{ zh: "检测到 {n} 个私有节点有改动,需要先推送到云端:\n\n  {list}\n\n代码推上去是秒级的;但如果这些节点的 requirements.txt 也改了,还要重建镜像(约 3-5 分钟)。\n\n点「确定」现在推送并继续提交。\n点「取消」中止本次提交 —— 不推就跑的话,云端用的是旧代码,出来的结果和你改的不一样,而且不会有任何报错。",
                         en: "{n} private node(s) changed and must be pushed to the cloud first:\n\n  {list}\n\nPushing the code is instant; but if their requirements.txt also changed, the image has to be rebuilt (~3-5 min).\n\nOK: push now and continue submitting.\nCancel: abort this submission — running without pushing means the cloud uses stale code, producing results that differ from your edits with no error at all." },
@@ -1033,6 +1033,19 @@ function removeActiveJob(jobId) {
   saveLS(LS_KEYS.activeJob, a.filter((x) => x.jobId !== jobId));
 }
 
+function markJobFetching(jobId) {
+  let a = loadLS(LS_KEYS.activeJob);
+  a = Array.isArray(a) ? a : (a ? [a] : []);
+  saveLS(LS_KEYS.activeJob, a.map((j) => j.jobId === jobId
+    ? { ...j, fetchStartedAt: j.fetchStartedAt || Date.now() } : j));
+}
+
+function recoveryDeadline(j, maxAgeSec) {
+  // 取回不消耗 worker 的运行时限，刷新也不会无限续期。
+  return Math.max((j.startedAt || Date.now()) + maxAgeSec * 1000,
+    j.fetchStartedAt ? j.fetchStartedAt + 3600000 : 0);
+}
+
 // 请求取消云端任务并**校验结果**。主流程和刷新恢复共用一份 —— 两处行为必须一致,
 // 否则会出现"恢复的卡片点了取消其实没取消"这种只在某条路径上成立的谎报。
 // 取消失败 = 云端还在跑还在计费,必须弹到用户面前;取消没赶上(cancel_noop)= 产物已生成
@@ -1062,21 +1075,18 @@ async function requestCancel(jobId, ctx, wfName = null) {
   if (d.cancel_noop && d.status === "completed") {
     notify(t("cancel.noop"), "warn");
     try {
-      const fr = await bridgeFetch("/modal_bridge/fetch_result", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ job_id: jobId, modal_state: d }),
-      });
-      const fd = await fr.json();
-      if (fd.ok) {
-        const sf = fd.outputs?.[0]?.subfolder || "modal_results";
-        // 卡片此刻停在乐观的 "✕ Cancelled" 上,但结果其实拿到了 —— 改成如实的。
-        if (ctx) ctx.finish(true, "✓ Done (cancel too late)");
-        notify(t("toast.recovered", { wf: wfName ? "「" + wfName + "」" : "", sf }), "success");
-      } else {
-        err("cancel_noop fetch failed", fd);
-      }
-    } catch (e) { err("cancel_noop fetch failed", e); }
+      const fd = await fetchJobResult(jobId, d, ctx);
+      const sf = fd.outputs?.[0]?.subfolder || "modal_results";
+      // 卡片此刻停在乐观的 "✕ Cancelled" 上,但结果其实拿到了 —— 改成如实的。
+      if (ctx) ctx.finish(true, "✓ Done (cancel too late)");
+      notify(t("toast.recovered", { wf: wfName ? "「" + wfName + "」" : "", sf }), "success");
+    } catch (e) {
+      err("cancel_noop fetch failed", e);
+      if (ctx) ctx.finish(false, "✗ Fetch failed — reload to retry", String(e));
+      return false;
+    }
+  } else if (d.status === "cancelled" || d.status === "failed") {
+    removeActiveJob(jobId);
   }
   return d;
 }
@@ -1116,7 +1126,6 @@ async function runOnceOnModal(workflowPrompt, outputNodeIds, ctx, submitGuard, b
     cancelled = true;
     reportJobEvent(jobId, "user_cancelled", "用户点取消");
     // 立即结束卡片(不依赖后续 poll 拿到 cancelled —— 那可能慢或因竞态拿不到)
-    removeActiveJob(jobId);
     ctx.finish(false, "✕ Cancelled");
     // 告诉 Modal 取消。UI 先乐观置为已取消(响应快),但**必须校验结果** ——
     // 取消失败意味着云端还在跑、还在计费,不能让 "✕ Cancelled" 骗过用户。
@@ -1229,13 +1238,12 @@ async function runOnceOnModal(workflowPrompt, outputNodeIds, ctx, submitGuard, b
       }
     }
   } finally {
-    removeActiveJob(jobId);
+    // completed 仍须取回；取消失败也要保留恢复记录。
+    if (final && (final.status === "failed" || final.status === "cancelled")) removeActiveJob(jobId);
   }
   if (!final) {
     reportJobEvent(jobId, "polling_timed_out", `前端等待超时,已请求取消云端任务`);
-    // 前端停止 poll 之后没有任何人会去 fetch_result,而上面的 finally 已把这个 job 移出
-    // 「未完成 job」恢复列表 —— 也就是说不取消的话:worker 会一路跑到它自己的超时上限
-    // (worker_timeout_sec)为止,全程计费,而跑出来的产物再也取不回来。所以主动取消止损。
+    // 主动放弃轮询时请求取消止损；确认失败则保留恢复记录。
     // 走共享的 requestCancel:取消失败会弹到用户面前(以前只 err 到 console),
     // 且如果超时那一刻云端恰好跑完(cancel_noop),产物会被取回落盘而不是白丢。
     // 仍然 throw —— 这条路径上工作流回填已经不可能了,如实报超时,产物在 output/ 里。
@@ -1251,6 +1259,27 @@ async function runOnceOnModal(workflowPrompt, outputNodeIds, ctx, submitGuard, b
     throw new Error(`[job ${jobId}] ${final.error || "Modal worker failed"}`);
   }
 
+  const fetched = await fetchJobResult(jobId, final, ctx, batchSuffix);
+  // 已确认文件落盘后才回填；切到后台的工作流延后渲染。
+  const sf = fetched.outputs?.[0]?.subfolder || "modal_results";
+  const has3d = (fetched.outputs || []).some((o) => MODEL3D_EXT_RE.test(o.filename || ""));
+  const wfKey = submitGuard?.wfKey;
+  const onFront = wfKey == null || activeWorkflowKey() === wfKey;
+  if (onFront) {
+    const placed = displayInGraph(outputNodeIds, fetched.outputs);
+    if (!placed && fetched.outputs?.length && !has3d) notify(t("toast.saved_no_node", { sf }), "warn");
+  } else if (fetched.outputs?.length) {
+    storePendingResult(wfKey, outputNodeIds, fetched.outputs);
+    notify(t("toast.bg_done", { sf }), "info");
+  }
+  if (has3d) notify(t("toast.saved_3d", { sf }), "info");
+  return { jobId, gpu, outputs: fetched.outputs };
+}
+
+// 主流程、刷新恢复、取消没赶上共用：失败保留任务，成功后才删除恢复记录。
+async function fetchJobResult(jobId, final, ctx, batchSuffix = "") {
+  markJobFetching(jobId);
+  ctx = ctx || { stage() {} };
   // ⚠ 这句文案以前**无条件**写死「Decoding base64...」,而大产物走的是 Volume 直连下载,
   //   根本不解码。2026-09-03 用户反馈 8K 全景图"卡在 Downloading result"一小时 ——
   //   实际是在下载,没有卡:一句说错了路径的静态文案挂一小时,和真卡住无法区分。
@@ -1317,23 +1346,8 @@ async function runOnceOnModal(workflowPrompt, outputNodeIds, ctx, submitGuard, b
   if (!fetchRes.ok || !fetched.ok) {
     throw new Error(`[job ${jobId}] ${fetched.error || `fetch HTTP ${fetchRes.status}`}`);
   }
-  // ComfyUI 单 graph:提交时的工作流当前在前台才能直接回填;在后台 tab 的先暂存,
-  // 等用户切回该 tab 再渲染(图始终也在 output 里,一张不丢)。
-  const sf = fetched.outputs?.[0]?.subfolder || "modal_results";
-  const has3d = (fetched.outputs || []).some((o) => MODEL3D_EXT_RE.test(o.filename || ""));
-  const wfKey = submitGuard?.wfKey;
-  const onFront = wfKey == null || activeWorkflowKey() === wfKey;
-  if (onFront) {
-    const placed = displayInGraph(outputNodeIds, fetched.outputs);
-    if (!placed && fetched.outputs?.length && !has3d) {  // 3D 已有专门提示,不再叠 saved_no_node
-      notify(t("toast.saved_no_node", { sf }), "warn");
-    }
-  } else if (fetched.outputs?.length) {
-    storePendingResult(wfKey, outputNodeIds, fetched.outputs);
-    notify(t("toast.bg_done", { sf }), "info");
-  }
-  if (has3d) notify(t("toast.saved_3d", { sf }), "info");  // 3D 产物:画板不渲染,明确提示文件位置
-  return { jobId, gpu, outputs: fetched.outputs };
+  removeActiveJob(jobId);
+  return fetched;
 }
 
 // =====================================================================
@@ -1638,12 +1652,13 @@ async function recoverPendingJob() {
   pending = Array.isArray(pending) ? pending : (pending ? [pending] : []);
   // 丢弃过期的,其余各自恢复(并行,每个一张卡)。过期线跟提交时那条一致:
   // max(前端设置, 云端 worker 上限 + 3 分钟尾巴),老条目没存 workerTimeoutSec 则退化为纯设置值。
+  // 已开始取回的额外保留到首次取回后 1 小时；仍受云端状态保留期限制。
   const settingSec = getSetting("ModalBridge.timeoutSec", 1200);
   const fresh = [];
   for (const j of pending) {
     if (!j?.jobId) continue;
     const maxAgeSec = Math.max(settingSec, j.workerTimeoutSec ? j.workerTimeoutSec + 180 : 0);
-    if ((Date.now() - j.startedAt) / 1000 <= maxAgeSec) fresh.push([j, maxAgeSec]);
+    if (Date.now() <= recoveryDeadline(j, maxAgeSec)) fresh.push([j, maxAgeSec]);
   }
   saveLS(LS_KEYS.activeJob, fresh.map(([j]) => j));
   for (const [j, maxAgeSec] of fresh) recoverOne(j, maxAgeSec);
@@ -1665,15 +1680,12 @@ async function recoverOne(pending, maxAgeSec) {
   ctx.setCancel(jobId, async () => {
     if (!confirm(`Cancel Modal job ${short}?`)) return;
     cancelled = true;
-    removeActiveJob(jobId);
     ctx.finish(false, "✕ Cancelled");
     await requestCancel(jobId, ctx, pending.wfName);
   });
 
-  // 截止线从**任务原本的提交时刻**算,不是从"现在" —— 否则刷一次页面就等于给它续一个
-  // 完整的超时窗口,一个早该被止损的任务靠反复刷新可以无限续命。与 recoverPendingJob
-  // 过滤过期条目用的是同一个 maxAgeSec,两处不会各算各的。
-  const deadline = (pending.startedAt || Date.now()) + maxAgeSec * 1000;
+  // 与恢复列表用同一截止线：原始提交窗口或首次取回窗口，刷新不重新起算。
+  const deadline = recoveryDeadline(pending, maxAgeSec);
   const interval = getSetting("ModalBridge.pollIntervalSec", 1.2) * 1000;
 
   let final = null;
@@ -1709,7 +1721,6 @@ async function recoverOne(pending, maxAgeSec) {
   if (!final) {
     // 到截止线仍未终结:和主流程一样主动取消止损 —— 这之后再没有人会 poll 它,
     // 不取消的话 worker 会一路跑到自己的上限,全程计费而产物取不回。
-    removeActiveJob(jobId);
     ctx.finish(false, "✗ recover timeout");
     notify(t("toast.recover_to", { id: short }), "warn");
     await requestCancel(jobId, ctx, pending.wfName);
@@ -1721,26 +1732,14 @@ async function recoverOne(pending, maxAgeSec) {
     return;
   }
 
-  ctx.stage("downloading", "Fetching result of recovered job...", false);
   try {
-    const fr = await bridgeFetch("/modal_bridge/fetch_result", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ job_id: jobId, modal_state: final }),
-    });
-    const fd = await fr.json();
+    const fd = await fetchJobResult(jobId, final, ctx);
     // 恢复时画板多半已不是当时的工作流 → 不强行回填,提示存盘路径
-    if (fd.ok) {
-      removeActiveJob(jobId);
-      const sf = fd.outputs?.[0]?.subfolder || "modal_results";
-      ctx.finish(true, "✓ Recovered");
-      notify(t("toast.recovered", { wf: pending.wfName ? "「" + pending.wfName + "」" : "", sf }), "success");
-    } else {
-      // ⚠ 取回失败**不删**恢复记录:任务已 completed、产物还在云端,下次刷新还能再试。
-      // 到 maxAgeSec 会被 recoverPendingJob 自动滤掉,不会无限残留。
-      ctx.finish(false, "✗ Recover fetch failed", JSON.stringify(fd));
-    }
+    const sf = fd.outputs?.[0]?.subfolder || "modal_results";
+    ctx.finish(true, "✓ Recovered");
+    notify(t("toast.recovered", { wf: pending.wfName ? "「" + pending.wfName + "」" : "", sf }), "success");
   } catch (e) {
+    // 失败保留记录，下次刷新可重试；超过 recoveryDeadline 后才从列表过期。
     err("recover fetch failed", e);
     ctx.finish(false, "✗ Recover fetch error", String(e));
   }
