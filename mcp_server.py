@@ -39,14 +39,16 @@ Modal Bridge MCP server — 让 Claude Code / Codex 等 agent 把「云端 GPU �
 
     示例值仅占位；真实 capability 只放私有环境/配置，不能提交到仓库或发送给 agent。
 
-代理:local 模式本文件显式绕过系统代理(localhost 流量不该进代理);cloud 模式的外网请求
-由 bridge_client 走系统代理 env —— 两条路互不干扰。
+代理:两种模式均继承系统代理；localhost/内网目标通过 no_proxy/NO_PROXY 直连。
+远程 BASE 同样保留代理，不以禁用系统代理作为连接失败时的回退。
 """
 import json
 import os
 import sys
 import urllib.request
 from pathlib import Path
+
+from bridge_client import _open_http
 
 try:                                        # mcp >= 2.0
     from mcp.server import MCPServer as _Server
@@ -63,10 +65,6 @@ if MODE == "cloud":
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     from bridge_client import BridgeClient, BridgeError  # noqa: F811
     _client = BridgeClient(_ENDPOINT, os.environ.get("MODAL_BRIDGE_KEY", ""))
-
-# local 模式全部调用都打本机/宿主机,显式禁用系统代理(容器里 https_proxy 常指向外网 relay,
-# 让 localhost 流量进代理是经典事故来源)。
-_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 _OUT_DIR = os.environ.get("MODAL_BRIDGE_OUT_DIR", "./modal_bridge_outputs")
 _INPUT_DIRS = [d for d in os.environ.get("MODAL_BRIDGE_INPUT_DIRS", ".").split(":") if d]
@@ -88,7 +86,8 @@ def _call(path: str, body: dict | None = None, timeout: int = 120) -> dict:
         headers["X-Modal-Bridge-Capability"] = _LOCAL_CAPABILITY
     req = urllib.request.Request(url, data=data, headers=headers)
     try:
-        with _OPENER.open(req, timeout=timeout) as r:
+        # 与独立客户端共用逐跳同源校验；不能将本地管理 capability 带给重定向目标。
+        with _open_http(req, timeout=timeout) as r:
             return json.loads(r.read().decode())
     except urllib.error.HTTPError as e:
         try:

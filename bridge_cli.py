@@ -32,6 +32,7 @@ from pathlib import Path
 _HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(_HERE))
 from bridge_client import BridgeClient, BridgeError  # noqa: E402
+from private_json import atomic_write_json  # noqa: E402
 
 CLI_CFG = Path.home() / ".modal_bridge" / "cli.json"
 
@@ -44,38 +45,8 @@ def _load_cli_cfg() -> dict:
 
 
 def _save_cli_cfg(d: dict) -> None:
-    """写 CLI 配置(含 bridge_key)。临时文件 → chmod 0600 → os.replace。
-
-    ⚠ 不能"先 write_text 再 chmod":
-      - 非原子 —— 写到一半崩掉会留下半截 JSON,而 _load_cli_cfg 的 except 会把它静默
-        当成空配置,表现成"凭据莫名其妙没了",没有任何线索指向真实原因;
-      - 中间存在 0644 窗口 —— 文件先以默认权限落地,chmod 之前同机其他用户可读;
-      - 原实现还吞掉 chmod 失败,于是权限没设上也无人知晓。
-    2026-09-02 codex 抓到:这段注释写对了,**实现却仍是"先 write_text 再 chmod"**。
-    现改为 os.open(..., 0o600) 直接创建 —— 0o600 不含 group/other 位,umask 只去位
-    不加位,创建出来必定是 0600,根本不存在窗口。fchmod 给残留旧 tmp 兜底,失败必须抛。
-    与主配置 config.save_config 用的是同一套模式。
-    """
-    CLI_CFG.parent.mkdir(parents=True, exist_ok=True)
-    tmp = CLI_CFG.with_name(CLI_CFG.name + ".tmp")
-    fd = os.open(tmp, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
-    try:
-        # tmp 可能是上次崩溃留下的、权限已经不对的旧文件 —— O_CREAT 不会改已有文件的模式,
-        # 所以在**写入任何内容之前**再收一次。失败必须抛,不能吞:吞掉等于权限没设上却无人知晓。
-        # ⚠ os.fchmod 在 Windows 上 **Python 3.13 才有**(gh-113191);ComfyUI Desktop 大量跑在
-        #   Windows + 3.12 上,这里不能无条件调用 —— 第一版就是这么写的,等于让每一次保存配置
-        #   在 Windows 上 AttributeError(review 抓到)。没有 fchmod 的平台本来也没有 group/other
-        #   位可收,os.open(..., 0o600) 已是它能做到的全部,所以"不可用"和"调用失败"要分开:
-        #   前者跳过,后者仍必须抛。
-        if hasattr(os, "fchmod"):
-            os.fchmod(fd, 0o600)
-        f = os.fdopen(fd, "w", encoding="utf-8")
-    except BaseException:
-        os.close(fd)          # fdopen 没接管成 fd,得自己关
-        raise
-    with f:
-        f.write(json.dumps(d, indent=2, ensure_ascii=False))
-    os.replace(tmp, CLI_CFG)
+    """含 bridge_key 的 CLI 配置，与插件配置共用私有原子写入。"""
+    atomic_write_json(CLI_CFG, d)
 
 
 def _client(args) -> BridgeClient:

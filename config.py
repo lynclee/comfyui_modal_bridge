@@ -8,6 +8,11 @@ import secrets
 import threading
 from pathlib import Path
 
+if __package__:
+    from .private_json import atomic_write_json
+else:  # deploy.py / mcp_server.py 和独立测试以顶层模块导入
+    from private_json import atomic_write_json
+
 # 默认配置(用户问答确认)
 DEFAULT_CONFIG = {
     # ── Endpoint(deploy.py 自动写)──
@@ -23,9 +28,8 @@ DEFAULT_CONFIG = {
     "modal_token_id": "",      # ak-xxx(account token,仅本机 deploy 用)
     "modal_token_secret": "",  # as-xxx
     "bridge_api_key": "",      # 部署时随机生成,调私有 endpoint 用(自建鉴权)
-    # 本地 HTTP 管理面的 capability。127.0.0.1/localhost 访问免填；经局域网、反向代理
-    # 或 host.docker.internal 访问时,所有读写本机/花费云账单的端点都必须带它。
-    # 首次远程调用时自动生成并原子写入 config；不会经 /config 回吐给浏览器。
+    # 本地 HTTP 管理面的 capability；含 localhost 在内的管理请求均须携带。
+    # 首次管理调用时自动生成并原子写入 config；不会经 /config 回吐给浏览器。
     "local_api_capability": "",
     # 最近一次成功 deploy 时镜像包含的本地私有节点依赖指纹；内部状态,不由前端修改。
     "local_node_reqs_deployed_hash": "",
@@ -142,43 +146,8 @@ def load_config() -> dict:
 
 
 def save_config(new_data: dict) -> None:
-    """覆盖写 config(完整对象)。原子 + 0600。
-
-    这个文件里躺着 modal_token_id / modal_token_secret / bridge_api_key /
-    comfy_api_key / local_api_capability 等凭据,直接 write_text 有两个问题:
-      1) 非原子 —— 写到一半崩(磁盘满、进程被杀)留下半个 JSON,而 load_config
-         解析失败后**静默回落默认配置**:endpoint 归零、凭据全丢,表现成"插件突然
-         没配置过",没有任何报错指向真实原因。
-      2) 默认 0644 —— 同机任意用户可读凭据。
-    tmp + os.replace 保证读者要么看到完整的旧的、要么看到完整的新的。
-
-    ⚠ 权限用 **os.open(..., 0o600) 直接创建**,不是"先写再 chmod"(2026-09-02 codex
-    抓到:此前正是后者)。先写后 chmod 有两个洞 —— 默认 umask 022 下临时文件会先以
-    0644 落地,chmod 之前同机其他用户可读;进程在 chmod 前崩掉则明文凭据就那样留着。
-    0o600 不含 group/other 位,umask 只会去位不会加位,所以创建出来必定是 0600。
-    fchmod 是给"上次崩溃残留的旧 tmp"兜底(O_CREAT 不改已有文件的模式),且失败必须抛。
-    """
-    p = _config_path()
-    p.parent.mkdir(parents=True, exist_ok=True)
-    tmp = p.with_name(p.name + ".tmp")
-    fd = os.open(tmp, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
-    try:
-        # tmp 可能是上次崩溃留下的、权限已经不对的旧文件 —— O_CREAT 不会改已有文件的模式,
-        # 所以在**写入任何内容之前**再收一次。失败必须抛,不能吞:吞掉等于权限没设上却无人知晓。
-        # ⚠ os.fchmod 在 Windows 上 **Python 3.13 才有**(gh-113191);ComfyUI Desktop 大量跑在
-        #   Windows + 3.12 上,这里不能无条件调用 —— 第一版就是这么写的,等于让每一次保存配置
-        #   在 Windows 上 AttributeError(review 抓到)。没有 fchmod 的平台本来也没有 group/other
-        #   位可收,os.open(..., 0o600) 已是它能做到的全部,所以"不可用"和"调用失败"要分开:
-        #   前者跳过,后者仍必须抛。
-        if hasattr(os, "fchmod"):
-            os.fchmod(fd, 0o600)
-        f = os.fdopen(fd, "w", encoding="utf-8")
-    except BaseException:
-        os.close(fd)          # fdopen 没接管成 fd,得自己关
-        raise
-    with f:
-        f.write(json.dumps(new_data, indent=2, ensure_ascii=False))
-    os.replace(tmp, p)
+    """覆盖写完整配置：独立随机临时文件、创建即私有、原子替换，失败抛出。"""
+    atomic_write_json(_config_path(), new_data)
 
 
 _CAPABILITY_LOCK = threading.Lock()

@@ -3,12 +3,9 @@
 # 即便在非 git 目录下发布也不会进 Registry 包。
 modal_app/_custom_nodes_data.py
 
-# ⚠ 测试与 CI 配置不进 Registry 包。它们对装插件的用户零价值,却贡献了大量
-# 「扫描器眼里的可疑模式」:tests/test_core.py 一个文件就有 384 个 assert(S101)、
-# 5 处硬编码假凭据(S105/S106)、34 处静默 except(S110);.github/workflows 里则是
-# 一串 shell 命令(pip install / python -m ...)。
-# 数据:0.7.9 的测试 1494 行 / 259 个 ruff-S 告警 → Registry 判 Active;
-#       0.8.x 涨到 2241 行 / 395 个 → 连续四版 Flagged。未必是根因(Registry 不给理由),
-#       但把它们排除出去是明确正确的:包从 643 KB 降到 ~540 KB,可疑模式基本清零。
+# 仅排除开发/CI 产物；部署、客户端、MCP 等承诺给用户的运行时代码仍完整发布。
+# 本地 lint 或减少扫描命中不代表 Registry 审核通过。
 tests/
 .github/
+# 独立性能实验入口，不被插件或生产镜像导入；开发者从源码仓库运行。
+modal_app/snapshot_bench.py

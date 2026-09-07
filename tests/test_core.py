@@ -1745,15 +1745,16 @@ def test_config_written_without_any_0644_window(tmp_path, monkeypatch):
 
 
 def test_config_write_does_not_swallow_permission_failure(tmp_path, monkeypatch):
-    """收权限失败必须抛出来 —— 吞掉等于"权限没设上却无人知晓"。"""
-    import os
+    """创建私有临时文件失败必须抛出；不再复用旧文件，因此不再需要 fchmod。"""
+    import tempfile
 
     monkeypatch.setattr(config, "_config_path", lambda: tmp_path / "config.json")
 
     def boom(*a, **kw):
-        raise OSError("fchmod denied")
+        raise PermissionError("private temporary file creation denied")
 
-    monkeypatch.setattr(os, "fchmod", boom)
+    # 只注入本次私有文件创建失败，不影响自跑入口随后清理 TemporaryDirectory。
+    monkeypatch.setattr(tempfile, "mkstemp", boom)
     with raises(OSError):
         config.save_config({"endpoint": "x"})
 
