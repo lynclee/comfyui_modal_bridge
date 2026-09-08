@@ -1269,6 +1269,34 @@ def test_discover_outputs_dict_and_bare_string():
     assert cw.discover_outputs({}) == []
 
 
+def test_upload_images_reports_shape_errors_clearly():
+    """缺 image 键 / 非 dict 元素 → status=error 且报错点名形态与收到的键;正常形态照旧上传。
+    以前缺键只抛 KeyError('image'),整条报错就一个 'image'(comfyagent 接 videos/audios 槽位时撞到)。"""
+    cw = _comfy_ws()
+    r = cw.upload_images([{"name": "clip.mp4", "file": "data:video/mp4;base64,AAAA"}])
+    assert r["status"] == "error"
+    assert "只支持图片参考" in r["details"][0] and "'file'" in r["details"][0] and "clip.mp4" in r["details"][0]
+    r = cw.upload_images(["not-a-dict"])
+    assert r["status"] == "error" and "str" in r["details"][0]
+    r = cw.upload_images([{"image": "data:image/png;base64,AAAA"}])   # 缺 name
+    assert r["status"] == "error" and r["details"][0].startswith("upload ? failed")
+    assert cw.upload_images([]) == {"status": "success"}
+    calls = []
+    class _R:
+        def raise_for_status(self):
+            pass
+    original = getattr(cw.requests, "post", None)
+    cw.requests.post = lambda url, files=None, timeout=None: (calls.append((files["image"][0], files["overwrite"])), _R())[1]
+    try:
+        r = cw.upload_images([{"name": "ref.png", "image": "data:image/png;base64,iVBORw0KGgo="}])
+    finally:
+        if original is None:
+            del cw.requests.post
+        else:
+            cw.requests.post = original
+    assert r == {"status": "success"} and calls == [("ref.png", (None, "true"))]
+
+
 def _with_history(cw, payload):
     """临时替换 _comfy_ws.get_history(不用 monkeypatch —— CI 跑的是裸 runner,不是 pytest)。"""
     original = cw.get_history

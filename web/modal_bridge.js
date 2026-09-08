@@ -263,6 +263,8 @@ const I18N = {
                         en: "Modal Bridge management requires pairing, including localhost. Open the plugin's user config.json on the ComfyUI machine and copy local_api_capability; the backend log shows the file path. It stays in this browser, never in workflows. Do not send it in chat." },
   "auth.invalid":     { zh: "配对值含无效字符。请只复制 local_api_capability 的值，不含字段名、空格或换行。",
                         en: "Invalid pairing characters. Copy only the local_api_capability value, without the field name, spaces or line breaks." },
+  "auth.ok":          { zh: "确定", en: "OK" },
+  "auth.cancel":      { zh: "取消", en: "Cancel" },
   "set.sage.on":      { zh: "已开启 SageAttention —— 去 Setup 点「部署」才生效(有损加速,建议同 seed 对比过再常开)", en: "SageAttention ON — redeploy in Setup to take effect (lossy; A/B before leaving it on)" },
   "set.sage.off":     { zh: "已关闭 SageAttention —— 去 Setup 点「部署」生效", en: "SageAttention OFF — redeploy in Setup to take effect" },
   "dlg.aigc.bypass_hint":{ zh: "(可选,站点开了 Vercel Protection 才需要)", en: "(optional; only if the site has Vercel Protection)" },
@@ -297,6 +299,75 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 // 所以配对成功后安全重试一次即可。
 const LOCAL_CAP_KEY = "modal_bridge.local_api_capability";
 let _capabilityPairing = null;
+
+// 配对输入用插件自己的 DOM,**不用 window.prompt**:Electron(ComfyUI Desktop)不支持它,
+// 一调用就抛 "prompt() is not supported." —— 0.8.36~0.8.38 在 Desktop 上所有管理操作
+// (部署 / 测试连接 / 同步节点)因此全部失败(2026-09-07 用户截图)。alert/confirm 在 Electron
+// 可用,prompt 不行,别混为一谈。字符集行内校验:粘错了原地改、不关窗;取消 / Esc / 空提交
+// 一律视为放弃(resolve "")。
+function askCapability() {
+  return new Promise((resolve) => {
+    const doc = window.document;
+    const overlay = doc.createElement("div");
+    overlay.id = "modal-bridge-pairing";
+    overlay.style.cssText =
+      "position:fixed;inset:0;z-index:100000;background:rgba(0,0,0,0.55);" +
+      "display:flex;align-items:center;justify-content:center;";
+    const box = doc.createElement("div");
+    box.style.cssText =
+      "width:min(560px,92vw);padding:16px 18px;background:rgba(28,28,36,0.98);color:#fff;" +
+      "border-radius:10px;font-size:13px;font-family:-apple-system,system-ui,sans-serif;" +
+      "box-shadow:0 8px 24px rgba(0,0,0,0.5);border:1px solid rgba(255,255,255,0.08);";
+    const msg = doc.createElement("div");
+    msg.textContent = t("auth.capability");
+    msg.style.cssText = "white-space:pre-wrap;line-height:1.5;margin-bottom:10px;";
+    const input = doc.createElement("input");
+    input.type = "text";
+    input.autocomplete = "off";
+    input.spellcheck = false;
+    input.style.cssText =
+      "width:100%;box-sizing:border-box;padding:8px 10px;border-radius:6px;" +
+      "border:1px solid rgba(255,255,255,0.2);background:#111;color:#fff;font-family:monospace;";
+    const err = doc.createElement("div");
+    err.className = "mb-pair-error";
+    err.style.cssText = "color:#ef4444;min-height:1.4em;margin:6px 0 10px;";
+    const row = doc.createElement("div");
+    row.style.cssText = "display:flex;justify-content:flex-end;gap:8px;";
+    const cancel = doc.createElement("button");
+    cancel.textContent = t("auth.cancel");
+    cancel.style.cssText =
+      "padding:6px 14px;border-radius:6px;border:1px solid rgba(255,255,255,0.2);" +
+      "background:transparent;color:#fff;cursor:pointer;";
+    const ok = doc.createElement("button");
+    ok.textContent = t("auth.ok");
+    ok.style.cssText = "padding:6px 14px;border-radius:6px;border:0;background:#2563eb;color:#fff;cursor:pointer;";
+    const finish = (value) => { overlay.remove(); resolve(value); };
+    const submit = () => {
+      const value = (input.value || "").trim();
+      if (value && !/^[\x21-\x7e]+$/.test(value)) {
+        err.textContent = t("auth.invalid");
+        input.focus();
+        return;
+      }
+      finish(value);
+    };
+    ok.addEventListener("click", submit);
+    cancel.addEventListener("click", () => finish(""));
+    input.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") { e.preventDefault(); submit(); }
+      else if (e.key === "Escape") { e.preventDefault(); finish(""); }
+    });
+    row.appendChild(cancel);
+    row.appendChild(ok);
+    box.appendChild(msg);
+    box.appendChild(input);
+    box.appendChild(err);
+    box.appendChild(row);
+    overlay.appendChild(box);
+    doc.body.appendChild(overlay);
+    input.focus();
+  });
+}
 function fmtRate(bps) {
   if (bps >= 1048576) return `${(bps / 1048576).toFixed(1)} MB/s`;
   if (bps >= 1024) return `${Math.round(bps / 1024)} KB/s`;
@@ -329,13 +400,9 @@ async function bridgeFetch(path, options = {}) {
       if (!_capabilityPairing || (!_capabilityPairing.pending && _capabilityPairing === pairingAtStart)) {
         const pairing = { pending: true, promise: null };
         _capabilityPairing = pairing;
-        pairing.promise = Promise.resolve().then(() => {
+        pairing.promise = Promise.resolve().then(async () => {
           localStorage.removeItem(LOCAL_CAP_KEY);
-          const value = (window.prompt(t("auth.capability")) || "").trim();
-          if (value && !/^[\x21-\x7e]+$/.test(value)) {
-            alert(t("auth.invalid"));
-            return "";
-          }
+          const value = await askCapability();
           if (value) localStorage.setItem(LOCAL_CAP_KEY, value);
           return value;
         }).finally(() => { pairing.pending = false; });

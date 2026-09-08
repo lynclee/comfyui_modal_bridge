@@ -142,9 +142,19 @@ def upload_images(images: list[dict]) -> dict:
         return {"status": "success"}
     errors = []
     for image in images:
+        # 形态是契约:本地 routes / bridge_client 都发 {name, image: data URI}。以前缺键只抛
+        # KeyError('image'),到用户手里整条报错就剩一个 'image',看不出是"只支持图片参考、
+        # 你传的是别的槽位"(comfyagent 接 videos/audios 时就会撞到)。任务本来就会失败
+        # (run_workflow 检查返回值后 raise),这里只是把原因说清。
+        if not isinstance(image, dict):
+            errors.append(f"upload failed: 期望 {{name, image}} 对象,收到 {type(image).__name__}")
+            continue
+        name = image.get("name")
         try:
-            name = image["name"]
-            data_uri = image["image"]
+            data_uri = image.get("image")
+            if not isinstance(name, str) or not name or not isinstance(data_uri, str) or not data_uri:
+                raise ValueError(
+                    f"需要 {{name, image: data URI}} 形态(只支持图片参考);收到的键: {sorted(image)}")
             b64 = data_uri.split(",", 1)[1] if "," in data_uri else data_uri
             blob = base64.b64decode(b64)
             files = {
@@ -154,7 +164,7 @@ def upload_images(images: list[dict]) -> dict:
             r = requests.post(f"http://{COMFY_HOST}/upload/image", files=files, timeout=30)
             r.raise_for_status()
         except Exception as e:
-            errors.append(f"upload {image.get('name','?')} failed: {e}")
+            errors.append(f"upload {name or '?'} failed: {e}")
     if errors:
         return {"status": "error", "details": errors}
     return {"status": "success"}
