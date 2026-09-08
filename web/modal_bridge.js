@@ -259,8 +259,8 @@ const I18N = {
   "set.save_failed":  { zh: "✗ 设置没保存成功:{msg} —— 请重试(改动未写入 config)", en: "✗ Setting not saved: {msg} — please retry (config unchanged)" },
   "set.cpu_guess":    { zh: "Auto 档下,仅凭‘没扫描到本地模型’把任务送进 CPU。只适合确定是纯 API 的工作流；节点内部下载权重、CUDA/Triton 图像处理、3D/光流可能被误判。关掉后,扫不到模型也走 GPU 梯子。改完立即生效。",
                         en: "In Auto tier, route to CPU solely when no local model is detected. Suitable only for known pure-API workflows; nodes downloading weights internally or using CUDA/Triton, 3D, or optical flow can be misclassified. Turn off to keep model-less workflows on the GPU ladder. Takes effect immediately." },
-  "auth.capability":  { zh: "Modal Bridge 管理操作需要配对(本机也一样)。请从运行 ComfyUI 的机器上打开插件用户配置 config.json，复制 local_api_capability；后端日志会显示文件路径。它只保存在当前浏览器，不写入工作流，也不要发到聊天中。",
-                        en: "Modal Bridge management requires pairing, including localhost. Open the plugin's user config.json on the ComfyUI machine and copy local_api_capability; the backend log shows the file path. It stays in this browser, never in workflows. Do not send it in chat." },
+  "auth.capability":  { zh: "你正经由局域网 / 反向代理 / 容器访问,需要配对(在跑 ComfyUI 的那台机器上直接开 127.0.0.1 则不需要)。请从该机器上打开插件用户配置 config.json，复制 local_api_capability 的值。它只保存在当前浏览器，不写入工作流，也不要发到聊天中。",
+                        en: "You are reaching this over LAN, a reverse proxy or a container, so pairing is required (direct 127.0.0.1 access on the ComfyUI machine is not). Open the plugin's user config.json on that machine and copy the local_api_capability value. It stays in this browser, never in workflows. Do not send it in chat." },
   "auth.invalid":     { zh: "配对值含无效字符。请只复制 local_api_capability 的值，不含字段名、空格或换行。",
                         en: "Invalid pairing characters. Copy only the local_api_capability value, without the field name, spaces or line breaks." },
   "auth.ok":          { zh: "确定", en: "OK" },
@@ -293,7 +293,7 @@ function t(key, vars) {
 // =====================================================================
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-// 管理请求统一要求 capability(含 localhost)，403 + 专用响应头发起配对。
+// 非本机的管理请求要 capability(本机同源直连免),403 + 专用响应头发起配对。
 // capability 只留在当前 origin 的 localStorage,
 // 不进 ComfyUI settings(可能同步)、工作流或日志。请求体都是可重放的 JSON 字符串,
 // 所以配对成功后安全重试一次即可。

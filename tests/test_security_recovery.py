@@ -17,7 +17,11 @@ from bridge_client import _SameOriginRedirect
 from comfyui_modal_bridge.result_receipts import ResultReceipts
 
 
-def test_loopback_requires_capability_before_parsing_request():
+def test_remote_host_requires_capability_before_parsing_request():
+    """非 loopback Host(反代 / 局域网)缺 token 必须在解析请求体之前就被拒。
+
+    0.8.40 起 loopback 免 capability,所以这条要用外部 Host 才测得到守卫;
+    用 loopback 测会把"放行"误当成"守卫失效"。"""
     harness._set_cfg()
 
     async def body(c):
@@ -26,10 +30,41 @@ def test_loopback_requires_capability_before_parsing_request():
                 continue
             for token in ("", "wrong-capability", "错误-token"):
                 r = await c.request(route.method, route.path, headers={
+                    "Host": "bridge.example",
                     "X-Modal-Bridge-Capability": token, "Content-Type": "text/plain",
                 }, data="invalid-json")
                 assert r.status == 403, (route.path, token, r.status)
                 assert r.headers.get("X-Modal-Bridge-Auth") == "capability-required"
+        assert harness.cfg_mod.load_config()["gpu_tier"] == "auto"
+
+    harness._run(body)
+
+
+def test_loopback_without_capability_is_allowed_but_still_origin_checked():
+    """本机直连免 token(0.8.40 撤回 0.8.36 的要求);跨站 Origin 仍在解析请求体前拒。"""
+    harness._set_cfg()
+
+    async def body(c):
+        # 无 token、无 Origin(本机 CLI 形态)→ 放行
+        r = await c.post("/modal_bridge/config", headers={"X-Modal-Bridge-Capability": ""},
+                         json={"gpu_tier": "cheap"})
+        assert r.status == 200
+        assert harness.cfg_mod.load_config()["gpu_tier"] == "cheap"
+        # 本机同源浏览器 → 放行
+        harness._set_cfg()
+        r = await c.post("/modal_bridge/config",
+                         headers={"Origin": str(c.make_url("/")).rstrip("/"),
+                                  "Sec-Fetch-Site": "same-origin"},
+                         json={"gpu_tier": "cheap"})
+        assert r.status == 200
+        # 跨站页面打本机 → 仍然拒,且没写进配置
+        harness._set_cfg()
+        for extra in ({"Origin": "https://foreign.example"},
+                      {"Sec-Fetch-Site": "cross-site"}):
+            r = await c.post("/modal_bridge/config", headers={**extra, "Content-Type": "text/plain"},
+                             data="invalid-json")
+            assert r.status == 403, extra
+            assert r.headers.get("X-Modal-Bridge-Auth") != "capability-required"  # 跨站不发起配对
         assert harness.cfg_mod.load_config()["gpu_tier"] == "auto"
 
     harness._run(body)
@@ -43,7 +78,9 @@ def test_first_pairing_generates_private_capability_without_returning_it():
         public = await c.get("/modal_bridge/config", headers=headers)
         assert public.status == 200
         assert not (await public.json())["has_local_api_capability"]
-        denied = await c.post("/modal_bridge/deploy", headers=headers, data="invalid-json")
+        # 首次远程(非 loopback Host)管理请求才会触发生成 —— 本机直连已免 capability。
+        denied = await c.post("/modal_bridge/deploy",
+                              headers={**headers, "Host": "bridge.example"}, data="invalid-json")
         assert denied.status == 403
         cap = harness.cfg_mod.load_config()["local_api_capability"]
         assert cap.startswith("lc-")
@@ -61,11 +98,12 @@ def test_first_pairing_generates_private_capability_without_returning_it():
     harness._run(body)
 
 
-def test_loopback_same_origin_also_requires_capability():
+def test_remote_same_host_still_requires_capability():
+    """反代 / 局域网 Host 即使 Origin 与之同源,也必须持 capability —— 那里没有本机可言。"""
     harness._set_cfg()
 
     async def body(c):
-        headers = {"Origin": str(c.make_url("/")).rstrip("/"),
+        headers = {"Host": "bridge.example", "Origin": "http://bridge.example",
                    "X-Modal-Bridge-Capability": ""}
         r = await c.post("/modal_bridge/config", headers=headers, json={"gpu_tier": "cheap"})
         assert r.status == 403

@@ -2,9 +2,15 @@
 
 插件在 ComfyUI 本地服务上注册的机器接口——UI 用它,任何脚本 / agent / MCP 也可以直接调。
 
-从 0.8.36 起，所有管理请求都必须带 capability，包括 localhost 和无 Origin 的本地 CLI。
-本机浏览器还会校验 Origin，跨源 Origin、`Origin: null` 和 `Sec-Fetch-Site: cross-site`
-会被拒绝，即使 ComfyUI 开启 CORS。远程配对不依赖反向代理内部连接的 HTTP/HTTPS 协议一致。
+本机直连(peer 与 `Host` 同为 loopback)且通过 Origin 校验的管理请求**不需要** capability。
+经局域网、反向代理、`host.docker.internal` 或容器过来的管理请求一律需要。
+本机请求仍校验 Origin：跨源 Origin、`Origin: null` 和 `Sec-Fetch-Site: cross-site`
+会被拒绝，即使 ComfyUI 开启 CORS——本机直连时这是唯一的守卫。
+远程配对不依赖反向代理内部连接的 HTTP/HTTPS 协议一致。
+
+> 0.8.36–0.8.39 曾对本机直连也要求 capability，0.8.40 撤回：每个浏览器都要手工粘一次
+> token，而 `/submit`、`/poll` 同在保护范围内，连提交任务都被拦；对同源浏览器页面的
+> 安全增量近乎为零——能在 ComfyUI 页面里执行 JS 的攻击者本就能直接排队跑工作流。
 
 - **Base URL**:ComfyUI 本地服务地址(Desktop 默认 `http://127.0.0.1:8000`,OSS 默认 `:8188`;容器内访问宿主机用 `host.docker.internal`)
 - **本地管理鉴权**:请求头 `X-Modal-Bridge-Capability` 的值来自服务器插件用户配置 `config.json` 的 `local_api_capability`；首次管理请求缺值时自动生成，日志只显示文件路径，API 不回吐 token。浏览器首次手动配对后存入当前 origin 的 localStorage。反代须保留外部 `Host` 或正确追加转发头，以维持 Origin 防护语义
@@ -12,10 +18,12 @@
 - **密钥**:`/config` 读写永不回吐 `modal_token_secret` / `bridge_api_key` / `comfy_api_key` / `aigc_bypass_secret`,只回 `has_*` 布尔标志
 - **prompt 格式**:均为 ComfyUI **API prompt**(`{node_id: {class_type, inputs}}`,即前端 `graphToPrompt().output`),不是画布 JSON
 
-| 调用方式 | 升级到 0.8.36 后 |
+| 调用方式 | 0.8.40 起 |
 |---|---|
-| 浏览器(本机/远程) | 首次管理请求提示配对；从服务器本机复制 token，不要发到聊天中。已有有效配对继续使用 |
-| 本地 HTTP 脚本 / MCP | 每次请求携带上述请求头；MCP 设置 `MODAL_BRIDGE_LOCAL_CAPABILITY`，不要提交含真实值的配置 |
+| 浏览器(ComfyUI 本机,`127.0.0.1`/`localhost`) | 不需要配对，直接可用 |
+| 浏览器(局域网 / 反代 / 容器) | 首次管理请求提示配对；从服务器本机复制 token，不要发到聊天中。已有有效配对继续使用 |
+| 本地 HTTP 脚本 / MCP(直连 loopback) | 不需要请求头 |
+| MCP 经 `host.docker.internal` / 局域网 | 每次请求携带上述请求头；用 `MODAL_BRIDGE_LOCAL_CONFIG` 指向 0600 的 config.json，不要提交含真实值的配置 |
 | 直连云端的 standalone CLI / MCP cloud | 不受影响，仍使用 `bridge_api_key` |
 | 公开只读端点 | GET `/config`(脱敏)、`/health`、`/platform_status`、`/version` 不要求 capability |
 
@@ -115,7 +123,7 @@ curl -X POST http://127.0.0.1:8000/modal_bridge/submit \
 | `/modal_bridge/version` | GET | 版本契约:`{local, deployed, match, reachable}`,不匹配应引导重新部署 |
 | `/modal_bridge/platform_status` | GET | Modal 官方状态页聚合态(`operational/degraded/...`),区分平台故障 vs 未部署 |
 | `/modal_bridge/config` | GET/POST | GET 返回脱敏配置；POST 只接受 GPU/高级设置 allowlist,不能改凭据或管理鉴权字段 |
-| `/modal_bridge/bridge_key` | GET | 取回 bridge_api_key；必须持有效 admin capability，含 localhost |
+| `/modal_bridge/bridge_key` | GET | 取回 bridge_api_key；本机同源直连放行，其余须持有效 admin capability |
 | `/modal_bridge/job_event` | POST | 前端/调用方上报客户端侧结局(`{job_id, event, detail}`)进后端日志留痕 |
 
 ## 无 ComfyUI 直连云端(standalone)

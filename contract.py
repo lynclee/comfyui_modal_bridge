@@ -39,7 +39,7 @@ def is_direct_loopback_request(remote: str | None, host: str | None,
                                forwarded_for: str | None = None) -> bool:
     """请求是否真的是通过 localhost/127.0.0.1/::1 访问。
 
-    只决定是否附加本机 Origin 校验，不授予权限；管理路由一律要求 capability。
+    本机直连 + 同源 = 免 capability(见 routes._admin_denial);非 loopback 一律要。
     只看 TCP peer 会把本机反向代理后的所有远程访客都认成 127.0.0.1；因此 peer 和
     浏览器实际访问的 Host 必须同时是 loopback。Host 头本身可伪造,但远程攻击者仍需
     先让 TCP peer 变成 loopback；常规浏览器经过反代时 Host 是外部域名,会被拒绝。
@@ -75,7 +75,10 @@ def is_direct_loopback_request(remote: str | None, host: str | None,
 
 def is_safe_local_origin(origin: str | None, scheme: str, host: str,
                          fetch_site: str = "") -> bool:
-    """本机浏览器跨站防护；无 Origin 的 CLI 仍须通过路由的 capability 校验。"""
+    """本机浏览器跨站防护。本机直连时这是**唯一**的守卫(capability 已对 loopback 豁免),
+    所以它必须自己站得住:Sec-Fetch-Site: cross-site 直接拒;带 Origin 就必须与本站同源。
+    无 Origin(本机 CLI / 脚本直连 loopback)放行 —— 本机进程本来就能读 0600 config
+    拿到 capability,拦它没有意义。"""
     if fetch_site.lower() == "cross-site":
         return False
     if origin is None:

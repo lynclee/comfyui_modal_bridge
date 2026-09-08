@@ -28,8 +28,9 @@ DEFAULT_CONFIG = {
     "modal_token_id": "",      # ak-xxx(account token,仅本机 deploy 用)
     "modal_token_secret": "",  # as-xxx
     "bridge_api_key": "",      # 部署时随机生成,调私有 endpoint 用(自建鉴权)
-    # 本地 HTTP 管理面的 capability；含 localhost 在内的管理请求均须携带。
-    # 首次管理调用时自动生成并原子写入 config；不会经 /config 回吐给浏览器。
+    # 本地 HTTP 管理面的 capability。127.0.0.1/localhost 同源访问免填；经局域网、
+    # 反向代理、host.docker.internal 或 MCP 访问时,所有读写本机 / 花费云账单的端点
+    # 都必须带它。首次需要时自动生成并原子写入 config；不会经 /config 回吐给浏览器。
     "local_api_capability": "",
     # 最近一次成功 deploy 时镜像包含的本地私有节点依赖指纹；内部状态,不由前端修改。
     "local_node_reqs_deployed_hash": "",

@@ -555,10 +555,18 @@ _ADMIN_REQUIRED_HEADER = "X-Modal-Bridge-Auth"
 
 
 def _admin_denial(request: web.Request) -> web.Response | None:
-    """所有管理请求均须持久 capability，包括本机直连。
+    """本机同源直连免 capability;经局域网 / 反向代理 / 容器过来的一律要。
 
     peer+Host 双判避免反向代理把远程访客伪装成 127.0.0.1。capability 只存在本机
     0600 config 和调用方浏览器 localStorage 中,绝不从匿名端点回吐。
+
+    ⚠ 0.8.36 曾对本机直连也要求 capability(为回应 Registry 的 policy-v0.2 判定),
+    2026-09-08 用户决定撤回。代价与收益不成比例:每个浏览器都要手工粘一次 token,
+    而 /submit /poll 也在保护范围内 —— 连正常提交任务都被拦;而对**同源浏览器页面**
+    的安全增量近乎为零 —— 能在 ComfyUI 页面里执行 JS 的攻击者本来就能直接排队跑
+    工作流,不必绕这些路由。跨站页面由下面的 is_safe_local_origin 挡住,那一层不需要
+    用户做任何事。保留的部分:非 loopback 访问(局域网 / 反代 / host.docker.internal
+    / MCP)仍须 capability —— 那里没有"同源"可言,而且花的是用户的云端账单。
     """
     try:
         host = request.host
@@ -574,6 +582,7 @@ def _admin_denial(request: web.Request) -> web.Response | None:
                 request.headers.get("Origin"), request.scheme, host,
                 request.headers.get("Sec-Fetch-Site", "")):
             return web.json_response({"error": "cross-origin local request rejected"}, status=403)
+        return None      # 本机同源(或无 Origin 的本机 CLI)直接放行
     expected = cfg_mod.ensure_local_api_capability()
     supplied = (request.headers.get(_ADMIN_HEADER) or "").strip()
     # token_urlsafe 生成 ASCII；误粘中文等输入应返回 403，不让 compare_digest 抛 500。

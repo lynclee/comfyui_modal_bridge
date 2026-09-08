@@ -254,8 +254,8 @@ def test_local_nodes_diff_reports_pending_image_rebuild():
         f"依赖镜像欠重建却没回报 —— 前端会说「无需推送」然后静默卡几分钟: {body}"
 
 
-def test_bridge_key_requires_capability_on_every_host():
-    """本机和外部 Host 都只能持有效 capability 取 key。"""
+def test_bridge_key_needs_capability_only_off_loopback():
+    """本机直连取 key 放行(0.8.40);外部 Host 无 capability 一律拒、有则放行。"""
     _set_cfg()
 
     async def body(c):
@@ -264,7 +264,14 @@ def test_bridge_key_requires_capability_on_every_host():
                               headers={"Host": "bridge.example.com", "X-Modal-Bridge-Capability": ""})
         local_anonymous = await c.get("/modal_bridge/bridge_key",
                                       headers={"X-Modal-Bridge-Capability": ""})
-        assert local_anonymous.status == 403
+        assert local_anonymous.status == 200, "本机直连不该再要 capability"
+        assert (await local_anonymous.json()).get("key") == "bk-secret-value"
+        # 本机但跨站页面发起 —— Origin 守卫必须挡住,否则任意网页能偷走云端 key。
+        cross_site = await c.get("/modal_bridge/bridge_key",
+                                 headers={"Origin": "https://foreign.example",
+                                          "X-Modal-Bridge-Capability": ""})
+        assert cross_site.status == 403, "跨站页面竟然能取走 bridge key"
+        assert "bk-secret-value" not in await cross_site.text()
         remote_authorized = await c.get("/modal_bridge/bridge_key",
                                         headers={"Host": "bridge.example.com"})
         assert remote_authorized.status == 200

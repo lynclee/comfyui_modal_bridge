@@ -9,7 +9,8 @@ Modal Bridge MCP server — 让 Claude Code / Codex 等 agent 把「云端 GPU �
                        用 http://host.docker.internal:8000)
     MODAL_BRIDGE_LOCAL_CONFIG      推荐:ComfyUI 那份插件 config.json 的路径(0600),MCP 进程
                                    直接从里面读 local_api_capability,token 不进 env / .mcp.json
-    MODAL_BRIDGE_LOCAL_CAPABILITY  或直接给值(优先级高于上面);本地 HTTP 模式两者必设其一(含 localhost)
+    MODAL_BRIDGE_LOCAL_CAPABILITY  或直接给值(优先级高于上面)。直连 127.0.0.1 时两者都不用设;
+                                   经 host.docker.internal / 局域网访问时必设其一
 
 **cloud 模式** — 经 bridge_client.py 直连 Modal 云端 endpoint,**不需要本地 ComfyUI**。
 前提:部署者已用完整插件部署过(模型在 Volume、节点在镜像)。适合拿到 endpoint + key 的
