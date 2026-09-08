@@ -1526,6 +1526,8 @@ def _setup_routes():
         comfyui_version = node_sync.detect_local_comfyui_version()
         _tags = await asyncio.to_thread(node_sync.list_comfyui_tags)
         comfyui_tag, _tag_note = node_sync.resolve_comfyui_tag(comfyui_version, _tags)
+        # ⚠ 必须在 cfg.update 之前取:那一步会用新值覆盖 comfyui_tag,取晚了永远相等。
+        _tag_change = node_sync.comfyui_tag_change_note(cfg.get("comfyui_tag"), comfyui_tag)
 
         # 合并出完整 config(用于 deploy_env + 最终落盘)
         cfg.update({
@@ -1556,6 +1558,8 @@ def _setup_routes():
         if _tag_note:
             await _emit(resp, f"   ⚠ {_tag_note}\n")
         await _emit(resp, f"   ComfyUI: 本机={comfyui_version or '未知'} → 云端 clone {comfyui_tag}\n")
+        if _tag_change:
+            await _emit(resp, f"   ⚠ {_tag_change}\n")
         await _emit(resp, f"   plugin_version={node_sync.plugin_version()}  (会烤进云端 deployed_version)\n")
         await _emit(resp, f"   endpoint={endpoint_base}\n\n")
 

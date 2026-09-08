@@ -105,6 +105,25 @@ def resolve_comfyui_tag(version: str, tags: list[str]) -> tuple[str, str]:
     return best, f"本机 ComfyUI v{'.'.join(map(str, lv))} 无对应 tag → 云端用最接近的 {best}"
 
 
+def comfyui_tag_change_note(prev_tag: str | None, new_tag: str | None) -> str:
+    """这次部署的 ComfyUI tag 与上次不同 → 返回一句警告;相同 / 首次部署 → 空串。
+
+    为什么需要:部署输出原本只打**当前值**(`本机=0.34.6 → 云端 clone v0.34.6`),
+    看不出它**变了**。而云端 ComfyUI tag 是跟随部署者本机的 —— 用户自己升了 ComfyUI
+    Desktop,下一次部署就被动把云端也换掉,同 seed 同工作流的产物随之改变,却没有
+    任何提示。2026-09-08 我(Claude)正是因此拿 config 里的旧值 v0.34.2 做了错误预测,
+    对协作方声明"这次 tag 不变",实际部署成了 v0.34.6。
+
+    「打印当前值」和「打印变化」是两回事:前者在该报警的时刻**看起来完全正常**。
+    """
+    prev = (prev_tag or "").strip()
+    new = (new_tag or "").strip()
+    if not prev or not new or prev == new:
+        return ""
+    return (f"云端 ComfyUI 版本变了:{prev} → {new}(跟随本机升级)。"
+            f"同 seed / 同工作流的产物可能与之前不同。")
+
+
 # ============================================================================
 # 云端模型目录映射:云端 extra_model_paths.yaml 跟随本机注册的模型目录类型,
 # 这样自定义类别(geometry_estimation / optical_flow / liveportrait / ...)里的模型

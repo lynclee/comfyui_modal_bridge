@@ -1084,6 +1084,29 @@ def test_contract_old_image_gpu_none_not_blocked():
 # ============================================================================
 # node_sync.resolve_comfyui_tag — ComfyUI 版本跟随(纯函数)
 # ============================================================================
+def test_comfyui_tag_change_note():
+    """变了才出声;相同 / 首次部署 / 空值一律沉默,免得每次部署都挂一条无意义警告。"""
+    note = node_sync.comfyui_tag_change_note("v0.34.2", "v0.34.6")
+    assert "v0.34.2" in note and "v0.34.6" in note and "产物" in note
+    assert node_sync.comfyui_tag_change_note("v0.34.6", "v0.34.6") == ""
+    assert node_sync.comfyui_tag_change_note("", "v0.34.6") == ""      # 首次部署
+    assert node_sync.comfyui_tag_change_note(None, "v0.34.6") == ""
+    assert node_sync.comfyui_tag_change_note("v0.34.2", "") == ""      # 测不到新值时别乱报
+    assert node_sync.comfyui_tag_change_note("  v0.34.6  ", "v0.34.6") == ""  # 空白不算变化
+
+
+def test_deploy_reads_previous_tag_before_overwriting_it():
+    """部署里取上次 tag 必须早于 cfg.update —— 取晚了两值永远相等,警告永不触发。
+
+    这条防的是「顺序对了才成立」的不变量:代码看起来都在,调换两行就静默失效,
+    而单测覆盖不到路由内部的语句顺序。"""
+    src = (ROOT / "routes.py").read_text(encoding="utf-8")
+    body = code_only(src)
+    read = body.index("comfyui_tag_change_note(")
+    update = body.index('"comfyui_tag": comfyui_tag')
+    assert read < update, "取上次 comfyui_tag 的位置晚于 cfg.update,警告会永远不触发"
+
+
 def test_resolve_comfyui_tag_exact():
     tag, note = node_sync.resolve_comfyui_tag("0.22.0", ["v0.21.0", "v0.22.0", "v0.23.0"])
     assert tag == "v0.22.0" and note == ""
