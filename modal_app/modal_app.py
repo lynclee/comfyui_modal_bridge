@@ -119,28 +119,42 @@ def _sweep_job_state():
     vol_gc_budget = _VOL_GC_PER_SWEEP
 
     def _drop(jid):
+        """清一个终态 job。返回 False = 本次 Volume 预算已用完,**什么都没动**(索引留着,
+        下次 sweep 再来)。
+
+        ⚠ 铁律:Volume 目录和 job_state 索引必须同生共死 —— 要么一起删,要么都不删。
+        曾经是「先无条件删索引,再判预算」,于是一次 sweep 撞上 11 个过期 job 时,
+        第 11 个索引没了、`_outputs/` 目录还在:下次 sweep 遍历 job_state 时再也看不到
+        这个 jid,那个目录从此无人认领。限流本意是「这次先清 10 个」,实际成了
+        「超出的部分永久泄漏」(2026-09-09 seedance 侧隔离执行复现,本文件同名回归测试钉死)。
+        """
         nonlocal vol_gc_budget
+        # 顺带清 Volume 上的 _outputs/<job_id>/:成功取回会即删(见 modal_volume.download_volume_file
+        # 和 fetch_endpoint 的 delete=1),但**失败/取消/客户端放弃**的大文件以前永久留在 Volume 上,
+        # 谁也不会去删。job_state 条目都过期了,产物更没人要。
+        # 二道闸:/run 已经挡住脏 id,但 Dict 里可能还留着旧版本写入的条目 ——
+        # remove_file 是 recursive 删除,宁可漏删一个孤儿目录,也不能拿不可信的 id 去删 Volume。
+        # 脏 id 不占预算也不阻塞索引清理:它压根不碰 Volume,索引留着只会让 Dict 白涨。
+        if _safe_job_id(jid):
+            # 限量:一次 sweep 最多删这么多个,避免某次提交撞上大批过期 job 时被一串 RPC 拖慢。
+            if vol_gc_budget <= 0:
+                return False
+            vol_gc_budget -= 1
+            try:
+                models_vol.remove_file(f"_outputs/{jid}", recursive=True)
+            except FileNotFoundError:
+                pass  # 目录不存在是常态(产物已取回 / 本来就是小文件走 base64)
+            except Exception as e:
+                # 别的异常要出声:静默失败 = GC 从来没生效过,而日志上看不出来。
+                # 索引也保留 —— 删失败还把索引丢掉,就又变成上面那种无人认领的孤儿目录。
+                print(f"[bridge] ⚠ Volume GC _outputs/{jid} 失败: {type(e).__name__}: {e}")
+                return False
         for k in (jid, f"{jid}:call"):  # 连带删独立的 call_id key,不留孤儿
             try:
                 del job_state[k]
             except Exception:
                 pass
-        # 顺带清 Volume 上的 _outputs/<job_id>/:成功取回会即删(见 modal_volume.download_volume_file
-        # 和 fetch_endpoint 的 delete=1),但**失败/取消/客户端放弃**的大文件以前永久留在 Volume 上,
-        # 谁也不会去删。job_state 条目都过期了,产物更没人要。
-        # 限量:一次 sweep 最多删这么多个,避免某次提交撞上大批过期 job 时被一串 RPC 拖慢。
-        # 二道闸:/run 已经挡住脏 id,但 Dict 里可能还留着旧版本写入的条目 ——
-        # 这行是 recursive 删除,宁可漏删一个孤儿目录,也不能拿不可信的 id 去删 Volume。
-        if vol_gc_budget <= 0 or not _safe_job_id(jid):
-            return
-        vol_gc_budget -= 1
-        try:
-            models_vol.remove_file(f"_outputs/{jid}", recursive=True)
-        except FileNotFoundError:
-            pass  # 目录不存在是常态(产物已取回 / 本来就是小文件走 base64)
-        except Exception as e:
-            # 别的异常要出声:静默失败 = GC 从来没生效过,而日志上看不出来
-            print(f"[bridge] ⚠ Volume GC _outputs/{jid} 失败: {type(e).__name__}: {e}")
+        return True
     # 1) 过期删
     for jid, done_at in finished:
         if done_at and now - done_at > JOB_TTL_S:
@@ -836,7 +850,17 @@ def status_endpoint(job_id: str, key: str = "", x_bridge_key: str = _Header(""))
         return deny
     s = job_state.get(job_id)
     if not s:
-        return {"error": "job not found", "id": job_id}
+        # ⚠ 必须带 status 字段。只回 {"error": ...} 的话,客户端归一状态时会落进「未知 → 兜底」,
+        #   而最保守的兜底恰好是 running(猜 completed 等于假装有产物,猜 failed 等于把还在
+        #   烧钱的任务当结束)—— 于是一条被 GC 清掉的任务被读成「还在跑」,永远不收敛。
+        #   本仓自己的 bridge_client.wait 也中招过:它只认 completed/failed/cancelled,
+        #   缺 status 就一路轮询到 timeout_s(默认 1 小时)。让「没有这条记录」在数据里显式存在。
+        #   (2026-09-10 comfyagent 侧实测:normalize_status(None) → running)
+        # ⚠ 刻意不改成 HTTP 404:下游已有 vendor 副本,改状态码是破坏性变更;而且 wait() 把
+        #   HTTP 异常当瞬态错重试,反而更难收敛。
+        # ⚠ not_found ≠ 立刻可判死:job_state 是 modal.Dict,跨容器最终一致,/run 刚写完的
+        #   条目在另一个容器上可能短暂读不到。客户端必须连续看到几次才作数(见 bridge_client.wait)。
+        return {"error": "job not found", "id": job_id, "status": "not_found"}
     return {"id": job_id, **s}
 
 
@@ -885,6 +909,15 @@ def cancel_endpoint(payload: dict):
     if not job_id:
         return {"error": "Missing 'job_id'"}
     s = job_state.get(job_id) or {}
+    # ⚠ 不存在的 job 必须在这里就如实报,不能往下走:底下那句 merge 会**凭空建一条 cancelled
+    #   记录**并返回 status: cancelled —— 对调用方是一次假成功(取消了一个根本不存在的任务),
+    #   对我们是一条垃圾索引,而且之后 status 查它会回 cancelled 而不是 not found。
+    #   (2026-09-10 comfyagent 侧读代码发现)
+    # ⚠ 判据必须用**裸 :call 键**,不能用 _call_id():run_endpoint 在 spawn 之前先写占位值,
+    #   那段窗口里 job_state[job_id] 还不存在、_call_id() 也返回空串 —— 拿 _call_id() 当判据
+    #   会把「正在提交中」误判成「不存在」,正好打掉下面那段专为它写的等待逻辑。
+    if not s and not job_state.get(f"{job_id}:call"):
+        return {"id": job_id, "status": "not_found", "error": "job not found"}
     was_running = s.get("status") == "running"
     call_id = _call_id(job_id) or s.get("call_id")  # 新独立 key,兼容旧字段
     # 占位状态 = run_endpoint 正在 spawn,真实 call_id 还没写回来。这时既不能当"没有 call_id"

@@ -1037,6 +1037,144 @@ def test_bridge_client_download_outputs_base64(tmp_path):
         pass
 
 
+def test_download_outputs_never_overwrites_on_collision(tmp_path):
+    """撞名生成的候选名可能**本来就在输入里** —— 只改一次名会静默覆盖前一份产物。
+
+    a.png / a_2.png / a.png 三份不同内容:第三份撞名后算出 a_2.png,正好是第二份已占的名字。
+    老实现把它 add 进 seen(已在)后原样返回 → 磁盘上只剩两个文件,而返回列表长度是 3、
+    三条都报成功。这个 bug 的形状决定了它只能靠数磁盘文件发现,调用方看不出来。
+    (2026-09-09 seedance 侧在 vendor 副本里复现。)
+    """
+    import base64
+    import bridge_client
+    c = bridge_client.BridgeClient("https://ws--comfyui-bridge", "k")
+
+    def item(fn, body):
+        return {"filename": fn, "data_base64": base64.b64encode(body).decode()}
+
+    state = {"status": "completed", "id": "j1",
+             "images": [item("a.png", b"one"), item("a_2.png", b"two"), item("a.png", b"three")]}
+    outs = c.download_outputs(state, str(tmp_path / "r"))
+    paths = {o["path"] for o in outs}
+    assert len(outs) == 3
+    assert len(paths) == 3, f"三份产物落到了 {len(paths)} 个路径,有一份被覆盖: {sorted(paths)}"
+    assert sorted(p.read_bytes() for p in (tmp_path / "r").iterdir()) == [b"one", b"three", b"two"]
+
+
+def _extract_nested(path: Path, name: str, ns: dict):
+    """把某个嵌套函数从源码里抠出来单独执行(routes.py import 不进测试:相对导入 + folder_paths)。"""
+    import ast
+    import textwrap
+    src = path.read_text(encoding="utf-8")
+    fn = next(n for n in ast.walk(ast.parse(src))
+              if isinstance(n, ast.FunctionDef) and n.name == name)
+    exec(textwrap.dedent(ast.get_source_segment(src, fn)), ns)
+    return ns[name]
+
+
+def test_dedup_identical_routes_and_bridge_client():
+    """两份重名去重必须逐字同行为。bridge_client.py 是独立可 vendor 的单文件(下游会整份复制走),
+    不能 import routes;routes 也不该反向依赖它。所以只能各写一份 —— 那就必须钉死。
+    ⚠ 顺带钉住无扩展名那条:rpartition 找不到 "." 时返回 ("", "", 整串),ext 反而非空,
+      只判 ext 会把 "noext" 变成 "_1.noext"。"""
+    seq = ["a.png", "a_2.png", "a.png", "a.png", "noext", "noext", ".png", ".png", "b.tar.gz", "b.tar.gz"]
+
+    seen_r = set()
+    dedup = _extract_nested(ROOT / "routes.py", "_dedup", {"seen": seen_r})
+    got_r = [dedup(x) for x in seq]
+
+    seen_b = set()
+    name = _extract_nested(ROOT / "bridge_client.py", "_name", {"seen": seen_b, "Path": Path})
+    got_b = [name(x) for x in seq]
+
+    assert got_r == got_b, f"两份去重行为漂移:\nroutes={got_r}\nclient={got_b}"
+    assert len(set(got_r)) == len(seq), f"去重后仍有重名: {got_r}"
+    assert got_r[:4] == ["a.png", "a_2.png", "a_3.png", "a_4.png"], got_r
+    # 起始序号取 len(seen),不是 1 —— 只要唯一即可,别把序号当序列语义。
+    assert got_r[4:6] == ["noext", "noext_5"], got_r
+    assert not any(g.startswith("_") for g in got_r[4:6]), f"无扩展名被当成扩展名了: {got_r}"
+
+
+def _load_endpoint(name, ns):
+    """把 modal_app 的某个 endpoint 函数抠出来单独跑(模块级 modal.Dict.from_name 让它 import 不进来)。
+    装饰器不在 FunctionDef 的源码区间里,所以取到的就是裸函数本身。"""
+    ns.setdefault("_Header", lambda default="": default)
+    return _extract_nested(ROOT / "modal_app" / "modal_app.py", name, ns)
+
+
+def test_status_endpoint_says_not_found_in_the_data_not_only_in_error():
+    """查无此 job 必须带 status 字段。
+
+    只回 {"error": ...} 的话,客户端归一状态时会落进「未知 → 兜底」,而最保守的兜底恰好是
+    running(猜 completed 等于假装有产物,猜 failed 等于把还在烧钱的任务当结束)。于是一条
+    被 GC 清掉的任务被读成「还在跑」,永远不收敛 —— comfyagent 侧实测就是这么中招的。
+    本仓自己的 bridge_client.wait 同样只认 completed/failed/cancelled,缺 status 就一路
+    轮询到 timeout_s(默认 1 小时)。"""
+    fn = _load_endpoint("status_endpoint", {"job_state": {}, "_check": lambda k: None})
+    r = fn("ghost")
+    assert r["status"] == "not_found", f"缺 status 字段,客户端只能靠猜: {r}"
+    assert r.get("error"), "同时保留 error,老客户端的判据不变"
+
+    live = {"j1": {"status": "running", "progress": {"step": 3}}}
+    fn = _load_endpoint("status_endpoint", {"job_state": live, "_check": lambda k: None})
+    assert fn("j1")["status"] == "running"
+
+
+def test_cancel_endpoint_refuses_unknown_job_instead_of_inventing_a_record():
+    """取消一个不存在的 job,曾经会**凭空写一条 cancelled 记录**并报成功。
+
+    路径:s={} → call_id 空 → 占位分支不进 → if call_id 不进 → cur=None → merge 空 dict
+    写回 job_state。对调用方是假成功(取消了根本不存在的任务),对云端是一条垃圾索引,
+    而且之后 status 查它会回 cancelled 而不是 not found。(2026-09-10 comfyagent 侧读代码发现)"""
+    state = {}
+    fn = _load_endpoint("cancel_endpoint", {
+        "job_state": state, "_check": lambda k: None, "_CALL_PENDING": "pending",
+        "_call_id": lambda j: "", "time": types.SimpleNamespace(sleep=lambda s: None, time=lambda: 0.0),
+    })
+    r = fn({"job_id": "ghost", "auth_key": "k"})
+    assert r["status"] == "not_found", f"不能报 cancelled: {r}"
+    assert state == {}, f"不能凭空建记录,实际写进了: {state}"
+
+
+def test_cancel_endpoint_still_waits_for_a_job_that_is_mid_spawn():
+    """「不存在」的判据必须是**裸 :call 键**,不能用 _call_id()。
+
+    run_endpoint 在 spawn 之前先写占位值,那段窗口里 job_state[job_id] 还不存在、
+    _call_id() 也返回空串。拿 _call_id() 当判据(最直觉的写法)会把「正在提交中」
+    误判成「不存在」,正好打掉专为这个窗口写的等待逻辑 —— 而那段逻辑存在的理由是:
+    这时报 cancelled 就是谎报,函数下一毫秒就要开始烧钱。"""
+    state = {"spawning:call": "pending"}
+    fn = _load_endpoint("cancel_endpoint", {
+        "job_state": state, "_check": lambda k: None, "_CALL_PENDING": "pending",
+        "_call_id": lambda j: "", "time": types.SimpleNamespace(sleep=lambda s: None, time=lambda: 0.0),
+    })
+    r = fn({"job_id": "spawning", "auth_key": "k"})
+    assert r["status"] != "not_found", f"正在提交中被误判成不存在: {r}"
+    assert "提交中" in (r.get("error") or ""), r
+
+
+def test_wait_gives_up_on_not_found_but_tolerates_one_stale_read():
+    """not_found 要能终止 wait,但不能第一次看见就判死。
+
+    job_state 是 modal.Dict,跨容器最终一致 —— /run 刚返回时另一个容器可能还读不到这条。
+    一次就判死会把刚提交的任务当成不存在;不判死则会一路空转到 timeout_s(默认 1 小时)。"""
+    import bridge_client
+    c = bridge_client.BridgeClient("https://ws--comfyui-bridge", "k")
+
+    seq = [{"status": "not_found", "error": "job not found"},
+           {"status": "running", "progress": {"step": 1}},
+           {"status": "completed"}]
+    c.status = lambda jid: seq.pop(0)
+    assert c.wait("j", timeout_s=30, poll_s=0)["status"] == "completed", "单次 stale 读不该判死"
+
+    c.status = lambda jid: {"status": "not_found", "error": "job not found"}
+    try:
+        c.wait("j", timeout_s=30, poll_s=0)
+        assert False, "连续 not_found 必须报错,不能空转到 timeout"
+    except bridge_client.BridgeError as e:
+        assert "查无此 job" in str(e), e
+
+
 def test_estimate_vram_video_v2_anchors():
     """激活公式的三个实测锚点(MiniMax H3,主模型 20GB):
     0.9MP×362 帧应放行 48G 卡(实测峰值 38-40G 无 offload);2K×362 应对 80G 卡报警(实测 offload)。
@@ -1658,6 +1796,89 @@ def test_job_id_rule_identical_local_and_cloud():
     b = pat.search((ROOT / "contract.py").read_text(encoding="utf-8"))
     assert a and b, "云端与本地都应有 _SAFE_JOB_ID 定义"
     assert a.group(1) == b.group(1), f"规则漂移: 云端 {a.group(1)} vs 本地 {b.group(1)}"
+
+
+def _load_sweep(job_state, remove_file, *, budget=10, ttl=3600, job_max=200):
+    """把 modal_app._sweep_job_state 从源码里抠出来单独执行。
+
+    modal_app.py import 不进测试:模块级就 `modal.Dict.from_name()` / `modal.Volume.from_name()`,
+    没有 Modal 凭据直接炸。但这个函数的 bug 是**执行顺序**问题,源码字符串断言看不出来
+    (顺序对不对得真跑一遍才知道),所以用 ast 取真函数体 + 桩全局的方式跑真代码。
+    """
+    import ast
+    import re as _re
+    import time as _time
+    src = (ROOT / "modal_app" / "modal_app.py").read_text(encoding="utf-8")
+    fn = next(n for n in ast.parse(src).body
+              if isinstance(n, ast.FunctionDef) and n.name == "_sweep_job_state")
+    safe_re = _re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
+    vol = types.SimpleNamespace(remove_file=remove_file)
+    ns = {
+        "time": _time, "job_state": job_state, "models_vol": vol,
+        "_safe_job_id": lambda j: isinstance(j, str) and bool(safe_re.match(j)) and ".." not in j,
+        "JOB_TTL_S": ttl, "JOB_MAX": job_max, "_VOL_GC_PER_SWEEP": budget,
+        "print": lambda *a, **k: None,
+    }
+    exec(ast.get_source_segment(src, fn), ns)
+    return ns["_sweep_job_state"]
+
+
+def test_sweep_volume_gc_budget_never_orphans_a_directory():
+    """预算用完的那个 job 必须**原样留着**,下次 sweep 还能被看见。
+
+    曾经的写法是「先无条件 del job_state[jid],再判预算」:一次 sweep 撞上 11 个过期 job,
+    第 11 个索引没了、`_outputs/` 目录还在 —— 下次 sweep 遍历 job_state 时再也看不到这个
+    jid,目录从此无人认领。限流本意是「这次先清 10 个,剩下的下次」,实际成了
+    「超出的部分永久泄漏」。GC 唯一的入口是 /run,漏掉就是漏一辈子。
+    (2026-09-09 seedance 侧 codex 复验发现,11 个过期目录首轮清 10 个、次轮一个都清不掉。)
+    """
+    import time as _time
+    old = _time.time() - 7200                      # 早已过 TTL
+    ids = [f"job-{i:02d}" for i in range(11)]
+    state = {j: {"status": "completed", "completed_at": old} for j in ids}
+    removed = []
+    sweep = _load_sweep(state, lambda path, recursive=False: removed.append(path), budget=10)
+
+    sweep()
+    assert len(removed) == 10, f"一次 sweep 应当只删 10 个(限流),实际 {len(removed)}"
+    assert len(state) == 1, f"被限流跳过的那个索引必须留着,实际剩 {sorted(state)}"
+
+    sweep()                                        # 第二次:预算重置,收尾
+    assert len(removed) == 11, "第二次 sweep 必须能看见并清掉剩下那个"
+    assert sorted(removed) == sorted(f"_outputs/{j}" for j in ids)
+    assert state == {}, f"两轮之后索引应清空,实际剩 {sorted(state)}"
+
+
+def test_sweep_drops_index_for_dirty_job_id_without_touching_volume():
+    """脏 id 不碰 Volume(remove_file 是 recursive,拿不可信的 id 去删等于给人删库),
+    但索引照删、也不占预算 —— 留着只会让 Dict 白涨,而它本来就没有对应的合法目录。"""
+    import time as _time
+    old = _time.time() - 7200
+    state = {"../../etc": {"status": "completed", "completed_at": old},
+             "good-1": {"status": "completed", "completed_at": old}}
+    removed = []
+    sweep = _load_sweep(state, lambda path, recursive=False: removed.append(path), budget=1)
+    sweep()
+    assert removed == ["_outputs/good-1"], f"只有干净 id 能进 remove_file,实际 {removed}"
+    assert state == {}, f"两条索引都该清掉,实际剩 {sorted(state)}"
+
+
+def test_sweep_keeps_index_when_volume_delete_fails():
+    """删目录失败也不能丢索引 —— 丢了就又变成一个无人认领的孤儿目录。
+    FileNotFoundError 例外:那是「已经取回了」的常态,不是失败。"""
+    import time as _time
+    old = _time.time() - 7200
+    state = {"boom": {"status": "completed", "completed_at": old},
+             "gone": {"status": "completed", "completed_at": old}}
+
+    def remove_file(path, recursive=False):
+        if path.endswith("boom"):
+            raise RuntimeError("volume rpc down")
+        raise FileNotFoundError(path)
+
+    _load_sweep(state, remove_file)()
+    assert "gone" not in state, "FileNotFoundError = 产物已取回,索引照清"
+    assert "boom" in state, "Volume 删失败时索引必须留着,下次 sweep 重试"
 
 
 def test_bridge_client_wait_tolerates_transient_errors():

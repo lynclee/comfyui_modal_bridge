@@ -143,9 +143,11 @@ def upload_images(images: list[dict]) -> dict:
     errors = []
     for image in images:
         # 形态是契约:本地 routes / bridge_client 都发 {name, image: data URI}。以前缺键只抛
-        # KeyError('image'),到用户手里整条报错就剩一个 'image',看不出是"只支持图片参考、
-        # 你传的是别的槽位"(comfyagent 接 videos/audios 时就会撞到)。任务本来就会失败
-        # (run_workflow 检查返回值后 raise),这里只是把原因说清。
+        # KeyError('image'),到用户手里整条报错就剩一个 'image',看不出是形态不对。
+        # ⚠ 别写成"comfyagent 接 videos/audios 就会撞到"(旧注释的错,2026-09-08 seedance 实测更正):
+        # 视频/音频在调用方也走同一个 image 键,这里照收、并以 image/png 传给 ComfyUI。
+        # 真正会走到缺键这条路的是 {name, url, sha256} —— 素材超预算被调用方转存对象存储后的形态。
+        # 任务本来就会失败(run_workflow 检查返回值后 raise),这里只是把原因说清。
         if not isinstance(image, dict):
             errors.append(f"upload failed: 期望 {{name, image}} 对象,收到 {type(image).__name__}")
             continue

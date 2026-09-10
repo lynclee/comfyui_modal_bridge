@@ -333,17 +333,29 @@ async def _write_results(final: dict, job_id: str, subfolder: str, cfg: dict) ->
         return len(data)
 
     def _dedup(fn: str) -> str:
+        """与 bridge_client.download_outputs._name 行为逐字一致(那份是独立可 vendor 的单文件,
+        不能 import 这里),test_dedup_identical_routes_and_bridge_client 钉死两边。"""
         if fn not in seen:
             seen.add(fn)
             return fn
-        stem, _, ext = fn.rpartition(".")
-        index = len(seen)
-        fn2 = f"{stem}_{index}.{ext}" if ext else f"{fn}_{index}"
-        while fn2 in seen:
-            index += 1
-            fn2 = f"{stem}_{index}.{ext}" if ext else f"{fn}_{index}"
-        seen.add(fn2)
-        return fn2
+        # ⚠ 撞名必须循环到真正空出来为止,不能只改一次名。曾经是「撞名就取 {stem}_{len(seen)}」,
+        #   而那个候选名可能**本来就在输入里**:a.png / a_2.png / a.png 三份不同内容,第三份
+        #   算出的 a_2.png 正好是第二份已占的名字 —— 第二份被静默覆盖,而三条都报成功、
+        #   返回列表长度还是 3。只有去数磁盘上的文件才看得出少了一份。
+        #   (2026-09-09 seedance 侧复现;H3 一个任务出视频+音频+预览,ComfyUI 的产物名又是
+        #   每实例独立递增,跨 job 撞名是常态,不是边角。)
+        # ⚠ rpartition 找不到 "." 时返回 ("", "", 整串) —— ext 反而是整个文件名。只判 ext
+        #   非空会把 "noext" 变成 "_1.noext"。要判分隔符,不能判 stem/ext 本身。
+        stem, sep, ext = fn.rpartition(".")
+        if not sep:
+            stem, ext = fn, ""
+        n = len(seen)
+        while True:
+            cand = f"{stem}_{n}.{ext}" if ext else f"{stem}_{n}"
+            if cand not in seen:
+                seen.add(cand)
+                return cand
+            n += 1
 
     images = final.get("images")
     if isinstance(images, list) and images:

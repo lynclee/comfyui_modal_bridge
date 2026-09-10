@@ -136,7 +136,10 @@ class BridgeClient:
 
     def status(self, job_id: str) -> dict:
         """status ∈ queued/running/delivering/completed/failed/cancelled;
-        running 带 progress:{step,total,s_it,elapsed}。"""
+        running 带 progress:{step,total,s_it,elapsed}。
+
+        查无此 job(id 不对 / 已过保留期被 GC)时是 HTTP 200 + status="not_found" + error,
+        **不是**缺字段 —— 归一状态时别把它兜底成 running。"""
         return self._get("status", {"job_id": job_id}, timeout=20)
 
     def wait(self, job_id: str, timeout_s: int = 3600, poll_s: float = 2.0,
@@ -151,6 +154,7 @@ class BridgeClient:
         deadline = time.time() + timeout_s
         last_sig = None
         errs = 0
+        gone = 0
         while time.time() < deadline:
             try:
                 s = self.status(job_id)
@@ -163,6 +167,19 @@ class BridgeClient:
                         f"可用 status/cancel 接管: {e}") from None
                 time.sleep(poll_s)
                 continue
+            if s.get("status") == "not_found":
+                # 云端查无此 job:id 不对,或已过 JOB_TTL_S 被 GC 清掉。它永远不会再变成终态,
+                # 继续轮询就是白等到 timeout_s(默认 1 小时)才无声返回最后一份状态。
+                # ⚠ 但第一次看见不能判死:job_state 是 modal.Dict,跨容器最终一致,/run 刚返回
+                #   时另一个容器可能还读不到这条 —— 连续看到才作数,阈值复用错误计数那套。
+                gone += 1
+                if gone >= max_consecutive_errors:
+                    raise BridgeError(
+                        f"云端查无此 job({job_id}):job_id 不对,或已超过保留期被清理"
+                        f"(连查 {gone} 次都不存在)") from None
+                time.sleep(poll_s)
+                continue
+            gone = 0
             sig = (s.get("status"), json.dumps(s.get("progress") or {}, sort_keys=True))
             if sig != last_sig:
                 last_sig = sig
@@ -195,11 +212,27 @@ class BridgeClient:
 
         def _name(fn: str) -> str:
             fn = Path(fn or "output.bin").name
-            if fn in seen:
-                stem, _, ext = fn.rpartition(".")
-                fn = f"{stem}_{len(seen)}.{ext}" if ext else f"{fn}_{len(seen)}"
-            seen.add(fn)
-            return fn
+            if fn not in seen:
+                seen.add(fn)
+                return fn
+            # ⚠ 撞名必须循环到真正空出来为止,不能只改一次名。曾经是「撞名就取 {stem}_{len(seen)}」,
+            #   而那个候选名可能**本来就在输入里**:a.png / a_2.png / a.png 三份不同内容,第三份
+            #   算出的 a_2.png 正好是第二份已占的名字 —— 第二份被静默覆盖,而三条都报成功、
+            #   返回列表长度还是 3。只有去数磁盘上的文件才看得出少了一份。
+            #   (2026-09-09 seedance 侧复现;H3 一个任务出视频+音频+预览,ComfyUI 的产物名又是
+            #   每实例独立递增,跨 job 撞名是常态,不是边角。)
+            # ⚠ rpartition 找不到 "." 时返回 ("", "", 整串) —— ext 反而是整个文件名。只判 ext
+            #   非空会把 "noext" 变成 "_1.noext"。要判分隔符,不能判 stem/ext 本身。
+            stem, sep, ext = fn.rpartition(".")
+            if not sep:
+                stem, ext = fn, ""
+            n = len(seen)
+            while True:
+                cand = f"{stem}_{n}.{ext}" if ext else f"{stem}_{n}"
+                if cand not in seen:
+                    seen.add(cand)
+                    return cand
+                n += 1
 
         images = state.get("images")
         items = images if isinstance(images, list) and images else (
