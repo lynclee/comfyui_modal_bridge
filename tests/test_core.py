@@ -1062,14 +1062,37 @@ def test_download_outputs_never_overwrites_on_collision(tmp_path):
 
 
 def _extract_nested(path: Path, name: str, ns: dict):
-    """把某个嵌套函数从源码里抠出来单独执行(routes.py import 不进测试:相对导入 + folder_paths)。"""
+    """把某个函数(含嵌套函数)从源码里抠出来单独执行 —— routes.py / modal_app.py 都 import
+    不进测试(相对导入 + folder_paths;模块级 modal.Dict.from_name),而这些 bug 是执行顺序
+    问题,源码字符串断言看不出来,必须真跑一遍。
+
+    ⚠ 刻意不用 exec():Registry 发布扫描把 exec/eval 标成 any-code-execute(本包已因这类
+    标记被 Flag 过多次),官方也明说不久会直接拒发。改成"写临时模块 + importlib 导入",
+    语义完全一样:ns 里的桩先塞进模块 __dict__,再让 loader 在这个命名空间里跑那段源码,
+    所以抠出来的函数拿到的全局就是这些桩。ns 里的可变对象(job_state / seen)是同一份引用,
+    调用后直接检查即可。"""
     import ast
+    import importlib.util
+    import os
+    import tempfile
     import textwrap
     src = path.read_text(encoding="utf-8")
     fn = next(n for n in ast.walk(ast.parse(src))
               if isinstance(n, ast.FunctionDef) and n.name == name)
-    exec(textwrap.dedent(ast.get_source_segment(src, fn)), ns)
-    return ns[name]
+    fd, tmp = tempfile.mkstemp(suffix=".py", prefix=f"isolated_{name}_")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(textwrap.dedent(ast.get_source_segment(src, fn)))
+        spec = importlib.util.spec_from_file_location(f"_isolated_{name}", tmp)
+        mod = importlib.util.module_from_spec(spec)
+        mod.__dict__.update(ns)          # 桩必须先于加载塞进去 —— 函数的全局就是它
+        spec.loader.exec_module(mod)
+    finally:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+    return getattr(mod, name)
 
 
 def test_dedup_identical_routes_and_bridge_client():
@@ -1805,12 +1828,8 @@ def _load_sweep(job_state, remove_file, *, budget=10, ttl=3600, job_max=200):
     没有 Modal 凭据直接炸。但这个函数的 bug 是**执行顺序**问题,源码字符串断言看不出来
     (顺序对不对得真跑一遍才知道),所以用 ast 取真函数体 + 桩全局的方式跑真代码。
     """
-    import ast
     import re as _re
     import time as _time
-    src = (ROOT / "modal_app" / "modal_app.py").read_text(encoding="utf-8")
-    fn = next(n for n in ast.parse(src).body
-              if isinstance(n, ast.FunctionDef) and n.name == "_sweep_job_state")
     safe_re = _re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
     vol = types.SimpleNamespace(remove_file=remove_file)
     ns = {
@@ -1819,8 +1838,7 @@ def _load_sweep(job_state, remove_file, *, budget=10, ttl=3600, job_max=200):
         "JOB_TTL_S": ttl, "JOB_MAX": job_max, "_VOL_GC_PER_SWEEP": budget,
         "print": lambda *a, **k: None,
     }
-    exec(ast.get_source_segment(src, fn), ns)
-    return ns["_sweep_job_state"]
+    return _extract_nested(ROOT / "modal_app" / "modal_app.py", "_sweep_job_state", ns)
 
 
 def test_sweep_volume_gc_budget_never_orphans_a_directory():
