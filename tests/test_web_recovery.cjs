@@ -166,11 +166,38 @@ test("刷新恢复:not_found 达阈值即清记录收工", async () => {
 });
 
 test("取消不存在的任务:不报'取消失败',不弹计费警告", async () => {
-  const t = setup({cancelGone: true});
+  const t = setup({cancelGone: true, status: "not_found"});   // 复查也查不到 = 确认没了
   t.sandbox.addActiveJob({jobId: "job", startedAt: Date.now()});
   const r = await t.sandbox.requestCancel("job", t.context(), null);
   assert.equal(r, false);
   assert.equal(t.observed.alerts, 0,
     "不存在的任务不该弹'云端可能仍在运行并继续计费'——那是假警报");
   assert.equal(t.saved().length, 0, "记录该清掉");
+});
+
+test("取消回 not_found 但复查时任务还在:不清记录、不承诺'不再计费'", async () => {
+  // ⚠ 这条路误判的代价比轮询那条路高一个量级:删掉恢复记录 → 再没人去取结果,任务继续
+  //   跑到底、继续计费、产物烂在 Volume 上;而且会告诉用户「不会继续计费」,那句可能是假的。
+  //   (2026-09-20 codex 复查抓到:轮询那条路论证了一次不算数,cancel 这条却一次就下结论。)
+  const t = setup({cancelGone: true, status: "running"});
+  t.sandbox.addActiveJob({jobId: "job", startedAt: Date.now()});
+  const r = await t.sandbox.requestCancel("job", t.context(), null);
+  assert.equal(r, false);
+  assert.equal(t.saved().length, 1, "没确认之前不能删恢复记录");
+  assert.equal(t.observed.alerts, 1, "状态没确认必须弹到用户面前,而不是安抚");
+  assert(t.observed.polls >= 1, "必须真的去复查过状态");
+});
+
+test("取消回 not_found、复查查不动:按'没确认'处理(fail-closed)", async () => {
+  const t = setup({cancelGone: true});
+  const inner = t.sandbox.bridgeFetch;
+  t.sandbox.bridgeFetch = async (url) => {
+    if (url.includes("/poll?")) throw new Error("network down");
+    return inner(url);
+  };
+  t.sandbox.addActiveJob({jobId: "job", startedAt: Date.now()});
+  const r = await t.sandbox.requestCancel("job", t.context(), null);
+  assert.equal(r, false);
+  assert.equal(t.saved().length, 1, "查不动就不敢下结论,记录留着");
+  assert.equal(t.observed.alerts, 1);
 });

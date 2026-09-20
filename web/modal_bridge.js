@@ -161,6 +161,9 @@ const I18N = {
                         en: "⚠ At {sit}s/step this needs ~{eta} more min and will overrun the {limit}-min worker limit (killed, fully billed, no output) — cancel and use a bigger-VRAM tier or lower res/duration (VRAM starvation silently slows jobs several-fold)" },
   "run.slow":         { zh: "⚠ 已跑 {min} 分钟,快到等待上限了(gpu={gpu}) — 常见原因是显存不足被 offload 拖慢:换更大显存的 GPU 档,或降低分辨率 / 时长 / 帧数",
                         en: "⚠ {min} min elapsed, approaching the wait limit (gpu={gpu}) — usually VRAM starvation causing offload: pick a larger GPU tier, or lower resolution / duration / frames" },
+  "cancel.gone_unconfirmed": {
+      zh: "云端对取消请求回了「查无此任务」,但随后复查时它又出现了 —— 状态没能确认。任务可能仍在运行并计费,请到 Modal 控制台确认。",
+      en: "The cloud answered 'job not found' to the cancel request, but the job reappeared on re-check — state unconfirmed. It may still be running and billing; please verify in the Modal dashboard." },
   "cancel.gone":      { zh: "✕ 云端已无此任务", en: "✕ Job no longer on cloud" },
   "cancel.gone_msg":  { zh: "任务 {id} 在云端已不存在(多半已过保留期被清理)。没有任务在跑,也不会继续计费。",
                         en: "Job {id} no longer exists on the cloud (most likely cleaned up after its retention window). Nothing is running or being billed." },
@@ -1151,6 +1154,23 @@ function recoveryDeadline(j, maxAgeSec) {
 
 // 请求取消云端任务并**校验结果**。主流程和刷新恢复共用一份 —— 两处行为必须一致,
 // 否则会出现"恢复的卡片点了取消其实没取消"这种只在某条路径上成立的谎报。
+// 复核「云端确实没有这条记录」。cancel 的响应算第一次,这里补齐到 NOT_FOUND_STREAK 次。
+// ⚠ 查不动(网络错)一律返回 false —— fail-closed:宁可说「没确认」,不能说「已停」。
+async function confirmJobGone(jobId) {
+  for (let i = 1; i < NOT_FOUND_STREAK; i++) {
+    await sleep(600);
+    try {
+      const r = await bridgeFetch(`/modal_bridge/poll?job_id=${encodeURIComponent(jobId)}`);
+      const d = await r.json();
+      if (d.status && d.status !== "not_found") return false;  // 还在 → cancel 那次是陈旧读
+    } catch (e) {
+      log("confirmJobGone probe failed (treat as unconfirmed)", e);
+      return false;
+    }
+  }
+  return true;
+}
+
 // 取消失败 = 云端还在跑还在计费,必须弹到用户面前;取消没赶上(cancel_noop)= 产物已生成
 // 且已计费,直接取回落盘,别因为点过取消就把付过钱的东西丢掉。
 async function requestCancel(jobId, ctx, wfName = null) {
@@ -1168,6 +1188,17 @@ async function requestCancel(jobId, ctx, wfName = null) {
     //   任务根本不存在,却让用户去控制台找一个不存在的容器:假警报比不报更糟。
     //   (这是把「缺字段」改成「显式 error」的副作用 —— 契约修好了,旧调用方反而更难发现。)
     if (d.status === "not_found") {
+      // ⚠ 一次 not_found 不能当定论 —— 这条路误判的代价比轮询那条路高一个量级:
+      //   轮询里误判只是多等一轮;这里误判会 (a) 删掉恢复记录,于是再没人去取结果,
+      //   任务继续跑到底、继续计费、产物烂在 Volume 上;(b) 告诉用户「不会继续计费」,
+      //   而那句话可能是假的。**钱的事上宁可说「没确认」,不能说「已停」。**
+      //   (2026-09-20 codex 复查抓到:我在轮询那条路论证了一次不算数,这里却一次就下结论。)
+      if (!(await confirmJobGone(jobId))) {
+        err("cancel returned not_found but job is still visible", jobId);
+        if (ctx) ctx.finish(false, t("cancel.failed"));
+        alert(t("cancel.failed_msg", { msg: t("cancel.gone_unconfirmed") }));
+        return false;
+      }
       removeActiveJob(jobId);
       if (ctx) ctx.finish(false, t("cancel.gone"));
       notify(t("cancel.gone_msg", { id: jobId.slice(0, 8) }), "warn");
