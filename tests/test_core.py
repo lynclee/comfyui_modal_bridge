@@ -1198,6 +1198,74 @@ def test_wait_gives_up_on_not_found_but_tolerates_one_stale_read():
         assert "查无此 job" in str(e), e
 
 
+def _input_file_nodes(path: Path) -> dict:
+    """把 _INPUT_FILE_NODES 这张表从源码里 literal_eval 出来(routes 是模块级,client 是类属性)。"""
+    import ast
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Assign) and any(
+                isinstance(t, ast.Name) and t.id == "_INPUT_FILE_NODES" for t in n.targets):
+            return ast.literal_eval(n.value)
+    raise AssertionError(f"{path.name} 里找不到 _INPUT_FILE_NODES")
+
+
+def test_input_file_nodes_identical_routes_and_client():
+    """两份「节点 → 输入键」映射必须逐字一致,并且必须覆盖视频/音频。
+
+    bridge_client.py 是零依赖、可被下游整份 vendor 的独立客户端,不能 import routes,
+    所以只能各写一份 —— 那就必须钉死(与 _SAFE_JOB_ID、产物去重同理)。
+    ⚠ 键名不统一是这条测试存在的真正理由:LoadVideo 用 "file"、LoadAudio 用 "audio"
+    (ComfyUI v0.34.6 源码核实)。只把 class 名加进白名单、沿用 ins.get("image") 的写法
+    一个都取不到 —— 而表现是「文件没被打包」,云端报的却是工作流参数错。"""
+    r = _input_file_nodes(ROOT / "routes.py")
+    b = _input_file_nodes(ROOT / "bridge_client.py")
+    assert r == b, f"两份映射漂移:\nroutes={r}\nclient={b}"
+    assert r["LoadVideo"] == ("file",), r
+    assert r["LoadAudio"] == ("audio",), r
+    for cls in ("LoadImage", "LoadImageMask", "LoadImageOutput"):
+        assert r[cls] == ("image",), r
+
+
+def test_pack_input_images_covers_video_and_audio(tmp_path):
+    """LoadVideo/LoadAudio 引用的文件必须被打包 —— 键仍是 "image"(云端契约),但取值来源不同。
+
+    2026-09-19 之前只扫三个 LoadImage*,视频/音频参考的文件从来没进过 payload:
+    云端 ComfyUI 找不到文件,报错长得像工作流参数错,看不出是少传了素材。"""
+    import bridge_client
+    for fn, body in (("a.png", b"\x89PNG"), ("b.mp4", b"\x00\x00\x00 ftypmp42"), ("c.wav", b"RIFF")):
+        (tmp_path / fn).write_bytes(body)
+    wf = {
+        "1": {"class_type": "LoadImage", "inputs": {"image": "a.png"}},
+        "2": {"class_type": "LoadVideo", "inputs": {"file": "b.mp4"}},
+        "3": {"class_type": "LoadAudio", "inputs": {"audio": "c.wav"}},
+        # 连线形态不是文件名,必须跳过(否则会拿 ["1", 0] 去找文件)
+        "4": {"class_type": "LoadImage", "inputs": {"image": ["1", 0]}},
+        "5": {"class_type": "KSampler", "inputs": {"seed": 1}},
+    }
+    out = bridge_client.BridgeClient.pack_input_images(wf, [str(tmp_path)])
+    assert [o["name"] for o in out] == ["a.png", "b.mp4", "c.wav"], out
+    mimes = {o["name"]: o["image"].split(";", 1)[0] for o in out}
+    assert mimes == {"a.png": "data:image/png", "b.mp4": "data:video/mp4",
+                     "c.wav": "data:audio/x-wav"}, mimes
+
+
+def test_routes_extract_input_names_covers_video_and_audio():
+    """routes 那份(本地面板走的路径)与 client 同步覆盖视频/音频。"""
+    ns = {"_INPUT_FILE_NODES": _input_file_nodes(ROOT / "routes.py")}
+    pick = _extract_nested(ROOT / "routes.py", "_extract_input_file_name", ns)
+    ns2 = {"_extract_input_file_name": pick, "print": lambda *a, **k: None}
+    names = _extract_nested(ROOT / "routes.py", "_extract_input_image_names", ns2)
+    got = names({
+        "1": {"class_type": "LoadImage", "inputs": {"image": "a.png"}},
+        "2": {"class_type": "LoadVideo", "inputs": {"file": "b.mp4"}},
+        "3": {"class_type": "LoadAudio", "inputs": {"audio": "c.wav"}},
+        "4": {"class_type": "LoadVideo", "inputs": {"file": ["1", 0]}},   # 连线,跳过
+        "5": {"class_type": "LoadImage", "inputs": {"image": "clipspace/x.png"}},  # 子路径,跳过
+        "6": {"class_type": "KSampler", "inputs": {"seed": 1}},
+    })
+    assert got == ["a.png", "b.mp4", "c.wav"], got
+
+
 def test_estimate_vram_video_v2_anchors():
     """激活公式的三个实测锚点(MiniMax H3,主模型 20GB):
     0.9MP×362 帧应放行 48G 卡(实测峰值 38-40G 无 offload);2K×362 应对 80G 卡报警(实测 offload)。

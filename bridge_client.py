@@ -298,19 +298,41 @@ class BridgeClient:
         finally:
             part.unlink(missing_ok=True)
 
-    # ── 输入图打包(LoadImage 类节点 → data uri,协议与官方插件一致)──
+    # ── 输入素材打包(引用 input/ 的节点 → data uri,协议与官方插件一致)──
+    # 引用 input/ 下本地文件的节点 → 各自的输入键。**键名不统一,不能一律取 "image"**:
+    # LoadVideo 是 "file"、LoadAudio 是 "audio"(ComfyUI v0.34.6 源码核实)。
+    # 漏一个键 = 那个文件根本不进 payload,云端 ComfyUI 找不到它,报错长得像工作流参数错
+    # 而不是"少传了素材"。2026-09-19 之前这里只有三个 LoadImage*,所以送不了视频/音频参考。
+    # ⚠ 这张表在 routes.py 和 bridge_client.py 各有一份(本模块是零依赖、可被下游整份 vendor
+    #   的独立客户端,不能 import routes),由 test_input_file_nodes_identical_routes_and_client 钉死。
+    _INPUT_FILE_NODES = {
+        "LoadImage": ("image",),
+        "LoadImageMask": ("image",),
+        "LoadImageOutput": ("image",),
+        "LoadVideo": ("file",),
+        "LoadAudio": ("audio",),
+    }
+
     @staticmethod
     def pack_input_images(workflow: dict, search_dirs: list[str]) -> list[dict]:
-        """扫 workflow 里 LoadImage/LoadImageMask/LoadImageOutput 引用的文件名,
-        在 search_dirs 里找到并编成 [{name, image: data uri}]。找不到的抛错(与云端报错等价但更早)。"""
+        """扫 workflow 里引用 input/ 本地文件的节点(图 / 视频 / 音频),在 search_dirs 里找到
+        并编成 [{name, image: data uri}]。找不到的抛错(与云端报错等价但更早)。
+
+        ⚠ 键仍叫 "image" 是既定协议 —— 云端 upload_images 只认这一个键,视频音频也走它
+        (ComfyUI 的 /upload/image 不校验类型,按文件名原样落进 input/)。"""
         names, out = [], []
         for node in (workflow or {}).values():
-            if isinstance(node, dict) and node.get("class_type") in (
-                    "LoadImage", "LoadImageMask", "LoadImageOutput"):
-                ins = node.get("inputs") or {}
-                n = ins.get("image") or ins.get("filename")
-                if isinstance(n, str) and n not in names:
-                    names.append(n)
+            if not isinstance(node, dict):
+                continue
+            keys = BridgeClient._INPUT_FILE_NODES.get(node.get("class_type"))
+            if not keys:
+                continue
+            ins = node.get("inputs") or {}
+            # "filename" 是给自定义节点的兜底;连线形态是 ["3", 0] 这样的 list,必须判 str 跳过。
+            n = next((ins[k] for k in (*keys, "filename")
+                      if isinstance(ins.get(k), str) and ins[k]), None)
+            if n and n not in names:
+                names.append(n)
         for n in names:
             # 工作流内容不可信:绝对路径 / ".." 会让 Path(d) / n 落到 search_dirs 之外,
             # 变成任意本地文件读取并上传。子目录相对路径(如 "sub/a.png")合法。

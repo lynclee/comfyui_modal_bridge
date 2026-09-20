@@ -8,6 +8,7 @@ import contextlib
 import functools
 import hashlib
 import json
+import mimetypes
 import secrets
 import subprocess
 from pathlib import Path
@@ -443,25 +444,51 @@ def _fetch_finished(job_id: str, task: asyncio.Task) -> None:
         task.exception()  # 请求断开时也收走异常，避免无人消费的 Task 警告
 
 
+# 引用 input/ 下本地文件的节点 → 各自的输入键。**键名不统一,不能一律取 "image"**:
+# LoadVideo 是 "file"、LoadAudio 是 "audio"(ComfyUI v0.34.6 源码核实)。
+# 漏一个键 = 那个文件根本不进 payload,云端 ComfyUI 找不到它,报错长得像工作流参数错
+# 而不是"少传了素材"。2026-09-19 之前这里只有三个 LoadImage*,所以面板送不了视频/音频参考。
+# ⚠ 这张表在 routes.py 和 bridge_client.py 各有一份(后者是零依赖、可被下游整份 vendor 的
+#   独立客户端,不能 import 前者),由 test_input_file_nodes_identical_routes_and_client 钉死。
+_INPUT_FILE_NODES = {
+    "LoadImage": ("image",),
+    "LoadImageMask": ("image",),
+    "LoadImageOutput": ("image",),
+    "LoadVideo": ("file",),
+    "LoadAudio": ("audio",),
+}
+
+
+def _extract_input_file_name(cls: str, ins: dict) -> str | None:
+    """按节点类型取它引用的本地文件名。取不到(或那一位接的是连线而非字面量)返回 None。"""
+    keys = _INPUT_FILE_NODES.get(cls)
+    if not keys:
+        return None
+    # "filename" 是给自定义节点的兜底;连线形态是 ["3", 0] 这样的 list,必须判 str 跳过。
+    for k in (*keys, "filename"):
+        v = ins.get(k)
+        if isinstance(v, str) and v:
+            return v
+    return None
+
+
 def _extract_input_image_names(prompt: dict) -> list[str]:
-    """遍历 prompt 找所有 LoadImage 类节点引用的本地文件名(去重)。"""
+    """遍历 prompt 找所有会引用 input/ 下本地文件的节点(图 / 视频 / 音频),返回去重文件名。"""
     names: list[str] = []
     seen: set[str] = set()
     for node in prompt.values():
         if not isinstance(node, dict):
             continue
         cls = node.get("class_type", "")
-        # 常见会引用 input/ 里图片的节点类型
-        if cls in ("LoadImage", "LoadImageMask", "LoadImageOutput"):
-            ins = node.get("inputs", {}) or {}
-            name = ins.get("image") or ins.get("filename")
-            if isinstance(name, str) and name not in seen:
-                # 跳过子目录形式 "clipspace/xxx"(ComfyUI 自动 cache 那种)— 第一版只支持 input 根
-                if "/" in name or "\\" in name:
-                    print(f"[modal_bridge] WARN: subpath input ignored: {name}")
-                    continue
-                seen.add(name)
-                names.append(name)
+        name = _extract_input_file_name(cls, node.get("inputs", {}) or {})
+        if not name or name in seen:
+            continue
+        # 跳过子目录形式 "clipspace/xxx"(ComfyUI 自动 cache 那种)— 第一版只支持 input 根
+        if "/" in name or "\\" in name:
+            print(f"[modal_bridge] WARN: subpath input ignored: {name}")
+            continue
+        seen.add(name)
+        names.append(name)
     return names
 
 
@@ -480,10 +507,12 @@ def _read_input_as_b64(name: str) -> dict:
     if not modal_volume.is_path_within_roots(p, [root]):
         raise FileNotFoundError(f"输入图越界(解析后不在 input 目录内): {name}")
     blob = p.read_bytes()
-    ext = p.suffix.lower().lstrip(".") or "png"
-    mime = {"jpg": "jpeg", "jpe": "jpeg"}.get(ext, ext)
+    # ⚠ 别硬拼 data:image/<ext> —— 视频/音频会拼出 "data:image/mp4" 这种假话。云端
+    # upload_images 只按逗号切 base64、不读 MIME,所以不会炸,但数据里不该写假的。
+    # 与 bridge_client.pack_input_images 用同一套判定(mimetypes,按扩展名)。
+    mime = mimetypes.guess_type(str(p))[0] or "image/png"
     b64 = base64.b64encode(blob).decode("ascii")
-    return {"name": name, "image": f"data:image/{mime};base64,{b64}"}
+    return {"name": name, "image": f"data:{mime};base64,{b64}"}
 
 
 async def _emit(resp: web.StreamResponse, text: str) -> None:
