@@ -350,9 +350,39 @@ def _worker_shutdown(self, wait_s: float = 20.0):
             raise RuntimeError(f"旧 ComfyUI 进程未能退出: {e}") from e
 
 
+# 容器指纹:同一容器里所有日志行带同一个值 —— 数不同值 = 数容器;几单共享一个值 = 那几单
+# 复用了同一个热容器。没有它时 `modal app logs` 既无时间戳也无容器标记,boot 和 job 对不上,
+# 「这单到底是冷是热」只能靠耗时猜(2026-09-20 comfyagent 为一单 55.8s 卡在冷热之间查不下去)。
+_CONTAINER_ID = ""
+
+
+def _new_container_id() -> str:
+    """给本容器掷一个新指纹。
+
+    ⚠ 绝不能写成模块级常量,也不能在 boot() 里生成 —— 开内存快照时 `@modal.enter(snap=True)`
+    跑在**快照之前**,那个值会被烤进快照,所有从同一份快照恢复出来的容器共享同一个指纹:
+    日志看着像热复用,其实是不同容器。**假证据比没有证据更糟。**
+    所以只在 snap=False 的 enter 钩子里调用(见 _worker_ensure_alive,且必须在它那句
+    `if not _SNAPSHOT: return` 之前 —— 快照关着时那句会直接返回)。"""
+    global _CONTAINER_ID
+    _CONTAINER_ID = uuid.uuid4().hex[:8]
+    return _CONTAINER_ID
+
+
+def _container_id() -> str:
+    """本容器指纹;没掷过就惰性补一个(正常路径不会走到,兜底防止日志里出现空值)。"""
+    return _CONTAINER_ID or _new_container_id()
+
+
 def _worker_ensure_alive(self):
     """快照恢复路径上的正确性闸门 + 自愈(GPU/CPU worker 共用):快照关时直接返回;开时探活失败
-    就原地重启子进程(退化为一次普通 boot,不比无快照更糟),而非 raise 杀容器进重试循环。"""
+    就原地重启子进程(退化为一次普通 boot,不比无快照更糟),而非 raise 杀容器进重试循环。
+
+    ⚠ 顺带承担「每容器掷一次指纹」——它是 snap=False 的钩子,是唯一每个真实容器都跑一次的
+    入口。那一行必须在下面的 _SNAPSHOT 早返回**之前**,否则关快照时永远不会掷。"""
+    # 这行是容器级标记:一个真实容器恰好打一次,比 "ComfyUI ready" 可靠
+    # (开快照时恢复的容器根本不 boot ComfyUI,那行不会出现)。
+    print(f"[bridge] container {_new_container_id()} up (snapshot={'on' if _SNAPSHOT else 'off'})")
     if not _SNAPSHOT:
         return
     import requests
@@ -413,6 +443,11 @@ def _worker_run(workflow: dict, job_id: str, input_images: list | None = None,
             break
         time.sleep(0.1)
     mode = (delivery or {}).get("mode", "desktop")
+    # 归属标记:container= 与上面那行 "container <id> up" 对得上就能确定这单跑在哪个容器,
+    # 从而直接读出冷/热。call= 是 Modal 的 function call id,把日志行连回提交方的句柄
+    # (我们自己存在 job_state 的 "<job_id>:call" 里),便于两边对账。
+    print(f"[bridge] job {job_id} start container={_container_id()} "
+          f"call={modal.current_function_call_id() or '?'}")
     job_state[job_id] = {**job_state.get(job_id, {}), "status": "running", "started_at": time.time()}
     try:
         # ⚠ 不在这里 free/reload!曾经"每 job 跑前 free+reload"会把 warm 容器显存里的模型卸掉,

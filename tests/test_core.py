@@ -1266,6 +1266,78 @@ def test_routes_extract_input_names_covers_video_and_audio():
     assert got == ["a.png", "b.mp4", "c.wav"], got
 
 
+def test_container_id_is_not_baked_into_the_snapshot():
+    """容器指纹只能在 snap=False 的钩子里掷,绝不能在模块级或 boot() 里生成。
+
+    开内存快照时 `@modal.enter(snap=True)` 的 boot() 跑在**快照之前**,那时生成的值会被
+    烤进快照 —— 所有从同一份快照恢复出来的容器共享同一个指纹,日志看着像热复用其实是
+    不同容器。**假证据比没有证据更糟**:它会让人对着日志得出反的结论。
+    (2026-09-20 加指纹时的设计约束;配置里 enable_snapshot 默认就是开的。)"""
+    import ast
+    src = (ROOT / "modal_app" / "modal_app.py").read_text(encoding="utf-8")
+    tree = ast.parse(src)
+
+    # 模块级不许有 _CONTAINER_ID = <计算出来的值>,只能是空串常量
+    for n in tree.body:
+        if isinstance(n, ast.Assign) and any(
+                isinstance(t, ast.Name) and t.id == "_CONTAINER_ID" for t in n.targets):
+            assert isinstance(n.value, ast.Constant) and n.value.value == "", \
+                "模块级就把指纹算出来了 —— 会被烤进内存快照"
+
+    # 掷指纹的调用不能出现在 _worker_boot 里(那是 snap=True 阶段)
+    boot = next(n for n in ast.walk(tree)
+                if isinstance(n, ast.FunctionDef) and n.name == "_worker_boot")
+    assert "_new_container_id" not in ast.get_source_segment(src, boot), \
+        "_worker_boot 是 snap=True 阶段,在那里掷指纹会进快照"
+
+
+def test_container_id_is_rolled_before_the_snapshot_early_return():
+    """掷指纹必须排在 _worker_ensure_alive 那句 `if not _SNAPSHOT: return` 之前。
+
+    排在后面的话,**关快照时永远不会掷** —— 而关快照恰恰是最需要靠指纹分辨冷热的场景
+    (没有快照就没有恢复,每个容器都是真冷启)。这条和 deploy 那个「取上次 tag 必须早于
+    cfg.update」是同一类:顺序错了功能就永远不触发,而测试不看顺序就发现不了。"""
+    import ast
+    src = (ROOT / "modal_app" / "modal_app.py").read_text(encoding="utf-8")
+    fn = next(n for n in ast.walk(ast.parse(src))
+              if isinstance(n, ast.FunctionDef) and n.name == "_worker_ensure_alive")
+    body = ast.get_source_segment(src, fn)
+    roll = body.index("_new_container_id(")
+    early = body.index("if not _SNAPSHOT:")
+    assert roll < early, "掷指纹晚于 _SNAPSHOT 早返回,关快照时永远不会执行"
+
+
+def test_container_id_changes_per_container_and_is_stable_within_one():
+    """真跑一遍抠出来的两个函数,各自的契约分开验(隔离执行时它们不共享全局,不能串起来测)。"""
+    import uuid as _uuid
+    MOD = ROOT / "modal_app" / "modal_app.py"
+
+    roll = _extract_nested(MOD, "_new_container_id", {"uuid": _uuid, "_CONTAINER_ID": ""})
+    a, b = roll(), roll()
+    assert a != b, "每次掷必须是新值,否则换容器看不出来"
+    assert len(a) == 8 and all(c in "0123456789abcdef" for c in a), a
+    assert roll.__globals__["_CONTAINER_ID"] == b, "掷完必须写回全局,否则 _container_id 取不到"
+
+    # 已掷过 → 原样返回,不重掷(同一容器内必须稳定)
+    get = _extract_nested(MOD, "_container_id",
+                          {"_CONTAINER_ID": "abcd1234", "_new_container_id": lambda: "FRESH"})
+    assert get() == "abcd1234" and get() == "abcd1234"
+    # 没掷过 → 惰性补一个(兜底,正常路径不会走到)
+    get2 = _extract_nested(MOD, "_container_id",
+                           {"_CONTAINER_ID": "", "_new_container_id": lambda: "FRESH"})
+    assert get2() == "FRESH"
+
+
+def test_job_start_log_carries_container_and_call_id():
+    """job 起跑那行必须同时带 container= 和 call= —— 少任一个都归不了因。
+    ⚠ 断言打在真代码上(挖掉注释):这两个串在注释里也出现过,不挖注释的话删掉真代码照样绿。"""
+    body = code_only((ROOT / "modal_app" / "modal_app.py").read_text(encoding="utf-8"))
+    i = body.index('f"[bridge] job {job_id} start container=')
+    seg = body[i:i + 200]
+    assert "_container_id()" in seg, seg
+    assert "modal.current_function_call_id()" in seg, seg
+
+
 def test_estimate_vram_video_v2_anchors():
     """激活公式的三个实测锚点(MiniMax H3,主模型 20GB):
     0.9MP×362 帧应放行 48G 卡(实测峰值 38-40G 无 offload);2K×362 应对 80G 卡报警(实测 offload)。
