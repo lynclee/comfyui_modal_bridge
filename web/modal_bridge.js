@@ -161,6 +161,12 @@ const I18N = {
                         en: "⚠ At {sit}s/step this needs ~{eta} more min and will overrun the {limit}-min worker limit (killed, fully billed, no output) — cancel and use a bigger-VRAM tier or lower res/duration (VRAM starvation silently slows jobs several-fold)" },
   "run.slow":         { zh: "⚠ 已跑 {min} 分钟,快到等待上限了(gpu={gpu}) — 常见原因是显存不足被 offload 拖慢:换更大显存的 GPU 档,或降低分辨率 / 时长 / 帧数",
                         en: "⚠ {min} min elapsed, approaching the wait limit (gpu={gpu}) — usually VRAM starvation causing offload: pick a larger GPU tier, or lower resolution / duration / frames" },
+  "cancel.gone":      { zh: "✕ 云端已无此任务", en: "✕ Job no longer on cloud" },
+  "cancel.gone_msg":  { zh: "任务 {id} 在云端已不存在(多半已过保留期被清理)。没有任务在跑,也不会继续计费。",
+                        en: "Job {id} no longer exists on the cloud (most likely cleaned up after its retention window). Nothing is running or being billed." },
+  "run.job_gone":     { zh: "云端查无此任务 {id} —— 多半已过保留期被清理,产物取不回了",
+                        en: "Job {id} not found on cloud — most likely cleaned up after its retention window; outputs are gone" },
+  "recover.gone":     { zh: "✕ 云端已无此任务(已过保留期)", en: "✕ Job gone from cloud (past retention)" },
   "cancel.failed":    { zh: "⚠ 取消失败 — 云端可能仍在运行", en: "⚠ Cancel failed — job may still be running" },
   "cancel.failed_msg":{ zh: "取消失败:{msg}\n\n云端任务可能仍在运行并继续计费。请到 Modal 控制台确认,必要时手动停止容器。",
                         en: "Cancel failed: {msg}\n\nThe cloud job may still be running and billing. Check the Modal dashboard and stop the container manually if needed." },
@@ -899,6 +905,12 @@ function reseedPrompt(prompt, newSeed) {
 // =====================================================================
 // 进度浮窗 — 每个 job 一张独立卡片(多 workflow 并发互不覆盖)
 // =====================================================================
+// 连续看到几次 not_found 才认定「云端确实没有这条记录」。
+// ⚠ 不能一次判死:云端 job_state 是 modal.Dict,跨容器最终一致 —— /run 刚返回时
+//   另一个容器可能还读不到这条,一次就判死会把刚提交的任务当成不存在。
+//   与 Python 客户端 bridge_client.wait 的 max_consecutive_errors 同口径。
+const NOT_FOUND_STREAK = 5;
+
 const STAGE_LABELS = {
   preparing: "Preparing", nodes: "Checking nodes", deploying: "Deploying image",
   checking: "Checking models", uploading: "Uploading models", submitting: "Submitting",
@@ -1150,6 +1162,17 @@ async function requestCancel(jobId, ctx, wfName = null) {
       body: JSON.stringify({ job_id: jobId }),
     });
     d = await r.json().catch(() => ({}));
+    // ⚠ 「查无此 job」必须先于错误分支判。云端 0.8.42 起对不存在的 job 回
+    //   {status:"not_found", error:"job not found"} —— 带 error 字段,会掉进下面的
+    //   「取消失败」里,弹出「云端可能仍在运行并继续计费,请到 Modal 控制台确认」。
+    //   任务根本不存在,却让用户去控制台找一个不存在的容器:假警报比不报更糟。
+    //   (这是把「缺字段」改成「显式 error」的副作用 —— 契约修好了,旧调用方反而更难发现。)
+    if (d.status === "not_found") {
+      removeActiveJob(jobId);
+      if (ctx) ctx.finish(false, t("cancel.gone"));
+      notify(t("cancel.gone_msg", { id: jobId.slice(0, 8) }), "warn");
+      return false;
+    }
     if (!r.ok || d.ok === false || d.error) {
       const msg = d.error || `HTTP ${r.status}`;
       err("cancel failed", msg);
@@ -1252,6 +1275,7 @@ async function runOnceOnModal(workflowPrompt, outputNodeIds, ctx, submitGuard, b
 
   let final = null;
   let lastStatus = "queued";
+  let gone = 0;                 // 连续看到 not_found 的次数(见下面的判据)
   try {
     while (Date.now() < deadline) {
       if (cancelled) return { jobId, gpu, cancelled: true };  // 用户已取消,卡片已结束,静默退出
@@ -1323,6 +1347,19 @@ async function runOnceOnModal(workflowPrompt, outputNodeIds, ctx, submitGuard, b
         log("slow job", jobId, `still running after ${min}min — possible VRAM starvation`);
         ctx.stage("running", t("run.slow", { min, gpu }), true);
       }
+      // 云端查无此 job(id 不对 / 已过 JOB_TTL_S 被 GC 清掉)。它永远不会变成终态,
+      // 再轮询下去就是白等到超时,然后去"取消"一个不存在的任务、弹一个吓人的假警报。
+      // ⚠ 第一次看见不能判死:job_state 是 modal.Dict,跨容器最终一致,/run 刚返回时
+      //   另一个容器可能还读不到这条。阈值与 Python 客户端 bridge_client.wait 同口径。
+      if (pData.status === "not_found") {
+        if (++gone >= NOT_FOUND_STREAK) {
+          final = { ...pData, status: "failed",
+                    error: t("run.job_gone", { id: jobId }) };
+          break;
+        }
+        continue;
+      }
+      gone = 0;
       if (pData.status === "completed" || pData.status === "failed" || pData.status === "cancelled") {
         final = pData;
         break;
@@ -1780,6 +1817,7 @@ async function recoverOne(pending, maxAgeSec) {
   const interval = getSetting("ModalBridge.pollIntervalSec", 1.2) * 1000;
 
   let final = null;
+  let gone = 0;                 // 连续 not_found 计数,同主轮询
   while (Date.now() < deadline) {
     if (cancelled) return;
     let pData;
@@ -1792,6 +1830,17 @@ async function recoverOne(pending, maxAgeSec) {
       await sleep(interval);
       continue;
     }
+    if (pData.status === "not_found") {
+      // 同主轮询:恢复记录里的 job 可能早被 GC 清了,连续确认后如实结束,别一直转。
+      if (++gone >= NOT_FOUND_STREAK) {
+        removeActiveJob(jobId);
+        ctx.finish(false, t("recover.gone"));
+        return;
+      }
+      await sleep(interval);
+      continue;
+    }
+    gone = 0;
     if (pData.status === "completed" || pData.status === "failed" || pData.status === "cancelled") {
       final = pData;
       break;

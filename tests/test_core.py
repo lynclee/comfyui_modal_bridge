@@ -1260,10 +1260,13 @@ def test_routes_extract_input_names_covers_video_and_audio():
         "2": {"class_type": "LoadVideo", "inputs": {"file": "b.mp4"}},
         "3": {"class_type": "LoadAudio", "inputs": {"audio": "c.wav"}},
         "4": {"class_type": "LoadVideo", "inputs": {"file": ["1", 0]}},   # 连线,跳过
-        "5": {"class_type": "LoadImage", "inputs": {"image": "clipspace/x.png"}},  # 子路径,跳过
-        "6": {"class_type": "KSampler", "inputs": {"seed": 1}},
+        "5": {"class_type": "LoadImage", "inputs": {"image": "clipspace/x.png"}},
+        "6": {"class_type": "LoadVideo", "inputs": {"file": "refs/clip.mp4"}},
+        "7": {"class_type": "KSampler", "inputs": {"seed": 1}},
     })
-    assert got == ["a.png", "b.mp4", "c.wav"], got
+    # 子目录必须**收下**,不能静默跳过 —— 跳过后提交流程照常往下走,用户看到的是提交成功,
+    # 实际少传了素材(2026-09-20 codex review 抓到的 P2)。越界的由 _read_input_as_b64 抛错拦。
+    assert got == ["a.png", "b.mp4", "c.wav", "clipspace/x.png", "refs/clip.mp4"], got
 
 
 def test_container_id_is_not_baked_into_the_snapshot():
@@ -1336,6 +1339,50 @@ def test_job_start_log_carries_container_and_call_id():
     seg = body[i:i + 200]
     assert "_container_id()" in seg, seg
     assert "modal.current_function_call_id()" in seg, seg
+
+
+def test_upload_images_splits_subfolder_instead_of_stuffing_filename():
+    """带子目录的素材必须拆成 subfolder 字段发,不能整串塞进 filename。
+
+    ComfyUI 的 image_upload 是 open(join(input_dir, normpath(subfolder), filename)),
+    而 makedirs 只建到 subfolder 那一层 —— filename 里带 "refs/" 时 input/refs/ 根本
+    没被创建,open() 直接 FileNotFoundError → HTTP 500。
+    (2026-09-20 codex review 对着 ComfyUI v0.34.6 server.py 复现。)"""
+    import base64 as _b64
+    sys.path.insert(0, str(ROOT / "modal_app"))
+    import _comfy_ws
+    seen = []
+
+    class _Resp:
+        def raise_for_status(self): pass
+
+    orig = _comfy_ws.requests.post
+    _comfy_ws.requests.post = lambda url, files=None, timeout=None: (
+        seen.append(files) or _Resp())
+    try:
+        uri = "data:video/mp4;base64," + _b64.b64encode(b"x").decode()
+        r = _comfy_ws.upload_images([{"name": "refs/clip.mp4", "image": uri},
+                                     {"name": "plain.png", "image": uri}])
+    finally:
+        _comfy_ws.requests.post = orig
+    assert r["status"] == "success", r
+    assert seen[0]["image"][0] == "clip.mp4", f"filename 里还带着目录: {seen[0]['image'][0]}"
+    assert seen[0]["subfolder"][1] == "refs", seen[0]
+    assert seen[1]["image"][0] == "plain.png"
+    assert "subfolder" not in seen[1], "根目录素材不该带 subfolder 字段"
+
+
+def test_upload_images_rejects_path_escape():
+    """越界自己也要挡:ComfyUI 有 commonpath 兜底,但 name 来自调用方提交的工作流,
+    不该把唯一的边界检查外包给对端。"""
+    import base64 as _b64
+    sys.path.insert(0, str(ROOT / "modal_app"))
+    import _comfy_ws
+    uri = "data:image/png;base64," + _b64.b64encode(b"x").decode()
+    for evil in ("../../etc/passwd", "/etc/shadow", "a/../../b.png"):
+        r = _comfy_ws.upload_images([{"name": evil, "image": uri}])
+        assert r["status"] == "error", f"没挡住: {evil}"
+        assert "非法" in str(r["details"]), r
 
 
 def test_estimate_vram_video_v2_anchors():

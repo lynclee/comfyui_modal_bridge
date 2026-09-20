@@ -483,10 +483,12 @@ def _extract_input_image_names(prompt: dict) -> list[str]:
         name = _extract_input_file_name(cls, node.get("inputs", {}) or {})
         if not name or name in seen:
             continue
-        # 跳过子目录形式 "clipspace/xxx"(ComfyUI 自动 cache 那种)— 第一版只支持 input 根
-        if "/" in name or "\\" in name:
-            print(f"[modal_bridge] WARN: subpath input ignored: {name}")
-            continue
+        # 子目录形式("clipspace/xxx"、"refs/clip.mp4")照收 —— 它们是 input/ 下的真实文件。
+        # ⚠ 曾经是「打一行 WARN 然后 continue」,而提交流程照常往下走:用户看到的是提交成功,
+        #   实际 input_image_count=0、云端找不到素材。**漏传后继续提交**是最糟的形态 ——
+        #   控制台那行 WARN 没人看,失败原因显示在云端、看起来像工作流参数错。
+        #   (2026-09-20 codex review 抓到。)现在越界的会在 _read_input_as_b64 里抛
+        #   FileNotFoundError → /submit 回 400,失败在本地、当场可见。
         seen.add(name)
         names.append(name)
     return names
@@ -495,10 +497,10 @@ def _extract_input_image_names(prompt: dict) -> list[str]:
 def _read_input_as_b64(name: str) -> dict:
     """读 input/<name>,返回 Modal 期望的 {name, image (data uri)} 格式。
 
-    ⚠ name 来自工作流 JSON。上游 _extract_input_image_names 已挡掉子路径形态,但那只是
-    字符串检查:input 目录里放一个指向目录外的**符号链接**,exists() 照样为真、
-    read_bytes() 就把目录外内容读出来上传了。必须 resolve 后确认仍在 input 目录内
-    —— 与模型查找用的是同一份囚笼(modal_volume.is_path_within_roots)。
+    ⚠ name 来自工作流 JSON,**可以带子目录**("refs/clip.mp4"),所以这里是唯一的边界检查:
+    input 目录里放一个指向目录外的**符号链接**,exists() 照样为真、read_bytes() 就把目录外
+    内容读出来上传了;"../" 同理。必须 resolve 后确认仍在 input 目录内 —— 与模型查找用的是
+    同一份囚笼(modal_volume.is_path_within_roots)。抛错即 /submit 400,不会漏传后继续提交。
     """
     root = _input_dir()
     p = root / name

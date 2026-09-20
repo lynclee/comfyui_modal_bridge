@@ -159,10 +159,23 @@ def upload_images(images: list[dict]) -> dict:
                     f"需要 {{name, image: data URI}} 形态(只支持图片参考);收到的键: {sorted(image)}")
             b64 = data_uri.split(",", 1)[1] if "," in data_uri else data_uri
             blob = base64.b64decode(b64)
+            # ⚠ 子目录必须拆成 subfolder 字段单独发,不能整串塞进 filename。
+            #   ComfyUI 的 image_upload 是 open(join(input_dir, normpath(subfolder), filename)),
+            #   而 makedirs 只建到 subfolder 那一层 —— filename 里带 "refs/" 时
+            #   input/refs/ 根本没被创建,open() 直接 FileNotFoundError → HTTP 500。
+            #   (2026-09-20 codex review 抓到;对着 ComfyUI v0.34.6 server.py 复现。)
+            # ⚠ 越界自己也要挡一道:ComfyUI 有 commonpath 兜底,但 name 来自调用方提交的
+            #   工作流,不该把唯一的边界检查外包给对端。
+            safe = str(name).replace("\\", "/")
+            if safe.startswith("/") or ".." in safe.split("/"):
+                raise ValueError(f"输入素材路径非法(绝对路径或含 ..): {name}")
+            sub, _, base_name = safe.rpartition("/")
             files = {
-                "image": (name, BytesIO(blob), "image/png"),
+                "image": (base_name, BytesIO(blob), "image/png"),
                 "overwrite": (None, "true"),
             }
+            if sub:
+                files["subfolder"] = (None, sub)
             r = requests.post(f"http://{COMFY_HOST}/upload/image", files=files, timeout=30)
             r.raise_for_status()
         except Exception as e:
