@@ -1543,7 +1543,6 @@ def test_sweep_drops_the_progress_key_too():
     state = {"j": {"status": "completed", "completed_at": _t.time() - 7200},
              "j:call": "fc-1", "j:progress": {"step": 1}}
     sweep = _load_sweep(state, lambda path, recursive=False: None)
-    sweep.__globals__["_stale_reason"] = lambda s, now: ""
     sweep()
     assert state == {}, f"独立键成了孤儿: {state}"
 
@@ -2339,6 +2338,9 @@ def _load_sweep(job_state, remove_file, *, budget=10, ttl=3600, job_max=200):
         "_safe_job_id": lambda j: isinstance(j, str) and bool(safe_re.match(j)) and ".." not in j,
         "JOB_TTL_S": ttl, "JOB_MAX": job_max, "_VOL_GC_PER_SWEEP": budget,
         "print": lambda *a, **k: None,
+        "_stale_reason": lambda s, now: "",
+        "_is_already_gone": _extract_nested(ROOT / "modal_app" / "modal_app.py",
+                                            "_is_already_gone", {}),
     }
     return _extract_nested(ROOT / "modal_app" / "modal_app.py", "_sweep_job_state", ns)
 
@@ -2383,6 +2385,33 @@ def test_sweep_drops_index_for_dirty_job_id_without_touching_volume():
     assert state == {}, f"两条索引都该清掉,实际剩 {sorted(state)}"
 
 
+def test_sweep_treats_server_side_no_such_file_as_already_gone():
+    """v2 Volume 对不存在的路径回 InvalidError("No such file or directory."),不是 FileNotFoundError。
+
+    0.8.42 起把「其它异常」当真失败、保留索引重试 —— 这些条目永远删不掉、每轮都吃一格预算,
+    10 个僵尸就吃光了每轮的预算,真正过期的任务一个都回收不了(2026-09-23 线上日志实证:
+    同一批 job id 每次 sweep 都在重复报错)。旧测试用 FileNotFoundError 模拟,所以一直是绿的。"""
+    import time as _time
+
+    class InvalidError(Exception):
+        pass
+
+    old = _time.time() - 7200
+    ids = [f"zombie-{i:02d}" for i in range(12)] + ["real"]
+    state = {j: {"status": "completed", "completed_at": old} for j in ids}
+    removed = []
+
+    def remove_file(path, recursive=False):
+        removed.append(path)
+        if "zombie" in path:
+            raise InvalidError("No such file or directory.")
+
+    sweep = _load_sweep(state, remove_file, budget=10)
+    sweep()
+    sweep()
+    assert state == {}, f"僵尸条目没被清掉、或挤占了真任务的预算: {sorted(state)}"
+
+
 def test_sweep_keeps_index_when_volume_delete_fails():
     """删目录失败也不能丢索引 —— 丢了就又变成一个无人认领的孤儿目录。
     FileNotFoundError 例外:那是「已经取回了」的常态,不是失败。"""
@@ -2396,7 +2425,8 @@ def test_sweep_keeps_index_when_volume_delete_fails():
             raise RuntimeError("volume rpc down")
         raise FileNotFoundError(path)
 
-    _load_sweep(state, remove_file)()
+    sweep = _load_sweep(state, remove_file)
+    sweep()
     assert "gone" not in state, "FileNotFoundError = 产物已取回,索引照清"
     assert "boom" in state, "Volume 删失败时索引必须留着,下次 sweep 重试"
 

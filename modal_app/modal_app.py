@@ -126,6 +126,21 @@ def _call_id(job_id: str) -> str:
     return "" if not cid or cid == _CALL_PENDING else str(cid)
 
 
+def _is_already_gone(e: BaseException) -> bool:
+    """remove_file 失败是不是只因为「路径本来就不存在」(= 产物已取回 / 本来就走 base64,常态)。
+
+    ⚠ 不能只认 FileNotFoundError。SDK 的本意是把服务端的 NotFoundError 转成 FileNotFoundError,
+      但 v2 Volume 的服务端对不存在的路径实际回的是 InvalidError("No such file or directory."),
+      SDK 那层映射接不住(2026-09-23 线上日志实证)。0.8.42 起 _drop 把「其它异常」当真失败、
+      保留索引下次重试 —— 于是这些目录早就不在的条目**永远删不掉**,每次 sweep 都重试,
+      每个还吃掉一格预算:10 个僵尸就把每轮的预算吃光,真正过期的任务一个都回收不了。
+      当时的测试用 FileNotFoundError 模拟「已经没了」,和 SDK 的意图一致、和服务端的真实行为
+      不一致,所以一直是绿的。"""
+    return (isinstance(e, FileNotFoundError)
+            or type(e).__name__ == "NotFoundError"
+            or "no such file or directory" in str(e).lower())
+
+
 def _sweep_job_state():
     """best-effort 清理过期/超量的终态 job。任何异常都不影响主流程。"""
     try:
@@ -169,13 +184,13 @@ def _sweep_job_state():
             vol_gc_budget -= 1
             try:
                 models_vol.remove_file(f"_outputs/{jid}", recursive=True)
-            except FileNotFoundError:
-                pass  # 目录不存在是常态(产物已取回 / 本来就是小文件走 base64)
             except Exception as e:
-                # 别的异常要出声:静默失败 = GC 从来没生效过,而日志上看不出来。
-                # 索引也保留 —— 删失败还把索引丢掉,就又变成上面那种无人认领的孤儿目录。
-                print(f"[bridge] ⚠ Volume GC _outputs/{jid} 失败: {type(e).__name__}: {e}")
-                return False
+                if not _is_already_gone(e):
+                    # 别的异常要出声:静默失败 = GC 从来没生效过,而日志上看不出来。
+                    # 索引也保留 —— 删失败还把索引丢掉,就又变成上面那种无人认领的孤儿目录。
+                    print(f"[bridge] ⚠ Volume GC _outputs/{jid} 失败: {type(e).__name__}: {e}")
+                    return False
+                # 目录不存在是常态(产物已取回 / 本来就是小文件走 base64)→ 照常删索引
         for k in (jid, f"{jid}:call", f"{jid}:progress"):  # 连带删独立键,不留孤儿
             try:
                 del job_state[k]
