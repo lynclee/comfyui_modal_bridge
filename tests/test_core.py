@@ -1133,13 +1133,14 @@ def test_status_endpoint_says_not_found_in_the_data_not_only_in_error():
     被 GC 清掉的任务被读成「还在跑」,永远不收敛 —— comfyagent 侧实测就是这么中招的。
     本仓自己的 bridge_client.wait 同样只认 completed/failed/cancelled,缺 status 就一路
     轮询到 timeout_s(默认 1 小时)。"""
-    fn = _load_endpoint("status_endpoint", {"job_state": {}, "_check": lambda k: None})
+    fn = _load_endpoint("status_endpoint", _status_ns({}))
     r = fn("ghost")
     assert r["status"] == "not_found", f"缺 status 字段,客户端只能靠猜: {r}"
     assert r.get("error"), "同时保留 error,老客户端的判据不变"
 
-    live = {"j1": {"status": "running", "progress": {"step": 3}}}
-    fn = _load_endpoint("status_endpoint", {"job_state": live, "_check": lambda k: None})
+    import time as _t
+    live = {"j1": {"status": "running", "started_at": _t.time()}}
+    fn = _load_endpoint("status_endpoint", _status_ns(live))
     assert fn("j1")["status"] == "running"
 
 
@@ -1419,6 +1420,284 @@ def test_upload_images_rejects_path_escape():
         r = _comfy_ws.upload_images([{"name": evil, "image": uri}])
         assert r["status"] == "error", f"没挡住: {evil}"
         assert "非法" in str(r["details"]), r
+
+
+MODAL_APP = ROOT / "modal_app" / "modal_app.py"
+
+
+def _status_ns(job_state, worker_timeout=1200):
+    """status_endpoint 的桩全局:它现在要判「worker 是否已被 Modal 杀掉」,依赖 _stale_reason。"""
+    import time as _t
+    stale = _extract_nested(MODAL_APP, "_stale_reason",
+                            {"WORKER_TIMEOUT": worker_timeout, "_STALE_GRACE_S": 120})
+    return {"job_state": job_state, "_check": lambda k: None, "time": _t, "_stale_reason": stale}
+
+
+# ── #9 ComfyUI tag 回落 ─────────────────────────────────────────────────────
+def test_tag_resolution_never_falls_back_to_stale_default_on_network_failure():
+    """拉不到 tag 列表时不能退回写死的 v0.22.0:那个版本不支持 H3、新节点全部导入失败,
+    而部署 rc=0、只多一行 ⚠ —— 一次网络抖动就让云端大面积坏掉(2026-09-23 review)。"""
+    tag, note = node_sync.resolve_comfyui_tag("0.34.6", [], prev_tag="v0.34.2")
+    assert tag == "v0.34.6", f"本机版本已知时应直接用它,实际 {tag}"
+    assert "拉不到" in note
+    tag, _ = node_sync.resolve_comfyui_tag("", [], prev_tag="v0.34.2")
+    assert tag == "v0.34.2", "本机版本未知时应沿用上次部署的 tag"
+    tag, _ = node_sync.resolve_comfyui_tag("", [], prev_tag="")
+    assert tag == node_sync.DEFAULT_COMFYUI_TAG, "两者都没有才用默认值"
+    # 正常路径不受影响
+    assert node_sync.resolve_comfyui_tag("0.34.6", ["v0.34.6", "v0.35.0"])[0] == "v0.34.6"
+
+
+# ── #13 凭据:脱敏一处、持久化、CLI 不轮换 key ─────────────────────────────
+def test_public_config_strips_every_secret_including_hf_and_civitai():
+    """脱敏只有一份清单。以前 GET/POST /config 各维护一份 pop 列表,加字段要改两处,漏一处就泄漏。"""
+    cfg = {k: f"SECRET-{k}" for k in contract.SECRET_CONFIG_FIELDS}
+    cfg.update(gpu_tier="auto", local_node_reqs_deployed_hash="h")
+    out = contract.public_config(cfg)
+    leaked = [k for k, v in out.items() if isinstance(v, str) and v.startswith("SECRET-")]
+    assert not leaked, f"凭据回吐到了浏览器: {leaked}"
+    assert "hf_token" in contract.SECRET_CONFIG_FIELDS and "civitai_token" in contract.SECRET_CONFIG_FIELDS
+    assert out["has_hf_token"] is True and out["has_civitai_token"] is True
+    assert "local_node_reqs_deployed_hash" not in out and out["gpu_tier"] == "auto"
+
+
+def test_deploy_reuses_stored_hf_and_civitai_tokens():
+    """secret create 用的是 --force(整份替换)。HF/Civitai 以前只从请求体取、从不持久化,
+    而面板根本不发这两个字段 —— 点一次「推送到云端」就把 deploy.py 配过的 token 抹掉。"""
+    body = code_only((ROOT / "routes.py").read_text(encoding="utf-8"))
+    assert 'or cfg.get("hf_token", "")' in body and 'or cfg.get("civitai_token", "")' in body
+    assert '"hf_token": hf_token,' in body and '"civitai_token": civitai_token,' in body
+
+
+def test_bridge_cli_deploy_reuses_plugin_bridge_key_instead_of_rotating():
+    """没有 cli.json 的机器上跑 bridge_cli deploy,曾经新生成一把 BRIDGE_API_KEY 并 --force 覆盖
+    Secret —— 插件 config 里那把随即失效,所有请求 401。必须先复用插件 config 里的 key。"""
+    body = code_only((ROOT / "bridge_cli.py").read_text(encoding="utf-8"))
+    i = body.index("bridge_key = (saved.get(")
+    seg = body[i:body.index(")", body.index("gen_bridge_key()", i)) + 1]
+    assert 'plugin.get("bridge_api_key")' in seg, f"没有复用插件 config 里的 key: {seg!r}"
+    assert seg.index('plugin.get("bridge_api_key")') < seg.index("gen_bridge_key()"), \
+        "生成新 key 必须排在复用插件 key 之后"
+
+
+# ── #3 取消要让 ComfyUI 停下 ────────────────────────────────────────────────
+def test_interrupt_comfy_clears_queue_before_interrupting():
+    """顺序必须是先清队列再中断 —— 反过来,中断那一刻下一个排队的 prompt 会立刻开跑。"""
+    sys.path.insert(0, str(ROOT / "modal_app"))
+    import _comfy_ws
+    calls = []
+    orig = _comfy_ws.requests.post
+    _comfy_ws.requests.post = lambda url, json=None, timeout=None: calls.append((url, json))
+    try:
+        _comfy_ws.interrupt_comfy()
+    finally:
+        _comfy_ws.requests.post = orig
+    assert [u.rsplit("/", 1)[-1] for u, _ in calls] == ["queue", "interrupt"], calls
+    assert calls[0][1] == {"clear": True}
+
+
+def test_worker_run_interrupts_comfy_on_cancellation_and_failure():
+    """取消走 Modal 的 InputCancellation,它是 BaseException —— `except Exception` 接不住。
+    以前没有 BaseException 分支,ComfyUI 子进程接着跑被取消的 prompt,暖容器的下一单排在它后面,
+    用户为已取消的任务付全部剩余 GPU 时间(2026-09-23 review)。"""
+    import ast
+    src = MODAL_APP.read_text(encoding="utf-8")
+    fn = next(n for n in ast.walk(ast.parse(src))
+              if isinstance(n, ast.FunctionDef) and n.name == "_worker_run")
+    # 只看「带 BaseException 分支」的那个主 try —— _worker_run 里还嵌着 _on_progress 等函数,
+    # 它们各有 except Exception: pass,按类型名收集会互相覆盖。
+    main = next((t for t in ast.walk(fn) if isinstance(t, ast.Try) and any(
+        isinstance(h.type, ast.Name) and h.type.id == "BaseException" for h in t.handlers)), None)
+    assert main is not None, "缺 except BaseException:取消时 ComfyUI 不会被中断"
+    handlers = {h.type.id: ast.get_source_segment(src, h)
+                for h in main.handlers if isinstance(h.type, ast.Name)}
+    for kind in ("BaseException", "Exception"):
+        assert "interrupt_comfy()" in handlers[kind], f"except {kind} 分支没有中断 ComfyUI"
+
+
+# ── #12 进度拆到独立键 ─────────────────────────────────────────────────────
+def test_progress_never_rewrites_the_whole_job_entry():
+    """_on_progress 读改写整条状态会和 cancel 竞态,把 cancelled 覆盖回 running。只能写独立键。"""
+    import ast
+    src = MODAL_APP.read_text(encoding="utf-8")
+    fn = next(n for n in ast.walk(ast.parse(src))
+              if isinstance(n, ast.FunctionDef) and n.name == "_on_progress")
+    body = code_only(ast.get_source_segment(src, fn))
+    assert 'job_state[f"{job_id}:progress"]' in body
+    assert "job_state[job_id] =" not in body, "进度写入又碰了整条状态,会和 cancel 竞态"
+
+
+def test_status_serves_progress_from_its_own_key():
+    import time as _t
+    state = {"j": {"status": "running", "started_at": _t.time()},
+             "j:progress": {"step": 3, "total": 20}}
+    out = _load_endpoint("status_endpoint", _status_ns(state))("j")
+    assert out["progress"] == {"step": 3, "total": 20}, out
+    state["j"] = {"status": "cancelled", "completed_at": _t.time()}
+    out = _load_endpoint("status_endpoint", _status_ns(state))("j")
+    assert "progress" not in out, "非 running 不该带进度"
+
+
+def test_sweep_drops_the_progress_key_too():
+    import time as _t
+    state = {"j": {"status": "completed", "completed_at": _t.time() - 7200},
+             "j:call": "fc-1", "j:progress": {"step": 1}}
+    sweep = _load_sweep(state, lambda path, recursive=False: None)
+    sweep.__globals__["_stale_reason"] = lambda s, now: ""
+    sweep()
+    assert state == {}, f"独立键成了孤儿: {state}"
+
+
+# ── #4 worker 被 Modal 杀掉后状态不能永远 running ──────────────────────────
+def test_status_declares_killed_worker_failed_after_timeout():
+    """超时 / OOM / 崩溃时容器里什么都执行不了,没人写终态。以前永远 running:前端空等后报错因,
+    CLI/MCP 等满 3600s,条目和产物永不回收。超过 worker 超时上限就判死。"""
+    import time as _t
+    now = _t.time()
+    state = {"dead": {"status": "running", "started_at": now - 1200 - 200},
+             "slow": {"status": "running", "started_at": now - 1000},
+             "queued": {"status": "queued", "started_at": now - 99999}}
+    fn = _load_endpoint("status_endpoint", _status_ns(state, worker_timeout=1200))
+    r = fn("dead")
+    assert r["status"] == "failed" and "强杀" in r["error"], r
+    assert state["dead"]["status"] == "failed", "必须写回,否则 GC 永远收不掉"
+    assert fn("slow")["status"] == "running", "还在超时上限内的不能误判"
+    assert fn("queued")["status"] == "queued", "排队不计费,不按超时判死"
+
+
+def test_sweep_collects_killed_workers_instead_of_keeping_them_forever():
+    import time as _t
+    state = {"dead": {"status": "running", "started_at": _t.time() - 99999}}
+    removed = []
+    sweep = _load_sweep(state, lambda path, recursive=False: removed.append(path))
+    sweep.__globals__["_stale_reason"] = _extract_nested(
+        MODAL_APP, "_stale_reason", {"WORKER_TIMEOUT": 1200, "_STALE_GRACE_S": 120})
+    sweep()
+    assert removed == ["_outputs/dead"] and state == {}, (removed, state)
+
+
+# ── #6 结果写回:总量预算 + 最后一道兜底 ───────────────────────────────────
+def test_inline_outputs_spill_to_volume_past_the_total_budget(monkeypatch):
+    """逐文件阈值没有总量:16 张 7MB 的图每张都走 base64,合计 ~150MB 写 Dict 时 RequestSizeError,
+    状态卡 running、产物拿不到。超过总预算的后续产物改走 Volume。"""
+    sys.path.insert(0, str(ROOT / "modal_app"))
+    import io
+    import _comfy_ws
+    blob = b"x" * 1000
+    monkeypatch.setattr(_comfy_ws, "get_image_data", lambda *a: blob)
+    monkeypatch.setattr(_comfy_ws, "_VOL_THRESHOLD", 10_000)          # 单个都不超
+    monkeypatch.setattr(_comfy_ws, "_INLINE_TOTAL_BUDGET", 2_500)     # 只容得下 2 个
+    monkeypatch.setattr(_comfy_ws.os, "makedirs", lambda *a, **k: None)
+    monkeypatch.setattr(_comfy_ws, "open", lambda *a, **k: io.BytesIO(), raising=False)
+    refs = [{"filename": f"o{i}.png", "subfolder": "", "type": "output",
+             "node_id": "9", "key": "images"} for i in range(4)]
+    images, errors = _comfy_ws.materialize_desktop_outputs(refs, "job1")
+    assert not errors, errors
+    inline = [i for i in images if "data_base64" in i]
+    spilled = [i for i in images if "volume_path" in i]
+    assert len(inline) == 2 and len(spilled) == 2, (len(inline), len(spilled))
+
+
+def test_final_completed_write_cannot_leave_the_job_running():
+    """写 completed 那句以前在 try 外:一抛异常,没人写终态,状态卡在 running。"""
+    body = code_only(MODAL_APP.read_text(encoding="utf-8"))
+    i = body.index("        job_state[job_id] = done\n")
+    assert body[:i].rstrip().endswith("try:"), "最后的写回必须包在 try 里"
+
+
+# ── #7 下载永不删,删除走确认后的 ack ───────────────────────────────────────
+def test_fetch_only_deletes_on_explicit_ack():
+    """以前 delete=1 在响应交给 ingress 之后就删,不等客户端收完 —— 断线时付费产物彻底丢失。"""
+    import ast
+    src = MODAL_APP.read_text(encoding="utf-8")
+    fn = next(n for n in ast.walk(ast.parse(src))
+              if isinstance(n, ast.FunctionDef) and n.name == "fetch_endpoint")
+    seg = code_only(ast.get_source_segment(src, fn))
+    assert "BackgroundTask" not in seg, "下载路径又挂上了删除任务"
+    removes = [n for n in ast.walk(fn) if isinstance(n, ast.Call)
+               and ast.get_source_segment(src, n).startswith("os.remove")]
+    assert removes, "ack 分支里应当有删除"
+    ack_if = next(n for n in ast.walk(fn) if isinstance(n, ast.If)
+                  and isinstance(n.test, ast.Name) and n.test.id == "ack")
+    inside = {id(x) for x in ast.walk(ack_if)}
+    assert all(id(r) in inside for r in removes), "有删除落在 ack 分支之外"
+
+
+def test_bridge_client_acks_only_after_a_verified_download(tmp_path):
+    """先完整落盘并校验大小,成功之后才发 ack;大小对不上时绝不能 ack。"""
+    import bridge_client as bc
+    c = bc.BridgeClient("https://ws--comfyui-bridge", "k")
+    seen = {"urls": [], "acks": 0}
+
+    class _Resp:
+        def __init__(self, body, clen): self.b, self.headers = io.BytesIO(body), {"Content-Length": str(clen)}
+        def read(self, n): return self.b.read(n)
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+
+    import io
+    def run(clen):
+        orig = bc._open_http
+        bc._open_http = lambda req, timeout=None: (seen["urls"].append(req.full_url), _Resp(b"abc", clen))[1]
+        c._req = lambda url, body, timeout: seen.__setitem__("acks", seen["acks"] + 1) or {}
+        try:
+            return c._download_volume("j", "_outputs/j/a.mp4", tmp_path / "a.mp4", delete_remote=True)
+        finally:
+            bc._open_http = orig
+    assert run(3) == 3
+    assert "delete" not in seen["urls"][0], "下载请求不能再让云端删"
+    assert seen["acks"] == 1, "成功落盘后应发一次 ack"
+    try:
+        run(999)
+        assert False, "大小不符必须报错"
+    except bc.BridgeError:
+        pass
+    assert seen["acks"] == 1, "大小不符时绝不能 ack —— 那等于亲手删掉唯一的副本"
+
+
+# ── #1 节点清单:多机取并集、永不互删 ──────────────────────────────────────
+def test_complete_baked_entries_prefers_cloud_manifest():
+    """云端只报名字时,以前只用本机清单补 url —— 别的机器加的节点被填成空 url,出口丢弃,
+    下次部署从镜像里删掉。云端 manifest 是镜像实际装的那份,优先用它。"""
+    local = {"A": {"name": "A", "url": "https://x/A", "commit": "old"}}
+    manifest = [{"name": "A", "url": "https://x/A", "commit": "new"},
+                {"name": "X", "url": "https://x/X", "commit": "c"}]
+    out = {e["name"]: e for e in node_sync.complete_baked_entries(["A", "X", "Z"], local, manifest)}
+    assert out["X"]["url"] == "https://x/X", "别的机器加的节点必须拿到 url,否则会被丢"
+    assert out["A"]["commit"] == "new", "云端 manifest 优先于本机「上次部署」的记录"
+    assert out["Z"]["url"] == "", "两边都没有才留空"
+
+
+def test_reconcile_adds_back_cloud_only_nodes_and_never_removes(tmp_path, monkeypatch):
+    """插件被 Manager 重装、本机清单丢了 → 一次部署清空云端全部节点。部署前并回,只加不删。"""
+    monkeypatch.setattr(node_sync, "DATA_FILE", tmp_path / "_custom_nodes_data.py")
+    node_sync.write_baked_nodes([{"name": "local_only", "url": "https://x/L", "commit": "1"}])
+    manifest = [{"name": "cloud_only", "url": "https://x/C", "commit": "2"},
+                {"name": "local_only", "url": "https://x/L", "commit": "1"},
+                {"name": "no_url", "url": "", "commit": ""}]
+    monkeypatch.setattr(node_sync, "fetch_cloud_manifest", lambda cfg: manifest)
+    back = node_sync.reconcile_baked_with_cloud({})
+    assert back == ["cloud_only"], back
+    names = {n["name"] for n in node_sync.read_baked_nodes()}
+    assert names == {"local_only", "cloud_only"}, f"只加不删,且不收空 url 条目: {names}"
+
+    monkeypatch.setattr(node_sync, "fetch_cloud_manifest", lambda cfg: None)
+    assert node_sync.reconcile_baked_with_cloud({}) == [], "拿不到 manifest 时原样不动"
+
+
+def test_every_deploy_path_reconciles_before_deploying():
+    """/deploy、/sync_local_nodes 自动重部署、bridge_cli、deploy.py 都拿本机清单当全局清单部署,
+    四处都必须先并回。只有 /sync_nodes 例外 —— 它执行的是显式计划(含面板里有意的 prune)。"""
+    import re as _re
+    for f, n in (("routes.py", 2), ("bridge_cli.py", 1), ("deploy.py", 1)):
+        body = code_only((ROOT / f).read_text(encoding="utf-8"))
+        got = len(_re.findall(r"\breconcile_baked_with_cloud\b", body))
+        assert got == n, f"{f} 部署前没有并回云端独有的节点(期望 {n} 处,实际 {got})"
+    # /sync_nodes 执行的是显式计划(可能含面板里有意的 prune),不能在那里并回
+    routes = (ROOT / "routes.py").read_text(encoding="utf-8")
+    i = routes.index('@routes.post("/modal_bridge/sync_nodes")')
+    seg = code_only(routes)[i:routes.index("@routes.", i + 10)]
+    assert "reconcile_baked_with_cloud" not in seg, "/sync_nodes 里并回会让有意的删除永远删不掉"
 
 
 def test_estimate_vram_video_v2_anchors():
@@ -3297,7 +3576,10 @@ def test_single_push_entry_point():
     # 而它真的会分流：推节点 + 按需重建（后端顺序由 test_deploy_syncs_... 钉死）
     py = (ROOT / "routes.py").read_text(encoding="utf-8")
     i = py.index("# 3) 部署 app")          # 锚点用原文(注释;改了会响,fail-loud)
-    seg = code_only(py)[i:i + 3000]        # 断言用挖空版(偏移相同)
+    # 截到下一个路由为止,而不是固定 3000 字符 —— 在中间插代码(2026-09-23 加了部署前并回节点)
+    # 就会把后面的调用挤出窗口,测试因为距离而不是因为行为转红。
+    j = py.index("@routes.", i)
+    seg = code_only(py)[i:j]               # 断言用挖空版(偏移相同)
     assert "plan_local_uploads" in seg, "主流程没有自动比对本机 digest"
     assert "await asyncio.to_thread(local_nodes.upload_local_nodes" in seg, \
         "主流程没有自动推送有改动的私有节点"

@@ -99,6 +99,27 @@ def _safe_job_id(job_id) -> bool:
             and ".." not in job_id)
 
 
+# worker 被 Modal 按 timeout 强杀(或 OOM / 容器崩溃)时,容器里什么都执行不了 —— 没人写终态,
+# 状态永远停在 running;_sweep_job_state 又只清终态,于是条目和 _outputs 目录也永不回收。
+# 不能靠轮询时问 Modal:FunctionCall.get() 会把结果(可能几十 MB base64)整个拉回来,
+# get_call_graph 官方文档明说「不实时、尽力而为、别用在关键路径」。
+# 所以用确定性规则:非终态条目超过部署时的 worker 超时上限,Modal 必然已经把它杀了。
+# 代价:OOM / 崩溃要到超时才被判定 —— 有上界,远好过永远 running。
+_STALE_GRACE_S = 120
+
+
+def _stale_reason(s, now: float) -> str:
+    """非终态条目若已超过 worker 超时上限 + 宽限,返回失败说明;否则空串。
+    只判已开跑的(running / delivering 有 started_at)—— queued 可能只是在排 GPU,不计费。"""
+    if not isinstance(s, dict) or s.get("status") not in ("running", "delivering"):
+        return ""
+    t0 = s.get("started_at") or 0
+    if t0 and now - t0 > WORKER_TIMEOUT + _STALE_GRACE_S:
+        return (f"worker 超过部署时的超时上限 {WORKER_TIMEOUT}s 仍未写回结果 —— 已被 Modal 强杀"
+                f"(超时 / OOM / 容器崩溃),这段时间已计费。可在 Modal 控制台看该调用的日志。")
+    return ""
+
+
 def _call_id(job_id: str) -> str:
     """取真实 call_id;还在占位(spawn 中)或没有则返回空串。"""
     cid = job_state.get(f"{job_id}:call")
@@ -119,6 +140,9 @@ def _sweep_job_state():
             continue
         if s.get("status") in terminal:
             finished.append((jid, s.get("completed_at") or 0))
+        elif _stale_reason(s, now):
+            # worker 早被杀了、没人写终态:按 started_at 当作已结束参与过期回收,否则永不 GC。
+            finished.append((jid, s.get("started_at") or 0))
     vol_gc_budget = _VOL_GC_PER_SWEEP
 
     def _drop(jid):
@@ -152,7 +176,7 @@ def _sweep_job_state():
                 # 索引也保留 —— 删失败还把索引丢掉,就又变成上面那种无人认领的孤儿目录。
                 print(f"[bridge] ⚠ Volume GC _outputs/{jid} 失败: {type(e).__name__}: {e}")
                 return False
-        for k in (jid, f"{jid}:call"):  # 连带删独立的 call_id key,不留孤儿
+        for k in (jid, f"{jid}:call", f"{jid}:progress"):  # 连带删独立键,不留孤儿
             try:
                 del job_state[k]
             except Exception:
@@ -453,6 +477,11 @@ def _worker_run(workflow: dict, job_id: str, input_images: list | None = None,
           f"call={modal.current_function_call_id() or '?'}")
     job_state[job_id] = {**job_state.get(job_id, {}), "status": "running", "started_at": time.time()}
     try:
+        del job_state[f"{job_id}:progress"]   # rerun 复用 job_id 时别显示上一次的进度
+    except Exception:
+        pass
+    from _comfy_ws import interrupt_comfy     # 放在 try 外:下面两个异常分支都要用
+    try:
         # ⚠ 不在这里 free/reload!曾经"每 job 跑前 free+reload"会把 warm 容器显存里的模型卸掉,
         # 导致每个 job 都得重新从 Volume 加载 flux2(~163s),彻底毁掉 warm 复用。
         # 正确策略:正常直接跑(模型在显存,秒级);只有验证失败(模型不在列表)时,queue_workflow
@@ -483,13 +512,17 @@ def _worker_run(workflow: dict, job_id: str, input_images: list | None = None,
             _prog["win"] = (_prog["win"] + [itv])[-5:]
             w = sorted(_prog["win"])
             s_it = w[len(w) // 2]
+            # ⚠ 写独立的 :progress 键,**绝不能读改写整条状态**:那样和 cancel_endpoint 竞态 ——
+            #   cancel() 返回后中断信号要异步才到 worker,这个窗口里 worker 读到旧的 running、
+            #   cancel 写入 cancelled、worker 再把带 progress 的 running 写回去,取消就被覆盖了,
+            #   之后 /status 永远是 running。run_endpoint 那侧的 :call 当年是同一个理由拆出去的。
             try:
-                job_state[job_id] = {**job_state.get(job_id, {}), "progress": {
+                job_state[f"{job_id}:progress"] = {
                     "step": v, "total": m,
                     "s_it": round(s_it, 2),
                     "n_samples": len(w),      # 前端据此决定预警可信度
                     "elapsed": int(now - _t0),
-                }}
+                }
             except Exception:
                 pass
 
@@ -511,6 +544,7 @@ def _worker_run(workflow: dict, job_id: str, input_images: list | None = None,
                                  "completed_at": time.time()}
             return {"delivered": dres["status"], "assets": len(dres["assets"])}
     except Exception as e:
+        interrupt_comfy()   # 失败时 prompt 可能还在 ComfyUI 里跑,别让它接着烧 GPU
         import traceback
         tb = traceback.format_exc()
         msg = str(e)
@@ -525,6 +559,12 @@ def _worker_run(workflow: dict, job_id: str, input_images: list | None = None,
                 print(f"[bridge] {hint}")
         job_state[job_id] = {**job_state.get(job_id, {}), "status": "failed",
                              "error": msg, "trace": tb[-2000:], "completed_at": time.time()}
+        raise
+    except BaseException:
+        # 取消走的是 Modal 的 InputCancellation —— 它是 BaseException,**不进上面那支**。
+        # 以前这里什么都不做,ComfyUI 子进程就接着跑被取消的 prompt(见 interrupt_comfy)。
+        # 终态不在这里写:cancel_endpoint 已经写了 cancelled,这里再写只会和它抢。
+        interrupt_comfy()
         raise
     # 大文件走了 Volume(item 带 volume_path)→ commit 一次,本地 SDK 才看得到刚写进 _outputs 的文件
     if any(i.get("volume_path") for i in (result.get("images") or [])):
@@ -555,7 +595,21 @@ def _worker_run(workflow: dict, job_id: str, input_images: list | None = None,
     else:
         done["data_base64"] = result.get("data_base64")
         done["filename"] = result.get("filename")
-    job_state[job_id] = done
+    try:
+        job_state[job_id] = done
+    except Exception as e:
+        # ⚠ 这句以前在 try 外:Dict 超限(RequestSizeError)或瞬时报错时异常直接冒出去,
+        #   没人写终态,状态卡在 running —— GPU 钱花了、产物只在容器里,谁也拿不到。
+        #   _comfy_ws 的内联总量预算会让超限基本不发生,这里是最后一道:至少如实落一个 failed。
+        why = f"产物已生成,但结果写回失败: {type(e).__name__}: {e}"
+        print(f"[bridge] ⚠ job {job_id}: {why}")
+        try:
+            job_state[job_id] = {**{k: v for k, v in done.items()
+                                    if k not in ("images", "data_base64")},
+                                 "status": "failed", "error": why}
+        except Exception:
+            pass
+        raise
     return result
 
 
@@ -899,42 +953,61 @@ def status_endpoint(job_id: str, key: str = "", x_bridge_key: str = _Header(""))
         # ⚠ not_found ≠ 立刻可判死:job_state 是 modal.Dict,跨容器最终一致,/run 刚写完的
         #   条目在另一个容器上可能短暂读不到。客户端必须连续看到几次才作数(见 bridge_client.wait)。
         return {"error": "job not found", "id": job_id, "status": "not_found"}
-    return {"id": job_id, **s}
+    now = time.time()
+    reason = _stale_reason(s, now)
+    if reason:
+        # worker 必然已被 Modal 杀掉(见 _stale_reason),没有竞态可言 —— 落成 failed,
+        # 调用方拿到真因,而不是空等到自己的超时再报一个错的原因。
+        s = {**s, "status": "failed", "error": reason, "completed_at": now}
+        try:
+            job_state[job_id] = s
+        except Exception:
+            pass
+    out = {"id": job_id, **s}
+    if s.get("status") == "running":
+        prog = job_state.get(f"{job_id}:progress")   # 进度在独立键里,见 _worker_run._on_progress
+        if isinstance(prog, dict):
+            out["progress"] = prog
+    return out
 
 
 @app.function(image=cuda_image, volumes={"/comfy-volume": models_vol},
               secrets=[bridge_secret], timeout=300)
 @modal.fastapi_endpoint(method="GET", label=f"{APP_NAME}-fetch")
-def fetch_endpoint(job_id: str, path: str, key: str = "", delete: int = 0,
+def fetch_endpoint(job_id: str, path: str, key: str = "", delete: int = 0, ack: int = 0,
                    x_bridge_key: str = _Header("")):
     """独立客户端(bridge_client / CLI / cloud 模式 MCP)取大文件:流式返回 Volume 上该 job 的
     产物。本地插件不用它(routes 走 modal SDK 直连);它的存在让外部消费者只凭 bridge_key 就能
     拿到走了 Volume 的视频/网格,不必持有 modal token。
     path 必须是该 job 某个 images[].volume_path(囚笼:仅限 _outputs/<job_id>/ 内,拒绝逃逸);
-    delete=1 → 响应发送完成后删文件并 commit(与本地 SDK 取回后即删的行为一致)。"""
+    ack=1 → **不传文件**,直接删掉该产物并 commit。客户端必须在**确认已完整收到并落盘之后**才调。
+    delete=1 → 已停用(见下),保留参数只为兼容老客户端。"""
     deny = _check(x_bridge_key or key)
     if deny:
         return deny
     from fastapi.responses import JSONResponse, FileResponse
-    from starlette.background import BackgroundTask
     prefix = f"_outputs/{job_id}/"
     if not path.startswith(prefix) or ".." in path or path != os.path.normpath(path):
         return JSONResponse({"error": "path out of job scope"}, status_code=403)
     models_vol.reload()  # worker 完成时 commit 过;reload 确保本容器看得到最新文件
     local = Path("/comfy-volume") / path
+    if ack:
+        # 客户端已确认完整落盘 → 这时才删。已经不在了也算成功(幂等:重试的 ack 不该报错)。
+        try:
+            if local.is_file():
+                os.remove(local)
+                models_vol.commit()
+                return {"deleted": path}
+            return {"deleted": path, "already_gone": True}
+        except Exception as e:
+            return JSONResponse({"error": f"delete failed: {e}"}, status_code=500)
     if not local.is_file():
         return JSONResponse({"error": f"not found: {path}"}, status_code=404)
-
-    cleanup = None
-    if delete:
-        def _cleanup(p=str(local)):
-            try:
-                os.remove(p)
-                models_vol.commit()
-            except Exception as e:
-                print(f"[bridge] fetch cleanup {p} failed: {e}")
-        cleanup = BackgroundTask(_cleanup)
-    return FileResponse(str(local), filename=Path(path).name, background=cleanup)
+    # ⚠ 下载**永不**删除。以前 delete=1 会在响应交给 Modal ingress 之后就在 BackgroundTask 里删,
+    #   不等客户端确认收完 —— 弱网断线、或客户端发现大小对不上,Volume 副本已经没了、客户端的
+    #   .part 也被清掉,付过钱的产物彻底丢失(2026-09-23 review)。现在删除只走上面的 ack。
+    #   老客户端仍会传 delete=1:对它们等于不删,由 _sweep_job_state 按 TTL 回收 —— 安全的一边。
+    return FileResponse(str(local), filename=Path(path).name)
 
 
 @app.function(image=cuda_image, secrets=[bridge_secret], timeout=15)
@@ -1040,6 +1113,16 @@ def health_endpoint(key: str = "", x_bridge_key: str = _Header("")):
         ) if cn_dir.exists() else []
     except Exception as e:
         info["custom_nodes_error"] = str(e)
+    # 镜像实际用的节点清单(带 url/commit)。上面 custom_nodes 只有文件夹名,本地拿它补全 url
+    # 时补不出别的机器加的节点 → 被当成空 url 丢掉 → 下次部署从镜像里删掉。_custom_nodes_data
+    # 已作为 Python 源随部署挂进容器,原样报回即可,不用改镜像。见 node_sync.complete_baked_entries。
+    try:
+        from _custom_nodes_data import CUSTOM_NODES as _baked
+        info["custom_nodes_manifest"] = [
+            {"name": n.get("name", ""), "url": n.get("url", ""), "commit": n.get("commit", "")}
+            for n in _baked if isinstance(n, dict)]
+    except Exception as e:
+        info["custom_nodes_manifest_error"] = str(e)
     return info
 
 

@@ -268,12 +268,13 @@ class BridgeClient:
 
     def _download_volume(self, job_id: str, vol_path: str, local: Path,
                          delete_remote: bool) -> int:
-        qs = urllib.parse.urlencode({"job_id": job_id, "path": vol_path,
-                                     "delete": int(delete_remote)})
+        # ⚠ 下载时**不**让云端删。以前带 delete=1,云端在响应交给 ingress 之后就删了,
+        #   不等这边收完:断线或大小对不上时,远端副本已没、下面 finally 又清掉 .part,
+        #   付过钱的产物两头落空。现在先完整落盘并校验,**成功之后**才发 ack 让云端删。
+        qs = urllib.parse.urlencode({"job_id": job_id, "path": vol_path})
         url = f"{self._url('fetch')}?{qs}"
         dl_req = urllib.request.Request(url, headers={"X-Bridge-Key": self.key})
-        # 先写 .part、校验后原子 rename:delete_remote 时远端边传边清,
-        # 中断若直接写终名会留下"看起来完整"的残缺文件。
+        # 先写 .part、校验后原子 rename:中断若直接写终名会留下"看起来完整"的残缺文件。
         part = local.with_name(local.name + ".part")
         try:
             with _open_http(dl_req, timeout=600) as r, open(part, "wb") as f:
@@ -289,6 +290,8 @@ class BridgeClient:
                 raise BridgeError(
                     f"/fetch 下载不完整: {size}/{expected} bytes({vol_path})")
             part.replace(local)
+            if delete_remote:
+                self._ack_remote(job_id, vol_path)
             return size
         except urllib.error.HTTPError as e:
             if e.code == 404:
@@ -297,6 +300,15 @@ class BridgeClient:
             raise BridgeError(f"/fetch HTTP {e.code}(云端是 0.7.3+ 吗?老部署没有该端点)") from None
         finally:
             part.unlink(missing_ok=True)
+
+    def _ack_remote(self, job_id: str, vol_path: str) -> None:
+        """本地已完整落盘并校验 → 通知云端删 Volume 副本。失败不影响结果:
+        云端 _sweep_job_state 会按 TTL 回收,最坏只是多占一会儿存储。"""
+        qs = urllib.parse.urlencode({"job_id": job_id, "path": vol_path, "ack": 1})
+        try:
+            self._req(f"{self._url('fetch')}?{qs}", None, 30)
+        except Exception:
+            pass
 
     # ── 输入素材打包(引用 input/ 的节点 → data uri,协议与官方插件一致)──
     # 引用 input/ 下本地文件的节点 → 各自的输入键。**键名不统一,不能一律取 "image"**:

@@ -132,4 +132,5 @@ async def list_nodes(session, cfg) -> dict:
     """镜像已装的 custom_nodes。模型相关全部走本地 SDK(modal_volume.py),这里只剩节点。"""
     h = await health(session, cfg)
     nodes = h.get("custom_nodes", []) if isinstance(h, dict) else []
-    return {"custom_nodes": nodes}
+    manifest = h.get("custom_nodes_manifest") if isinstance(h, dict) else None
+    return {"custom_nodes": nodes, "custom_nodes_manifest": manifest or []}

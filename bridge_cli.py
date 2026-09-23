@@ -139,8 +139,24 @@ def cmd_deploy(args):
     from config import DEFAULT_CONFIG
 
     saved = _load_cli_cfg()
-    bridge_key = saved.get("key") or node_sync.gen_bridge_key()  # 复用旧 key,重部署不换锁
+    # 同一台机器上若装着插件,它的 config.json 才是这个 app 的权威凭据来源。
+    # ⚠ 以前只看 ~/.modal_bridge/cli.json:用 GUI 部署过、从没跑过 CLI 的机器上 cli.json 不存在,
+    #   于是新生成一把 BRIDGE_API_KEY 并 --force 覆盖 Secret —— 插件 config 里那把随即失效,
+    #   **所有请求 401**;COMFY_API_KEY / AIGC_* / HF 也因为这里的 cfg 是空默认值而被一起抹掉。
+    #   (2026-09-23 review 抓到)
+    try:
+        import config as _plugin_cfg
+        plugin = _plugin_cfg.load_config()
+    except Exception:
+        plugin = {}
+    same_app = (plugin.get("modal_app_name") or "comfyui-bridge") == args.app_name
+    if not same_app:
+        plugin = {}   # 部署的是另一个 app,插件那套凭据不属于它,别串
+    bridge_key = (saved.get("key") or plugin.get("bridge_api_key")
+                  or node_sync.gen_bridge_key())   # 复用旧 key,重部署不换锁
     cfg = {**DEFAULT_CONFIG,
+           **{k: plugin[k] for k in ("comfy_api_key", "hf_token", "civitai_token",
+                                     "aigc_studio_base_url", "aigc_bypass_secret") if plugin.get(k)},
            "modal_app_name": args.app_name,
            "comfyui_tag": args.comfyui_tag,
            "default_gpu": args.gpu, "cheap_gpu": args.cheap_gpu, "top_gpu": args.top_gpu,
@@ -150,11 +166,21 @@ def cmd_deploy(args):
     env = node_sync.deploy_env(cfg)
 
     print(f"[1/2] 建/更新 Secret({args.app_name}-secrets)…")
-    r = subprocess.run(node_sync.secret_create_cmd(cfg, bridge_key=bridge_key),
+    r = subprocess.run(node_sync.secret_create_cmd(
+                           cfg, cfg.get("hf_token", ""), cfg.get("civitai_token", ""), bridge_key,
+                           cfg.get("comfy_api_key", ""), cfg.get("aigc_studio_base_url", ""),
+                           cfg.get("aigc_bypass_secret", "")),
                        env=env, capture_output=True, text=True)
     if r.returncode != 0:
         sys.exit(f"secret 创建失败:{r.stderr[-500:]}\n(先 `pip install modal && modal token new`)")
 
+    # 镜像节点清单取自本机那份被 gitignore 的文件;先把云端有、本机缺的并回来(只加不删),
+    # 否则在清单丢失 / 别的机器加过节点时,这次部署会把它们从镜像里删掉。
+    node_sync.ensure_baked_file()
+    back = node_sync.reconcile_baked_with_cloud({**cfg, **plugin,
+                                                 "bridge_api_key": bridge_key})
+    if back:
+        print(f"      节点清单:并回云端独有的 {len(back)} 个 —— {', '.join(back)}")
     print(f"[2/2] modal deploy(ComfyUI tag {args.comfyui_tag},首次要构建镜像,10 分钟级)…")
     proc = subprocess.Popen(node_sync.deploy_command(), cwd=str(_HERE / "modal_app"), env=env,
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)

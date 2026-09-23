@@ -23,6 +23,29 @@ PUBLIC_CONFIG_WRITE_FIELDS = frozenset({
 })
 
 
+# 永不回吐浏览器的 config 字段。⚠ 新增任何凭据字段必须加在这里 —— 以前 GET / POST /config
+# 各维护一份 pop 列表,加一个字段要记得改两处,漏一处就是把凭据送进浏览器(2026-09-23 收成一份)。
+SECRET_CONFIG_FIELDS = (
+    "modal_token_secret", "bridge_api_key", "comfy_api_key", "aigc_bypass_secret",
+    "local_api_capability", "hf_token", "civitai_token",
+)
+_INTERNAL_CONFIG_FIELDS = ("local_node_reqs_deployed_hash",)
+
+
+def public_config(cfg: dict) -> dict:
+    """config 的浏览器可见视图:凭据一律抹掉,只留 has_xxx 标志(部署框据此显示"已保存,留空=沿用")。"""
+    safe = dict(cfg)
+    safe["has_token_secret"] = bool(safe.get("modal_token_secret"))
+    safe["has_comfy_api_key"] = bool(safe.get("comfy_api_key"))
+    safe["has_aigc_bypass_secret"] = bool(safe.get("aigc_bypass_secret"))
+    safe["has_local_api_capability"] = bool(safe.get("local_api_capability"))
+    safe["has_hf_token"] = bool(safe.get("hf_token"))
+    safe["has_civitai_token"] = bool(safe.get("civitai_token"))
+    for k in SECRET_CONFIG_FIELDS + _INTERNAL_CONFIG_FIELDS:
+        safe.pop(k, None)
+    return safe
+
+
 def is_safe_job_id(job_id) -> bool:
     """job_id 能不能安全地拼进文件路径。
 

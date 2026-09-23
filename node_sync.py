@@ -82,16 +82,29 @@ def list_comfyui_tags(repo: str = COMFYUI_REPO, timeout: int = 20) -> list[str]:
         return []
 
 
-def resolve_comfyui_tag(version: str, tags: list[str]) -> tuple[str, str]:
-    """纯函数:本机版本 + 可用 tag 列表 → (选用的 tag, 警告说明)。
+def resolve_comfyui_tag(version: str, tags: list[str], prev_tag: str = "") -> tuple[str, str]:
+    """纯函数:本机版本 + 可用 tag 列表 (+ 上次部署的 tag) → (选用的 tag, 警告说明)。
     精确命中 → ('vX.Y.Z', '')。无精确 → 取 semver 距离最近的(平手取更老的 ≤ 本机,避免云端比本地新),
-    返回说明。版本测不到 / tag 列表空 → 默认 tag + 说明。"""
+    返回说明。
+
+    ⚠ 拉不到 tag 列表(本机没 git / GitHub 一时连不上 / 20s 超时)时,**绝不能退回写死的
+    DEFAULT_COMFYUI_TAG**。那是 v0.22.0,不支持 MiniMax H3、新节点全部导入失败 —— 而部署
+    rc=0、日志只多一行 ⚠,一次网络抖动就让云端大面积坏掉(2026-09-23 review 抓到)。回落顺序:
+      · 本机版本已知 → 直接用 v{本机版本}。它几乎必然是个真 tag;万一不是(开发版),
+        镜像 build 时 git clone 会**明确失败**,远好过静默装一个老版本。
+      · 本机版本未知 → 沿用上次部署的 tag(它至少是上次跑通过的)。
+      · 两者都没有 → 才用默认值,并在说明里写清楚。"""
     lv = _parse_ver(version)
+    prev = (prev_tag or "").strip()
     if not lv:
-        return DEFAULT_COMFYUI_TAG, f"本机 ComfyUI 版本未知 → 云端用默认 {DEFAULT_COMFYUI_TAG}"
+        if prev:
+            return prev, f"本机 ComfyUI 版本未知 → 云端沿用上次部署的 {prev}"
+        return DEFAULT_COMFYUI_TAG, f"本机 ComfyUI 版本未知、也没有上次部署记录 → 云端用默认 {DEFAULT_COMFYUI_TAG}"
     cand = [(pv, t) for t in tags if (pv := _parse_ver(t))]
     if not cand:
-        return DEFAULT_COMFYUI_TAG, f"拉不到 ComfyUI tag 列表 → 云端用默认 {DEFAULT_COMFYUI_TAG}"
+        guess = "v" + ".".join(map(str, lv))
+        return guess, (f"拉不到 ComfyUI tag 列表(网络 / git 不可用)→ 按本机版本直接用 {guess};"
+                       f"若它不是正式 tag,镜像构建会明确失败")
     exact = [t for pv, t in cand if pv == lv]
     if exact:
         return next((t for t in exact if t.startswith("v")), exact[0]), ""
@@ -228,6 +241,60 @@ def read_baked_nodes() -> list[dict]:
 
 def baked_node_names() -> set[str]:
     return {n.get("name", "") for n in read_baked_nodes() if n.get("name")}
+
+
+def complete_baked_entries(names: list[str], local_by_name: dict,
+                           manifest: list[dict] | None) -> list[dict]:
+    """云端 /health 只保证给出节点**名字**,url/commit 从哪来:**云端 manifest 优先**,本机清单兜底。
+
+    ⚠ 以前只用本机清单补,本机没有的节点被填成 {url: ""},随后 write_baked_nodes 在出口把空 url
+      条目丢掉 —— 下一次部署就把它从镜像里删了。机器 A 加的节点被机器 B 一次同步删掉;
+      插件被 Manager 重装、本机清单丢了,一次部署清空云端全部节点。设计本意是「多机取并集、
+      永不互删」(见 plan_node_sync),实现却因为云端只报名字把自己的承诺打破了(2026-09-23 review)。
+    云端优先的理由:manifest 就是镜像实际装的那份,比本机「上次从这台机器部署的」更权威。"""
+    cloud = {n["name"]: n for n in (manifest or []) if isinstance(n, dict) and n.get("name")}
+    out = []
+    for name in names:
+        e = cloud.get(name) or local_by_name.get(name) or {"name": name, "url": "", "commit": ""}
+        out.append({"name": name, "url": e.get("url", ""), "commit": e.get("commit", "")})
+    return out
+
+
+def fetch_cloud_manifest(cfg: dict, timeout: int = 20) -> list[dict] | None:
+    """取云端镜像实际装的节点清单(带 url/commit;0.8.48 起 /health 才报)。拿不到返回 None。
+    同步实现,部署路径(含 CLI)共用;async 路由里请用 asyncio.to_thread 调。"""
+    import urllib.request
+    base = (cfg.get("modal_endpoint_base") or "").rstrip("/")
+    key = cfg.get("bridge_api_key") or ""
+    if not base or not key:
+        return None
+    try:
+        req = urllib.request.Request(f"{base}-health.modal.run", headers={"X-Bridge-Key": key})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            info = json.loads(r.read().decode())
+    except Exception:
+        return None
+    m = info.get("custom_nodes_manifest") if isinstance(info, dict) else None
+    return m if isinstance(m, list) else None
+
+
+def reconcile_baked_with_cloud(cfg: dict) -> list[str]:
+    """部署前把「云端镜像里有、本机清单里没有」的节点并回本机清单。返回被并回的节点名。
+
+    只加不删 —— 删除只能走「管理云端节点」面板的显式 prune(那条路径不调这里)。
+    拿不到 manifest(云端还是老版本 / 不可达 / 首次部署)就原样不动。"""
+    manifest = fetch_cloud_manifest(cfg)
+    if not manifest:
+        return []
+    local = read_baked_nodes()
+    have = {n.get("name") for n in local}
+    back = [{"name": n["name"], "url": n.get("url", ""), "commit": n.get("commit", "")}
+            for n in manifest
+            if isinstance(n, dict) and n.get("name") and (n.get("url") or "").strip()
+            and n["name"] not in have]
+    if back:
+        write_baked_nodes(local + back)
+    return [n["name"] for n in back]
 
 
 def ensure_baked_file() -> None:

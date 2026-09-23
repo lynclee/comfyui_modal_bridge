@@ -744,18 +744,7 @@ def _setup_routes():
     async def _get_config(request: web.Request):
         # 不把密钥送到浏览器:抹掉 token_secret 和 bridge_api_key,只给前端要的非敏感字段
         # + 一个 has_token_secret 标志(部署框据此显示"已保存,留空=沿用")。
-        cfg = dict(cfg_mod.load_config())
-        cfg["has_token_secret"] = bool(cfg.get("modal_token_secret"))
-        cfg["has_comfy_api_key"] = bool(cfg.get("comfy_api_key"))
-        cfg["has_aigc_bypass_secret"] = bool(cfg.get("aigc_bypass_secret"))
-        cfg["has_local_api_capability"] = bool(cfg.get("local_api_capability"))
-        cfg.pop("modal_token_secret", None)
-        cfg.pop("bridge_api_key", None)
-        cfg.pop("comfy_api_key", None)  # 账单凭据,不回吐浏览器(同 bridge_api_key)
-        cfg.pop("aigc_bypass_secret", None)  # Vercel 旁路密钥,同上
-        cfg.pop("local_api_capability", None)  # 本地管理 capability,永不匿名回吐
-        cfg.pop("local_node_reqs_deployed_hash", None)  # 内部部署状态
-        return web.json_response(cfg)
+        return web.json_response(contract.public_config(cfg_mod.load_config()))
 
     @routes.get("/modal_bridge/bridge_key")
     @_admin_only
@@ -779,19 +768,7 @@ def _setup_routes():
         except ValueError as e:
             return web.json_response({"error": str(e)}, status=400)
         cfg_mod.save_config(cur)
-        # 不回吐密钥(和 GET /config 一致):抹掉 token_secret / bridge_api_key
-        safe = dict(cur)
-        safe["has_token_secret"] = bool(safe.get("modal_token_secret"))
-        safe["has_comfy_api_key"] = bool(safe.get("comfy_api_key"))
-        safe["has_aigc_bypass_secret"] = bool(safe.get("aigc_bypass_secret"))
-        safe["has_local_api_capability"] = bool(safe.get("local_api_capability"))
-        safe.pop("modal_token_secret", None)
-        safe.pop("bridge_api_key", None)
-        safe.pop("comfy_api_key", None)
-        safe.pop("aigc_bypass_secret", None)
-        safe.pop("local_api_capability", None)
-        safe.pop("local_node_reqs_deployed_hash", None)
-        return web.json_response(safe)
+        return web.json_response(contract.public_config(cur))  # 与 GET /config 同一份脱敏
 
     # -------- 异步提交(返回 job_id,不阻塞)--------
     @routes.post("/modal_bridge/submit")
@@ -1267,6 +1244,11 @@ def _setup_routes():
                     needs_redeploy = target_hash != deployed_hash and bool(reqs or deployed_hash)
                     if needs_redeploy:
                         await _emit(resp, f"== 私有节点依赖已变化({len(reqs)} 条),自动重新部署 ==\n")
+                        # 同 /deploy:这里也拿本机清单当全局清单部署,先并回云端独有的节点。
+                        node_sync.ensure_baked_file()
+                        _back = await asyncio.to_thread(node_sync.reconcile_baked_with_cloud, latest_cfg)
+                        if _back:
+                            await _emit(resp, f"   节点清单:并回云端独有的 {len(_back)} 个 —— {', '.join(_back)}\n")
                         rc = await _ensure_modal(resp)
                         if rc == 0:
                             rc = await _run_streamed(
@@ -1376,22 +1358,22 @@ def _setup_routes():
         """
         cfg = cfg_mod.load_config()
         local_baked = {n["name"]: n for n in node_sync.read_baked_nodes()}
-        names, source = None, "local"
+        names, source, manifest = None, "local", []
         try:
             async with aiohttp.ClientSession() as session:
                 info = await modal_client.list_nodes(session, cfg)
             if isinstance(info, dict) and isinstance(info.get("custom_nodes"), list):
                 names = info["custom_nodes"]
+                manifest = info.get("custom_nodes_manifest") or []
                 source = "modal"
         except Exception as e:
             print(f"[modal_bridge] list_nodes: /health 不可达,回退本地 ({e})")
         if names is None:
             names = list(local_baked.keys())
-        nodes = []
-        for name in sorted(names):
-            b = local_baked.get(name, {})
-            nodes.append({"name": name, "url": b.get("url", ""), "commit": b.get("commit", ""),
-                          "in_local_baked": name in local_baked})
+        # url/commit 云端 manifest 优先 —— 否则别的机器加的节点在这里 url 为空,面板「移除并重部署」
+        # 会把它们连同被移除的那个一起丢掉(见 node_sync.complete_baked_entries)。
+        nodes = [{**e, "in_local_baked": e["name"] in local_baked}
+                 for e in node_sync.complete_baked_entries(sorted(names), local_baked, manifest)]
         return web.json_response({"ok": True, "source": source, "nodes": nodes})
 
     @routes.post("/modal_bridge/check_nodes")
@@ -1415,10 +1397,12 @@ def _setup_routes():
             async with aiohttp.ClientSession() as session:
                 nodes_info = await modal_client.list_nodes(session, cfg)
             if isinstance(nodes_info, dict) and isinstance(nodes_info.get("custom_nodes"), list):
-                # Modal 只给名字;url/commit 用本地清单补全(prune 只看名字,add/update 用本地 git)
+                # url/commit:云端 manifest 优先,本机清单兜底。以前只用本机清单,本机没有的节点
+                # 被填成空 url → write_baked_nodes 出口丢弃 → 下次部署从镜像里删掉(多机互删)。
                 local_baked = {n["name"]: n for n in node_sync.read_baked_nodes()}
-                baked = [local_baked.get(name, {"name": name, "url": "", "commit": ""})
-                         for name in nodes_info["custom_nodes"]]
+                baked = node_sync.complete_baked_entries(
+                    nodes_info["custom_nodes"], local_baked,
+                    nodes_info.get("custom_nodes_manifest") or [])
                 source = "modal"
         except Exception as e:
             print(f"[modal_bridge] check_nodes: /health 不可达,回退本地清单 ({e})")
@@ -1536,8 +1520,12 @@ def _setup_routes():
         volume_name = (body.get("volume_name") or cfg.get("modal_volume_name") or "comfyui-bridge-models").strip()
         default_gpu = (body.get("default_gpu") or cfg.get("default_gpu") or "H100").strip()
         scaledown = int(body.get("scaledown_window") or cfg.get("scaledown_window") or 12)
-        hf_token = (body.get("hf_token") or "").strip()
-        civitai_token = (body.get("civitai_token") or "").strip()
+        # ⚠ 下面 secret create 用的是 --force,会**整份替换** Modal Secret。HF / Civitai token
+        #   以前只从请求体取、从不持久化,而面板根本不发这两个字段 —— 于是用 deploy.py
+        #   --hf-token 配过的 token,点一次「推送到云端」就被抹掉,节点下 gated 权重静默失败。
+        #   现在同 comfy_api_key:留空 = 沿用已存,且写回 config(0600)。(2026-09-23 review)
+        hf_token = (body.get("hf_token") or "").strip() or cfg.get("hf_token", "")
+        civitai_token = (body.get("civitai_token") or "").strip() or cfg.get("civitai_token", "")
         # comfy.org API key(API 节点用):留空 = 沿用已存的(/config 不回显)。持久化进 config,重部署不丢。
         comfy_api_key = (body.get("comfy_api_key") or "").strip() or cfg.get("comfy_api_key", "")
         # AIGC Studio 交付(可选,网站 aigc-r2 模式)。URL 明文回显、输入框预填现值 →
@@ -1568,7 +1556,8 @@ def _setup_routes():
         # ComfyUI 版本跟随本机:检测本机版本 → 解析云端 clone tag(无对应取最接近,只警告不中止)
         comfyui_version = node_sync.detect_local_comfyui_version()
         _tags = await asyncio.to_thread(node_sync.list_comfyui_tags)
-        comfyui_tag, _tag_note = node_sync.resolve_comfyui_tag(comfyui_version, _tags)
+        comfyui_tag, _tag_note = node_sync.resolve_comfyui_tag(
+            comfyui_version, _tags, prev_tag=cfg.get("comfyui_tag", ""))
         # ⚠ 必须在 cfg.update 之前取:那一步会用新值覆盖 comfyui_tag,取晚了永远相等。
         _tag_change = node_sync.comfyui_tag_change_note(cfg.get("comfyui_tag"), comfyui_tag)
 
@@ -1590,6 +1579,8 @@ def _setup_routes():
             "modal_token_secret": token_secret,
             "bridge_api_key": bridge_key,
             "comfy_api_key": comfy_api_key,
+            "hf_token": hf_token,
+            "civitai_token": civitai_token,
             "aigc_studio_base_url": aigc_base_url,
             "aigc_bypass_secret": aigc_bypass,
         })
@@ -1632,6 +1623,13 @@ def _setup_routes():
 
             # 3) 部署 app(首次拉镜像 3-5 分钟)
             node_sync.ensure_baked_file()  # 本地清单是 .gitignore 状态,缺则建空,免得 modal_image 打包炸
+            # ⚠ 本机清单是被 gitignore 的本地状态,却会被当成镜像的全局清单去部署。插件被 Manager
+            #   重装、清单丢了 → 上面建出一个空清单 → 这次部署清空云端全部节点;多机时另一台加的
+            #   节点也会被删。部署前先把云端有、本机没有的并回来(只加不删)。
+            _back = await asyncio.to_thread(node_sync.reconcile_baked_with_cloud, cfg)
+            if _back:
+                await _emit(resp, f"   节点清单:云端有而本机清单缺的 {len(_back)} 个已并回"
+                                  f"(不会被这次部署删掉)—— {', '.join(_back)}\n")
             await _emit(resp, "\n== 推送到云端:比对本机与云端的差异,只推有变化的部分 ==\n")
             # 3.0) 先把**本机**的私有节点推上 Volume,再去读 manifest。
             #
