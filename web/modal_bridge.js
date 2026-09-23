@@ -161,9 +161,12 @@ const I18N = {
                         en: "⚠ At {sit}s/step this needs ~{eta} more min and will overrun the {limit}-min worker limit (killed, fully billed, no output) — cancel and use a bigger-VRAM tier or lower res/duration (VRAM starvation silently slows jobs several-fold)" },
   "run.slow":         { zh: "⚠ 已跑 {min} 分钟,快到等待上限了(gpu={gpu}) — 常见原因是显存不足被 offload 拖慢:换更大显存的 GPU 档,或降低分辨率 / 时长 / 帧数",
                         en: "⚠ {min} min elapsed, approaching the wait limit (gpu={gpu}) — usually VRAM starvation causing offload: pick a larger GPU tier, or lower resolution / duration / frames" },
-  "cancel.gone_unconfirmed": {
-      zh: "云端对取消请求回了「查无此任务」,但随后复查时它又出现了 —— 状态没能确认。任务可能仍在运行并计费,请到 Modal 控制台确认。",
-      en: "The cloud answered 'job not found' to the cancel request, but the job reappeared on re-check — state unconfirmed. It may still be running and billing; please verify in the Modal dashboard." },
+  // ⚠ 下面两条只描述「没能确认的原因」,计费警告由外层 cancel.failed_msg 统一给,别再写一遍。
+  "cancel.confirming":        { zh: "… 云端回「查无此任务」,正在确认", en: "… Cloud says job not found — confirming" },
+  "cancel.state_unknown":     { zh: "云端对取消回了「查无此任务」,但随后复查没能拿到状态(网络或云端暂时不可达),无法确认任务是否已停。",
+                                en: "The cloud answered 'job not found' to the cancel, but the follow-up check couldn't reach it (network or cloud temporarily unavailable), so whether the job stopped is unconfirmed." },
+  "cancel.state_inconsistent":{ zh: "云端对取消回了「查无此任务」,复查却看到它处于 {status};重发取消后仍回「查无此任务」—— 两边结果矛盾。",
+                                en: "The cloud answered 'job not found' to the cancel, yet the follow-up check saw it as {status}; a retried cancel again said 'not found' — the answers contradict each other." },
   "cancel.gone":      { zh: "✕ 云端已无此任务", en: "✕ Job no longer on cloud" },
   "cancel.gone_msg":  { zh: "任务 {id} 在云端已不存在(多半已过保留期被清理)。没有任务在跑,也不会继续计费。",
                         en: "Job {id} no longer exists on the cloud (most likely cleaned up after its retention window). Nothing is running or being billed." },
@@ -1152,71 +1155,53 @@ function recoveryDeadline(j, maxAgeSec) {
     j.fetchStartedAt ? j.fetchStartedAt + 3600000 : 0);
 }
 
-// 请求取消云端任务并**校验结果**。主流程和刷新恢复共用一份 —— 两处行为必须一致,
-// 否则会出现"恢复的卡片点了取消其实没取消"这种只在某条路径上成立的谎报。
-// 复核「云端确实没有这条记录」。cancel 的响应算第一次,这里补齐到 NOT_FOUND_STREAK 次。
-// ⚠ 查不动(网络错)一律返回 false —— fail-closed:宁可说「没确认」,不能说「已停」。
-async function confirmJobGone(jobId) {
-  for (let i = 1; i < NOT_FOUND_STREAK; i++) {
-    await sleep(600);
-    try {
-      const r = await bridgeFetch(`/modal_bridge/poll?job_id=${encodeURIComponent(jobId)}`);
-      const d = await r.json();
-      if (d.status && d.status !== "not_found") return false;  // 还在 → cancel 那次是陈旧读
-    } catch (e) {
-      log("confirmJobGone probe failed (treat as unconfirmed)", e);
-      return false;
+// 一次状态探测,把「看到了状态」和「这一拍没看清」分开 —— 主轮询、刷新恢复、取消复核三处共用。
+// ⚠ bridgeFetch 对非 2xx **不抛异常**:本地 /poll 连不上 Modal 时回 502 {error},没有 status。
+//   只防 throw 是不够的 —— 0.8.46 的复核就只 catch 了异常,{error} 被当成「又确认一次不存在」,
+//   号称 fail-closed、实际 fail-open。三处各写一份时对 {error} 的处理也各不相同
+//   (跳过 / 清零 / 当成确认),重复代码的维护成本直接变成了 bug,所以收成这一份。
+// job 执行失败的响应也带 error,但同时有 status:"failed" —— 那是终态,如实返回,不当瞬态。
+async function probeJobStatus(jobId) {
+  try {
+    const r = await bridgeFetch(`/modal_bridge/poll?job_id=${encodeURIComponent(jobId)}`);
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok || !d || typeof d.status !== "string" || !d.status) {
+      return { transient: true, data: d };
     }
+    return { status: d.status, data: d };
+  } catch (e) {
+    return { transient: true, error: e };
   }
-  return true;
 }
 
-// 取消失败 = 云端还在跑还在计费,必须弹到用户面前;取消没赶上(cancel_noop)= 产物已生成
-// 且已计费,直接取回落盘,别因为点过取消就把付过钱的东西丢掉。
-async function requestCancel(jobId, ctx, wfName = null) {
-  let d;
-  try {
-    const r = await bridgeFetch("/modal_bridge/cancel", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ job_id: jobId }),
-    });
-    d = await r.json().catch(() => ({}));
-    // ⚠ 「查无此 job」必须先于错误分支判。云端 0.8.42 起对不存在的 job 回
-    //   {status:"not_found", error:"job not found"} —— 带 error 字段,会掉进下面的
-    //   「取消失败」里,弹出「云端可能仍在运行并继续计费,请到 Modal 控制台确认」。
-    //   任务根本不存在,却让用户去控制台找一个不存在的容器:假警报比不报更糟。
-    //   (这是把「缺字段」改成「显式 error」的副作用 —— 契约修好了,旧调用方反而更难发现。)
-    if (d.status === "not_found") {
-      // ⚠ 一次 not_found 不能当定论 —— 这条路误判的代价比轮询那条路高一个量级:
-      //   轮询里误判只是多等一轮;这里误判会 (a) 删掉恢复记录,于是再没人去取结果,
-      //   任务继续跑到底、继续计费、产物烂在 Volume 上;(b) 告诉用户「不会继续计费」,
-      //   而那句话可能是假的。**钱的事上宁可说「没确认」,不能说「已停」。**
-      //   (2026-09-20 codex 复查抓到:我在轮询那条路论证了一次不算数,这里却一次就下结论。)
-      if (!(await confirmJobGone(jobId))) {
-        err("cancel returned not_found but job is still visible", jobId);
-        if (ctx) ctx.finish(false, t("cancel.failed"));
-        alert(t("cancel.failed_msg", { msg: t("cancel.gone_unconfirmed") }));
-        return false;
-      }
-      removeActiveJob(jobId);
-      if (ctx) ctx.finish(false, t("cancel.gone"));
-      notify(t("cancel.gone_msg", { id: jobId.slice(0, 8) }), "warn");
-      return false;
+// 复核「云端确实没有这条记录」。返回**判决**而不是 true/false —— 复查看到的东西本身有用:
+// 还活着要重发取消,已结束要按结局收尾。二值返回会把这些全丢掉(0.8.46 就因此把 completed
+// 的产物当成「可能仍在计费」、不去取回)。cancel 的响应算第一次,这里补齐到 NOT_FOUND_STREAK 次。
+//   gone     连续都说不存在
+//   alive    看到非终态(queued / running / delivering / 不认识的状态 —— 不认识的按活着处理,
+//            方向是「再取消一次」,那是安全的一边)
+//   terminal 看到 completed / failed / cancelled
+//   unknown  有一拍没看清。立刻返回、不重试:这是一次性的钱的判断,fail-closed。
+// ⚠ 间隔跟轮询设置走,不能写死:阈值的依据是**最终一致的时间窗**,不是次数。0.8.46 写死
+//   600ms,总窗口只有轮询路径的一半 —— 误判代价更高的那条路,确认反而更弱。
+async function confirmJobGone(jobId) {
+  const interval = getSetting("ModalBridge.pollIntervalSec", 1.2) * 1000;
+  for (let i = 1; i < NOT_FOUND_STREAK; i++) {
+    await sleep(interval);
+    const p = await probeJobStatus(jobId);
+    if (p.transient) return { verdict: "unknown", detail: p };
+    if (p.status === "not_found") continue;
+    if (p.status === "completed" || p.status === "failed" || p.status === "cancelled") {
+      return { verdict: "terminal", data: p.data };
     }
-    if (!r.ok || d.ok === false || d.error) {
-      const msg = d.error || `HTTP ${r.status}`;
-      err("cancel failed", msg);
-      if (ctx) ctx.finish(false, t("cancel.failed"));
-      alert(t("cancel.failed_msg", { msg }));
-      return false;
-    }
-  } catch (e) {
-    err("cancel failed", e);
-    if (ctx) ctx.finish(false, t("cancel.failed"));
-    alert(t("cancel.failed_msg", { msg: String(e) }));
-    return false;
+    return { verdict: "alive", data: p.data };
   }
+  return { verdict: "gone" };
+}
+
+// 取消收尾(正常取消与「复核后发现已结束」共用):cancel_noop = 取消没赶上,产物已生成且已计费,
+// 直接取回落盘,别因为点过取消就把付过钱的东西丢掉。
+async function settleCancel(jobId, d, ctx, wfName) {
   if (d.cancel_noop && d.status === "completed") {
     notify(t("cancel.noop"), "warn");
     try {
@@ -1234,6 +1219,88 @@ async function requestCancel(jobId, ctx, wfName = null) {
     removeActiveJob(jobId);
   }
   return d;
+}
+
+// 云端对取消回了 not_found。云端自己已经重读过几秒(见 modal_app.cancel_endpoint),这里再从
+// 前端复核一遍 —— 误判的代价在这条路上比轮询高一个量级:删掉恢复记录 = 没人再去取结果,
+// 告诉用户「不会继续计费」可能是假话。**钱的事上宁可说「没确认」,不能说「已停」。**
+async function onCancelNotFound(jobId, ctx, wfName, retried) {
+  // 卡片此刻停在乐观的 "✕ Cancelled" 上,复核要好几秒 —— 如实显示「确认中」,
+  // 别让用户看到 Cancelled 就关卡片走人,然后被几十秒后的弹窗吓一跳。
+  if (ctx) ctx.finish(false, t("cancel.confirming"));
+  const v = await confirmJobGone(jobId);
+
+  if (v.verdict === "gone") {
+    removeActiveJob(jobId);
+    reportJobEvent(jobId, "cancel_job_gone", "取消时云端查无此任务,已连续确认");
+    if (ctx) ctx.finish(false, t("cancel.gone"));
+    notify(t("cancel.gone_msg", { id: jobId.slice(0, 8) }), "warn");
+    return false;
+  }
+  if (v.verdict === "alive" && !retried) {
+    // 复查看到它还在 → 刚才那次 cancel 是陈旧读,根本没生效。直接对这个现在可见的任务
+    // 再取消一次,这才是止损;只弹框让用户去控制台,等于把能做的事推给用户。只重发一次。
+    reportJobEvent(jobId, "cancel_retry_after_stale_not_found", `复查状态=${v.data.status}`);
+    if (ctx) ctx.finish(false, "✕ Cancelled");
+    return await requestCancel(jobId, ctx, wfName, true);
+  }
+  if (v.verdict === "terminal") {
+    // 复查时它已经结束了:completed 按「取消没赶上」取回(产物已付费),failed/cancelled 如实收尾。
+    // 这里对已结束的任务报「可能仍在计费」就是假警报。
+    reportJobEvent(jobId, "cancel_found_terminal", `复查状态=${v.data.status}`);
+    const st = v.data.status;
+    if (st !== "completed" && ctx) ctx.finish(false, st === "cancelled" ? "✕ Cancelled" : "✗ Failed");
+    return await settleCancel(jobId, st === "completed" ? { ...v.data, cancel_noop: true } : v.data,
+                              ctx, wfName);
+  }
+  // unknown(复查没看清),或重发的取消又回 not_found 而复查说它活着(自相矛盾)。
+  // ⚠ 两种情况文案必须分开:网络问题时任务从没被看到过,不能说「它又出现了」,
+  //   否则用户和排障的人都会被引向「任务确实在跑」的错误结论。
+  // 恢复记录保留,但**真正的保障是这个弹窗**:超时路径上调用时 recoveryDeadline 已过,
+  // 下次加载会丢掉这条记录 —— 所以必须让用户知道要自己去控制台看。
+  const why = v.verdict === "unknown"
+    ? t("cancel.state_unknown")
+    : t("cancel.state_inconsistent", { status: v.data.status });
+  err("cancel not_found unresolved", jobId, v.verdict);
+  reportJobEvent(jobId, "cancel_unconfirmed", why);
+  if (ctx) ctx.finish(false, t("cancel.failed"));
+  alert(t("cancel.failed_msg", { msg: why }));
+  return false;
+}
+
+// 请求取消云端任务并**校验结果**。主流程和刷新恢复共用一份 —— 两处行为必须一致,
+// 否则会出现"恢复的卡片点了取消其实没取消"这种只在某条路径上成立的谎报。
+// 取消失败 = 云端还在跑还在计费,必须弹到用户面前。
+// retried:onCancelNotFound 复查看到任务还活着时重发取消用,防止无限重试。
+async function requestCancel(jobId, ctx, wfName = null, retried = false) {
+  let d;
+  try {
+    const r = await bridgeFetch("/modal_bridge/cancel", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ job_id: jobId }),
+    });
+    d = await r.json().catch(() => ({}));
+    // ⚠ 「查无此 job」必须先于错误分支判。云端 0.8.42 起对不存在的 job 回
+    //   {status:"not_found", error:"job not found"} —— 带 error 字段,会掉进下面的
+    //   「取消失败」里,弹出「云端可能仍在运行并继续计费,请到 Modal 控制台确认」。
+    //   任务根本不存在,却让用户去控制台找一个不存在的容器:假警报比不报更糟。
+    //   (这是把「缺字段」改成「显式 error」的副作用 —— 契约修好了,旧调用方反而更难发现。)
+    if (d.status === "not_found") return await onCancelNotFound(jobId, ctx, wfName, retried);
+    if (!r.ok || d.ok === false || d.error) {
+      const msg = d.error || `HTTP ${r.status}`;
+      err("cancel failed", msg);
+      if (ctx) ctx.finish(false, t("cancel.failed"));
+      alert(t("cancel.failed_msg", { msg }));
+      return false;
+    }
+  } catch (e) {
+    err("cancel failed", e);
+    if (ctx) ctx.finish(false, t("cancel.failed"));
+    alert(t("cancel.failed_msg", { msg: String(e) }));
+    return false;
+  }
+  return await settleCancel(jobId, d, ctx, wfName);
 }
 
 async function runOnceOnModal(workflowPrompt, outputNodeIds, ctx, submitGuard, batchInfo = null) {
@@ -1312,21 +1379,15 @@ async function runOnceOnModal(workflowPrompt, outputNodeIds, ctx, submitGuard, b
       if (cancelled) return { jobId, gpu, cancelled: true };  // 用户已取消,卡片已结束,静默退出
       await sleep(interval);
       if (cancelled) return { jobId, gpu, cancelled: true };
-      let pData;
-      try {
-        const pRes = await bridgeFetch(`/modal_bridge/poll?job_id=${encodeURIComponent(jobId)}`);
-        pData = await pRes.json();
-      } catch (e) {
-        log("poll error (will retry)", e);
+      // 「这一拍没看清」(网络错 / 502 {error} / 缺 status)一律当瞬态重试,判据只在 probeJobStatus
+      // 一处。job 执行失败的响应带 error 但也有 status:"failed",probe 会如实返回终态、不当瞬态吞掉
+      // (否则一直 poll 到超时,真正的失败原因回不到前端)。瞬态既不计入也不打断 not_found 连续计数。
+      const probe = await probeJobStatus(jobId);
+      if (probe.transient) {
+        log("poll transient (will retry):", probe.data || probe.error);
         continue;
       }
-      // 只有「纯接口错误」(有 error 但没有 status)才当临时错误重试。
-      // job 执行失败的响应也带 error,但同时有 status:"failed" —— 不能在这里 continue,
-      // 否则漏掉终态、一直 poll 到超时,把真正的失败原因吞掉(报错不回前端的根因)。
-      if (pData.error && !pData.status) {
-        log("poll resp error (will retry):", pData);
-        continue;
-      }
+      const pData = probe.data;
       if (pData.status !== lastStatus) {
         lastStatus = pData.status;
         log("status →", pData.status);
@@ -1851,16 +1912,15 @@ async function recoverOne(pending, maxAgeSec) {
   let gone = 0;                 // 连续 not_found 计数,同主轮询
   while (Date.now() < deadline) {
     if (cancelled) return;
-    let pData;
-    try {
-      const pRes = await bridgeFetch(`/modal_bridge/poll?job_id=${encodeURIComponent(jobId)}`);
-      pData = await pRes.json();
-    } catch (e) {
-      // 临时网络错误只能重试,绝不能借机结束这张卡(见函数头注释)。
-      log("recover poll error (will retry)", e);
+    // 临时错误只能重试,绝不能借机结束这张卡(见函数头注释)。判据与主轮询同一份:
+    // 以前这里只防 throw,502 {error} 会一路落到下面、把 not_found 连续计数清零。
+    const probe = await probeJobStatus(jobId);
+    if (probe.transient) {
+      log("recover poll transient (will retry)", probe.data || probe.error);
       await sleep(interval);
       continue;
     }
+    const pData = probe.data;
     if (pData.status === "not_found") {
       // 同主轮询:恢复记录里的 job 可能早被 GC 清了,连续确认后如实结束,别一直转。
       if (++gone >= NOT_FOUND_STREAK) {

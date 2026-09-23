@@ -74,6 +74,9 @@ job_state = modal.Dict.from_name(f"{APP_NAME}-jobs", create_if_missing=True)
 JOB_TTL_S = int(os.environ.get("MODAL_BRIDGE_JOB_TTL", "3600"))   # 终态保留 1 小时(够客户端取回)
 JOB_MAX = int(os.environ.get("MODAL_BRIDGE_JOB_MAX", "200"))       # 最多保留多少条
 _VOL_GC_PER_SWEEP = 10  # 一次 sweep 最多删多少个 Volume 上的 _outputs/<job> 目录(见 _drop)
+# cancel 对「查无此 job」的确认窗口(秒)。一次读就回 not_found 会漏掉跨容器还没同步到的任务,
+# 见 cancel_endpoint。对真不存在的 job 只是晚几秒回复,对刚提交的 job 是「取消生不生效」的区别。
+_CANCEL_NOT_FOUND_WAIT_S = 3.0
 
 
 # `<job_id>:call` 的占位值:run_endpoint 在 spawn *之前* 写它,拿到真实 call_id 再覆盖。
@@ -952,7 +955,21 @@ def cancel_endpoint(payload: dict):
     #   那段窗口里 job_state[job_id] 还不存在、_call_id() 也返回空串 —— 拿 _call_id() 当判据
     #   会把「正在提交中」误判成「不存在」,正好打掉下面那段专为它写的等待逻辑。
     if not s and not job_state.get(f"{job_id}:call"):
-        return {"id": job_id, "status": "not_found", "error": "job not found"}
+        # ⚠ 一次读不算数:job_state 是 modal.Dict,跨容器最终一致 —— /run 刚在另一个容器里
+        #   写完,这里可能还读不到。凭一次读就回 not_found 且**不执行取消**,调用方会据此放弃,
+        #   任务照常跑满、照常计费。所以先短暂重读,两个键都始终没有才回 not_found。
+        #   这是根因修复:此前只在前端(一个调用方)补了确认,bridge_cli cancel / MCP
+        #   cancel_job 直调云端时拿到的仍是单次读的结果(2026-09-23 review 抓到)。
+        #   与上面等 :call 占位是同一个套路;status_endpoint 不这么做,因为它被反复轮询、
+        #   客户端自带连续确认,而 cancel 是一次性的决定。
+        deadline = time.time() + _CANCEL_NOT_FOUND_WAIT_S
+        while time.time() < deadline:
+            time.sleep(0.1)
+            s = job_state.get(job_id) or {}
+            if s or job_state.get(f"{job_id}:call"):
+                break
+        else:
+            return {"id": job_id, "status": "not_found", "error": "job not found"}
     was_running = s.get("status") == "running"
     call_id = _call_id(job_id) or s.get("call_id")  # 新独立 key,兼容旧字段
     # 占位状态 = run_endpoint 正在 spawn,真实 call_id 还没写回来。这时既不能当"没有 call_id"

@@ -1143,6 +1143,14 @@ def test_status_endpoint_says_not_found_in_the_data_not_only_in_error():
     assert fn("j1")["status"] == "running"
 
 
+def _fake_clock():
+    """随 sleep 推进的假时钟。⚠ 不能用固定返回 0.0 的 time 桩:按时间窗重读的循环
+    (cancel 对 not_found 的确认)会因为时间永远不走而死循环。"""
+    now = [0.0]
+    return types.SimpleNamespace(time=lambda: now[0],
+                                 sleep=lambda dt: now.__setitem__(0, now[0] + dt))
+
+
 def test_cancel_endpoint_refuses_unknown_job_instead_of_inventing_a_record():
     """取消一个不存在的 job,曾经会**凭空写一条 cancelled 记录**并报成功。
 
@@ -1152,7 +1160,7 @@ def test_cancel_endpoint_refuses_unknown_job_instead_of_inventing_a_record():
     state = {}
     fn = _load_endpoint("cancel_endpoint", {
         "job_state": state, "_check": lambda k: None, "_CALL_PENDING": "pending",
-        "_call_id": lambda j: "", "time": types.SimpleNamespace(sleep=lambda s: None, time=lambda: 0.0),
+        "_call_id": lambda j: "", "time": _fake_clock(), "_CANCEL_NOT_FOUND_WAIT_S": 3.0,
     })
     r = fn({"job_id": "ghost", "auth_key": "k"})
     assert r["status"] == "not_found", f"不能报 cancelled: {r}"
@@ -1169,11 +1177,39 @@ def test_cancel_endpoint_still_waits_for_a_job_that_is_mid_spawn():
     state = {"spawning:call": "pending"}
     fn = _load_endpoint("cancel_endpoint", {
         "job_state": state, "_check": lambda k: None, "_CALL_PENDING": "pending",
-        "_call_id": lambda j: "", "time": types.SimpleNamespace(sleep=lambda s: None, time=lambda: 0.0),
+        "_call_id": lambda j: "", "time": _fake_clock(), "_CANCEL_NOT_FOUND_WAIT_S": 3.0,
     })
     r = fn({"job_id": "spawning", "auth_key": "k"})
     assert r["status"] != "not_found", f"正在提交中被误判成不存在: {r}"
     assert "提交中" in (r.get("error") or ""), r
+
+
+def test_cancel_endpoint_rereads_before_declaring_not_found():
+    """云端 cancel 不能凭一次读就回 not_found —— 那是根因,前端补丁只护得住一个调用方。
+
+    job_state 是 modal.Dict,跨容器最终一致:/run 刚在另一个容器里写完,cancel 这边可能
+    还读不到。一次读就回 not_found 且不执行取消,bridge_cli cancel / MCP cancel_job 这类
+    直调云端的调用方会据此放弃,任务照常跑满计费。(2026-09-23 review 抓到。)"""
+    class LaggyDict(dict):
+        """前 lag 次读 job_id 都读不到,之后才「同步」过来 —— 模拟跨容器的陈旧读。"""
+        def __init__(self, lag, *a, **kw):
+            super().__init__(*a, **kw); self.lag = lag; self.reads = 0
+        def get(self, k, default=None):
+            if not k.endswith(":call"):
+                self.reads += 1
+                if self.reads <= self.lag:
+                    return default
+            return super().get(k, default)
+
+    state = LaggyDict(4, {"late": {"status": "queued"}})
+    fn = _load_endpoint("cancel_endpoint", {
+        "job_state": state, "_check": lambda k: None, "_CALL_PENDING": "pending",
+        "_call_id": lambda j: "", "time": _fake_clock(), "_CANCEL_NOT_FOUND_WAIT_S": 3.0,
+    })
+    r = fn({"job_id": "late", "auth_key": "k"})
+    assert r["status"] != "not_found", f"陈旧读被当成了不存在,取消没执行: {r}"
+    assert r["status"] == "cancelled", r
+    assert state["late"]["status"] == "cancelled", "必须真的写下取消"
 
 
 def test_wait_gives_up_on_not_found_but_tolerates_one_stale_read():

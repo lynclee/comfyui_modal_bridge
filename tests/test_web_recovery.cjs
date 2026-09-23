@@ -11,19 +11,21 @@ const NOT_FOUND_STREAK = Number(
   /const NOT_FOUND_STREAK = (\d+);/.exec(source)[1]);
 
 function setup({ fetchFails = false, status = "completed", cancelError = false,
-                 cancelGone = false } = {}) {
+                 cancelGone = false, pollSeq = null, cancelSeq = null } = {}) {
   let saved = [];
-  const observed = { stages: [], timers: [], cleared: [], fetches: 0, polls: 0, alerts: 0 };
+  const observed = { stages: [], timers: [], cleared: [], fetches: 0, polls: 0, alerts: 0,
+                     cancels: 0, sleeps: [], notifies: [], finishes: [] };
   const context = () => ({
     wfName: "test", stage: (...args) => observed.stages.push(args),
-    finish: () => {}, setCancel: () => {},
+    finish: (ok, label) => observed.finishes.push(label), setCancel: () => {},
   });
   const sandbox = {
     Date, Headers, LS_KEYS: { activeJob: "jobs" },
     loadLS: () => JSON.parse(JSON.stringify(saved)),
     saveLS: (_key, value) => { saved = JSON.parse(JSON.stringify(value)); },
     getSetting: (_key, value) => value, getVramTier: () => "80g",
-    sleep: async () => {}, log: () => {}, err: () => {}, notify: () => {},
+    sleep: async (ms) => { observed.sleeps.push(ms); }, log: () => {}, err: () => {},
+    notify: (m) => { observed.notifies.push(m); },
     alert: () => { observed.alerts++; },
     reportJobEvent: () => {}, confirm: () => true, t: (key) => key,
     NOT_FOUND_STREAK,
@@ -35,9 +37,13 @@ function setup({ fetchFails = false, status = "completed", cancelError = false,
       if (url.endsWith("/submit")) return {ok: true, json: async () => ({ok: true, job_id: "job", gpu: "test"})};
       if (url.includes("/poll?")) {
         observed.polls++;
+        // pollSeq:按次给响应(用完后停在最后一个),用来模拟 502 {error}、中途变状态等真实形态
+        if (pollSeq) return pollSeq[Math.min(observed.polls - 1, pollSeq.length - 1)];
         return {ok: true, json: async () => ({status, images: []})};
       }
       if (url.endsWith("/cancel")) {
+        observed.cancels++;
+        if (cancelSeq) return cancelSeq[Math.min(observed.cancels - 1, cancelSeq.length - 1)];
         if (cancelGone) return {ok: true, json: async () =>
           ({id: "job", status: "not_found", error: "job not found"})};
         return {ok: !cancelError, json: async () => cancelError
@@ -184,8 +190,9 @@ test("取消回 not_found 但复查时任务还在:不清记录、不承诺'不�
   const r = await t.sandbox.requestCancel("job", t.context(), null);
   assert.equal(r, false);
   assert.equal(t.saved().length, 1, "没确认之前不能删恢复记录");
-  assert.equal(t.observed.alerts, 1, "状态没确认必须弹到用户面前,而不是安抚");
+  assert.equal(t.observed.alerts, 1, "两次结果矛盾,必须弹到用户面前,而不是安抚");
   assert(t.observed.polls >= 1, "必须真的去复查过状态");
+  assert.equal(t.observed.cancels, 2, "复查看到它活着,应当重发一次取消(且只重发一次)");
 });
 
 test("取消回 not_found、复查查不动:按'没确认'处理(fail-closed)", async () => {
@@ -200,4 +207,89 @@ test("取消回 not_found、复查查不动:按'没确认'处理(fail-closed)", 
   assert.equal(r, false);
   assert.equal(t.saved().length, 1, "查不动就不敢下结论,记录留着");
   assert.equal(t.observed.alerts, 1);
+});
+
+// ── 2026-09-23 review:0.8.46 的复核号称 fail-closed,在最常见的故障形态下是 fail-open ──
+// bridgeFetch 对非 2xx 不抛异常,本地 /poll 连不上 Modal 时回 502 {error}、没有 status。
+// 0.8.46 只 catch 了 throw,测试也只 mock 了 throw —— 所以测试全绿给的是假保证。
+// 下面这几条全部用**真实会出现的响应形态**,不再只模拟抛异常。
+
+const GONE = {ok: true, json: async () => ({id: "job", status: "not_found", error: "job not found"})};
+const r502 = {ok: false, status: 502, json: async () => ({error: "upstream timeout"})};
+
+test("复核遇到本地 /poll 502 {error}:按'没确认'处理,绝不说'不再计费'", async () => {
+  const t = setup({cancelSeq: [GONE], pollSeq: [r502]});
+  t.sandbox.addActiveJob({jobId: "job", startedAt: Date.now()});
+  await t.sandbox.requestCancel("job", t.context(), null);
+  assert.equal(t.saved().length, 1, "Modal 不可达时删记录 = 任务可能在跑却没人管");
+  assert.equal(t.observed.alerts, 1);
+  assert(!t.observed.notifies.includes("cancel.gone_msg"),
+    "不能对用户说'没有任务在跑,也不会继续计费'——这正是 0.8.46 的 fail-open");
+});
+
+test("复核遇到 200 但缺 status 的 {error}:同样按'没确认'处理", async () => {
+  const t = setup({cancelSeq: [GONE],
+                   pollSeq: [{ok: true, json: async () => ({error: "weird"})}]});
+  t.sandbox.addActiveJob({jobId: "job", startedAt: Date.now()});
+  await t.sandbox.requestCancel("job", t.context(), null);
+  assert.equal(t.saved().length, 1);
+  assert(!t.observed.notifies.includes("cancel.gone_msg"));
+});
+
+test("复核看到 completed:按'取消没赶上'取回产物,不报假警报", async () => {
+  const t = setup({cancelSeq: [GONE], status: "completed"});
+  t.sandbox.addActiveJob({jobId: "job", startedAt: Date.now()});
+  await t.sandbox.requestCancel("job", t.context(), null);
+  assert.equal(t.observed.fetches, 1, "已付费的产物必须取回");
+  assert.equal(t.observed.alerts, 0, "对已结束的任务报'可能仍在计费'是假警报");
+  assert.equal(t.saved().length, 0);
+});
+
+test("复核看到 failed:如实收尾,不报'可能仍在计费'", async () => {
+  const t = setup({cancelSeq: [GONE], status: "failed"});
+  t.sandbox.addActiveJob({jobId: "job", startedAt: Date.now()});
+  await t.sandbox.requestCancel("job", t.context(), null);
+  assert.equal(t.observed.alerts, 0);
+  assert.equal(t.observed.fetches, 0);
+  assert.equal(t.saved().length, 0);
+});
+
+test("复核看到 running:重发取消,真正止损", async () => {
+  const cancelled = {ok: true, json: async () => ({id: "job", status: "cancelled"})};
+  const t = setup({cancelSeq: [GONE, cancelled], status: "running"});
+  t.sandbox.addActiveJob({jobId: "job", startedAt: Date.now()});
+  await t.sandbox.requestCancel("job", t.context(), null);
+  assert.equal(t.observed.cancels, 2, "看到它活着就该对它再发一次取消");
+  assert.equal(t.observed.alerts, 0, "重发成功就不该再吓用户");
+  assert.equal(t.saved().length, 0);
+});
+
+test("复核窗口跟轮询间隔走,不写死(依据是最终一致的时间窗,不是次数)", async () => {
+  const t = setup({cancelGone: true, status: "not_found"});
+  t.sandbox.getSetting = (key, dflt) => key === "ModalBridge.pollIntervalSec" ? 2 : dflt;
+  t.sandbox.addActiveJob({jobId: "job", startedAt: Date.now()});
+  await t.sandbox.requestCancel("job", t.context(), null);
+  assert.equal(t.observed.sleeps.length, NOT_FOUND_STREAK - 1);
+  assert(t.observed.sleeps.every((ms) => ms === 2000),
+    `复核间隔必须等于轮询间隔 2000ms,实际 ${t.observed.sleeps}`);
+});
+
+test("复核期间卡片显示'确认中',不停在乐观的 Cancelled 上", async () => {
+  const t = setup({cancelGone: true, status: "not_found"});
+  t.sandbox.addActiveJob({jobId: "job", startedAt: Date.now()});
+  await t.sandbox.requestCancel("job", t.context(), null);
+  assert.equal(t.observed.finishes[0], "cancel.confirming", t.observed.finishes);
+  assert.equal(t.observed.finishes.at(-1), "cancel.gone");
+});
+
+test("刷新恢复:502 {error} 夹在 not_found 之间既不计数也不清零", async () => {
+  // 0.8.46 之前 recoverOne 只防 throw,502 {error} 会落到下面把连续计数清零,永远凑不满。
+  const nf = {ok: true, json: async () => ({status: "not_found", error: "job not found"})};
+  const seq = [];
+  for (let i = 0; i < NOT_FOUND_STREAK; i++) seq.push(nf, r502);
+  const t = setup({pollSeq: seq});
+  const job = {jobId: "job", startedAt: Date.now()};
+  t.sandbox.addActiveJob(job);
+  await t.sandbox.recoverOne(job, 1200);
+  assert.equal(t.saved().length, 0, "凑满 NOT_FOUND_STREAK 次肯定的 not_found 后应当收工");
 });
