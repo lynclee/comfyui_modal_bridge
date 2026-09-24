@@ -87,7 +87,8 @@ def list_comfyui_tags(repo: str = COMFYUI_REPO, timeout: int = 20) -> list[str]:
         return []
 
 
-def resolve_comfyui_tag(version: str, tags: list[str], prev_tag: str = "") -> tuple[str, str]:
+def resolve_comfyui_tag(version: str, tags: list[str], prev_tag: str = "",
+                        pin: str = "") -> tuple[str, str]:
     """纯函数:本机版本 + 可用 tag 列表 (+ 上次部署的 tag) → (选用的 tag, 警告说明)。
     精确命中 → ('vX.Y.Z', '')。无精确 → 取 semver 距离最近的(平手取更老的 ≤ 本机,避免云端比本地新),
     返回说明。
@@ -99,6 +100,13 @@ def resolve_comfyui_tag(version: str, tags: list[str], prev_tag: str = "") -> tu
         镜像 build 时 git clone 会**明确失败**,远好过静默装一个老版本。
       · 本机版本未知 → 沿用上次部署的 tag(它至少是上次跑通过的)。
       · 两者都没有 → 才用默认值,并在说明里写清楚。"""
+    # 钉住(config 的 comfyui_tag_pin):云端版本不再跟随本机。用于「本机 Desktop 还没出新版,但云端
+    # 要先升」—— 没有它,面板里下一次「推送到云端」会按本机版本把云端退回去。说明里必须写清楚,
+    # 否则这种「故意不一致」和「跟随失败」在部署日志里分不出来。
+    pinned = (pin or "").strip()
+    if pinned:
+        return pinned, (f"云端 ComfyUI 钉在 {pinned}(config 的 comfyui_tag_pin),不跟随本机 "
+                        f"{version or '未知'};要恢复跟随就清空这个字段")
     lv = _parse_ver(version)
     prev = (prev_tag or "").strip()
     if not lv:

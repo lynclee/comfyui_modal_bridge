@@ -1628,7 +1628,8 @@ def _setup_routes():
         comfyui_version = node_sync.detect_local_comfyui_version()
         _tags = await asyncio.to_thread(node_sync.list_comfyui_tags)
         comfyui_tag, _tag_note = node_sync.resolve_comfyui_tag(
-            comfyui_version, _tags, prev_tag=cfg.get("comfyui_tag", ""))
+            comfyui_version, _tags, prev_tag=cfg.get("comfyui_tag", ""),
+            pin=cfg.get("comfyui_tag_pin", ""))
         # ⚠ 必须在 cfg.update 之前取:那一步会用新值覆盖 comfyui_tag,取晚了永远相等。
         _tag_change = node_sync.comfyui_tag_change_note(cfg.get("comfyui_tag"), comfyui_tag)
 

@@ -2126,6 +2126,17 @@ def test_every_health_reader_goes_through_the_shared_rules():
     assert "-health.modal.run" not in ns, "node_sync 里又自己拼了一份 /health URL"
 
 
+def test_comfyui_tag_pin_overrides_following_the_local_version():
+    """本机 Desktop 还没出新版、云端要先升时用。没有钉,面板下一次部署会按本机版本把云端退回去。"""
+    tag, note = node_sync.resolve_comfyui_tag("0.34.6", ["v0.34.6", "v0.37.2"], prev_tag="v0.37.2",
+                                              pin="v0.37.2")
+    assert tag == "v0.37.2", "钉住时必须用钉的版本,不能按本机 0.34.6 退回去"
+    assert "comfyui_tag_pin" in note and "0.34.6" in note, "日志要写清是故意不一致、以及怎么恢复"
+    assert node_sync.resolve_comfyui_tag("0.34.6", ["v0.34.6"], pin="")[0] == "v0.34.6", "不钉照常跟随"
+    body = code_only((ROOT / "routes.py").read_text(encoding="utf-8"))
+    assert 'pin=cfg.get("comfyui_tag_pin", "")' in body, "GUI 部署没把钉传进去"
+
+
 def test_estimate_vram_video_v2_anchors():
     """激活公式的三个实测锚点(MiniMax H3,主模型 20GB):
     0.9MP×362 帧应放行 48G 卡(实测峰值 38-40G 无 offload);2K×362 应对 80G 卡报警(实测 offload)。

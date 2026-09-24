@@ -100,6 +100,7 @@ DEFAULT_CONFIG = {
     # Vercel Protection 旁路密钥(可选,仅生产域名被保护时需要)。存本地 + Modal Secret,
     # /config 永不回吐(同 bridge_api_key),页面只显示「已保存」。
     "aigc_bypass_secret": "",
+    "comfyui_tag_pin": "",  # 非空 = 云端 ComfyUI 钉在这个 tag,不跟随本机 Desktop(见 node_sync.resolve_comfyui_tag)
     "hf_token": "",        # 持久化:Secret 是 --force 整份重建的,不存就会在下次部署时被抹掉
     "civitai_token": "",
 
