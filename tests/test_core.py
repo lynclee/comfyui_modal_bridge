@@ -1802,6 +1802,70 @@ def test_worktree_dirty_ignores_runtime_junk_but_catches_uncommitted_code(tmp_pa
     assert node_sync.worktree_dirty(tmp_path) is True, "已跟踪文件的任何改动照旧算"
 
 
+# ── P3 #10 GC 不再每次 /run 全量拉两遍 ─────────────────────────────────────
+class _CountingDict(dict):
+    """记录 items() 被调了几次 —— 每调一次就是把整个 Dict(含 base64 产物)拉一遍。"""
+    pulls = 0
+
+    def items(self):
+        type(self).pulls += 1
+        return super().items()
+
+
+def test_sweep_pulls_the_dict_once_even_when_the_count_cap_kicks_in():
+    import time as _time
+    _CountingDict.pulls = 0
+    state = _CountingDict({f"j{i}": {"status": "completed", "completed_at": _time.time() - i}
+                           for i in range(5)})
+    sweep = _load_sweep(state, lambda path, recursive=False: None, job_max=2)
+    sweep()
+    assert _CountingDict.pulls == 1, f"一次 sweep 拉了 {_CountingDict.pulls} 遍整个 Dict"
+    assert len(state) == 2, f"数量兜底没生效: {sorted(state)}"
+
+
+def test_sweep_is_throttled_per_container():
+    """一串连续提交时,每次 /run 都全量拉一遍 Dict 会吃掉 run_endpoint 的超时。"""
+    import time as _time
+    _CountingDict.pulls = 0
+    state = _CountingDict({"j": {"status": "completed", "completed_at": _time.time() - 99999}})
+    sweep = _load_sweep(state, lambda path, recursive=False: None)
+    sweep.__globals__["_SWEEP_EVERY_S"] = 60
+    sweep.__globals__["_last_sweep"] = [0.0]
+    sweep(); sweep(); sweep()
+    assert _CountingDict.pulls == 1, f"60s 内扫了 {_CountingDict.pulls} 次"
+
+
+def test_status_treats_non_job_keys_as_not_found():
+    """拿 "<id>:call" 这类独立键当 job_id 查,以前 {**s} 对字符串展开直接 500。"""
+    state = {"j:call": "fc-123", "j:progress": {"step": 1}}
+    fn = _load_endpoint("status_endpoint", _status_ns(state))
+    assert fn("j:call")["status"] == "not_found"
+
+
+# ── P3 #11 async 路由里不许直接做阻塞 I/O ───────────────────────────────────
+def test_async_routes_do_not_block_the_event_loop():
+    """routes 跑在 ComfyUI 的事件循环里:同步做 git / Modal SDK / 读大文件 / 递归扫目录,
+    期间 websocket 进度、别的请求、版本检查全部卡住 —— 注释里记过的「/version 6s 超时误判」
+    就是这么来的(2026-09-23 review)。这类调用必须经 asyncio.to_thread。"""
+    import ast
+    import re as _re
+    src = (ROOT / "routes.py").read_text(encoding="utf-8")
+    blocking = _re.compile(r"^(node_sync\.(plan_node_sync)|local_nodes\.(list_volume_local_nodes|"
+                           r"remove_volume_local_node|expected_digests|plan_local_uploads|"
+                           r"upload_local_nodes)|_read_input_as_b64|resolver)$")
+    offenders = []
+    for fn in ast.walk(ast.parse(src)):
+        if not isinstance(fn, ast.AsyncFunctionDef):
+            continue
+        # 嵌套的同步 def(交给线程跑的 work / do_upload / _sizes 之类)里面的调用不算
+        nested = {id(n) for d in ast.walk(fn) if isinstance(d, (ast.FunctionDef, ast.Lambda))
+                  for n in ast.walk(d)}
+        for n in ast.walk(fn):
+            if isinstance(n, ast.Call) and id(n) not in nested and blocking.match(ast.unparse(n.func)):
+                offenders.append(f"{fn.name}:{n.lineno} {ast.unparse(n.func)}()")
+    assert not offenders, "这些阻塞调用直接跑在事件循环里:\n  " + "\n  ".join(offenders)
+
+
 def test_estimate_vram_video_v2_anchors():
     """激活公式的三个实测锚点(MiniMax H3,主模型 20GB):
     0.9MP×362 帧应放行 48G 卡(实测峰值 38-40G 无 offload);2K×362 应对 80G 卡报警(实测 offload)。
@@ -2442,6 +2506,7 @@ def _load_sweep(job_state, remove_file, *, budget=10, ttl=3600, job_max=200):
         "JOB_TTL_S": ttl, "JOB_MAX": job_max, "_VOL_GC_PER_SWEEP": budget,
         "print": lambda *a, **k: None,
         "_stale_reason": lambda s, now: "",
+        "_SWEEP_EVERY_S": 0, "_last_sweep": [0.0],      # 默认关节流,节流另有专门测试
         "_is_already_gone": _extract_nested(ROOT / "modal_app" / "modal_app.py",
                                             "_is_already_gone", {}),
     }

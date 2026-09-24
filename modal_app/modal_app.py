@@ -141,10 +141,23 @@ def _is_already_gone(e: BaseException) -> bool:
             or "no such file or directory" in str(e).lower())
 
 
+# GC 节流:每个 run_endpoint 容器最多每 _SWEEP_EVERY_S 秒扫一次。
+# ⚠ job_state.items() 会把**所有条目的完整值**拉回来 —— 包括最多 JOB_MAX 个已完成任务里的
+#   base64 产物,动辄几百 MB。以前每次 /run 都拉(而且拉两遍),一串连续提交时每次都要先
+#   传输并反序列化整个 Dict,run_endpoint 的 60s 超时很容易被吃掉(2026-09-23 review)。
+#   GC 本来就是 best-effort,晚一分钟回收无所谓。节流状态放模块级(每容器),不放 Dict —— 放 Dict
+#   里就成了一个非 job 的条目,得在所有遍历处特判。
+_SWEEP_EVERY_S = 60
+_last_sweep = [0.0]
+
+
 def _sweep_job_state():
     """best-effort 清理过期/超量的终态 job。任何异常都不影响主流程。"""
+    now = time.time()
+    if now - _last_sweep[0] < _SWEEP_EVERY_S:
+        return
+    _last_sweep[0] = now
     try:
-        now = time.time()
         items = list(job_state.items())
     except Exception:
         return
@@ -159,6 +172,7 @@ def _sweep_job_state():
             # worker 早被杀了、没人写终态:按 started_at 当作已结束参与过期回收,否则永不 GC。
             finished.append((jid, s.get("started_at") or 0))
     vol_gc_budget = _VOL_GC_PER_SWEEP
+    dropped = set()
 
     def _drop(jid):
         """清一个终态 job。返回 False = 本次 Volume 预算已用完,**什么都没动**(索引留着,
@@ -196,15 +210,15 @@ def _sweep_job_state():
                 del job_state[k]
             except Exception:
                 pass
+        dropped.add(jid)
         return True
     # 1) 过期删
     for jid, done_at in finished:
         if done_at and now - done_at > JOB_TTL_S:
             _drop(jid)
-    # 2) 数量兜底:仍超上限就删最旧的终态条目
+    # 2) 数量兜底:仍超上限就删最旧的终态条目。用同一份快照算,**不再拉第二遍**(每拉一遍都是全量值)。
     try:
-        remaining = [(j, s.get("completed_at") or 0) for j, s in job_state.items()
-                     if isinstance(s, dict) and s.get("status") in terminal]
+        remaining = [(j, t) for j, t in finished if j not in dropped]
         if len(remaining) > JOB_MAX:
             remaining.sort(key=lambda x: x[1])
             for jid, _ in remaining[: len(remaining) - JOB_MAX]:
@@ -956,7 +970,9 @@ def status_endpoint(job_id: str, key: str = "", x_bridge_key: str = _Header(""))
     if deny:
         return deny
     s = job_state.get(job_id)
-    if not s:
+    if not isinstance(s, dict) or not s:
+        # 非 dict:有人拿 "<id>:call" 这类独立键当 job_id 来查 —— 它不是任务记录,当查无此 job,
+        # 别让下面的 {**s} 对字符串展开抛 500。
         # ⚠ 必须带 status 字段。只回 {"error": ...} 的话,客户端归一状态时会落进「未知 → 兜底」,
         #   而最保守的兜底恰好是 running(猜 completed 等于假装有产物,猜 failed 等于把还在
         #   烧钱的任务当结束)—— 于是一条被 GC 清掉的任务被读成「还在跑」,永远不收敛。

@@ -318,3 +318,29 @@ if __name__ == "__main__":
             failed += 1
     print(f"\n{passed} passed, {failed} failed")
     raise SystemExit(1 if failed else 0)
+
+
+def test_sync_models_never_trusts_local_path_from_the_request_body():
+    """以前 local_path 原样交给 upload_models(只查 is_file):发一个指向 ~/.ssh 的路径,
+    就能把任意本地文件传上 Volume,本地模型路径囚笼等于白做(2026-09-23 review)。
+    现在一律用服务端(带囚笼的)解析器重新定位,解析不到的拒绝。"""
+    import comfyui_modal_bridge.routes as rt
+    seen = {}
+    rt.modal_volume.modal_importable = lambda: True
+    rt.modal_volume.upload_models = lambda cfg, items, on_progress=None: (
+        seen.setdefault("items", items) and {"uploaded": [], "skipped": [], "total_mb": 0})
+    rt._local_model_resolver = lambda: (
+        lambda t, fn: Path("/models/checkpoints/ok.safetensors") if fn == "ok.safetensors" else None)
+
+    async def ask(c):
+        r = await c.post("/modal_bridge/sync_models", json={"items": [
+            {"type": "checkpoints", "filename": "ok.safetensors", "local_path": "/Users/me/.ssh/id_ed25519"},
+            {"type": "checkpoints", "filename": "nope.safetensors", "local_path": "/etc/passwd"},
+        ]})
+        return r.status, await r.text()
+    st, text = _run(ask)
+    assert st == 200, text
+    paths = [it["local_path"] for it in seen.get("items", [])]
+    assert paths == ["/models/checkpoints/ok.safetensors"], \
+        f"请求体里的 local_path 被原样用了,或解析不到的没被拒: {paths}"
+    assert "nope.safetensors" in text, "被拒的要在输出里说明"

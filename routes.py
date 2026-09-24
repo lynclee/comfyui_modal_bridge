@@ -838,7 +838,9 @@ def _setup_routes():
 
         try:
             image_names = _extract_input_image_names(prompt)
-            input_images = [_read_input_as_b64(n) for n in image_names]
+            # 读盘 + base64 放线程里:参考视频动辄几十 MB,在事件循环里做会冻结整个 ComfyUI
+            input_images = await asyncio.to_thread(
+                lambda: [_read_input_as_b64(n) for n in image_names])
         except FileNotFoundError as e:
             return web.json_response({"error": str(e)}, status=400)
         except Exception as e:
@@ -855,7 +857,7 @@ def _setup_routes():
         local_digests = body.get("local_nodes") if isinstance(body.get("local_nodes"), dict) else None
         if local_digests is None:
             try:
-                plan = node_sync.plan_node_sync(prompt)
+                plan = await asyncio.to_thread(node_sync.plan_node_sync, prompt)   # 每个节点目录跑 git
                 # 没走前端预检的调用方也必须声明 baked 期望,否则历史本地覆盖包会在暖容器里
                 # 永久存活。digest 与 sentinel 共用一个 map,worker 能统一做版本闸门。
                 local_digests = {
@@ -864,7 +866,8 @@ def _setup_routes():
                 }
                 folders = [p["folder"] for p in plan.get("local_pack", [])]
                 if folders:
-                    local_digests.update(local_nodes.expected_digests(
+                    local_digests.update(await asyncio.to_thread(   # 对整个节点目录做哈希
+                        local_nodes.expected_digests,
                         folders, Path(node_sync._comfyui_root()) / "custom_nodes"))
             except Exception as e:
                 print(f"[modal_bridge] 本地节点指纹计算跳过: {e}")
@@ -1088,19 +1091,26 @@ def _setup_routes():
             return web.json_response({"error": "prompt required"}, status=400)
         required = extract_required_models(prompt)
         resolver = _local_model_resolver()
-        total_bytes, largest_bytes, known, unknown = 0, 0, 0, []
-        for m in required:
-            p = resolver(m["type"], m["filename"])
-            try:
-                if p and Path(p).exists():
-                    sz = Path(p).stat().st_size
-                    total_bytes += sz
-                    largest_bytes = max(largest_bytes, sz)
-                    known += 1
-                else:
-                    unknown.append(f"{m['type']}/{m['filename']}")
-            except OSError:
-                unknown.append(f"{m['type']}/{m['filename']}")
+
+        def _sizes():
+            # 放线程里:解析器找不到时会递归 rglob 整个模型目录(Desktop 按子目录归类模型时),
+            # 在事件循环里做会冻结整个 ComfyUI。
+            total, largest, kn, unk = 0, 0, 0, []
+            for m in required:
+                p = resolver(m["type"], m["filename"])
+                try:
+                    if p and Path(p).exists():
+                        sz = Path(p).stat().st_size
+                        total += sz
+                        largest = max(largest, sz)
+                        kn += 1
+                    else:
+                        unk.append(f"{m['type']}/{m['filename']}")
+                except OSError:
+                    unk.append(f"{m['type']}/{m['filename']}")
+            return total, largest, kn, unk
+
+        total_bytes, largest_bytes, known, unknown = await asyncio.to_thread(_sizes)
         # 按类别估显存。视频优先激活公式(最大模型常驻 + W×H×帧数,实测校准,见 categories.py);
         # 工作流里抠不出尺寸字面量时回退旧的「权重总和×系数」保守公式(basis 标明用的哪个)。
         category = categories.classify(prompt)
@@ -1144,6 +1154,34 @@ def _setup_routes():
 
         if not modal_volume.modal_importable():
             await _emit(resp, "✗ 本地没装 modal,无法上传\n\n__DEPLOY_DONE__ rc=1\n")
+            await resp.write_eof()
+            return resp
+
+        # ⚠ 不信请求体里的 local_path —— 用服务端带路径囚笼的解析器重新定位。以前原样交给
+        #   upload_models(只查 is_file),发一个 local_path="/Users/me/.ssh/id_ed25519" 就能把
+        #   任意本地文件传上 Volume,find_local_model / is_path_within_roots 那道囚笼等于白做
+        #   (2026-09-23 review)。正常流程里这个值本来就是 /check_models 用同一个解析器算出来的,
+        #   重新解析结果一致;解析不到的一律拒。远端路径那一半由 modal_volume.model_relpath 把关。
+        resolver = _local_model_resolver()
+
+        def _reresolve():
+            ok, bad = [], []
+            for it in items:
+                if not isinstance(it, dict):
+                    bad.append(repr(it)[:80])
+                    continue
+                p = resolver(it.get("type"), it.get("filename"))
+                if p is None:
+                    bad.append(f"{it.get('type')}/{it.get('filename')}")
+                    continue
+                ok.append({**it, "local_path": str(p)})
+            return ok, bad
+
+        items, rejected = await asyncio.to_thread(_reresolve)
+        for b in rejected:
+            await _emit(resp, f"  ✗ 本地找不到(或不在模型目录内),跳过:{b}\n")
+        if not items:
+            await _emit(resp, "\n__DEPLOY_DONE__ rc=1\n")
             await resp.write_eof()
             return resp
 
@@ -1362,7 +1400,8 @@ def _setup_routes():
         cfg = cfg_mod.load_config()
         if not modal_volume.modal_importable():
             return web.json_response({"ok": False, "nodes": [], "error": "modal 未安装"})
-        return web.json_response({"ok": True, "nodes": local_nodes.list_volume_local_nodes(cfg)})
+        nodes = await asyncio.to_thread(local_nodes.list_volume_local_nodes, cfg)   # Modal SDK,同步
+        return web.json_response({"ok": True, "nodes": nodes})
 
     @routes.post("/modal_bridge/remove_local_node")
     @_admin_only
@@ -1376,7 +1415,7 @@ def _setup_routes():
         if not modal_volume.modal_importable():
             return web.json_response({"ok": False, "error": "modal 未安装,无法操作 Volume"},
                                      status=503)
-        r = local_nodes.remove_volume_local_node(cfg, folder)
+        r = await asyncio.to_thread(local_nodes.remove_volume_local_node, cfg, folder)   # Modal SDK
         return web.json_response({**r, "folder": folder},
                                  status=200 if r["ok"] else 502)
 
@@ -1442,10 +1481,13 @@ def _setup_routes():
         except Exception as e:
             print(f"[modal_bridge] check_nodes: /health 不可达,回退本地清单 ({e})")
 
-        result = node_sync.plan_node_sync(prompt, baked=baked)
+        # 每次点 RunModal 都会调这里:同步跑的话,每个节点目录 5 次 git 子进程(各 10s 超时)
+        # + 未命中缓存的 Modal SDK 查询 0.8~2.4s,期间 websocket 进度、别的请求、版本检查全卡住
+        # —— 注释里记过的「/version 6s 超时误判」就是这么来的(2026-09-23 review)。
+        result = await asyncio.to_thread(node_sync.plan_node_sync, prompt, baked=baked)
         # 只对 Volume 中实际存在的旧覆盖包发删除请求；expect_baked 仍保留全部应跑镜像版
         # 的节点,用于修复已解压旧包的暖容器以及列表查询暂时失败的情况。
-        volume_local = set(local_nodes.list_volume_local_nodes(cfg))
+        volume_local = set(await asyncio.to_thread(local_nodes.list_volume_local_nodes, cfg))
         result["local_remove"] = sorted(set(result.get("expect_baked", [])) & volume_local)
         result["ok"] = True
         result["source"] = source
