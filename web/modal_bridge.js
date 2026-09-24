@@ -1217,6 +1217,8 @@ async function settleCancel(jobId, d, ctx, wfName) {
     }
   } else if (d.status === "cancelled" || d.status === "failed") {
     removeActiveJob(jobId);
+    // 取消没赶上、任务其实是失败的:如实显示失败原因,别停在乐观的 "✕ Cancelled" 上
+    if (d.cancel_noop && d.status === "failed" && ctx) ctx.finish(false, "✗ Failed", d.error || "");
   }
   return d;
 }
@@ -1287,6 +1289,10 @@ async function requestCancel(jobId, ctx, wfName = null, retried = false) {
     //   任务根本不存在,却让用户去控制台找一个不存在的容器:假警报比不报更糟。
     //   (这是把「缺字段」改成「显式 error」的副作用 —— 契约修好了,旧调用方反而更难发现。)
     if (d.status === "not_found") return await onCancelNotFound(jobId, ctx, wfName, retried);
+    // 取消没赶上:任务已经自己结束了(完成 / 失败 / worker 早已死)。这时响应里带的 error 是
+    // **任务的**失败原因,不是取消失败 —— 不能掉进下面「取消失败,云端可能仍在运行并计费」的分支,
+    // 那句对一个已经结束的任务正好说反(2026-09-24 review #12)。
+    if (d.cancel_noop) return await settleCancel(jobId, d, ctx, wfName);
     if (!r.ok || d.ok === false || d.error) {
       const msg = d.error || `HTTP ${r.status}`;
       err("cancel failed", msg);

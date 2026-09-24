@@ -293,3 +293,16 @@ test("刷新恢复:502 {error} 夹在 not_found 之间既不计数也不清零",
   await t.sandbox.recoverOne(job, 1200);
   assert.equal(t.saved().length, 0, "凑满 NOT_FOUND_STREAK 次肯定的 not_found 后应当收工");
 });
+
+test("取消没赶上、任务其实失败了:显示失败原因,不弹「可能仍在计费」", async () => {
+  // 取消一个已结束(失败 / worker 早已死)的任务时,响应里的 error 是**任务的**失败原因。
+  // 以前它掉进「取消失败,云端可能仍在运行并计费」分支 —— 对已结束的任务正好说反(review #12)。
+  const failed = {ok: true, json: async () => ({id: "job", status: "failed",
+    error: "worker 超过部署时的超时上限 1200s 仍未写回结果 —— 已被 Modal 强杀", cancel_noop: true})};
+  const t = setup({cancelSeq: [failed]});
+  t.sandbox.addActiveJob({jobId: "job", startedAt: Date.now()});
+  await t.sandbox.requestCancel("job", t.context(), null);
+  assert.equal(t.observed.alerts, 0, "对已结束的任务弹「可能仍在计费」是假警报");
+  assert.equal(t.saved().length, 0, "任务已结束,恢复记录该清");
+  assert.equal(t.observed.finishes.at(-1), "✗ Failed", t.observed.finishes);
+});

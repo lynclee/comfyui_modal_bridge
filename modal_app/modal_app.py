@@ -106,12 +106,23 @@ def _safe_job_id(job_id) -> bool:
 # 所以用确定性规则:非终态条目超过部署时的 worker 超时上限,Modal 必然已经把它杀了。
 # 代价:OOM / 崩溃要到超时才被判定 —— 有上界,远好过永远 running。
 _STALE_GRACE_S = 120
+# queued 的判死线。排队不计费、也可能只是在等 GPU(B200 之类可能排很久),所以给得很宽 ——
+# 这条只为兜住「容器在 @modal.enter 就失败(镜像 / 依赖 / ComfyUI 起不来)」:run() 根本不会执行,
+# 状态永远 queued,不回收、Dict 一直涨,CLI / MCP 一直等(2026-09-24 review #12)。
+_QUEUE_STALE_S = 6 * 3600
 
 
 def _stale_reason(s, now: float) -> str:
-    """非终态条目若已超过 worker 超时上限 + 宽限,返回失败说明;否则空串。
-    只判已开跑的(running / delivering 有 started_at)—— queued 可能只是在排 GPU,不计费。"""
-    if not isinstance(s, dict) or s.get("status") not in ("running", "delivering"):
+    """非终态条目若 worker 必然已死 / 从没起来,返回失败说明;否则空串。"""
+    if not isinstance(s, dict):
+        return ""
+    if s.get("status") == "queued":
+        t0 = s.get("queued_at") or 0
+        if t0 and now - t0 > _QUEUE_STALE_S:
+            return (f"排队超过 {_QUEUE_STALE_S // 3600} 小时仍未开始执行 —— worker 多半在启动阶段就失败了"
+                    f"(镜像 / 依赖 / ComfyUI 起不来),排队期间不计费。可在 Modal 控制台看该调用的日志。")
+        return ""
+    if s.get("status") not in ("running", "delivering"):
         return ""
     t0 = s.get("started_at") or 0
     # ⚠ 用任务**起跑时**记下的超时,不能用当前部署的 WORKER_TIMEOUT:调小超时并重部署时,
@@ -122,6 +133,19 @@ def _stale_reason(s, now: float) -> str:
         return (f"worker 超过部署时的超时上限 {limit}s 仍未写回结果 —— 已被 Modal 强杀"
                 f"(超时 / OOM / 容器崩溃),这段时间已计费。可在 Modal 控制台看该调用的日志。")
     return ""
+
+
+def _effective(s, now: float):
+    """**所有**读取方共用的实际状态:非终态但 worker 必然已死 / 从没起来 → 视为 failed(附原因)。
+    没变返回原对象,变了返回新 dict —— 调用方用 `is` 判断要不要写回。
+
+    ⚠ 以前这个判断只在 status 和 GC 两处:/run 仍把死任务当活的(rerun=1 也被当成重复提交挡掉),
+      /cancel 去取消一个早已结束的调用,报「取消失败」、前端据此提示「可能仍在计费」,正好说反
+      (2026-09-24 review #12)。"""
+    reason = _stale_reason(s, now)
+    if not reason:
+        return s
+    return {**s, "status": "failed", "error": reason, "completed_at": now}
 
 
 def _call_id(job_id: str) -> str:
@@ -173,8 +197,8 @@ def _sweep_job_state():
         if s.get("status") in terminal:
             finished.append((jid, s.get("completed_at") or 0))
         elif _stale_reason(s, now):
-            # worker 早被杀了、没人写终态:按 started_at 当作已结束参与过期回收,否则永不 GC。
-            finished.append((jid, s.get("started_at") or 0))
+            # worker 早被杀了 / 从没起来、没人写终态:按开始(或入队)时间当作已结束参与过期回收,否则永不 GC。
+            finished.append((jid, s.get("started_at") or s.get("queued_at") or 0))
     vol_gc_budget = _VOL_GC_PER_SWEEP
     dropped = set()
 
@@ -509,12 +533,14 @@ def _worker_run(workflow: dict, job_id: str, input_images: list | None = None,
     print(f"[bridge] job {job_id} start container={_container_id()} "
           f"call={modal.current_function_call_id() or '?'}")
     cur = job_state.get(job_id) or {}
-    if cur.get("status") == "cancelled":
-        # 用户在 /run 之后、worker 起跑之前就取消了(上面还等了最多 5s 的 call_id)。
-        # 别再写 running 把它覆盖掉,也别开跑烧 GPU。/run 每次都会写一条新的 queued,
-        # 所以这里看到 cancelled 只可能是这一轮的取消,不会误伤 rerun。
-        print(f"[bridge] job {job_id}: 起跑前已被取消,不执行")
-        return {"cancelled": True}
+    if cur.get("status") in ("cancelled", "failed"):
+        # cancelled:用户在 /run 之后、worker 起跑之前就取消了(上面还等了最多 5s 的 call_id)。
+        # failed:排队太久已被判死(_stale_reason),客户端已被告知失败、停止轮询 —— 再跑就是白付钱、
+        #   产物也没人取。本 app 没配自动重试,run() 里写 failed 的路径又是写完就抛、进不到这里,
+        #   所以起跑时看到 failed 只可能是被判死的。
+        # 别写 running 把它覆盖掉,也别开跑烧 GPU。/run 每次都写一条新的 queued,不会误伤 rerun。
+        print(f"[bridge] job {job_id}: 起跑前已是 {cur.get('status')},不执行")
+        return {"skipped": cur.get("status")}
     job_state[job_id] = {**cur, "status": "running", "started_at": time.time(),
                          "timeout_s": WORKER_TIMEOUT}   # 按任务记超时,见 _stale_reason
     try:
@@ -926,6 +952,8 @@ def run_endpoint(payload: dict):
     # spawn 过了 —— 响应丢在网关不代表任务没跑。
     rerun = bool(payload.get("rerun"))
     prior = job_state.get(job_id)
+    if isinstance(prior, dict):
+        prior = _effective(prior, time.time())   # 死任务按 failed 看:rerun=1 应能重跑,而不是被当成还在跑
     prior_status = prior.get("status") if isinstance(prior, dict) else None
     # (a) 非终态:一律不再 spawn,连 rerun 也不给绕 —— 那会开出第二个同样的 GPU 任务,
     #     双跑双计费,而调用方只看得到后一个。要重跑得先取消。
@@ -1010,11 +1038,11 @@ def status_endpoint(job_id: str, key: str = "", x_bridge_key: str = _Header(""))
         #   条目在另一个容器上可能短暂读不到。客户端必须连续看到几次才作数(见 bridge_client.wait)。
         return {"error": "job not found", "id": job_id, "status": "not_found"}
     now = time.time()
-    reason = _stale_reason(s, now)
-    if reason:
-        # worker 必然已被 Modal 杀掉(见 _stale_reason),没有竞态可言 —— 落成 failed,
+    eff = _effective(s, now)
+    if eff is not s:
+        # worker 必然已死 / 从没起来(见 _stale_reason),没有竞态可言 —— 落成 failed,
         # 调用方拿到真因,而不是空等到自己的超时再报一个错的原因。
-        s = {**s, "status": "failed", "error": reason, "completed_at": now}
+        s = eff
         try:
             job_state[job_id] = s
         except Exception:
@@ -1099,6 +1127,15 @@ def cancel_endpoint(payload: dict):
                 break
         else:
             return {"id": job_id, "status": "not_found", "error": "job not found"}
+    eff = _effective(s, time.time()) if s else s
+    if eff is not s:
+        # worker 早就死了 / 从没起来:没有正在进行的执行可取消。去 cancel 一个已结束的调用会报
+        # 「取消失败」,前端据此提示「可能仍在计费」—— 正好说反。按终态如实回,带上真因。
+        try:
+            job_state[job_id] = eff
+        except Exception:
+            pass
+        return {"id": job_id, **eff, "cancel_noop": True, "was_running": False}
     was_running = s.get("status") == "running"
     call_id = _call_id(job_id) or s.get("call_id")  # 新独立 key,兼容旧字段
     # 占位状态 = run_endpoint 正在 spawn,真实 call_id 还没写回来。这时既不能当"没有 call_id"

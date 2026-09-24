@@ -1300,12 +1300,14 @@ def _setup_routes():
                         await _emit(resp, f"== 私有节点依赖已变化({len(reqs)} 条),自动重新部署 ==\n")
                         # 同 /deploy:这里也拿本机清单当全局清单部署,先并回云端独有的节点。
                         node_sync.ensure_baked_file()
-                        _back, _lost = await asyncio.to_thread(node_sync.reconcile_baked_with_cloud, latest_cfg)
-                        if _back:
-                            await _emit(resp, f"   节点清单:并回云端独有的 {len(_back)} 个 —— {', '.join(_back)}\n")
-                        rc = await _ensure_modal(resp) if not _lost else 1
-                        if _lost:
-                            await _emit(resp, f"== ✗ {node_sync.unresolved_nodes_message(_lost)} ==\n")
+                        try:
+                            _back = await asyncio.to_thread(node_sync.reconcile_baked_with_cloud, latest_cfg)
+                            if _back:
+                                await _emit(resp, f"   节点清单:并回云端独有的 {len(_back)} 个 —— {', '.join(_back)}\n")
+                            rc = await _ensure_modal(resp)
+                        except node_sync.DeployBlocked as _blk:
+                            await _emit(resp, f"== ✗ {_blk} ==\n")
+                            rc = 1
                         if rc == 0:
                             rc = await _run_streamed(
                                 resp, node_sync.deploy_command(),
@@ -1697,15 +1699,16 @@ def _setup_routes():
             # ⚠ 本机清单是被 gitignore 的本地状态,却会被当成镜像的全局清单去部署。插件被 Manager
             #   重装、清单丢了 → 上面建出一个空清单 → 这次部署清空云端全部节点;多机时另一台加的
             #   节点也会被删。部署前先把云端有、本机没有的并回来(只加不删)。
-            _back, _lost = await asyncio.to_thread(node_sync.reconcile_baked_with_cloud, cfg)
-            if _back:
-                await _emit(resp, f"   节点清单:云端有而本机清单缺的 {len(_back)} 个已并回"
-                                  f"(不会被这次部署删掉)—— {', '.join(_back)}\n")
-            if _lost:
-                await _emit(resp, f"\n== ✗ {node_sync.unresolved_nodes_message(_lost)} ==\n")
+            try:
+                _back = await asyncio.to_thread(node_sync.reconcile_baked_with_cloud, cfg)
+            except node_sync.DeployBlocked as _blk:
+                await _emit(resp, f"\n== ✗ {_blk} ==\n")
                 await _emit(resp, "\n__DEPLOY_DONE__ rc=1\n")
                 await resp.write_eof()
                 return resp
+            if _back:
+                await _emit(resp, f"   节点清单:云端有而本机清单缺的 {len(_back)} 个已并回"
+                                  f"(不会被这次部署删掉)—— {', '.join(_back)}\n")
             await _emit(resp, "\n== 推送到云端:比对本机与云端的差异,只推有变化的部分 ==\n")
             # 3.0) 先把**本机**的私有节点推上 Volume,再去读 manifest。
             #

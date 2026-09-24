@@ -1122,6 +1122,7 @@ def _load_endpoint(name, ns):
     """把 modal_app 的某个 endpoint 函数抠出来单独跑(模块级 modal.Dict.from_name 让它 import 不进来)。
     装饰器不在 FunctionDef 的源码区间里,所以取到的就是裸函数本身。"""
     ns.setdefault("_Header", lambda default="": default)
+    ns.setdefault("_effective", lambda s, now: s)     # 默认不判死;要测判死的用 _status_ns / 显式传
     return _extract_nested(ROOT / "modal_app" / "modal_app.py", name, ns)
 
 
@@ -1431,10 +1432,13 @@ def _status_ns(job_state, worker_timeout=1200):
     """status_endpoint 的桩全局:它现在要判「worker 是否已被 Modal 杀掉」,依赖 _stale_reason。"""
     import time as _t
     stale = _extract_nested(MODAL_APP, "_stale_reason",
-                            {"WORKER_TIMEOUT": worker_timeout, "_STALE_GRACE_S": 120})
+                            {"WORKER_TIMEOUT": worker_timeout, "_STALE_GRACE_S": 120,
+                             "_QUEUE_STALE_S": 6 * 3600})
     import re as _re
     safe = _re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
+    eff = _extract_nested(MODAL_APP, "_effective", {"_stale_reason": stale})
     return {"job_state": job_state, "_check": lambda k: None, "time": _t, "_stale_reason": stale,
+            "_effective": eff,
             "_safe_job_id": lambda j: isinstance(j, str) and bool(safe.match(j)) and ".." not in j}
 
 
@@ -1577,7 +1581,8 @@ def test_sweep_collects_killed_workers_instead_of_keeping_them_forever():
     removed = []
     sweep = _load_sweep(state, lambda path, recursive=False: removed.append(path))
     sweep.__globals__["_stale_reason"] = _extract_nested(
-        MODAL_APP, "_stale_reason", {"WORKER_TIMEOUT": 1200, "_STALE_GRACE_S": 120})
+        MODAL_APP, "_stale_reason", {"WORKER_TIMEOUT": 1200, "_STALE_GRACE_S": 120,
+                                     "_QUEUE_STALE_S": 6 * 3600})
     sweep()
     assert removed == ["_outputs/dead"] and state == {}, (removed, state)
 
@@ -1688,6 +1693,7 @@ def test_complete_baked_entries_prefers_cloud_manifest():
 
 def test_reconcile_adds_back_cloud_only_nodes_and_never_removes(tmp_path, monkeypatch):
     """插件被 Manager 重装、本机清单丢了 → 一次部署清空云端全部节点。部署前并回,只加不删。"""
+    import health_client as hc
     monkeypatch.setattr(node_sync, "DATA_FILE", tmp_path / "_custom_nodes_data.py")
     monkeypatch.setattr(node_sync, "folder_git_info", lambda name: {"has_git": False})
     node_sync.write_baked_nodes([{"name": "local_only", "url": "https://x/L", "commit": "1"}])
@@ -1695,28 +1701,58 @@ def test_reconcile_adds_back_cloud_only_nodes_and_never_removes(tmp_path, monkey
                 {"name": "local_only", "url": "https://x/L", "commit": "1"}]
     monkeypatch.setattr(node_sync, "fetch_cloud_nodes",
                         lambda cfg: (["cloud_only", "local_only"], manifest))
-    back, lost = node_sync.reconcile_baked_with_cloud({})
-    assert back == ["cloud_only"] and lost == [], (back, lost)
+    assert node_sync.reconcile_baked_with_cloud({}) == ["cloud_only"]
     assert {n["name"] for n in node_sync.read_baked_nodes()} == {"local_only", "cloud_only"}
 
-    monkeypatch.setattr(node_sync, "fetch_cloud_nodes", lambda cfg: (None, None))
-    assert node_sync.reconcile_baked_with_cloud({}) == ([], []), "云端不可达 / 首次部署:无从比较"
+    def not_deployed(cfg):
+        raise hc.HealthUnavailable("not_deployed", "404")
+    monkeypatch.setattr(node_sync, "fetch_cloud_nodes", not_deployed)
+    assert node_sync.reconcile_baked_with_cloud({}) == [], "全新部署(404):没有可保护的,照常部署"
 
 
 def test_reconcile_protects_nodes_even_when_the_cloud_is_too_old_to_report_sources(tmp_path, monkeypatch):
-    """云端 < 0.8.48 没有 manifest —— 而 Registry 的 latest 还是 0.7.9,所有从 Registry 升级的用户
-    第一次部署都是这种云端。第一版此时直接什么都不做,保护恰好在最需要的升级路径上失效
-    (2026-09-24 review)。现在:本机装着的用本机 git 信息补;补不出来的必须报出来,由调用方拒绝部署。"""
+    """云端 < 0.8.48 没有 manifest —— Registry 的 latest 还是 0.7.9,所有从 Registry 升级的用户
+    第一次部署都是这种云端(2026-09-24 review)。本机装着的用本机 git 补;补不出来的必须中止部署。"""
     monkeypatch.setattr(node_sync, "DATA_FILE", tmp_path / "_custom_nodes_data.py")
-    node_sync.write_baked_nodes([])                                   # 清单丢了
+    node_sync.write_baked_nodes([])
     monkeypatch.setattr(node_sync, "fetch_cloud_nodes",
-                        lambda cfg: (["installed_here", "gone_everywhere", "private_tok"], None))
+                        lambda cfg: (["installed_here", "gone_everywhere"], None))
     monkeypatch.setattr(node_sync, "folder_git_info", lambda name: (
         {"has_git": True, "url": "https://x/installed_here", "commit": "c"} if name == "installed_here"
         else {"has_git": False}))
-    back, lost = node_sync.reconcile_baked_with_cloud({})
-    assert back == ["installed_here"], back
-    assert sorted(lost) == ["gone_everywhere", "private_tok"], "补不出来源的必须报出来,不能静默丢"
+    try:
+        node_sync.reconcile_baked_with_cloud({})
+        assert False, "补不出来源的节点必须让部署中止,不能静默删掉"
+    except node_sync.DeployBlocked as e:
+        assert "gone_everywhere" in str(e)
+    assert node_sync.read_baked_nodes() == [], "中止时不能半途写清单"
+
+
+def test_reconcile_blocks_when_the_cloud_is_unreadable_and_the_local_list_is_empty(tmp_path, monkeypatch):
+    """以前把 401、超时统统当「拿不到」,保护静默跳过(review #14)。读不到云端 + 本机清单空,
+    正是「插件重装丢了清单」的形态,贸然部署就清空云端 —— 必须中止。本机有清单则照常。"""
+    import health_client as hc
+    monkeypatch.setattr(node_sync, "DATA_FILE", tmp_path / "_custom_nodes_data.py")
+    for kind in ("unauthorized", "unreachable", "http"):
+        def boom(cfg, kind=kind):
+            raise hc.HealthUnavailable(kind, kind)
+        monkeypatch.setattr(node_sync, "fetch_cloud_nodes", boom)
+        node_sync.write_baked_nodes([])
+        try:
+            node_sync.reconcile_baked_with_cloud({})
+            assert False, f"{kind} + 本机清单为空,必须中止"
+        except node_sync.DeployBlocked:
+            pass
+        node_sync.write_baked_nodes([{"name": "a", "url": "https://x/a", "commit": "1"}])
+        assert node_sync.reconcile_baked_with_cloud({}) == [], f"{kind} + 本机有清单:尽力而为,照常部署"
+
+    # 404 = app 还没部署 / 已删:全新部署,本机清单为空是正常的(用户可能根本没有自定义节点)。
+    # 把它也当「读不到」会把第一次部署挡死。
+    def not_deployed(cfg):
+        raise hc.HealthUnavailable("not_deployed", "404")
+    monkeypatch.setattr(node_sync, "fetch_cloud_nodes", not_deployed)
+    node_sync.write_baked_nodes([])
+    assert node_sync.reconcile_baked_with_cloud({}) == [], "全新部署不能被挡"
 
 
 def test_redacted_manifest_urls_are_never_copied_back(tmp_path, monkeypatch):
@@ -1729,9 +1765,9 @@ def test_redacted_manifest_urls_are_never_copied_back(tmp_path, monkeypatch):
 
 
 def test_every_deploy_path_aborts_on_unresolvable_nodes():
-    for f in ("routes.py", "bridge_cli.py", "deploy.py"):
+    for f, n in (("routes.py", 2), ("bridge_cli.py", 1), ("deploy.py", 1)):
         body = code_only((ROOT / f).read_text(encoding="utf-8"))
-        assert "unresolved_nodes_message(" in body, f"{f} 没有在补不出来源时中止部署"
+        assert body.count("except node_sync.DeployBlocked") == n, f"{f} 没有在 DeployBlocked 时中止部署"
 
 
 def test_every_deploy_path_reconciles_before_deploying():
@@ -1948,14 +1984,15 @@ def test_cancel_is_finalised_by_the_worker_itself():
     seg = code_only(ast.get_source_segment(src, h))
     assert "InputCancellation" in seg and '"status": "cancelled"' in seg, "取消分支没有落定终态"
     body = code_only(ast.get_source_segment(src, fn))
-    i = body.index('if cur.get("status") == "cancelled":')
-    assert i < body.index('"status": "running", "started_at"'), "起跑时会覆盖已到的取消"
+    i = body.index('if cur.get("status") in ("cancelled", "failed"):')
+    assert i < body.index('"status": "running", "started_at"'), "起跑时会覆盖已到的取消 / 判死"
 
 
 def test_stale_check_uses_the_timeout_the_job_started_with():
     """调小超时并重部署时,老部署上还在跑的长任务不能被新部署按新上限判死。"""
     import time as _t
-    stale = _extract_nested(MODAL_APP, "_stale_reason", {"WORKER_TIMEOUT": 1200, "_STALE_GRACE_S": 120})
+    stale = _extract_nested(MODAL_APP, "_stale_reason", {"WORKER_TIMEOUT": 1200, "_STALE_GRACE_S": 120,
+                                                        "_QUEUE_STALE_S": 6 * 3600})
     now = _t.time()
     long_job = {"status": "running", "started_at": now - 2000, "timeout_s": 3600}
     assert stale(long_job, now) == "", "按起跑时的 3600s 算它还活着"
@@ -2023,6 +2060,70 @@ def test_sync_models_script_uses_relative_paths_like_the_gui():
 def test_deploy_paths_record_the_deployed_reqs_for_other_machines():
     body = code_only((ROOT / "routes.py").read_text(encoding="utf-8"))
     assert body.count("record_deployed_reqs,") == 3, "三条部署成功路径都要记下依赖清单"
+
+
+# ── 0.8.53:review #12 实际状态、#14 共享的 /health 规则 ────────────────────
+def test_queued_forever_is_eventually_declared_dead():
+    """容器在 @modal.enter 就失败时 run() 根本不执行,状态永远 queued —— 不回收、Dict 一直涨、
+    CLI / MCP 一直等(review #12)。判死线给得很宽:排队不计费,也可能只是在等 GPU。"""
+    import time as _t
+    stale = _extract_nested(MODAL_APP, "_stale_reason",
+                            {"WORKER_TIMEOUT": 1200, "_STALE_GRACE_S": 120, "_QUEUE_STALE_S": 6 * 3600})
+    now = _t.time()
+    assert stale({"status": "queued", "queued_at": now - 7 * 3600}, now), "排队 7 小时应判死"
+    assert stale({"status": "queued", "queued_at": now - 3600}, now) == "", "排队 1 小时可能只是等 GPU"
+
+
+def test_cancel_on_a_dead_worker_answers_with_the_real_outcome():
+    """去 cancel 一个早已结束的调用会报「取消失败」,前端据此提示「可能仍在计费」—— 正好说反。"""
+    import time as _t
+    cancels = []
+    ns = _status_ns({"dead": {"status": "running", "started_at": _t.time() - 99999}})
+    ns.update({"_CALL_PENDING": "pending", "_call_id": lambda j: "fc-dead",
+               "modal": types.SimpleNamespace(FunctionCall=types.SimpleNamespace(
+                   from_id=lambda cid: types.SimpleNamespace(cancel=lambda: cancels.append(cid)))),
+               "_CANCEL_NOT_FOUND_WAIT_S": 3.0})
+    r = _load_endpoint("cancel_endpoint", ns)({"job_id": "dead", "auth_key": "k"})
+    assert r["status"] == "failed" and r.get("cancel_noop"), r
+    assert cancels == [], "死任务不该再去 cancel 一个已结束的调用"
+    assert ns["job_state"]["dead"]["status"] == "failed", "要写回,否则 GC 收不掉"
+
+
+def test_run_treats_a_dead_prior_as_finished():
+    """/run 以前把死任务当活的:rerun=1 也被当成重复提交挡掉,永远重跑不了。"""
+    import ast
+    src = MODAL_APP.read_text(encoding="utf-8")
+    fn = next(n for n in ast.walk(ast.parse(src))
+              if isinstance(n, ast.FunctionDef) and n.name == "run_endpoint")
+    body = code_only(ast.get_source_segment(src, fn))
+    assert body.index("_effective(prior") < body.index('prior_status in ("queued", "running", "delivering")')
+
+
+def test_health_client_tells_why_it_could_not_read():
+    """401、404、5xx、非 JSON 以前被一律当「拿不到」,调用方无从决定该继续还是该停(review #14)。"""
+    import health_client as hc
+    for status, body, kind in ((401, '{"error":"x"}', "unauthorized"), (404, "", "not_deployed"),
+                               (502, "bad gateway", "http"), (200, "<html>", "unreachable"),
+                               (200, "[1,2]", "unreachable")):
+        try:
+            hc.interpret(status, body)
+            assert False, f"{status} {body!r} 应抛"
+        except hc.HealthUnavailable as e:
+            assert e.kind == kind, (status, body, e.kind)
+    assert hc.interpret(200, '{"healthy": true}') == {"healthy": True}
+    assert issubclass(hc.HealthUnavailable, RuntimeError), "调用方原来按 RuntimeError / Exception 接"
+
+
+def test_every_health_reader_goes_through_the_shared_rules():
+    """URL、鉴权头、状态码语义只许有一份。"""
+    mc = code_only((ROOT / "modal_client.py").read_text(encoding="utf-8"))
+    i = mc.index("async def health(")
+    seg = mc[i:mc.index("async def ", i + 10)]
+    assert "health_client.interpret(" in seg and "health_client.url(" in seg
+    ns = code_only((ROOT / "node_sync.py").read_text(encoding="utf-8"))
+    i = ns.index("def fetch_cloud_nodes(")
+    assert "health_client.fetch(" in ns[i:ns.index("\ndef ", i + 10)]
+    assert "-health.modal.run" not in ns, "node_sync 里又自己拼了一份 /health URL"
 
 
 def test_estimate_vram_video_v2_anchors():

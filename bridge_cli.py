@@ -191,12 +191,12 @@ def cmd_deploy(args):
     # 镜像节点清单取自本机那份被 gitignore 的文件;先把云端有、本机缺的并回来(只加不删),
     # 否则在清单丢失 / 别的机器加过节点时,这次部署会把它们从镜像里删掉。
     node_sync.ensure_baked_file()
-    back, lost = node_sync.reconcile_baked_with_cloud({**cfg, **plugin,
-                                                       "bridge_api_key": bridge_key})
+    try:
+        back = node_sync.reconcile_baked_with_cloud({**cfg, **plugin, "bridge_api_key": bridge_key})
+    except node_sync.DeployBlocked as e:
+        sys.exit(f"✗ {e}")
     if back:
         print(f"      节点清单:并回云端独有的 {len(back)} 个 —— {', '.join(back)}")
-    if lost:
-        sys.exit("✗ " + node_sync.unresolved_nodes_message(lost))
     print(f"[2/2] modal deploy(ComfyUI tag {cfg['comfyui_tag']},首次要构建镜像,10 分钟级)…")
     proc = subprocess.Popen(node_sync.deploy_command(), cwd=str(_HERE / "modal_app"), env=env,
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)

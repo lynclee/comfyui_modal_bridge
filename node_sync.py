@@ -14,6 +14,11 @@ import ast
 import hashlib
 import inspect
 import json
+
+try:                                   # 插件里是包内相对导入;CLI / 测试里是顶层模块
+    from . import health_client
+except ImportError:
+    import health_client
 import os
 import re
 import subprocess
@@ -277,54 +282,64 @@ def _local_git_entry(name: str) -> dict | None:
     return None
 
 
-def fetch_cloud_nodes(cfg: dict, timeout: int = 20) -> tuple[list | None, list | None]:
+def fetch_cloud_nodes(cfg: dict, timeout: int = 20) -> tuple[list, list | None]:
     """取云端镜像装的节点:(文件夹名列表, 带 url/commit 的 manifest)。
-    名字所有版本都报;manifest 0.8.48 起才有。云端不可达 / 首次部署 → (None, None)。
+    名字所有版本都报;manifest 0.8.48 起才有(老云端为 None)。
+    拿不到时抛 health_client.HealthUnavailable,kind 说明原因(未部署 / key 不对 / 网络……)。
     同步实现,部署路径(含 CLI)共用;async 路由里请用 asyncio.to_thread 调。"""
-    import urllib.request
-    base = (cfg.get("modal_endpoint_base") or "").rstrip("/")
-    key = cfg.get("bridge_api_key") or ""
-    if not base or not key:
-        return None, None
-    try:
-        req = urllib.request.Request(f"{base}-health.modal.run", headers={"X-Bridge-Key": key})
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            info = json.loads(r.read().decode())
-    except Exception:
-        return None, None
-    if not isinstance(info, dict):
-        return None, None
+    info = health_client.fetch(cfg, timeout)
     names = info.get("custom_nodes")
+    if not isinstance(names, list):
+        raise health_client.HealthUnavailable(
+            "http", f"/health 没有报节点清单: {info.get('custom_nodes_error', '字段缺失')}")
     manifest = info.get("custom_nodes_manifest")
-    return (names if isinstance(names, list) else None,
-            manifest if isinstance(manifest, list) else None)
+    return names, (manifest if isinstance(manifest, list) else None)
 
 
-def reconcile_baked_with_cloud(cfg: dict) -> tuple[list[str], list[str]]:
-    """部署前把「云端镜像里有、本机清单里没有」的节点并回本机清单。
-    返回 (并回的节点名, **无法并回**的节点名)。
+class DeployBlocked(Exception):
+    """部署前检查发现「继续部署会删掉云端节点」。调用方**必须中止**,把消息原样给用户。
+    用异常而不是返回值:忘了处理的调用方会直接失败,而不是静默继续部署 —— 失败方向是安全的。"""
+
+
+def reconcile_baked_with_cloud(cfg: dict) -> list[str]:
+    """部署前把「云端镜像里有、本机清单里没有」的节点并回本机清单。返回并回的节点名。
 
     只加不删 —— 删除只能走「管理云端节点」面板的显式 prune(那条路径不调这里)。
     来源优先级:云端 manifest(未脱敏的)→ 本机 custom_nodes 的 git 信息。
 
-    ⚠ 「无法并回」非空时调用方**必须拒绝部署**:部署下去就把它们从镜像里删了。
-      第一版在云端没有 manifest 时直接什么都不做 —— 而那恰恰是最需要保护的路径:Registry 上的
-      latest 还是 0.7.9,所有从 Registry 升级的用户云端都是老版本,插件重装丢了清单后第一次部署
-      照样清空全部节点(2026-09-24 review)。"""
-    names, manifest = fetch_cloud_nodes(cfg)
-    if names is None:
-        return [], []                      # 云端不可达 / 首次部署:无从比较
+    会抛 DeployBlocked(调用方必须中止部署),两种情况:
+      · 有节点补不出来源(云端太老报不出来源 / 来源带凭据被脱敏 / 本机也没装)——
+        部署下去就把它们从镜像删了。第一版在云端没有 manifest 时直接什么都不做,而 Registry 的
+        latest 还是 0.7.9,所有从 Registry 升级的用户第一次部署都是这种云端(2026-09-24 review)。
+      · 读不到云端装了什么(key 不对 / 网络 / 服务出错),**而本机清单又是空的** —— 这是最危险的组合:
+        多半是插件重装丢了清单,贸然部署就清空云端。以前把 401、超时、未部署统统当「拿不到」,
+        保护静默跳过(2026-09-24 review #14)。
+    云端 404(app 还没部署 / 已删)不算读不到:那是全新部署,没有可保护的东西。
+    本机清单非空时读不到云端就尽力而为、照常部署 —— 那不是丢清单的形态。"""
+    try:
+        names, manifest = fetch_cloud_nodes(cfg)
+    except health_client.HealthUnavailable as e:
+        if e.kind == "not_deployed":
+            return []
+        if not read_baked_nodes():
+            raise DeployBlocked(
+                f"读不到云端装了哪些自定义节点({e}),而本机节点清单是空的 —— 多半是插件重装丢了"
+                f"清单,继续部署可能清空云端全部自定义节点,已中止。\n"
+                f"处理:检查网络 / bridge key 后重试。若确认云端不需要任何自定义节点,可在 Modal 控制台"
+                f"删掉这个 app 再部署(会按全新部署处理)。") from None
+        return []
     local = read_baked_nodes()
     have = {n.get("name") for n in local}
     missing = [n for n in names if n not in have]
     if not missing:
-        return [], []
+        return []
     entries = complete_baked_entries(missing, {}, manifest)
     back = [e for e in entries if (e.get("url") or "").strip()]
-    unresolved = [e["name"] for e in entries if not (e.get("url") or "").strip()]
-    if back:
-        write_baked_nodes(local + back)
-    return [e["name"] for e in back], unresolved
+    lost = [e["name"] for e in entries if not (e.get("url") or "").strip()]
+    if lost:
+        raise DeployBlocked(unresolved_nodes_message(lost))
+    write_baked_nodes(local + back)
+    return [e["name"] for e in back]
 
 
 def unresolved_nodes_message(unresolved: list[str]) -> str:

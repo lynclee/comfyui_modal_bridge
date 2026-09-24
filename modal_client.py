@@ -7,6 +7,11 @@ from typing import Optional
 
 import aiohttp
 
+try:                                   # 插件里是包内相对导入;CLI / 测试里是顶层模块
+    from . import health_client
+except ImportError:
+    import health_client
+
 
 def _endpoint(base: str, label: str) -> str:
     """https://<ws>--comfyui-bridge + '-run' → https://<ws>--comfyui-bridge-run.modal.run"""
@@ -90,24 +95,19 @@ async def submit_job(
 
 
 async def health(session, cfg) -> dict:
-    """健康检查。⚠ 必须查 HTTP 状态码:401 的 body 也是合法 JSON({"error": ...}),
-    以前无脑 return 会让 /modal_bridge/health 把它包成 {"ok": True, "modal": {"error": ...}},
-    key 错了用户看到的却是"健康检查通过"—— 最误导的一类假阳性。"""
-    url = _endpoint(cfg["modal_endpoint_base"], "health")
+    """健康检查(异步,最多 3 轮)。URL、鉴权头、状态码语义与同步版共用 health_client 的一份规则。
+    401 / 404 重试无意义,直接抛;其它 4xx/5xx 与网络错重试。"""
     last = None
     for attempt in range(3):
         try:
-            async with session.get(url, headers={"X-Bridge-Key": _key(cfg)},
+            async with session.get(health_client.url(cfg), headers=health_client.headers(cfg),
                                    timeout=aiohttp.ClientTimeout(total=10)) as r:
-                if r.status == 401:
-                    # 重试无意义,直接抛(RuntimeError 不在下面的 except 里,会冒到调用方)
-                    raise RuntimeError("Modal /health 401 — bridge key 不对/缺失。"
-                                       "点 [Modal Setup] 重新部署会刷新 key")
-                if r.status >= 400:
-                    last = RuntimeError(f"Modal /health {r.status}: {(await r.text())[:200]}")
-                    await asyncio.sleep(1.0)
-                    continue
-                return await r.json(content_type=None)
+                return health_client.interpret(r.status, await r.text())
+        except health_client.HealthUnavailable as e:
+            if e.kind in ("unauthorized", "not_deployed"):
+                raise
+            last = e
+            await asyncio.sleep(1.0)
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
             last = e
             await asyncio.sleep(1.0)
