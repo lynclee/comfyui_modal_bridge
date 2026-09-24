@@ -1194,7 +1194,9 @@ def test_cancel_endpoint_rereads_before_declaring_not_found():
     class LaggyDict(dict):
         """前 lag 次读 job_id 都读不到,之后才「同步」过来 —— 模拟跨容器的陈旧读。"""
         def __init__(self, lag, *a, **kw):
-            super().__init__(*a, **kw); self.lag = lag; self.reads = 0
+            super().__init__(*a, **kw)
+            self.lag = lag
+            self.reads = 0
         def get(self, k, default=None):
             if not k.endswith(":call"):
                 self.reads += 1
@@ -1645,7 +1647,8 @@ def test_bridge_client_acks_only_after_every_output_is_on_disk(tmp_path):
         def __exit__(self, *a): return False
 
     def run(clens):
-        urls.clear(); acks.clear()
+        urls.clear()
+        acks.clear()
         it = iter(clens)
         orig = bc._open_http
         bc._open_http = lambda req, timeout=None: (urls.append(req.full_url), _Resp(b"abc", next(it)))[1]
@@ -1836,14 +1839,19 @@ def test_worktree_dirty_ignores_runtime_junk_but_catches_uncommitted_code(tmp_pa
     import subprocess as sp
     def git(*a):
         sp.run(["git", *a], cwd=tmp_path, check=True, capture_output=True)
-    git("init", "-q"); git("config", "user.email", "t@t"); git("config", "user.name", "t")
+    git("init", "-q")
+    git("config", "user.email", "t@t")
+    git("config", "user.name", "t")
     (tmp_path / "node.py").write_text("x = 1\n")
-    git("add", "."); git("commit", "-qm", "init")
+    git("add", ".")
+    git("commit", "-qm", "init")
     assert node_sync.worktree_dirty(tmp_path) is False
 
     (tmp_path / "run.log").write_text("log")
-    (tmp_path / "cache").mkdir(); (tmp_path / "cache" / "blob.bin").write_bytes(b"x")
-    (tmp_path / "__pycache__").mkdir(); (tmp_path / "__pycache__" / "m.pyc").write_bytes(b"x")
+    (tmp_path / "cache").mkdir()
+    (tmp_path / "cache" / "blob.bin").write_bytes(b"x")
+    (tmp_path / "__pycache__").mkdir()
+    (tmp_path / "__pycache__" / "m.pyc").write_bytes(b"x")
     (tmp_path / ".DS_Store").write_bytes(b"x")
     assert node_sync.worktree_dirty(tmp_path) is False, "日志 / 缓存 / 字节码不该算改动"
 
@@ -1852,7 +1860,8 @@ def test_worktree_dirty_ignores_runtime_junk_but_catches_uncommitted_code(tmp_pa
         (tmp_path / f).write_text("x")
         assert node_sync.worktree_dirty(tmp_path) is True, f"用户新加的 {f} 必须算改动"
         (tmp_path / f).unlink()
-    shutil.rmtree(tmp_path / "presets"); shutil.rmtree(tmp_path / "wildcards")
+    shutil.rmtree(tmp_path / "presets")
+    shutil.rmtree(tmp_path / "wildcards")
     assert node_sync.worktree_dirty(tmp_path) is False
 
     (tmp_path / "node.py").write_text("x = 2\n")
@@ -1888,7 +1897,9 @@ def test_sweep_is_throttled_per_container():
     sweep = _load_sweep(state, lambda path, recursive=False: None)
     sweep.__globals__["_SWEEP_EVERY_S"] = 60
     sweep.__globals__["_last_sweep"] = [0.0]
-    sweep(); sweep(); sweep()
+    sweep()
+    sweep()
+    sweep()
     assert _CountingDict.pulls == 1, f"60s 内扫了 {_CountingDict.pulls} 次"
 
 
