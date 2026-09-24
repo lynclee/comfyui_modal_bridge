@@ -93,6 +93,33 @@ def model_relpath(filename) -> str | None:
     return "/".join(parts)
 
 
+def _meta_dict(cfg: dict):
+    """<app>-meta:插件在 Modal 上的小型共享元数据 —— 多机共享、SDK 直读(~100ms)、没有冷启动。"""
+    import modal
+    apply_token(cfg)
+    return modal.Dict.from_name(f"{cfg.get('modal_app_name', 'comfyui-bridge')}-meta",
+                                create_if_missing=True)
+
+
+def record_deployed_reqs(cfg: dict, reqs) -> bool:
+    """部署成功后记下这次烤进镜像的私有节点依赖。best-effort,失败只影响下次预检多问一次。"""
+    try:
+        _meta_dict(cfg)["deployed_local_node_reqs"] = list(reqs)
+        return True
+    except Exception as e:
+        print(f"[modal_bridge] ⚠ 记录已部署依赖清单失败(下次预检可能多问一次重建): {e}")
+        return False
+
+
+def deployed_reqs(cfg: dict) -> list | None:
+    """镜像里实际装的私有节点依赖(由最近一次成功部署记下,任何一台机器)。拿不到返回 None。"""
+    try:
+        v = _meta_dict(cfg).get("deployed_local_node_reqs")
+    except Exception:
+        return None
+    return v if isinstance(v, list) else None
+
+
 def _listdir_names(vol, type_) -> set:
     """models/<type>/ 下所有**文件**的相对路径(含子目录,如 "SDXL/x.safetensors")。
 

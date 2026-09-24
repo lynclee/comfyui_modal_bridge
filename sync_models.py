@@ -69,12 +69,16 @@ def main():
     for type_, files in types_with_files.items():
         existing = have.get(type_, set())
         for f in files:
-            if f.name in existing:
+            # ⚠ 用相对 models/<type>/ 的路径,不能用 f.name:volume_files_by_type 返回的是带子目录的
+            #   相对路径(ComfyUI 列表里看到的也是 "SDXL/x.safetensors")。按 basename 比会把已在子目录
+            #   的模型判成缺失、再拍平重传一份,云端 ComfyUI 里出现两个同名条目(2026-09-24 review)。
+            rel = f.relative_to(MODELS / type_).as_posix()
+            if rel in existing:
                 continue
             if modal_volume.file_in_progress(f):
-                in_progress.append(f"{type_}/{f.name}")
+                in_progress.append(f"{type_}/{rel}")
                 continue
-            items.append({"type": type_, "filename": f.name, "local_path": str(f),
+            items.append({"type": type_, "filename": rel, "local_path": str(f),
                           "size_mb": f.stat().st_size // 1024 // 1024})
 
     if in_progress:

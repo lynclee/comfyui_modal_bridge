@@ -391,7 +391,8 @@ def materialize_desktop_outputs(refs: list[dict], job_id: str) -> tuple[list[dic
             continue
         rec = {"filename": ref["filename"], "node_id": ref["node_id"], "key": ref["key"]}
         over_file = _VOL_THRESHOLD and len(image_bytes) > _VOL_THRESHOLD
-        over_total = (_INLINE_TOTAL_BUDGET
+        # 阈值为 0 的约定是「关闭、全部内联」,总量预算也必须跟着关 —— 否则破坏既有契约
+        over_total = (_VOL_THRESHOLD and _INLINE_TOTAL_BUDGET
                       and inline_total + len(image_bytes) > _INLINE_TOTAL_BUDGET)
         if over_file or over_total:
             # 大文件:写进挂载的 Volume(_outputs/<job>/<node>__<fn>)→ 本地 SDK 直连取回,不走 base64。

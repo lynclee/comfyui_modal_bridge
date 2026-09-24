@@ -96,9 +96,11 @@ def main():
     print("\n== 部署(首次拉镜像约 3-5 分钟)==")
     # 同 GUI /deploy:本机清单会被当成镜像的全局清单,先并回云端独有的节点(只加不删)。
     node_sync.ensure_baked_file()
-    back = node_sync.reconcile_baked_with_cloud(cfg)
+    back, lost = node_sync.reconcile_baked_with_cloud(cfg)
     if back:
         print(f"   节点清单:并回云端独有的 {len(back)} 个 —— {', '.join(back)}")
+    if lost:
+        sys.exit("✗ " + node_sync.unresolved_nodes_message(lost))
     rc = run(node_sync.deploy_command(), cwd=str(MODAL_APP_DIR), env=env)
     if rc != 0:
         print("✗ deploy 失败")

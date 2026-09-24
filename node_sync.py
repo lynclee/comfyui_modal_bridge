@@ -252,49 +252,86 @@ def complete_baked_entries(names: list[str], local_by_name: dict,
       插件被 Manager 重装、本机清单丢了,一次部署清空云端全部节点。设计本意是「多机取并集、
       永不互删」(见 plan_node_sync),实现却因为云端只报名字把自己的承诺打破了(2026-09-23 review)。
     云端优先的理由:manifest 就是镜像实际装的那份,比本机「上次从这台机器部署的」更权威。"""
-    cloud = {n["name"]: n for n in (manifest or []) if isinstance(n, dict) and n.get("name")}
+    cloud = {n["name"]: n for n in (manifest or []) if isinstance(n, dict) and n.get("name")
+             and (n.get("url") or "").strip() and not n.get("url_redacted")}
     out = []
     for name in names:
-        e = cloud.get(name) or local_by_name.get(name) or {"name": name, "url": "", "commit": ""}
+        e = cloud.get(name) or local_by_name.get(name) or _local_git_entry(name) \
+            or {"name": name, "url": "", "commit": ""}
         out.append({"name": name, "url": e.get("url", ""), "commit": e.get("commit", "")})
     return out
 
 
-def fetch_cloud_manifest(cfg: dict, timeout: int = 20) -> list[dict] | None:
-    """取云端镜像实际装的节点清单(带 url/commit;0.8.48 起 /health 才报)。拿不到返回 None。
+def _local_git_entry(name: str) -> dict | None:
+    """本机 custom_nodes/<name> 装着的话,用它的 git 信息补。
+
+    ⚠ 这是云端报不出来源时的兜底:云端 < 0.8.48 没有 manifest(Registry 上的 latest 还是 0.7.9,
+      所有从 Registry 升级的用户第一次部署都走这里),或 url 带凭据被 /health 脱敏了
+      (url_redacted —— 照抄脱敏后的地址会让私有仓库克隆失败)。"""
+    try:
+        g = folder_git_info(name)
+    except Exception:
+        return None
+    if g.get("has_git") and (g.get("url") or "").strip():
+        return {"name": name, "url": g["url"], "commit": g.get("commit", "")}
+    return None
+
+
+def fetch_cloud_nodes(cfg: dict, timeout: int = 20) -> tuple[list | None, list | None]:
+    """取云端镜像装的节点:(文件夹名列表, 带 url/commit 的 manifest)。
+    名字所有版本都报;manifest 0.8.48 起才有。云端不可达 / 首次部署 → (None, None)。
     同步实现,部署路径(含 CLI)共用;async 路由里请用 asyncio.to_thread 调。"""
     import urllib.request
     base = (cfg.get("modal_endpoint_base") or "").rstrip("/")
     key = cfg.get("bridge_api_key") or ""
     if not base or not key:
-        return None
+        return None, None
     try:
         req = urllib.request.Request(f"{base}-health.modal.run", headers={"X-Bridge-Key": key})
         with urllib.request.urlopen(req, timeout=timeout) as r:
             info = json.loads(r.read().decode())
     except Exception:
-        return None
-    m = info.get("custom_nodes_manifest") if isinstance(info, dict) else None
-    return m if isinstance(m, list) else None
+        return None, None
+    if not isinstance(info, dict):
+        return None, None
+    names = info.get("custom_nodes")
+    manifest = info.get("custom_nodes_manifest")
+    return (names if isinstance(names, list) else None,
+            manifest if isinstance(manifest, list) else None)
 
 
-def reconcile_baked_with_cloud(cfg: dict) -> list[str]:
-    """部署前把「云端镜像里有、本机清单里没有」的节点并回本机清单。返回被并回的节点名。
+def reconcile_baked_with_cloud(cfg: dict) -> tuple[list[str], list[str]]:
+    """部署前把「云端镜像里有、本机清单里没有」的节点并回本机清单。
+    返回 (并回的节点名, **无法并回**的节点名)。
 
     只加不删 —— 删除只能走「管理云端节点」面板的显式 prune(那条路径不调这里)。
-    拿不到 manifest(云端还是老版本 / 不可达 / 首次部署)就原样不动。"""
-    manifest = fetch_cloud_manifest(cfg)
-    if not manifest:
-        return []
+    来源优先级:云端 manifest(未脱敏的)→ 本机 custom_nodes 的 git 信息。
+
+    ⚠ 「无法并回」非空时调用方**必须拒绝部署**:部署下去就把它们从镜像里删了。
+      第一版在云端没有 manifest 时直接什么都不做 —— 而那恰恰是最需要保护的路径:Registry 上的
+      latest 还是 0.7.9,所有从 Registry 升级的用户云端都是老版本,插件重装丢了清单后第一次部署
+      照样清空全部节点(2026-09-24 review)。"""
+    names, manifest = fetch_cloud_nodes(cfg)
+    if names is None:
+        return [], []                      # 云端不可达 / 首次部署:无从比较
     local = read_baked_nodes()
     have = {n.get("name") for n in local}
-    back = [{"name": n["name"], "url": n.get("url", ""), "commit": n.get("commit", "")}
-            for n in manifest
-            if isinstance(n, dict) and n.get("name") and (n.get("url") or "").strip()
-            and n["name"] not in have]
+    missing = [n for n in names if n not in have]
+    if not missing:
+        return [], []
+    entries = complete_baked_entries(missing, {}, manifest)
+    back = [e for e in entries if (e.get("url") or "").strip()]
+    unresolved = [e["name"] for e in entries if not (e.get("url") or "").strip()]
     if back:
         write_baked_nodes(local + back)
-    return [n["name"] for n in back]
+    return [e["name"] for e in back], unresolved
+
+
+def unresolved_nodes_message(unresolved: list[str]) -> str:
+    return (f"云端镜像装着 {', '.join(unresolved)},但本机清单里没有,也拿不到它们的来源"
+            f"(云端版本太旧报不出来源 / 来源带凭据被脱敏 / 本机也没装)。"
+            f"继续部署会把它们从镜像里删掉,已中止。\n"
+            f"处理:在本机装上这些节点后再部署;若确实不要它们,到「管理云端节点」里移除。")
 
 
 def ensure_baked_file() -> None:
@@ -448,22 +485,21 @@ def commit_on_remote(path: Path, commit: str) -> bool:
     return bool(out.strip())
 
 
-_CODE_SUFFIXES = (".py", ".js", ".mjs", ".cjs", ".ts")
+# 未跟踪文件里**已知的运行时垃圾**:日志、缓存、字节码、编辑器 / 系统残留。只有它们不算改动。
+_JUNK_DIRS = frozenset({"__pycache__", ".cache", "cache", "caches", "logs", "log", "tmp", "temp",
+                        ".pytest_cache", ".mypy_cache", ".ruff_cache", "node_modules",
+                        ".ipynb_checkpoints"})
+_JUNK_SUFFIXES = frozenset({".log", ".tmp", ".pyc", ".pyo", ".swp", ".bak"})
+_JUNK_NAMES = frozenset({".DS_Store", "Thumbs.db", "desktop.ini"})
 
 
-def _untracked_has_code(root: Path, rel: str, limit: int = 3000) -> bool:
-    """未跟踪的文件 / 目录里有没有源码。看不清时一律按「有」(方向安全,见 worktree_dirty)。"""
-    p = root / rel.rstrip("/")
-    if p.is_file():
-        return p.suffix.lower() in _CODE_SUFFIXES
-    if not p.is_dir():
+def _untracked_is_junk(rel: str) -> bool:
+    parts = [x for x in rel.strip().strip('"').rstrip("/").split("/") if x]
+    if not parts:
+        return False
+    if any(x in _JUNK_DIRS for x in parts):
         return True
-    for i, f in enumerate(p.rglob("*")):
-        if i >= limit:
-            return True      # 目录大到看不完:宁可多传一次包,也不冒漏掉代码的险
-        if f.suffix.lower() in _CODE_SUFFIXES and f.is_file():
-            return True
-    return False
+    return parts[-1] in _JUNK_NAMES or Path(parts[-1]).suffix.lower() in _JUNK_SUFFIXES
 
 
 def worktree_dirty(path: Path) -> bool:
@@ -472,12 +508,14 @@ def worktree_dirty(path: Path) -> bool:
     而云端只按 commit clone —— HEAD 没变但文件变了,镜像里跑的还是旧代码,
     且改前改后结果一模一样、毫无线索。所以 dirty 必须当成「本地版本 ≠ 云端版本」。
 
-    ⚠ 未跟踪文件只在**是源码**时才算。以前 `git status --porcelain` 把所有未跟踪文件都算改动,
-      于是运行时会往自己目录写配置 / 日志 / 缓存(又没 gitignore)的公开节点被永久判 dirty,
-      走私有覆盖包通道:文件一变 digest 就变,几乎每次运行都弹「私有节点有改动,需先推送」,
-      还要整目录上传(≤200MB)(2026-09-23 review)。
-      只看源码的理由:云端 clone 里缺一个用户新写、忘了提交的 .py 才真正改变行为;
-      运行时生成的数据文件云端运行时会自己再生成。已跟踪文件的任何改动照旧一律算 dirty。"""
+    ⚠ 未跟踪文件:只豁免**已知的运行时垃圾**(日志 / 缓存 / 字节码,见 _JUNK_*),其余一律算改动。
+      以前把所有未跟踪文件都算改动,运行时往自己目录写日志、缓存的公开节点被永久判 dirty
+      (2026-09-23 review)。0.8.48 改成「只有源码(.py/.js…)才算」—— **方向反了**:用户往节点里加的
+      .json 预设、.txt 通配词、提示词模板、.so/.cu 扩展照样改变云端行为,却被判成干净,云端 clone
+      里没有它们,出错或静默出不同的结果、毫无线索;而 .js/.ts 在无头的云端反而无关紧要
+      (2026-09-24 review)。误判 dirty 的代价是多传一次包、多弹一次框;误判干净是静默出错 ——
+      所以默认算改动,只豁免能确定是垃圾的。运行时生成的配置文件(如 settings.json)仍会判 dirty,
+      这类请在节点里 gitignore。已跟踪文件的任何改动照旧一律算 dirty。"""
     out = _git(["status", "--porcelain", "--untracked-files=normal"], path)
     # 已确认是该节点自己的 repo 后,status 仍失败时按 dirty 处理:方向安全,最多多传一次包;
     # 反过来当 clean 会把本地改动静默丢掉。
@@ -488,7 +526,7 @@ def worktree_dirty(path: Path) -> bool:
             continue
         if not line.startswith("??"):
             return True                       # 已跟踪文件有改动
-        if _untracked_has_code(path, line[3:].strip().strip('"')):
+        if not _untracked_is_junk(line[3:]):
             return True
     return False
 
@@ -912,6 +950,7 @@ def deploy_env(cfg: dict) -> dict:
     # 包在镜像里总是装好,这里只控制启动参数 → 切换不必重编译 kernel。
     env["MODAL_BRIDGE_SAGE_ATTENTION"] = "1" if cfg.get("use_sage_attention") else "0"
     env["MODAL_BRIDGE_VOLUME_THRESHOLD_MB"] = str(cfg.get("volume_threshold_mb", 8))  # 大产物走 Volume 的阈值
+    env["MODAL_BRIDGE_INLINE_TOTAL_MB"] = str(cfg.get("inline_total_mb", 24))  # 单任务内联总量上限
     env["MODAL_BRIDGE_VERSION"] = plugin_version()  # 版本契约:烤进 app,health 回传供前端比对
     if cfg.get("modal_token_id"):
         env["MODAL_TOKEN_ID"] = cfg["modal_token_id"]

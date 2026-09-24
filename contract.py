@@ -54,13 +54,27 @@ def merge_after_deploy(base: dict, ours: dict, theirs: dict) -> dict:
       (onchange 立即 POST /config,提示「✓ 已切到…」)、在设置页改 sage / CPU 路由 / AIGC URL,
       或别的请求生成了 local_api_capability、另一次部署写了指纹 —— 部署一结束全被悄悄还原
       (2026-09-23 review)。/sync_nodes、/sync_local_nodes 保存前都会重新 load,只有 /deploy 没有。
-    规则:某字段在部署期间被别处改过(theirs ≠ base)→ 以别处为准;没人动过 → 写部署的值。
-    ours 之外的字段一律取 theirs。"""
+    规则:
+      · ours 里的**运行时偏好**(_PREFER_LATEST_ON_DEPLOY):部署期间被别处改过就以别处为准 ——
+        那是用户的最新意图,部署只是顺手收下了开始时的值。
+      · ours 里的其余字段(bridge_api_key、Modal token、endpoint、tag……)定义了**刚部署出去的东西**,
+        必须和云端一致,一律用部署的值。⚠ 第一版对所有字段都「别处改过就以别处为准」,两个并发的
+        首次部署(双击 / 两个 tab)会各生成一把 key:A 写 Secret=K1 并存 K1,B 再 --force 写
+        Secret=K2,合并时却保留了 K1 —— config 与 Secret 不一致,之后**所有请求 401**(2026-09-24 review)。
+      · ours 之外的字段一律取 theirs。"""
     out = dict(theirs)
     for k, v in ours.items():
-        if theirs.get(k) == base.get(k):
-            out[k] = v
+        if k in _PREFER_LATEST_ON_DEPLOY and theirs.get(k) != base.get(k):
+            continue
+        out[k] = v
     return out
+
+
+# 部署期间可能被用户在别处改掉的运行时偏好(不决定部署出去的东西,以用户最新意图为准)。
+# aigc_bypass_secret 与 URL 成对:设置页清空 URL 时会连带清掉它,不能被部署写回旧值。
+_PREFER_LATEST_ON_DEPLOY = frozenset({
+    "gpu_tier", "auto_downgrade", "aigc_studio_base_url", "aigc_bypass_secret",
+})
 
 
 def is_safe_job_id(job_id) -> bool:

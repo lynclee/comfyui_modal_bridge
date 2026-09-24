@@ -459,36 +459,17 @@ _INPUT_FILE_NODES = {
 }
 
 
-async def _cloud_local_node_reqs(cfg: dict) -> list | None:
-    """云端 /health 报的私有节点依赖清单;拿不到返回 None。
-
-    ⚠ 单次请求、短超时,**不用** modal_client.health:那个会重试 3 轮、每轮 10s,云端不可达时
-      卡 30 多秒 —— 而这里在「提交前预检」的路径上,卡住就是界面挂着不动。拿不到就退回本机记录,
-      最坏只是多问一次「要不要重建」,不值得让用户等。"""
-    try:
-        url = modal_client._endpoint(cfg["modal_endpoint_base"], "health")
-        async with aiohttp.ClientSession() as s:
-            async with s.get(url, headers={"X-Bridge-Key": modal_client._key(cfg)},
-                             timeout=aiohttp.ClientTimeout(total=8)) as r:
-                if r.status != 200:
-                    return None
-                h = await r.json(content_type=None)
-        reqs = h.get("local_node_reqs") if isinstance(h, dict) else None
-        return reqs if isinstance(reqs, list) else None
-    except Exception as e:
-        print(f"[modal_bridge] 读云端依赖清单失败,退回本机记录: {type(e).__name__}: {e}")
-        return None
-
-
 async def _deployed_reqs_hash(cfg: dict) -> str:
     """云端镜像**实际装的**私有节点依赖的指纹。
 
-    ⚠ 以前用本机 config 里的 local_node_reqs_deployed_hash。但镜像是多台机器共享的:机器 A 改了
-      依赖并部署,A 存下新指纹;机器 B 的 config 还是旧的,于是 B 每次都误判「还欠一次镜像重建」,
-      用户确认后白花 3-5 分钟构建费(2026-09-23 review)。现在 /health 原样报回镜像里的依赖清单,
-      这里用同一个 local_node_reqs_hash 算 —— 云端不复制哈希算法,就不存在两份漂移。
-    拿不到(云端还是老版本 / 不可达)才退回本机 config 的记录。"""
-    reqs = await _cloud_local_node_reqs(cfg)
+    ⚠ 以前用本机 config 里的 local_node_reqs_deployed_hash,而镜像是多台机器共享的:机器 A 改了依赖
+      并部署,机器 B 的 config 还是旧的,每次都误判「欠一次重建」(2026-09-23 review)。
+      0.8.50 改成读云端 /health,又引入两个问题(2026-09-24 review):/health 跑在大镜像上,冷启动常超
+      8s 超时 → 静默退回本机旧指纹,多机误判原样回来,而且 /sync_local_nodes 会据此**无确认地**自动
+      重建 3-5 分钟;每次 RunModal 预检还要多等最多 8s;依赖行里的 git+https://TOKEN@ 也经 /health 外泄。
+    现在由每次成功部署把依赖清单写进 <app>-meta 这个 modal.Dict(任何机器部署都写),这里用 SDK 直读:
+    确定、共享、没有冷启动,也不再经 /health。拿不到(老部署还没写过)才退回本机记录。"""
+    reqs = await asyncio.to_thread(modal_volume.deployed_reqs, cfg)
     if reqs is not None:
         return node_sync.local_node_reqs_hash(reqs)
     return cfg.get("local_node_reqs_deployed_hash", "")
@@ -1319,10 +1300,12 @@ def _setup_routes():
                         await _emit(resp, f"== 私有节点依赖已变化({len(reqs)} 条),自动重新部署 ==\n")
                         # 同 /deploy:这里也拿本机清单当全局清单部署,先并回云端独有的节点。
                         node_sync.ensure_baked_file()
-                        _back = await asyncio.to_thread(node_sync.reconcile_baked_with_cloud, latest_cfg)
+                        _back, _lost = await asyncio.to_thread(node_sync.reconcile_baked_with_cloud, latest_cfg)
                         if _back:
                             await _emit(resp, f"   节点清单:并回云端独有的 {len(_back)} 个 —— {', '.join(_back)}\n")
-                        rc = await _ensure_modal(resp)
+                        rc = await _ensure_modal(resp) if not _lost else 1
+                        if _lost:
+                            await _emit(resp, f"== ✗ {node_sync.unresolved_nodes_message(_lost)} ==\n")
                         if rc == 0:
                             rc = await _run_streamed(
                                 resp, node_sync.deploy_command(),
@@ -1333,6 +1316,7 @@ def _setup_routes():
                             final_cfg = cfg_mod.load_config()
                             final_cfg["local_node_reqs_deployed_hash"] = target_hash
                             cfg_mod.save_config(final_cfg)
+                            await asyncio.to_thread(modal_volume.record_deployed_reqs, latest_cfg, reqs)
                             await _emit(resp, "== ✓ 私有节点依赖镜像已更新 ==\n")
                         else:
                             await _emit(resp, "== ✗ 私有节点依赖部署失败,停止本次提交 ==\n")
@@ -1514,6 +1498,13 @@ def _setup_routes():
                 continue
             clean.append({"name": name, "url": e.get("url", ""), "commit": e.get("commit", "")})
 
+        # ⚠ 空 url 的条目以前会在 write_baked_nodes 出口被静默丢掉,随后的部署就把它从镜像里删了。
+        #   这里的 new_baked 来自 /check_nodes 的补全,补不出 url(云端太老 / 来源被脱敏 / 本机没装)
+        #   的节点必须拒绝,不能当成「用户要删它」(2026-09-24 review)。
+        _lost = [e["name"] for e in clean if not (e.get("url") or "").strip()]
+        if _lost:
+            return web.json_response({"error": node_sync.unresolved_nodes_message(_lost)}, status=409)
+
         summary = body.get("summary") or {}
         cfg = cfg_mod.load_config()
         cwd = str(node_sync.MODAL_APP_DIR)
@@ -1549,6 +1540,7 @@ def _setup_routes():
                 final_cfg = cfg_mod.load_config()
                 final_cfg["local_node_reqs_deployed_hash"] = reqs_hash
                 cfg_mod.save_config(final_cfg)
+                await asyncio.to_thread(modal_volume.record_deployed_reqs, cfg, reqs)
         await _emit(resp, f"\n__DEPLOY_DONE__ rc={rc}\n")
         await resp.write_eof()
         return resp
@@ -1705,10 +1697,15 @@ def _setup_routes():
             # ⚠ 本机清单是被 gitignore 的本地状态,却会被当成镜像的全局清单去部署。插件被 Manager
             #   重装、清单丢了 → 上面建出一个空清单 → 这次部署清空云端全部节点;多机时另一台加的
             #   节点也会被删。部署前先把云端有、本机没有的并回来(只加不删)。
-            _back = await asyncio.to_thread(node_sync.reconcile_baked_with_cloud, cfg)
+            _back, _lost = await asyncio.to_thread(node_sync.reconcile_baked_with_cloud, cfg)
             if _back:
                 await _emit(resp, f"   节点清单:云端有而本机清单缺的 {len(_back)} 个已并回"
                                   f"(不会被这次部署删掉)—— {', '.join(_back)}\n")
+            if _lost:
+                await _emit(resp, f"\n== ✗ {node_sync.unresolved_nodes_message(_lost)} ==\n")
+                await _emit(resp, "\n__DEPLOY_DONE__ rc=1\n")
+                await resp.write_eof()
+                return resp
             await _emit(resp, "\n== 推送到云端:比对本机与云端的差异,只推有变化的部分 ==\n")
             # 3.0) 先把**本机**的私有节点推上 Volume,再去读 manifest。
             #
@@ -1800,6 +1797,7 @@ def _setup_routes():
             _final = contract.merge_after_deploy(_base_cfg, _deploy_updates, cfg_mod.load_config())
             _final["local_node_reqs_deployed_hash"] = _local_reqs_hash
             cfg_mod.save_config(_final)
+            await asyncio.to_thread(modal_volume.record_deployed_reqs, _final, _local_reqs)
             cfg = _final
             await _emit(resp, f"\n== ✓ config 已写入(endpoint={endpoint_base})==\n")
 

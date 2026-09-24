@@ -114,8 +114,12 @@ def _stale_reason(s, now: float) -> str:
     if not isinstance(s, dict) or s.get("status") not in ("running", "delivering"):
         return ""
     t0 = s.get("started_at") or 0
-    if t0 and now - t0 > WORKER_TIMEOUT + _STALE_GRACE_S:
-        return (f"worker 超过部署时的超时上限 {WORKER_TIMEOUT}s 仍未写回结果 —— 已被 Modal 强杀"
+    # ⚠ 用任务**起跑时**记下的超时,不能用当前部署的 WORKER_TIMEOUT:调小超时并重部署时,
+    #   老部署上还在跑的长任务会被新部署的 status 按新上限误判死亡 —— 前端停止轮询,
+    #   任务随后写回 completed 也没人取,付过钱的产物被 GC 清掉(2026-09-24 review)。
+    limit = s.get("timeout_s") or WORKER_TIMEOUT
+    if t0 and now - t0 > limit + _STALE_GRACE_S:
+        return (f"worker 超过部署时的超时上限 {limit}s 仍未写回结果 —— 已被 Modal 强杀"
                 f"(超时 / OOM / 容器崩溃),这段时间已计费。可在 Modal 控制台看该调用的日志。")
     return ""
 
@@ -504,7 +508,15 @@ def _worker_run(workflow: dict, job_id: str, input_images: list | None = None,
     # (我们自己存在 job_state 的 "<job_id>:call" 里),便于两边对账。
     print(f"[bridge] job {job_id} start container={_container_id()} "
           f"call={modal.current_function_call_id() or '?'}")
-    job_state[job_id] = {**job_state.get(job_id, {}), "status": "running", "started_at": time.time()}
+    cur = job_state.get(job_id) or {}
+    if cur.get("status") == "cancelled":
+        # 用户在 /run 之后、worker 起跑之前就取消了(上面还等了最多 5s 的 call_id)。
+        # 别再写 running 把它覆盖掉,也别开跑烧 GPU。/run 每次都会写一条新的 queued,
+        # 所以这里看到 cancelled 只可能是这一轮的取消,不会误伤 rerun。
+        print(f"[bridge] job {job_id}: 起跑前已被取消,不执行")
+        return {"cancelled": True}
+    job_state[job_id] = {**cur, "status": "running", "started_at": time.time(),
+                         "timeout_s": WORKER_TIMEOUT}   # 按任务记超时,见 _stale_reason
     try:
         del job_state[f"{job_id}:progress"]   # rerun 复用 job_id 时别显示上一次的进度
     except Exception:
@@ -589,11 +601,22 @@ def _worker_run(workflow: dict, job_id: str, input_images: list | None = None,
         job_state[job_id] = {**job_state.get(job_id, {}), "status": "failed",
                              "error": msg, "trace": tb[-2000:], "completed_at": time.time()}
         raise
-    except BaseException:
+    except BaseException as e:
         # 取消走的是 Modal 的 InputCancellation —— 它是 BaseException,**不进上面那支**。
         # 以前这里什么都不做,ComfyUI 子进程就接着跑被取消的 prompt(见 interrupt_comfy)。
-        # 终态不在这里写:cancel_endpoint 已经写了 cancelled,这里再写只会和它抢。
         interrupt_comfy()
+        if type(e).__name__ == "InputCancellation":
+            # ⚠ 终态必须在这里再落定一次。cancel_endpoint 写的 cancelled 会被上面 running /
+            #   delivering 那两处读改写覆盖(它们读的是取消送达之前的旧值),之后再没人写终态 ——
+            #   状态停在 running,22 分钟后被 _stale_reason 误报成「被 Modal 强杀、已计费」,
+            #   而那是用户自己取消的任务(2026-09-24 review)。写的是同一个值,与 cancel_endpoint
+            #   不冲突;已是终态(worker 抢先写完)就不动。
+            try:
+                cur = job_state.get(job_id) or {}
+                if cur.get("status") not in ("completed", "failed", "cancelled"):
+                    job_state[job_id] = {**cur, "status": "cancelled", "completed_at": time.time()}
+            except Exception:
+                pass
         raise
     # 大文件走了 Volume(item 带 volume_path)→ commit 一次,本地 SDK 才看得到刚写进 _outputs 的文件
     if any(i.get("volume_path") for i in (result.get("images") or [])):
@@ -969,7 +992,9 @@ def status_endpoint(job_id: str, key: str = "", x_bridge_key: str = _Header(""))
     deny = _check(x_bridge_key or key)
     if deny:
         return deny
-    s = job_state.get(job_id)
+    # 先校验 job_id:"<id>:call" / "<id>:progress" 这类独立键不是任务记录。只挡非 dict 不够 ——
+    # :progress 的值就是 dict,查它会拿到一条没有 status 的记录,正是客户端会兜底成 running 的形态。
+    s = job_state.get(job_id) if _safe_job_id(job_id) else None
     if not isinstance(s, dict) or not s:
         # 非 dict:有人拿 "<id>:call" 这类独立键当 job_id 来查 —— 它不是任务记录,当查无此 job,
         # 别让下面的 {**s} 对字符串展开抛 500。
@@ -1147,21 +1172,38 @@ def health_endpoint(key: str = "", x_bridge_key: str = _Header("")):
     # 镜像实际用的节点清单(带 url/commit)。上面 custom_nodes 只有文件夹名,本地拿它补全 url
     # 时补不出别的机器加的节点 → 被当成空 url 丢掉 → 下次部署从镜像里删掉。_custom_nodes_data
     # 已作为 Python 源随部署挂进容器,原样报回即可,不用改镜像。见 node_sync.complete_baked_entries。
+    # ⚠ url 必须脱敏:它来自 `git config remote.origin.url`,私有节点常用
+    #   https://user:ghp_xxx@github.com/... 克隆。bridge key 会给 AIGC Studio、MCP、导出的脚本,
+    #   以前这些凭据只在私有镜像里,/health 一报就等于发给了所有持 key 的一方(2026-09-24 review)。
+    #   被脱敏的条目标 url_redacted —— 本地据此知道这条不能照抄回清单(会丢掉克隆所需的凭据)。
     try:
         from _custom_nodes_data import CUSTOM_NODES as _baked
-        info["custom_nodes_manifest"] = [
-            {"name": n.get("name", ""), "url": n.get("url", ""), "commit": n.get("commit", "")}
-            for n in _baked if isinstance(n, dict)]
+        manifest = []
+        for n in _baked:
+            if not isinstance(n, dict):
+                continue
+            url, red = _redact_url(n.get("url", ""))
+            e = {"name": n.get("name", ""), "url": url, "commit": n.get("commit", "")}
+            if red:
+                e["url_redacted"] = True
+            manifest.append(e)
+        info["custom_nodes_manifest"] = manifest
     except Exception as e:
         info["custom_nodes_manifest_error"] = str(e)
-    # 镜像里实际装的私有节点依赖。本地据此判断「要不要重建镜像」—— 以前用每台机器各自 config 里的
-    # 指纹,而镜像是多机共享的,别的机器一改就误判(见 routes._deployed_reqs_hash)。
-    try:
-        from _local_nodes_data import LOCAL_NODE_REQS as _reqs
-        info["local_node_reqs"] = list(_reqs)
-    except Exception as e:
-        info["local_node_reqs_error"] = str(e)
     return info
+
+
+def _redact_url(u: str) -> tuple[str, bool]:
+    """去掉 URL 里的 userinfo(user:token@)。返回 (脱敏后的 url, 是否动过)。"""
+    from urllib.parse import urlsplit, urlunsplit
+    try:
+        p = urlsplit(u or "")
+        if not (p.username or p.password):
+            return u or "", False
+        host = (p.hostname or "") + (f":{p.port}" if p.port else "")
+        return urlunsplit((p.scheme, host, p.path, p.query, p.fragment)), True
+    except Exception:
+        return "", True    # 解析不了就一个字都不报
 
 
 # ============================================================================

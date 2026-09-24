@@ -1430,7 +1430,10 @@ def _status_ns(job_state, worker_timeout=1200):
     import time as _t
     stale = _extract_nested(MODAL_APP, "_stale_reason",
                             {"WORKER_TIMEOUT": worker_timeout, "_STALE_GRACE_S": 120})
-    return {"job_state": job_state, "_check": lambda k: None, "time": _t, "_stale_reason": stale}
+    import re as _re
+    safe = _re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
+    return {"job_state": job_state, "_check": lambda k: None, "time": _t, "_stale_reason": stale,
+            "_safe_job_id": lambda j: isinstance(j, str) and bool(safe.match(j)) and ".." not in j}
 
 
 # ── #9 ComfyUI tag 回落 ─────────────────────────────────────────────────────
@@ -1473,11 +1476,13 @@ def test_bridge_cli_deploy_reuses_plugin_bridge_key_instead_of_rotating():
     """没有 cli.json 的机器上跑 bridge_cli deploy,曾经新生成一把 BRIDGE_API_KEY 并 --force 覆盖
     Secret —— 插件 config 里那把随即失效,所有请求 401。必须先复用插件 config 里的 key。"""
     body = code_only((ROOT / "bridge_cli.py").read_text(encoding="utf-8"))
-    i = body.index("bridge_key = (saved.get(")
+    i = body.index("bridge_key = (plugin.get(")
     seg = body[i:body.index(")", body.index("gen_bridge_key()", i)) + 1]
     assert 'plugin.get("bridge_api_key")' in seg, f"没有复用插件 config 里的 key: {seg!r}"
-    assert seg.index('plugin.get("bridge_api_key")') < seg.index("gen_bridge_key()"), \
-        "生成新 key 必须排在复用插件 key 之后"
+    # 同一个 app 时插件的 key 必须**最先**被用 —— 过时的 cli.json key 排在前面会 --force 覆盖 Secret,
+    # 插件照样全部 401(2026-09-24 review:第一版顺序写反了)。
+    assert seg.index('plugin.get("bridge_api_key")') < seg.index('saved.get("key")') \
+        < seg.index("gen_bridge_key()"), f"优先级必须是 插件 → cli.json → 新生成: {seg!r}"
 
 
 # ── #3 取消要让 ComfyUI 停下 ────────────────────────────────────────────────
@@ -1622,36 +1627,47 @@ def test_fetch_only_deletes_on_explicit_ack():
     assert all(id(r) in inside for r in removes), "有删除落在 ack 分支之外"
 
 
-def test_bridge_client_acks_only_after_a_verified_download(tmp_path):
-    """先完整落盘并校验大小,成功之后才发 ack;大小对不上时绝不能 ack。"""
+def test_bridge_client_acks_only_after_every_output_is_on_disk(tmp_path):
+    """ack 要等**这个任务的全部产物**都落盘并校验之后才发。
+
+    逐文件 ack 的话,后面某个文件断线失败,重试时前面已被删的文件 404,整个任务再也取不全
+    (2026-09-24 review)。大小对不上的那个文件更是绝不能 ack。"""
+    import io
     import bridge_client as bc
     c = bc.BridgeClient("https://ws--comfyui-bridge", "k")
-    seen = {"urls": [], "acks": 0}
+    urls, acks = [], []
 
     class _Resp:
-        def __init__(self, body, clen): self.b, self.headers = io.BytesIO(body), {"Content-Length": str(clen)}
+        def __init__(self, body, clen):
+            self.b, self.headers = io.BytesIO(body), {"Content-Length": str(clen)}
         def read(self, n): return self.b.read(n)
         def __enter__(self): return self
         def __exit__(self, *a): return False
 
-    import io
-    def run(clen):
+    def run(clens):
+        urls.clear(); acks.clear()
+        it = iter(clens)
         orig = bc._open_http
-        bc._open_http = lambda req, timeout=None: (seen["urls"].append(req.full_url), _Resp(b"abc", clen))[1]
-        c._req = lambda url, body, timeout: seen.__setitem__("acks", seen["acks"] + 1) or {}
+        bc._open_http = lambda req, timeout=None: (urls.append(req.full_url), _Resp(b"abc", next(it)))[1]
+        c._req = lambda url, body, timeout: acks.append(url) or {}
+        state = {"status": "completed", "id": "j", "images": [
+            {"filename": "a.mp4", "volume_path": "_outputs/j/a.mp4"},
+            {"filename": "b.wav", "volume_path": "_outputs/j/b.wav"}]}
         try:
-            return c._download_volume("j", "_outputs/j/a.mp4", tmp_path / "a.mp4", delete_remote=True)
+            return c.download_outputs(state, str(tmp_path / f"out{len(clens)}"), delete_remote=True)
         finally:
             bc._open_http = orig
-    assert run(3) == 3
-    assert "delete" not in seen["urls"][0], "下载请求不能再让云端删"
-    assert seen["acks"] == 1, "成功落盘后应发一次 ack"
+
+    run([3, 3])
+    assert all("delete" not in u for u in urls), "下载请求不能再让云端删"
+    assert len(acks) == 2 and all("ack=1" in u for u in acks), acks
+
     try:
-        run(999)
+        run([3, 999])      # 第二个文件大小对不上
         assert False, "大小不符必须报错"
     except bc.BridgeError:
         pass
-    assert seen["acks"] == 1, "大小不符时绝不能 ack —— 那等于亲手删掉唯一的副本"
+    assert acks == [], f"有文件没取成功,就一个都不能 ack(否则重试时前面的 404): {acks}"
 
 
 # ── #1 节点清单:多机取并集、永不互删 ──────────────────────────────────────
@@ -1670,18 +1686,49 @@ def test_complete_baked_entries_prefers_cloud_manifest():
 def test_reconcile_adds_back_cloud_only_nodes_and_never_removes(tmp_path, monkeypatch):
     """插件被 Manager 重装、本机清单丢了 → 一次部署清空云端全部节点。部署前并回,只加不删。"""
     monkeypatch.setattr(node_sync, "DATA_FILE", tmp_path / "_custom_nodes_data.py")
+    monkeypatch.setattr(node_sync, "folder_git_info", lambda name: {"has_git": False})
     node_sync.write_baked_nodes([{"name": "local_only", "url": "https://x/L", "commit": "1"}])
     manifest = [{"name": "cloud_only", "url": "https://x/C", "commit": "2"},
-                {"name": "local_only", "url": "https://x/L", "commit": "1"},
-                {"name": "no_url", "url": "", "commit": ""}]
-    monkeypatch.setattr(node_sync, "fetch_cloud_manifest", lambda cfg: manifest)
-    back = node_sync.reconcile_baked_with_cloud({})
-    assert back == ["cloud_only"], back
-    names = {n["name"] for n in node_sync.read_baked_nodes()}
-    assert names == {"local_only", "cloud_only"}, f"只加不删,且不收空 url 条目: {names}"
+                {"name": "local_only", "url": "https://x/L", "commit": "1"}]
+    monkeypatch.setattr(node_sync, "fetch_cloud_nodes",
+                        lambda cfg: (["cloud_only", "local_only"], manifest))
+    back, lost = node_sync.reconcile_baked_with_cloud({})
+    assert back == ["cloud_only"] and lost == [], (back, lost)
+    assert {n["name"] for n in node_sync.read_baked_nodes()} == {"local_only", "cloud_only"}
 
-    monkeypatch.setattr(node_sync, "fetch_cloud_manifest", lambda cfg: None)
-    assert node_sync.reconcile_baked_with_cloud({}) == [], "拿不到 manifest 时原样不动"
+    monkeypatch.setattr(node_sync, "fetch_cloud_nodes", lambda cfg: (None, None))
+    assert node_sync.reconcile_baked_with_cloud({}) == ([], []), "云端不可达 / 首次部署:无从比较"
+
+
+def test_reconcile_protects_nodes_even_when_the_cloud_is_too_old_to_report_sources(tmp_path, monkeypatch):
+    """云端 < 0.8.48 没有 manifest —— 而 Registry 的 latest 还是 0.7.9,所有从 Registry 升级的用户
+    第一次部署都是这种云端。第一版此时直接什么都不做,保护恰好在最需要的升级路径上失效
+    (2026-09-24 review)。现在:本机装着的用本机 git 信息补;补不出来的必须报出来,由调用方拒绝部署。"""
+    monkeypatch.setattr(node_sync, "DATA_FILE", tmp_path / "_custom_nodes_data.py")
+    node_sync.write_baked_nodes([])                                   # 清单丢了
+    monkeypatch.setattr(node_sync, "fetch_cloud_nodes",
+                        lambda cfg: (["installed_here", "gone_everywhere", "private_tok"], None))
+    monkeypatch.setattr(node_sync, "folder_git_info", lambda name: (
+        {"has_git": True, "url": "https://x/installed_here", "commit": "c"} if name == "installed_here"
+        else {"has_git": False}))
+    back, lost = node_sync.reconcile_baked_with_cloud({})
+    assert back == ["installed_here"], back
+    assert sorted(lost) == ["gone_everywhere", "private_tok"], "补不出来源的必须报出来,不能静默丢"
+
+
+def test_redacted_manifest_urls_are_never_copied_back(tmp_path, monkeypatch):
+    """/health 会把带凭据的 url 脱敏;照抄脱敏后的地址,私有仓库下次就克隆失败。"""
+    monkeypatch.setattr(node_sync, "folder_git_info", lambda name: {"has_git": False})
+    out = node_sync.complete_baked_entries(
+        ["priv"], {"priv": {"name": "priv", "url": "https://u:tok@x/priv", "commit": "1"}},
+        [{"name": "priv", "url": "https://x/priv", "commit": "1", "url_redacted": True}])
+    assert out[0]["url"] == "https://u:tok@x/priv", "脱敏条目应退回本机清单里的完整地址"
+
+
+def test_every_deploy_path_aborts_on_unresolvable_nodes():
+    for f in ("routes.py", "bridge_cli.py", "deploy.py"):
+        body = code_only((ROOT / f).read_text(encoding="utf-8"))
+        assert "unresolved_nodes_message(" in body, f"{f} 没有在补不出来源时中止部署"
 
 
 def test_every_deploy_path_reconciles_before_deploying():
@@ -1749,20 +1796,26 @@ def test_upload_models_validates_remote_path_before_putting():
 
 # ── P2 #8 部署收尾不冲掉并发改动 ───────────────────────────────────────────
 def test_merge_after_deploy_keeps_changes_made_during_the_deploy():
-    """部署要跑 3-5 分钟,这期间用户切了 GPU 档位 / 别的请求生成了 capability。
-    以前整份写回部署开始时的快照,全被悄悄还原。"""
-    base = {"gpu_tier": "auto", "comfyui_tag": "v1", "use_sage_attention": False}
-    ours = {"gpu_tier": "auto", "comfyui_tag": "v2", "use_sage_attention": False}
-    theirs = {"gpu_tier": "top", "comfyui_tag": "v1", "use_sage_attention": True,
-              "local_api_capability": "cap-made-meanwhile"}
+    """部署要跑 3-5 分钟,这期间用户切的 GPU 档位、别的请求生成的 capability 不能被冲掉。"""
+    base = {"gpu_tier": "auto", "comfyui_tag": "v1"}
+    ours = {"gpu_tier": "auto", "comfyui_tag": "v2"}
+    theirs = {"gpu_tier": "top", "comfyui_tag": "v1", "local_api_capability": "cap-made-meanwhile"}
     out = contract.merge_after_deploy(base, ours, theirs)
     assert out["gpu_tier"] == "top", "部署期间用户切的档位被冲掉了"
-    assert out["use_sage_attention"] is True
     assert out["comfyui_tag"] == "v2", "部署自己的结果必须写进去"
     assert out["local_api_capability"] == "cap-made-meanwhile", "部署不管的字段必须原样保留"
-    # 部署请求本身带了新档位、而期间没人改 → 用部署的
     assert contract.merge_after_deploy({"gpu_tier": "auto"}, {"gpu_tier": "cheap"},
                                        {"gpu_tier": "auto"})["gpu_tier"] == "cheap"
+
+
+def test_merge_after_deploy_never_keeps_a_key_the_cloud_does_not_have():
+    """两个并发的首次部署(双击 / 两个 tab)各生成一把 key:A 写 Secret=K1 存 K1,B 再 --force 写
+    Secret=K2。第一版合并时对所有字段「别处改过就以别处为准」,保留了 K1 —— config 与 Secret 不一致,
+    之后所有请求 401(2026-09-24 review)。定义「刚部署出去的东西」的字段必须用部署的值。"""
+    out = contract.merge_after_deploy(
+        {"bridge_api_key": ""}, {"bridge_api_key": "K2", "modal_token_secret": "S2"},
+        {"bridge_api_key": "K1", "modal_token_secret": "S1"})
+    assert out["bridge_api_key"] == "K2" and out["modal_token_secret"] == "S2", out
 
 
 def test_deploy_writes_config_through_the_merge_not_the_stale_snapshot():
@@ -1775,8 +1828,11 @@ def test_deploy_writes_config_through_the_merge_not_the_stale_snapshot():
 
 # ── P2 #15 未跟踪文件只看源码 ──────────────────────────────────────────────
 def test_worktree_dirty_ignores_runtime_junk_but_catches_uncommitted_code(tmp_path):
-    """运行时往节点目录写日志 / 缓存 / 配置(又没 gitignore)的公开节点,以前被永久判 dirty,
-    每次运行都弹「私有节点有改动,需先推送」还整目录上传。只有源码才真正改变云端行为。"""
+    """只豁免**已知的运行时垃圾**,其余未跟踪文件都算改动。
+
+    0.8.48 改成「只有源码才算」方向反了:用户往节点里加的 .json 预设、.txt 通配词会被判干净,
+    云端 clone 里没有它们,静默出错(2026-09-24 review)。误判 dirty 最多多传一次包,误判干净是静默出错。"""
+    import shutil
     import subprocess as sp
     def git(*a):
         sp.run(["git", *a], cwd=tmp_path, check=True, capture_output=True)
@@ -1787,16 +1843,17 @@ def test_worktree_dirty_ignores_runtime_junk_but_catches_uncommitted_code(tmp_pa
 
     (tmp_path / "run.log").write_text("log")
     (tmp_path / "cache").mkdir(); (tmp_path / "cache" / "blob.bin").write_bytes(b"x")
-    (tmp_path / "settings.json").write_text("{}")
-    assert node_sync.worktree_dirty(tmp_path) is False, "运行时垃圾不该算改动"
+    (tmp_path / "__pycache__").mkdir(); (tmp_path / "__pycache__" / "m.pyc").write_bytes(b"x")
+    (tmp_path / ".DS_Store").write_bytes(b"x")
+    assert node_sync.worktree_dirty(tmp_path) is False, "日志 / 缓存 / 字节码不该算改动"
 
-    (tmp_path / "new_helper.py").write_text("y = 2\n")
-    assert node_sync.worktree_dirty(tmp_path) is True, "新写没提交的源码必须算改动"
-    (tmp_path / "new_helper.py").unlink()
-
-    (tmp_path / "subpkg").mkdir(); (tmp_path / "subpkg" / "mod.py").write_text("z = 3\n")
-    assert node_sync.worktree_dirty(tmp_path) is True, "未跟踪的新子包里有源码,也要算"
-    import shutil; shutil.rmtree(tmp_path / "subpkg")
+    for f in ("presets/my_style.json", "wildcards/foo.txt", "new_helper.py"):
+        (tmp_path / f).parent.mkdir(exist_ok=True)
+        (tmp_path / f).write_text("x")
+        assert node_sync.worktree_dirty(tmp_path) is True, f"用户新加的 {f} 必须算改动"
+        (tmp_path / f).unlink()
+    shutil.rmtree(tmp_path / "presets"); shutil.rmtree(tmp_path / "wildcards")
+    assert node_sync.worktree_dirty(tmp_path) is False
 
     (tmp_path / "node.py").write_text("x = 2\n")
     assert node_sync.worktree_dirty(tmp_path) is True, "已跟踪文件的任何改动照旧算"
@@ -1864,6 +1921,97 @@ def test_async_routes_do_not_block_the_event_loop():
             if isinstance(n, ast.Call) and id(n) not in nested and blocking.match(ast.unparse(n.func)):
                 offenders.append(f"{fn.name}:{n.lineno} {ast.unparse(n.func)}()")
     assert not offenders, "这些阻塞调用直接跑在事件循环里:\n  " + "\n  ".join(offenders)
+
+
+# ── 0.8.52:review 0.8.48–0.8.51 的修复 ─────────────────────────────────────
+def test_cancel_is_finalised_by_the_worker_itself():
+    """cancel_endpoint 写的 cancelled 会被 worker 起跑 / 交付时的读改写覆盖,之后没人写终态 ——
+    停在 running,22 分钟后被误报成「被 Modal 强杀、已计费」,而那是用户自己取消的(2026-09-24 review)。"""
+    import ast
+    src = MODAL_APP.read_text(encoding="utf-8")
+    fn = next(n for n in ast.walk(ast.parse(src))
+              if isinstance(n, ast.FunctionDef) and n.name == "_worker_run")
+    main = next(t for t in ast.walk(fn) if isinstance(t, ast.Try) and any(
+        isinstance(h.type, ast.Name) and h.type.id == "BaseException" for h in t.handlers))
+    h = next(h for h in main.handlers if isinstance(h.type, ast.Name) and h.type.id == "BaseException")
+    seg = code_only(ast.get_source_segment(src, h))
+    assert "InputCancellation" in seg and '"status": "cancelled"' in seg, "取消分支没有落定终态"
+    body = code_only(ast.get_source_segment(src, fn))
+    i = body.index('if cur.get("status") == "cancelled":')
+    assert i < body.index('"status": "running", "started_at"'), "起跑时会覆盖已到的取消"
+
+
+def test_stale_check_uses_the_timeout_the_job_started_with():
+    """调小超时并重部署时,老部署上还在跑的长任务不能被新部署按新上限判死。"""
+    import time as _t
+    stale = _extract_nested(MODAL_APP, "_stale_reason", {"WORKER_TIMEOUT": 1200, "_STALE_GRACE_S": 120})
+    now = _t.time()
+    long_job = {"status": "running", "started_at": now - 2000, "timeout_s": 3600}
+    assert stale(long_job, now) == "", "按起跑时的 3600s 算它还活着"
+    assert stale({"status": "running", "started_at": now - 2000}, now), "老条目没记超时就退回当前值"
+
+
+def test_status_rejects_every_non_job_key():
+    state = {"j:progress": {"step": 1, "total": 20}, "j:call": "fc-1"}
+    fn = _load_endpoint("status_endpoint", _status_ns(state))
+    for k in ("j:progress", "j:call"):
+        assert fn(k)["status"] == "not_found", f"{k} 被当成了任务记录"
+
+
+def test_health_redacts_credentials_in_node_urls():
+    """/health 的 manifest 来自 git remote url,私有节点常带 token。bridge key 会给 AIGC Studio、
+    MCP、导出的脚本 —— 凭据不能经 /health 外泄(2026-09-24 review)。依赖清单也不再经 /health。"""
+    red = _extract_nested(MODAL_APP, "_redact_url", {})
+    assert red("https://u:ghp_x@github.com/o/r.git") == ("https://github.com/o/r.git", True)
+    assert red("https://ghp_x@github.com/o/r.git") == ("https://github.com/o/r.git", True)
+    assert red("https://github.com/o/r.git") == ("https://github.com/o/r.git", False)
+    import ast
+    src = MODAL_APP.read_text(encoding="utf-8")
+    fn = next(n for n in ast.walk(ast.parse(src))
+              if isinstance(n, ast.FunctionDef) and n.name == "health_endpoint")
+    seg = code_only(ast.get_source_segment(src, fn))
+    assert "_redact_url(" in seg, "manifest 没脱敏"
+    assert "local_node_reqs" not in seg, "依赖行可能带 git+https://TOKEN@,不能经 /health 报"
+
+
+def test_threshold_zero_still_means_everything_inline(monkeypatch):
+    """阈值 0 的约定是「关闭、全部内联」。总量预算不能绕过它(2026-09-24 review)。"""
+    sys.path.insert(0, str(ROOT / "modal_app"))
+    import _comfy_ws
+    monkeypatch.setattr(_comfy_ws, "get_image_data", lambda *a: b"x" * 1000)
+    monkeypatch.setattr(_comfy_ws, "_VOL_THRESHOLD", 0)
+    monkeypatch.setattr(_comfy_ws, "_INLINE_TOTAL_BUDGET", 10)
+    refs = [{"filename": f"o{i}.png", "subfolder": "", "type": "output", "node_id": "9", "key": "images"}
+            for i in range(3)]
+    images, _ = _comfy_ws.materialize_desktop_outputs(refs, "job1")
+    assert all("data_base64" in i for i in images), "阈值 0 时不该有任何产物走 Volume"
+
+
+def test_inline_budget_setting_actually_reaches_the_container():
+    """只在 deploy_env 里设不够 —— 不在 modal_image 的 .env 烤入清单里,容器里读不到,开关静默失效。"""
+    img = code_only((ROOT / "modal_app" / "modal_image.py").read_text(encoding="utf-8"))
+    assert '"MODAL_BRIDGE_INLINE_TOTAL_MB"' in img
+    assert node_sync.deploy_env({})["MODAL_BRIDGE_INLINE_TOTAL_MB"] == "24"
+
+
+def test_bridge_cli_never_overrides_plugin_deploy_settings_with_its_own_defaults():
+    """CLI 部署到插件的 app 上时,拿自己的默认值会把云端静默退回 v0.30.2、换 Volume、关 sage。"""
+    body = code_only((ROOT / "bridge_cli.py").read_text(encoding="utf-8"))
+    for flag in ("--comfyui-tag", "--gpu", "--cheap-gpu", "--top-gpu", "--timeout-s", "--sage"):
+        i = body.index(f'p.add_argument("{flag}"')
+        assert "default=None" in body[i:body.index(")", i)], f"{flag} 的默认值会覆盖插件配置"
+    assert 'pick(args.comfyui_tag, "comfyui_tag"' in body
+    assert '"modal_volume_name"' in body
+
+
+def test_sync_models_script_uses_relative_paths_like_the_gui():
+    body = code_only((ROOT / "sync_models.py").read_text(encoding="utf-8"))
+    assert "relative_to(" in body and "f.name in existing" not in body
+
+
+def test_deploy_paths_record_the_deployed_reqs_for_other_machines():
+    body = code_only((ROOT / "routes.py").read_text(encoding="utf-8"))
+    assert body.count("record_deployed_reqs,") == 3, "三条部署成功路径都要记下依赖清单"
 
 
 def test_estimate_vram_video_v2_anchors():

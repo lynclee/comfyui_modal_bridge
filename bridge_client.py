@@ -238,12 +238,14 @@ class BridgeClient:
         items = images if isinstance(images, list) and images else (
             [{"filename": state.get("filename"), "data_base64": state.get("data_base64")}]
             if state.get("data_base64") else [])
+        acks = []
         for img in items:
             fn = _name(img.get("filename"))
             local = out / fn
             vp = img.get("volume_path")
             if vp:
-                size = self._download_volume(job_id, vp, local, delete_remote)
+                size = self._download_volume(job_id, vp, local)
+                acks.append(vp)
             elif img.get("data_base64"):
                 # 与大文件那条路一致:写 .part、成功后原子 rename。直接写正式名的话,
                 # 进程中断会在输出目录里留下一个**看起来完整**的截断文件。
@@ -264,10 +266,15 @@ class BridgeClient:
             results.append({"filename": fn, "path": str(local), "size_bytes": size})
         if not results:
             raise BridgeError("状态里没有可落盘的产物(images 为空)")
+        # ⚠ 等**这个任务的全部产物**都落盘之后才发 ack。逐个文件 ack 的话,后面某个文件断线失败,
+        #   重试时前面那些已被删掉的就 404,整个任务再也取不全(2026-09-24 review)。
+        #   routes._write_results 那条路径早就是「全部落盘后统一清理」,这里对齐。
+        if delete_remote:
+            for vp in acks:
+                self._ack_remote(job_id, vp)
         return results
 
-    def _download_volume(self, job_id: str, vol_path: str, local: Path,
-                         delete_remote: bool) -> int:
+    def _download_volume(self, job_id: str, vol_path: str, local: Path) -> int:
         # ⚠ 下载时**不**让云端删。以前带 delete=1,云端在响应交给 ingress 之后就删了,
         #   不等这边收完:断线或大小对不上时,远端副本已没、下面 finally 又清掉 .part,
         #   付过钱的产物两头落空。现在先完整落盘并校验,**成功之后**才发 ack 让云端删。
@@ -290,8 +297,6 @@ class BridgeClient:
                 raise BridgeError(
                     f"/fetch 下载不完整: {size}/{expected} bytes({vol_path})")
             part.replace(local)
-            if delete_remote:
-                self._ack_remote(job_id, vol_path)
             return size
         except urllib.error.HTTPError as e:
             if e.code == 404:

@@ -234,9 +234,7 @@ def test_local_nodes_diff_reports_pending_image_rebuild():
     rt._compute_local_node_reqs = lambda cfg: reqs
     cloud = {"reqs": None}          # None = 云端拿不到(老版本 / 不可达)→ 退回本机 config 记录
 
-    async def _cloud(cfg):
-        return cloud["reqs"]
-    rt._cloud_local_node_reqs = _cloud
+    rt.modal_volume.deployed_reqs = lambda cfg: cloud["reqs"]
 
     async def ask(c):
         r = await c.post("/modal_bridge/local_nodes_diff", json={"folders": ["my_node"]})
@@ -320,17 +318,17 @@ if __name__ == "__main__":
     raise SystemExit(1 if failed else 0)
 
 
-def test_sync_models_never_trusts_local_path_from_the_request_body():
+def test_sync_models_never_trusts_local_path_from_the_request_body(monkeypatch):
     """以前 local_path 原样交给 upload_models(只查 is_file):发一个指向 ~/.ssh 的路径,
     就能把任意本地文件传上 Volume,本地模型路径囚笼等于白做(2026-09-23 review)。
     现在一律用服务端(带囚笼的)解析器重新定位,解析不到的拒绝。"""
     import comfyui_modal_bridge.routes as rt
     seen = {}
-    rt.modal_volume.modal_importable = lambda: True
-    rt.modal_volume.upload_models = lambda cfg, items, on_progress=None: (
-        seen.setdefault("items", items) and {"uploaded": [], "skipped": [], "total_mb": 0})
-    rt._local_model_resolver = lambda: (
-        lambda t, fn: Path("/models/checkpoints/ok.safetensors") if fn == "ok.safetensors" else None)
+    monkeypatch.setattr(rt.modal_volume, "modal_importable", lambda: True)
+    monkeypatch.setattr(rt.modal_volume, "upload_models", lambda cfg, items, on_progress=None: (
+        seen.setdefault("items", items) and {"uploaded": [], "skipped": [], "total_mb": 0}))
+    monkeypatch.setattr(rt, "_local_model_resolver", lambda: (
+        lambda t, fn: Path("/models/checkpoints/ok.safetensors") if fn == "ok.safetensors" else None))
 
     async def ask(c):
         r = await c.post("/modal_bridge/sync_models", json={"items": [
@@ -344,3 +342,33 @@ def test_sync_models_never_trusts_local_path_from_the_request_body():
     assert paths == ["/models/checkpoints/ok.safetensors"], \
         f"请求体里的 local_path 被原样用了,或解析不到的没被拒: {paths}"
     assert "nope.safetensors" in text, "被拒的要在输出里说明"
+
+
+def test_sync_nodes_refuses_entries_without_a_source(monkeypatch):
+    """空 url 的条目以前在写清单时被静默丢掉,随后的部署就把节点从镜像删了(2026-09-24 review)。"""
+    import comfyui_modal_bridge.routes as rt
+    wrote, touched = [], []
+    monkeypatch.setattr(rt.node_sync, "write_baked_nodes", lambda nodes: wrote.append(nodes))
+    # ⚠ 守卫之后的每一步都桩掉:守卫哪天回归,这条测试必须**快速失败**,
+    #   而不是一路走到真的 `modal deploy` —— 那等于从测试里触发一次真实部署。
+    monkeypatch.setattr(rt, "_refresh_local_node_reqs", lambda cfg: touched.append("reqs") or [])
+
+    async def _no_modal(resp):
+        touched.append("ensure_modal")
+        return 1
+    monkeypatch.setattr(rt, "_ensure_modal", _no_modal)
+
+    async def _no_run(*a, **k):
+        touched.append("run_streamed")
+        return 1
+    monkeypatch.setattr(rt, "_run_streamed", _no_run)
+
+    async def ask(c):
+        r = await c.post("/modal_bridge/sync_nodes", json={"new_baked": [
+            {"name": "ok", "url": "https://x/ok", "commit": "1"},
+            {"name": "no_source", "url": "", "commit": ""}]})
+        return r.status, await r.text()
+    st, text = _run(ask)
+    assert st == 409, text
+    assert "no_source" in text and wrote == [] and touched == [], \
+        f"必须在写清单、碰云端之前拒绝(写了 {wrote},碰了 {touched})"

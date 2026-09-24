@@ -152,16 +152,30 @@ def cmd_deploy(args):
     same_app = (plugin.get("modal_app_name") or "comfyui-bridge") == args.app_name
     if not same_app:
         plugin = {}   # 部署的是另一个 app,插件那套凭据不属于它,别串
-    bridge_key = (saved.get("key") or plugin.get("bridge_api_key")
+    # ⚠ 同一个 app 时**插件的 key 优先**,cli.json 的只在插件没有 key 时用。反过来的话,一把过时的
+    #   cli.json key 会 --force 覆盖 Secret,插件照样全部 401(2026-09-24 review:第一版顺序写反了,
+    #   和上面注释自相矛盾)。
+    bridge_key = (plugin.get("bridge_api_key") or saved.get("key")
                   or node_sync.gen_bridge_key())   # 复用旧 key,重部署不换锁
+
+    # ⚠ 部署参数同理:CLI 现在会部署到插件的 app 上,就不能拿自己的默认值去覆盖插件的配置 ——
+    #   否则一次 `bridge_cli deploy` 会把云端 ComfyUI 静默退回 v0.30.2、换掉 Volume、改 GPU、关 sage,
+    #   正是 resolve_comfyui_tag 刚修掉的那类静默降级。显式传了参数才用参数,否则插件 → CLI 默认。
+    def pick(arg, key, default):
+        return arg if arg is not None else plugin.get(key, default)
     cfg = {**DEFAULT_CONFIG,
            **{k: plugin[k] for k in ("comfy_api_key", "hf_token", "civitai_token",
-                                     "aigc_studio_base_url", "aigc_bypass_secret") if plugin.get(k)},
+                                     "aigc_studio_base_url", "aigc_bypass_secret",
+                                     "modal_volume_name", "scaledown_window",
+                                     "volume_threshold_mb", "inline_total_mb",
+                                     "disable_dynamic_vram", "enable_snapshot") if k in plugin},
            "modal_app_name": args.app_name,
-           "comfyui_tag": args.comfyui_tag,
-           "default_gpu": args.gpu, "cheap_gpu": args.cheap_gpu, "top_gpu": args.top_gpu,
-           "worker_timeout_sec": args.timeout_s,
-           "use_sage_attention": args.sage,
+           "comfyui_tag": pick(args.comfyui_tag, "comfyui_tag", "v0.30.2"),
+           "default_gpu": pick(args.gpu, "default_gpu", "H100"),
+           "cheap_gpu": pick(args.cheap_gpu, "cheap_gpu", "L40S"),
+           "top_gpu": pick(args.top_gpu, "top_gpu", "B200"),
+           "worker_timeout_sec": pick(args.timeout_s, "worker_timeout_sec", 3600),
+           "use_sage_attention": pick(args.sage, "use_sage_attention", False),
            "bridge_api_key": bridge_key}
     env = node_sync.deploy_env(cfg)
 
@@ -177,11 +191,13 @@ def cmd_deploy(args):
     # 镜像节点清单取自本机那份被 gitignore 的文件;先把云端有、本机缺的并回来(只加不删),
     # 否则在清单丢失 / 别的机器加过节点时,这次部署会把它们从镜像里删掉。
     node_sync.ensure_baked_file()
-    back = node_sync.reconcile_baked_with_cloud({**cfg, **plugin,
-                                                 "bridge_api_key": bridge_key})
+    back, lost = node_sync.reconcile_baked_with_cloud({**cfg, **plugin,
+                                                       "bridge_api_key": bridge_key})
     if back:
         print(f"      节点清单:并回云端独有的 {len(back)} 个 —— {', '.join(back)}")
-    print(f"[2/2] modal deploy(ComfyUI tag {args.comfyui_tag},首次要构建镜像,10 分钟级)…")
+    if lost:
+        sys.exit("✗ " + node_sync.unresolved_nodes_message(lost))
+    print(f"[2/2] modal deploy(ComfyUI tag {cfg['comfyui_tag']},首次要构建镜像,10 分钟级)…")
     proc = subprocess.Popen(node_sync.deploy_command(), cwd=str(_HERE / "modal_app"), env=env,
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     tail_lines: list[str] = []
@@ -263,12 +279,12 @@ def main():
 
     p = sub.add_parser("deploy", help="[自建者] 无 ComfyUI 部署云端 app(需 modal token)")
     p.add_argument("--app-name", default="comfyui-bridge")
-    p.add_argument("--comfyui-tag", default="v0.30.2", help="云端 ComfyUI 版本 tag")
-    p.add_argument("--gpu", default="H100")
-    p.add_argument("--cheap-gpu", default="L40S")
-    p.add_argument("--top-gpu", default="B200")
-    p.add_argument("--timeout-s", type=int, default=3600)
-    p.add_argument("--sage", action="store_true", help="开 SageAttention(H100/L40S 生效,自行看片验证)")
+    p.add_argument("--comfyui-tag", default=None, help="云端 ComfyUI 版本 tag(不传:沿用插件配置,没有则 v0.30.2)")
+    p.add_argument("--gpu", default=None, help="不传:沿用插件配置,没有则 H100")
+    p.add_argument("--cheap-gpu", default=None)
+    p.add_argument("--top-gpu", default=None)
+    p.add_argument("--timeout-s", type=int, default=None)
+    p.add_argument("--sage", action="store_true", default=None, help="开 SageAttention(H100/L40S 生效,自行看片验证)")
     p.set_defaults(f=cmd_deploy)
 
     p = sub.add_parser("upload-model", help="[自建者] 本地模型上 Volume")
