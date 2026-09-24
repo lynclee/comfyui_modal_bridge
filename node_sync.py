@@ -448,15 +448,49 @@ def commit_on_remote(path: Path, commit: str) -> bool:
     return bool(out.strip())
 
 
+_CODE_SUFFIXES = (".py", ".js", ".mjs", ".cjs", ".ts")
+
+
+def _untracked_has_code(root: Path, rel: str, limit: int = 3000) -> bool:
+    """未跟踪的文件 / 目录里有没有源码。看不清时一律按「有」(方向安全,见 worktree_dirty)。"""
+    p = root / rel.rstrip("/")
+    if p.is_file():
+        return p.suffix.lower() in _CODE_SUFFIXES
+    if not p.is_dir():
+        return True
+    for i, f in enumerate(p.rglob("*")):
+        if i >= limit:
+            return True      # 目录大到看不完:宁可多传一次包,也不冒漏掉代码的险
+        if f.suffix.lower() in _CODE_SUFFIXES and f.is_file():
+            return True
+    return False
+
+
 def worktree_dirty(path: Path) -> bool:
-    """工作树有未提交改动(含未跟踪文件)。
+    """工作树有未提交改动。
     这是自写 / 调试节点**最常见**的状态:改一行试一下,谁会先 commit 再 push?
     而云端只按 commit clone —— HEAD 没变但文件变了,镜像里跑的还是旧代码,
-    且改前改后结果一模一样、毫无线索。所以 dirty 必须当成「本地版本 ≠ 云端版本」。"""
-    out = _git(["status", "--porcelain"], path)
+    且改前改后结果一模一样、毫无线索。所以 dirty 必须当成「本地版本 ≠ 云端版本」。
+
+    ⚠ 未跟踪文件只在**是源码**时才算。以前 `git status --porcelain` 把所有未跟踪文件都算改动,
+      于是运行时会往自己目录写配置 / 日志 / 缓存(又没 gitignore)的公开节点被永久判 dirty,
+      走私有覆盖包通道:文件一变 digest 就变,几乎每次运行都弹「私有节点有改动,需先推送」,
+      还要整目录上传(≤200MB)(2026-09-23 review)。
+      只看源码的理由:云端 clone 里缺一个用户新写、忘了提交的 .py 才真正改变行为;
+      运行时生成的数据文件云端运行时会自己再生成。已跟踪文件的任何改动照旧一律算 dirty。"""
+    out = _git(["status", "--porcelain", "--untracked-files=normal"], path)
     # 已确认是该节点自己的 repo 后,status 仍失败时按 dirty 处理:方向安全,最多多传一次包;
     # 反过来当 clean 会把本地改动静默丢掉。
-    return out is None or bool(out.strip())
+    if out is None:
+        return True
+    for line in out.splitlines():
+        if not line.strip():
+            continue
+        if not line.startswith("??"):
+            return True                       # 已跟踪文件有改动
+        if _untracked_has_code(path, line[3:].strip().strip('"')):
+            return True
+    return False
 
 
 def _is_own_git_repo(path: Path) -> bool:

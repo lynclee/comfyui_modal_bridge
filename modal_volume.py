@@ -78,11 +78,41 @@ def get_volume(cfg: dict):
     return modal.Volume.from_name(vol_name, create_if_missing=True)
 
 
+def model_relpath(filename) -> str | None:
+    """工作流里的模型名 → Volume 上 models/<type>/ 下的相对路径(保留子目录)。非法返回 None。
+
+    ⚠ 这个值会拼进远端路径,而它来自工作流 JSON:绝对路径、".." 一律拒绝。反斜杠按分隔符处理。"""
+    if not isinstance(filename, str) or not filename.strip():
+        return None
+    rel = filename.strip().replace("\\", "/")
+    while rel.startswith("./"):
+        rel = rel[2:]
+    parts = [x for x in rel.split("/") if x not in ("", ".")]
+    if rel.startswith("/") or not parts or ".." in parts:
+        return None
+    return "/".join(parts)
+
+
 def _listdir_names(vol, type_) -> set:
+    """models/<type>/ 下所有**文件**的相对路径(含子目录,如 "SDXL/x.safetensors")。
+
+    ⚠ 以前是非递归 listdir + 取 basename:子目录里的模型在存在性检查里根本看不见,而检查又按
+      basename 比对 —— 工作流引用 "SDXL/sd_xl_base.safetensors",上传却落到
+      models/checkpoints/sd_xl_base.safetensors,云端 ComfyUI 列表里只有不带目录的名字 →
+      value not in list,先烧约 43s GPU(5 轮 free+reload)才失败;下次预检又按 basename
+      判「已齐」,**这个工作流永远跑不通**(2026-09-23 review)。
+    实查过真实 Volume:recursive 返回完整卷路径 "models/<type>/..." 且目录也会作为条目出现。"""
+    prefix = f"models/{type_}/"
     try:
-        return {Path(e.path).name for e in vol.listdir(f"models/{type_}")}
+        entries = vol.listdir(f"models/{type_}", recursive=True)
     except Exception:
         return set()  # 该 type 目录在 Volume 还不存在
+    out = set()
+    for e in entries:
+        if getattr(e.type, "name", str(e.type)) != "FILE":
+            continue
+        out.add(e.path[len(prefix):] if e.path.startswith(prefix) else Path(e.path).name)
+    return out
 
 
 def volume_files_by_type(cfg, types) -> dict:
@@ -179,18 +209,24 @@ def check_models(cfg: dict, required: list, resolver) -> dict:
     present, missing_local, downloading, missing_no_source = [], [], [], []
     for item in required:
         t, fn = item["type"], item["filename"]
-        base = Path(fn).name
-        if base in have.get(t, set()) or fn in have.get(t, set()):
+        rel = model_relpath(fn)
+        if rel is None:
+            # 绝对路径 / 含 ".." —— 不能当远端路径用,也就无从上传
+            missing_no_source.append({"type": t, "filename": fn})
+            continue
+        # 按带子目录的相对路径**精确**比对。按 basename 比会把「别的子目录里的同名文件」
+        # 误判成已存在,于是永远不上传到工作流真正引用的位置(见 _listdir_names)。
+        if rel in have.get(t, set()):
             present.append({"type": t, "filename": fn})
             continue
         local = resolver(t, fn)
         if local is None:
             missing_no_source.append({"type": t, "filename": fn})
         elif file_in_progress(local):
-            downloading.append({"type": t, "filename": base})
+            downloading.append({"type": t, "filename": rel})
         else:
             missing_local.append({
-                "type": t, "filename": base,
+                "type": t, "filename": rel,
                 "local_path": str(local),
                 "size_mb": local.stat().st_size // 1024 // 1024,
             })
@@ -241,6 +277,14 @@ def upload_models(cfg: dict, items: list, on_progress=None) -> dict:
     uploaded, skipped, total_mb = [], [], 0
     pending = []
     for it in items:
+        # 远端路径 models/<type>/<rel> 的两段都来自请求体:type 只许是单段名,filename 过
+        # model_relpath(拒绝绝对路径和 "..")。/sync_models 完全信任请求体,这里是它唯一的闸。
+        rel = model_relpath(it.get("filename"))
+        t = it.get("type")
+        if rel is None or not isinstance(t, str) or not t or "/" in t or "\\" in t or t in (".", ".."):
+            skipped.append({**it, "reason": "非法的 type / filename(绝对路径或含 ..)"})
+            continue
+        it = {**it, "filename": rel}
         local = Path(it["local_path"])
         if not local.is_file():
             skipped.append({**it, "reason": "local file missing"})

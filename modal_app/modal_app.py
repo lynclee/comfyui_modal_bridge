@@ -1138,6 +1138,13 @@ def health_endpoint(key: str = "", x_bridge_key: str = _Header("")):
             for n in _baked if isinstance(n, dict)]
     except Exception as e:
         info["custom_nodes_manifest_error"] = str(e)
+    # 镜像里实际装的私有节点依赖。本地据此判断「要不要重建镜像」—— 以前用每台机器各自 config 里的
+    # 指纹,而镜像是多机共享的,别的机器一改就误判(见 routes._deployed_reqs_hash)。
+    try:
+        from _local_nodes_data import LOCAL_NODE_REQS as _reqs
+        info["local_node_reqs"] = list(_reqs)
+    except Exception as e:
+        info["local_node_reqs_error"] = str(e)
     return info
 
 

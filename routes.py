@@ -459,6 +459,41 @@ _INPUT_FILE_NODES = {
 }
 
 
+async def _cloud_local_node_reqs(cfg: dict) -> list | None:
+    """云端 /health 报的私有节点依赖清单;拿不到返回 None。
+
+    ⚠ 单次请求、短超时,**不用** modal_client.health:那个会重试 3 轮、每轮 10s,云端不可达时
+      卡 30 多秒 —— 而这里在「提交前预检」的路径上,卡住就是界面挂着不动。拿不到就退回本机记录,
+      最坏只是多问一次「要不要重建」,不值得让用户等。"""
+    try:
+        url = modal_client._endpoint(cfg["modal_endpoint_base"], "health")
+        async with aiohttp.ClientSession() as s:
+            async with s.get(url, headers={"X-Bridge-Key": modal_client._key(cfg)},
+                             timeout=aiohttp.ClientTimeout(total=8)) as r:
+                if r.status != 200:
+                    return None
+                h = await r.json(content_type=None)
+        reqs = h.get("local_node_reqs") if isinstance(h, dict) else None
+        return reqs if isinstance(reqs, list) else None
+    except Exception as e:
+        print(f"[modal_bridge] 读云端依赖清单失败,退回本机记录: {type(e).__name__}: {e}")
+        return None
+
+
+async def _deployed_reqs_hash(cfg: dict) -> str:
+    """云端镜像**实际装的**私有节点依赖的指纹。
+
+    ⚠ 以前用本机 config 里的 local_node_reqs_deployed_hash。但镜像是多台机器共享的:机器 A 改了
+      依赖并部署,A 存下新指纹;机器 B 的 config 还是旧的,于是 B 每次都误判「还欠一次镜像重建」,
+      用户确认后白花 3-5 分钟构建费(2026-09-23 review)。现在 /health 原样报回镜像里的依赖清单,
+      这里用同一个 local_node_reqs_hash 算 —— 云端不复制哈希算法,就不存在两份漂移。
+    拿不到(云端还是老版本 / 不可达)才退回本机 config 的记录。"""
+    reqs = await _cloud_local_node_reqs(cfg)
+    if reqs is not None:
+        return node_sync.local_node_reqs_hash(reqs)
+    return cfg.get("local_node_reqs_deployed_hash", "")
+
+
 def _extract_input_file_name(cls: str, ins: dict) -> str | None:
     """按节点类型取它引用的本地文件名。取不到(或那一位接的是连线而非字面量)返回 None。"""
     keys = _INPUT_FILE_NODES.get(cls)
@@ -1240,7 +1275,7 @@ def _setup_routes():
                     latest_cfg = cfg_mod.load_config()
                     reqs = await asyncio.to_thread(_refresh_local_node_reqs, latest_cfg)
                     target_hash = node_sync.local_node_reqs_hash(reqs)
-                    deployed_hash = latest_cfg.get("local_node_reqs_deployed_hash", "")
+                    deployed_hash = await _deployed_reqs_hash(latest_cfg)
                     needs_redeploy = target_hash != deployed_hash and bool(reqs or deployed_hash)
                     if needs_redeploy:
                         await _emit(resp, f"== 私有节点依赖已变化({len(reqs)} 条),自动重新部署 ==\n")
@@ -1307,7 +1342,7 @@ def _setup_routes():
         try:
             _reqs = await asyncio.to_thread(_compute_local_node_reqs, cfg)   # 纯读,不落盘
             _target = node_sync.local_node_reqs_hash(_reqs)
-            _deployed = cfg.get("local_node_reqs_deployed_hash", "")
+            _deployed = await _deployed_reqs_hash(cfg)
             reqs_pending = _target != _deployed and bool(_reqs or _deployed)
         except Exception as e:
             # 同上:查不出来就别拦路,当作"要重建"多问一次,不会漏
@@ -1562,7 +1597,8 @@ def _setup_routes():
         _tag_change = node_sync.comfyui_tag_change_note(cfg.get("comfyui_tag"), comfyui_tag)
 
         # 合并出完整 config(用于 deploy_env + 最终落盘)
-        cfg.update({
+        _base_cfg = dict(cfg)   # 部署开始时的快照,收尾写回时做三方合并(见 contract.merge_after_deploy)
+        _deploy_updates = {
             "modal_endpoint_base": endpoint_base,
             "modal_app_name": app_name,
             "modal_workspace": workspace,
@@ -1583,7 +1619,8 @@ def _setup_routes():
             "civitai_token": civitai_token,
             "aigc_studio_base_url": aigc_base_url,
             "aigc_bypass_secret": aigc_bypass,
-        })
+        }
+        cfg.update(_deploy_updates)
         env = node_sync.deploy_env(cfg)
         cwd = str(node_sync.MODAL_APP_DIR)
 
@@ -1717,8 +1754,11 @@ def _setup_routes():
                 return resp
 
             # 4) 写本地 config(在 ComfyUI 进程里,路径用 folder_paths,必对)
-            cfg["local_node_reqs_deployed_hash"] = _local_reqs_hash
-            cfg_mod.save_config(cfg)
+            # ⚠ 不能整份写回 cfg:那是几分钟前的快照,会把部署期间别处的改动冲掉。三方合并。
+            _final = contract.merge_after_deploy(_base_cfg, _deploy_updates, cfg_mod.load_config())
+            _final["local_node_reqs_deployed_hash"] = _local_reqs_hash
+            cfg_mod.save_config(_final)
+            cfg = _final
             await _emit(resp, f"\n== ✓ config 已写入(endpoint={endpoint_base})==\n")
 
         # 5) 验证 health(锁外即可)

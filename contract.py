@@ -46,6 +46,23 @@ def public_config(cfg: dict) -> dict:
     return safe
 
 
+def merge_after_deploy(base: dict, ours: dict, theirs: dict) -> dict:
+    """部署结束写回 config 的三方合并。
+
+    base   = 部署开始时读到的 config;ours = 这次部署要写的字段;theirs = 收尾时重新读到的 config。
+    ⚠ 以前是把 base+ours 整份写回:部署要跑 3-5 分钟,这期间用户在同一个 Setup 框里切 GPU 档位
+      (onchange 立即 POST /config,提示「✓ 已切到…」)、在设置页改 sage / CPU 路由 / AIGC URL,
+      或别的请求生成了 local_api_capability、另一次部署写了指纹 —— 部署一结束全被悄悄还原
+      (2026-09-23 review)。/sync_nodes、/sync_local_nodes 保存前都会重新 load,只有 /deploy 没有。
+    规则:某字段在部署期间被别处改过(theirs ≠ base)→ 以别处为准;没人动过 → 写部署的值。
+    ours 之外的字段一律取 theirs。"""
+    out = dict(theirs)
+    for k, v in ours.items():
+        if theirs.get(k) == base.get(k):
+            out[k] = v
+    return out
+
+
 def is_safe_job_id(job_id) -> bool:
     """job_id 能不能安全地拼进文件路径。
 

@@ -232,6 +232,11 @@ def test_local_nodes_diff_reports_pending_image_rebuild():
         "upload": [], "uptodate": [{"folder": f} for f in folders], "failed": [],
     }
     rt._compute_local_node_reqs = lambda cfg: reqs
+    cloud = {"reqs": None}          # None = 云端拿不到(老版本 / 不可达)→ 退回本机 config 记录
+
+    async def _cloud(cfg):
+        return cloud["reqs"]
+    rt._cloud_local_node_reqs = _cloud
 
     async def ask(c):
         r = await c.post("/modal_bridge/local_nodes_diff", json={"folders": ["my_node"]})
@@ -252,6 +257,20 @@ def test_local_nodes_diff_reports_pending_image_rebuild():
     assert body["uptodate"] == ["my_node"], "内容明明一致,不该报成有改动"
     assert body["reqs_redeploy_pending"] is True, \
         f"依赖镜像欠重建却没回报 —— 前端会说「无需推送」然后静默卡几分钟: {body}"
+
+    # ③ 多机:本机 config 的指纹是旧的,但云端镜像里的依赖其实已经是最新的
+    #    (另一台机器改了依赖并部署过)。以前按本机记录判 → 每次都误报「欠重建」,
+    #    用户确认后白花 3-5 分钟构建费。镜像是共享的,必须以云端为准(2026-09-23 review)。
+    cloud["reqs"] = list(reqs)
+    st, body = _run(ask)
+    assert st == 200, body
+    assert body["reqs_redeploy_pending"] is False, \
+        f"云端镜像已是最新,却按本机的旧指纹判成欠重建: {body}"
+    # 反过来:云端确实旧了,就算本机记录「一致」也要如实报
+    _set_cfg(local_node_reqs_deployed_hash=matching)
+    cloud["reqs"] = ["pandas"]
+    st, body = _run(ask)
+    assert body["reqs_redeploy_pending"] is True, f"云端镜像的依赖是旧的却没报: {body}"
 
 
 def test_bridge_key_needs_capability_only_off_loopback():

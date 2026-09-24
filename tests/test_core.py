@@ -1699,6 +1699,109 @@ def test_every_deploy_path_reconciles_before_deploying():
     assert "reconcile_baked_with_cloud" not in seg, "/sync_nodes 里并回会让有意的删除永远删不掉"
 
 
+# ── P2 #5 模型子目录 ────────────────────────────────────────────────────────
+def test_model_relpath_keeps_subdirs_and_rejects_escapes():
+    f = modal_volume.model_relpath
+    assert f("SDXL/sd_xl_base.safetensors") == "SDXL/sd_xl_base.safetensors"
+    assert f("SDXL\\sd_xl_base.safetensors") == "SDXL/sd_xl_base.safetensors", "反斜杠按分隔符"
+    assert f("./a//b.safetensors") == "a/b.safetensors"
+    for bad in ("../x.safetensors", "/etc/passwd", "a/../../b", "", None):
+        assert f(bad) is None, f"没挡住: {bad!r}"
+
+
+def test_listdir_names_recurses_and_keeps_relative_paths():
+    """实查过真实 Volume:recursive 返回完整卷路径 models/<type>/...,目录也作为条目出现。"""
+    from types import SimpleNamespace as NS
+    FILE, DIR = NS(name="FILE"), NS(name="DIRECTORY")
+    vol = NS(listdir=lambda path, recursive=False: [
+        NS(path="models/checkpoints/flat.safetensors", type=FILE),
+        NS(path="models/checkpoints/SDXL", type=DIR),
+        NS(path="models/checkpoints/SDXL/base.safetensors", type=FILE),
+    ] if recursive else [NS(path="models/checkpoints/flat.safetensors", type=FILE)])
+    got = modal_volume._listdir_names(vol, "checkpoints")
+    assert got == {"flat.safetensors", "SDXL/base.safetensors"}, got
+
+
+def test_check_models_does_not_treat_flattened_copy_as_present(monkeypatch, tmp_path):
+    """工作流引用 SDXL/x,Volume 上只有被拍平的 x —— 云端 ComfyUI 找不到 SDXL/x。
+    以前按 basename 判「已齐」,这个工作流就永远跑不通(先烧约 43s GPU 才失败)。"""
+    local = tmp_path / "x.safetensors"
+    local.write_bytes(b"w")
+    monkeypatch.setattr(modal_volume, "volume_files_by_type",
+                        lambda cfg, types: {"checkpoints": {"x.safetensors"}})
+    monkeypatch.setattr(modal_volume, "file_in_progress", lambda p, **k: False)
+    r = modal_volume.check_models({}, [{"type": "checkpoints", "filename": "SDXL/x.safetensors"}],
+                                  lambda t, fn: local)
+    assert not r["present"], f"拍平的同名文件被当成了已存在: {r['present']}"
+    assert [m["filename"] for m in r["missing_local"]] == ["SDXL/x.safetensors"], \
+        "上传目标必须保留子目录,否则云端路径和工作流对不上"
+
+
+def test_upload_models_validates_remote_path_before_putting():
+    """/sync_models 完全信任请求体,upload_models 是远端路径唯一的闸。"""
+    import ast
+    src = (ROOT / "modal_volume.py").read_text(encoding="utf-8")
+    fn = next(n for n in ast.walk(ast.parse(src))
+              if isinstance(n, ast.FunctionDef) and n.name == "upload_models")
+    body = code_only(ast.get_source_segment(src, fn))
+    assert body.index("model_relpath(") < body.index("put_file("), "远端路径没校验就写了"
+
+
+# ── P2 #8 部署收尾不冲掉并发改动 ───────────────────────────────────────────
+def test_merge_after_deploy_keeps_changes_made_during_the_deploy():
+    """部署要跑 3-5 分钟,这期间用户切了 GPU 档位 / 别的请求生成了 capability。
+    以前整份写回部署开始时的快照,全被悄悄还原。"""
+    base = {"gpu_tier": "auto", "comfyui_tag": "v1", "use_sage_attention": False}
+    ours = {"gpu_tier": "auto", "comfyui_tag": "v2", "use_sage_attention": False}
+    theirs = {"gpu_tier": "top", "comfyui_tag": "v1", "use_sage_attention": True,
+              "local_api_capability": "cap-made-meanwhile"}
+    out = contract.merge_after_deploy(base, ours, theirs)
+    assert out["gpu_tier"] == "top", "部署期间用户切的档位被冲掉了"
+    assert out["use_sage_attention"] is True
+    assert out["comfyui_tag"] == "v2", "部署自己的结果必须写进去"
+    assert out["local_api_capability"] == "cap-made-meanwhile", "部署不管的字段必须原样保留"
+    # 部署请求本身带了新档位、而期间没人改 → 用部署的
+    assert contract.merge_after_deploy({"gpu_tier": "auto"}, {"gpu_tier": "cheap"},
+                                       {"gpu_tier": "auto"})["gpu_tier"] == "cheap"
+
+
+def test_deploy_writes_config_through_the_merge_not_the_stale_snapshot():
+    routes = (ROOT / "routes.py").read_text(encoding="utf-8")
+    i = routes.index("# 4) 写本地 config")
+    seg = code_only(routes)[i:i + 600]
+    assert "merge_after_deploy(" in seg and "load_config()" in seg, seg
+    assert "save_config(cfg)" not in seg, "又把部署开始时的快照整份写回了"
+
+
+# ── P2 #15 未跟踪文件只看源码 ──────────────────────────────────────────────
+def test_worktree_dirty_ignores_runtime_junk_but_catches_uncommitted_code(tmp_path):
+    """运行时往节点目录写日志 / 缓存 / 配置(又没 gitignore)的公开节点,以前被永久判 dirty,
+    每次运行都弹「私有节点有改动,需先推送」还整目录上传。只有源码才真正改变云端行为。"""
+    import subprocess as sp
+    def git(*a):
+        sp.run(["git", *a], cwd=tmp_path, check=True, capture_output=True)
+    git("init", "-q"); git("config", "user.email", "t@t"); git("config", "user.name", "t")
+    (tmp_path / "node.py").write_text("x = 1\n")
+    git("add", "."); git("commit", "-qm", "init")
+    assert node_sync.worktree_dirty(tmp_path) is False
+
+    (tmp_path / "run.log").write_text("log")
+    (tmp_path / "cache").mkdir(); (tmp_path / "cache" / "blob.bin").write_bytes(b"x")
+    (tmp_path / "settings.json").write_text("{}")
+    assert node_sync.worktree_dirty(tmp_path) is False, "运行时垃圾不该算改动"
+
+    (tmp_path / "new_helper.py").write_text("y = 2\n")
+    assert node_sync.worktree_dirty(tmp_path) is True, "新写没提交的源码必须算改动"
+    (tmp_path / "new_helper.py").unlink()
+
+    (tmp_path / "subpkg").mkdir(); (tmp_path / "subpkg" / "mod.py").write_text("z = 3\n")
+    assert node_sync.worktree_dirty(tmp_path) is True, "未跟踪的新子包里有源码,也要算"
+    import shutil; shutil.rmtree(tmp_path / "subpkg")
+
+    (tmp_path / "node.py").write_text("x = 2\n")
+    assert node_sync.worktree_dirty(tmp_path) is True, "已跟踪文件的任何改动照旧算"
+
+
 def test_estimate_vram_video_v2_anchors():
     """激活公式的三个实测锚点(MiniMax H3,主模型 20GB):
     0.9MP×362 帧应放行 48G 卡(实测峰值 38-40G 无 offload);2K×362 应对 80G 卡报警(实测 offload)。
