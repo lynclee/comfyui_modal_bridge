@@ -52,6 +52,11 @@ def classify_asset_type(filename: str, out_key: str = "") -> str:
 # 大于此字节数的产物走 Volume 直连取回(本地 SDK 读),小的仍 base64。0 = 关(全 base64)。
 # 阈值由部署烤进镜像 env(MODAL_BRIDGE_VOLUME_THRESHOLD_MB,默认 8MB)。
 _VOL_THRESHOLD = int(os.environ.get("MODAL_BRIDGE_VOLUME_THRESHOLD_MB", "8")) * 1024 * 1024
+# 单个任务内联(base64 进 job_state)的**总量**上限。上面那个阈值是逐文件判的,没有总量:
+# 批量出 16 张每张 7MB 的 4K 图,每张都低于 8MB 走 base64,合计 ~150MB,写 job_state 时
+# modal.Dict 抛 RequestSizeError —— 状态卡在 running,GPU 钱花了、产物只在容器里(2026-09-23
+# review)。超出预算的后续产物一律改走 Volume,和大文件同一条取回路径。
+_INLINE_TOTAL_BUDGET = int(os.environ.get("MODAL_BRIDGE_INLINE_TOTAL_MB", "24")) * 1024 * 1024
 
 
 def wait_comfy_ready(timeout_s: int = 180) -> None:
@@ -159,10 +164,23 @@ def upload_images(images: list[dict]) -> dict:
                     f"需要 {{name, image: data URI}} 形态(只支持图片参考);收到的键: {sorted(image)}")
             b64 = data_uri.split(",", 1)[1] if "," in data_uri else data_uri
             blob = base64.b64decode(b64)
+            # ⚠ 子目录必须拆成 subfolder 字段单独发,不能整串塞进 filename。
+            #   ComfyUI 的 image_upload 是 open(join(input_dir, normpath(subfolder), filename)),
+            #   而 makedirs 只建到 subfolder 那一层 —— filename 里带 "refs/" 时
+            #   input/refs/ 根本没被创建,open() 直接 FileNotFoundError → HTTP 500。
+            #   (2026-09-20 codex review 抓到;对着 ComfyUI v0.34.6 server.py 复现。)
+            # ⚠ 越界自己也要挡一道:ComfyUI 有 commonpath 兜底,但 name 来自调用方提交的
+            #   工作流,不该把唯一的边界检查外包给对端。
+            safe = str(name).replace("\\", "/")
+            if safe.startswith("/") or ".." in safe.split("/"):
+                raise ValueError(f"输入素材路径非法(绝对路径或含 ..): {name}")
+            sub, _, base_name = safe.rpartition("/")
             files = {
-                "image": (name, BytesIO(blob), "image/png"),
+                "image": (base_name, BytesIO(blob), "image/png"),
                 "overwrite": (None, "true"),
             }
+            if sub:
+                files["subfolder"] = (None, sub)
             r = requests.post(f"http://{COMFY_HOST}/upload/image", files=files, timeout=30)
             r.raise_for_status()
         except Exception as e:
@@ -170,6 +188,26 @@ def upload_images(images: list[dict]) -> dict:
     if errors:
         return {"status": "error", "details": errors}
     return {"status": "success"}
+
+
+def interrupt_comfy() -> None:
+    """让 ComfyUI 停下当前 prompt 并清空排队。best-effort,失败不抛(调用方正在处理异常)。
+
+    ⚠ 顺序必须是**先清队列、再中断**:反过来的话,中断的那一刻下一个排队的 prompt 会立刻开跑。
+    ⚠ 取消只会中断 worker 的 Python 线程(Modal 的 InputCancellation),**不会**碰容器里的
+      ComfyUI 子进程 —— 它会继续跑被取消的 prompt。暖容器的下一单排在它后面等它跑完,
+      用户为已取消的任务付了全部剩余 GPU 时间,而界面显示「✕ Cancelled」(2026-09-23 review)。
+    接口依据 ComfyUI v0.34.6 server.py:POST /queue {"clear": true}、POST /interrupt。"""
+    ok = True
+    for path, body in (("/queue", {"clear": True}), ("/interrupt", {})):
+        try:
+            requests.post(f"http://{COMFY_HOST}{path}", json=body, timeout=5)
+        except Exception as e:
+            ok = False
+            print(f"[bridge] ⚠ ComfyUI {path} 失败(prompt 可能仍在跑): {e}")
+    if ok:
+        # 留痕:没有这行的话,线上根本看不出取消后 ComfyUI 有没有被叫停(modal app logs 可查)
+        print("[bridge] 已让 ComfyUI 停下:清空排队 + 中断当前 prompt")
 
 
 def free_comfy_models() -> None:
@@ -345,13 +383,18 @@ def materialize_desktop_outputs(refs: list[dict], job_id: str) -> tuple[list[dic
     返回 (images 记录, errors)。"""
     images: list[dict] = []
     errors: list[str] = []
+    inline_total = 0
     for ref in refs:
         image_bytes = get_image_data(ref["filename"], ref["subfolder"], ref["type"])
         if not image_bytes:
             errors.append(f"failed to fetch {ref['filename']}")
             continue
         rec = {"filename": ref["filename"], "node_id": ref["node_id"], "key": ref["key"]}
-        if _VOL_THRESHOLD and len(image_bytes) > _VOL_THRESHOLD:
+        over_file = _VOL_THRESHOLD and len(image_bytes) > _VOL_THRESHOLD
+        # 阈值为 0 的约定是「关闭、全部内联」,总量预算也必须跟着关 —— 否则破坏既有契约
+        over_total = (_VOL_THRESHOLD and _INLINE_TOTAL_BUDGET
+                      and inline_total + len(image_bytes) > _INLINE_TOTAL_BUDGET)
+        if over_file or over_total:
             # 大文件:写进挂载的 Volume(_outputs/<job>/<node>__<fn>)→ 本地 SDK 直连取回,不走 base64。
             # commit 由 modal_app._worker_run 在跑完后统一做(这里只写挂载点文件)。
             vp = f"_outputs/{job_id}/{ref['node_id']}__{ref['filename']}"
@@ -372,6 +415,7 @@ def materialize_desktop_outputs(refs: list[dict], job_id: str) -> tuple[list[dic
                 f.write(image_bytes)
             rec["volume_path"] = vp
         else:
+            inline_total += len(image_bytes)
             rec["data_base64"] = base64.b64encode(image_bytes).decode("utf-8")
         images.append(rec)
     return images, errors

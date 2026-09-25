@@ -23,6 +23,60 @@ PUBLIC_CONFIG_WRITE_FIELDS = frozenset({
 })
 
 
+# 永不回吐浏览器的 config 字段。⚠ 新增任何凭据字段必须加在这里 —— 以前 GET / POST /config
+# 各维护一份 pop 列表,加一个字段要记得改两处,漏一处就是把凭据送进浏览器(2026-09-23 收成一份)。
+SECRET_CONFIG_FIELDS = (
+    "modal_token_secret", "bridge_api_key", "comfy_api_key", "aigc_bypass_secret",
+    "local_api_capability", "hf_token", "civitai_token",
+)
+_INTERNAL_CONFIG_FIELDS = ("local_node_reqs_deployed_hash",)
+
+
+def public_config(cfg: dict) -> dict:
+    """config 的浏览器可见视图:凭据一律抹掉,只留 has_xxx 标志(部署框据此显示"已保存,留空=沿用")。"""
+    safe = dict(cfg)
+    safe["has_token_secret"] = bool(safe.get("modal_token_secret"))
+    safe["has_comfy_api_key"] = bool(safe.get("comfy_api_key"))
+    safe["has_aigc_bypass_secret"] = bool(safe.get("aigc_bypass_secret"))
+    safe["has_local_api_capability"] = bool(safe.get("local_api_capability"))
+    safe["has_hf_token"] = bool(safe.get("hf_token"))
+    safe["has_civitai_token"] = bool(safe.get("civitai_token"))
+    for k in SECRET_CONFIG_FIELDS + _INTERNAL_CONFIG_FIELDS:
+        safe.pop(k, None)
+    return safe
+
+
+def merge_after_deploy(base: dict, ours: dict, theirs: dict) -> dict:
+    """部署结束写回 config 的三方合并。
+
+    base   = 部署开始时读到的 config;ours = 这次部署要写的字段;theirs = 收尾时重新读到的 config。
+    ⚠ 以前是把 base+ours 整份写回:部署要跑 3-5 分钟,这期间用户在同一个 Setup 框里切 GPU 档位
+      (onchange 立即 POST /config,提示「✓ 已切到…」)、在设置页改 sage / CPU 路由 / AIGC URL,
+      或别的请求生成了 local_api_capability、另一次部署写了指纹 —— 部署一结束全被悄悄还原
+      (2026-09-23 review)。/sync_nodes、/sync_local_nodes 保存前都会重新 load,只有 /deploy 没有。
+    规则:
+      · ours 里的**运行时偏好**(_PREFER_LATEST_ON_DEPLOY):部署期间被别处改过就以别处为准 ——
+        那是用户的最新意图,部署只是顺手收下了开始时的值。
+      · ours 里的其余字段(bridge_api_key、Modal token、endpoint、tag……)定义了**刚部署出去的东西**,
+        必须和云端一致,一律用部署的值。⚠ 第一版对所有字段都「别处改过就以别处为准」,两个并发的
+        首次部署(双击 / 两个 tab)会各生成一把 key:A 写 Secret=K1 并存 K1,B 再 --force 写
+        Secret=K2,合并时却保留了 K1 —— config 与 Secret 不一致,之后**所有请求 401**(2026-09-24 review)。
+      · ours 之外的字段一律取 theirs。"""
+    out = dict(theirs)
+    for k, v in ours.items():
+        if k in _PREFER_LATEST_ON_DEPLOY and theirs.get(k) != base.get(k):
+            continue
+        out[k] = v
+    return out
+
+
+# 部署期间可能被用户在别处改掉的运行时偏好(不决定部署出去的东西,以用户最新意图为准)。
+# aigc_bypass_secret 与 URL 成对:设置页清空 URL 时会连带清掉它,不能被部署写回旧值。
+_PREFER_LATEST_ON_DEPLOY = frozenset({
+    "gpu_tier", "auto_downgrade", "aigc_studio_base_url", "aigc_bypass_secret",
+})
+
+
 def is_safe_job_id(job_id) -> bool:
     """job_id 能不能安全地拼进文件路径。
 

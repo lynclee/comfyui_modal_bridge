@@ -232,6 +232,9 @@ def test_local_nodes_diff_reports_pending_image_rebuild():
         "upload": [], "uptodate": [{"folder": f} for f in folders], "failed": [],
     }
     rt._compute_local_node_reqs = lambda cfg: reqs
+    cloud = {"reqs": None}          # None = 云端拿不到(老版本 / 不可达)→ 退回本机 config 记录
+
+    rt.modal_volume.deployed_reqs = lambda cfg: cloud["reqs"]
 
     async def ask(c):
         r = await c.post("/modal_bridge/local_nodes_diff", json={"folders": ["my_node"]})
@@ -252,6 +255,20 @@ def test_local_nodes_diff_reports_pending_image_rebuild():
     assert body["uptodate"] == ["my_node"], "内容明明一致,不该报成有改动"
     assert body["reqs_redeploy_pending"] is True, \
         f"依赖镜像欠重建却没回报 —— 前端会说「无需推送」然后静默卡几分钟: {body}"
+
+    # ③ 多机:本机 config 的指纹是旧的,但云端镜像里的依赖其实已经是最新的
+    #    (另一台机器改了依赖并部署过)。以前按本机记录判 → 每次都误报「欠重建」,
+    #    用户确认后白花 3-5 分钟构建费。镜像是共享的,必须以云端为准(2026-09-23 review)。
+    cloud["reqs"] = list(reqs)
+    st, body = _run(ask)
+    assert st == 200, body
+    assert body["reqs_redeploy_pending"] is False, \
+        f"云端镜像已是最新,却按本机的旧指纹判成欠重建: {body}"
+    # 反过来:云端确实旧了,就算本机记录「一致」也要如实报
+    _set_cfg(local_node_reqs_deployed_hash=matching)
+    cloud["reqs"] = ["pandas"]
+    st, body = _run(ask)
+    assert body["reqs_redeploy_pending"] is True, f"云端镜像的依赖是旧的却没报: {body}"
 
 
 def test_bridge_key_needs_capability_only_off_loopback():
@@ -299,3 +316,59 @@ if __name__ == "__main__":
             failed += 1
     print(f"\n{passed} passed, {failed} failed")
     raise SystemExit(1 if failed else 0)
+
+
+def test_sync_models_never_trusts_local_path_from_the_request_body(monkeypatch):
+    """以前 local_path 原样交给 upload_models(只查 is_file):发一个指向 ~/.ssh 的路径,
+    就能把任意本地文件传上 Volume,本地模型路径囚笼等于白做(2026-09-23 review)。
+    现在一律用服务端(带囚笼的)解析器重新定位,解析不到的拒绝。"""
+    import comfyui_modal_bridge.routes as rt
+    seen = {}
+    monkeypatch.setattr(rt.modal_volume, "modal_importable", lambda: True)
+    monkeypatch.setattr(rt.modal_volume, "upload_models", lambda cfg, items, on_progress=None: (
+        seen.setdefault("items", items) and {"uploaded": [], "skipped": [], "total_mb": 0}))
+    monkeypatch.setattr(rt, "_local_model_resolver", lambda: (
+        lambda t, fn: Path("/models/checkpoints/ok.safetensors") if fn == "ok.safetensors" else None))
+
+    async def ask(c):
+        r = await c.post("/modal_bridge/sync_models", json={"items": [
+            {"type": "checkpoints", "filename": "ok.safetensors", "local_path": "/Users/me/.ssh/id_ed25519"},
+            {"type": "checkpoints", "filename": "nope.safetensors", "local_path": "/etc/passwd"},
+        ]})
+        return r.status, await r.text()
+    st, text = _run(ask)
+    assert st == 200, text
+    paths = [it["local_path"] for it in seen.get("items", [])]
+    assert paths == ["/models/checkpoints/ok.safetensors"], \
+        f"请求体里的 local_path 被原样用了,或解析不到的没被拒: {paths}"
+    assert "nope.safetensors" in text, "被拒的要在输出里说明"
+
+
+def test_sync_nodes_refuses_entries_without_a_source(monkeypatch):
+    """空 url 的条目以前在写清单时被静默丢掉,随后的部署就把节点从镜像删了(2026-09-24 review)。"""
+    import comfyui_modal_bridge.routes as rt
+    wrote, touched = [], []
+    monkeypatch.setattr(rt.node_sync, "write_baked_nodes", lambda nodes: wrote.append(nodes))
+    # ⚠ 守卫之后的每一步都桩掉:守卫哪天回归,这条测试必须**快速失败**,
+    #   而不是一路走到真的 `modal deploy` —— 那等于从测试里触发一次真实部署。
+    monkeypatch.setattr(rt, "_refresh_local_node_reqs", lambda cfg: touched.append("reqs") or [])
+
+    async def _no_modal(resp):
+        touched.append("ensure_modal")
+        return 1
+    monkeypatch.setattr(rt, "_ensure_modal", _no_modal)
+
+    async def _no_run(*a, **k):
+        touched.append("run_streamed")
+        return 1
+    monkeypatch.setattr(rt, "_run_streamed", _no_run)
+
+    async def ask(c):
+        r = await c.post("/modal_bridge/sync_nodes", json={"new_baked": [
+            {"name": "ok", "url": "https://x/ok", "commit": "1"},
+            {"name": "no_source", "url": "", "commit": ""}]})
+        return r.status, await r.text()
+    st, text = _run(ask)
+    assert st == 409, text
+    assert "no_source" in text and wrote == [] and touched == [], \
+        f"必须在写清单、碰云端之前拒绝(写了 {wrote},碰了 {touched})"

@@ -8,6 +8,7 @@ import contextlib
 import functools
 import hashlib
 import json
+import mimetypes
 import secrets
 import subprocess
 from pathlib import Path
@@ -443,35 +444,79 @@ def _fetch_finished(job_id: str, task: asyncio.Task) -> None:
         task.exception()  # 请求断开时也收走异常，避免无人消费的 Task 警告
 
 
+# 引用 input/ 下本地文件的节点 → 各自的输入键。**键名不统一,不能一律取 "image"**:
+# LoadVideo 是 "file"、LoadAudio 是 "audio"(ComfyUI v0.34.6 源码核实)。
+# 漏一个键 = 那个文件根本不进 payload,云端 ComfyUI 找不到它,报错长得像工作流参数错
+# 而不是"少传了素材"。2026-09-19 之前这里只有三个 LoadImage*,所以面板送不了视频/音频参考。
+# ⚠ 这张表在 routes.py 和 bridge_client.py 各有一份(后者是零依赖、可被下游整份 vendor 的
+#   独立客户端,不能 import 前者),由 test_input_file_nodes_identical_routes_and_client 钉死。
+_INPUT_FILE_NODES = {
+    "LoadImage": ("image",),
+    "LoadImageMask": ("image",),
+    "LoadImageOutput": ("image",),
+    "LoadVideo": ("file",),
+    "LoadAudio": ("audio",),
+}
+
+
+async def _deployed_reqs_hash(cfg: dict) -> str:
+    """云端镜像**实际装的**私有节点依赖的指纹。
+
+    ⚠ 以前用本机 config 里的 local_node_reqs_deployed_hash,而镜像是多台机器共享的:机器 A 改了依赖
+      并部署,机器 B 的 config 还是旧的,每次都误判「欠一次重建」(2026-09-23 review)。
+      0.8.50 改成读云端 /health,又引入两个问题(2026-09-24 review):/health 跑在大镜像上,冷启动常超
+      8s 超时 → 静默退回本机旧指纹,多机误判原样回来,而且 /sync_local_nodes 会据此**无确认地**自动
+      重建 3-5 分钟;每次 RunModal 预检还要多等最多 8s;依赖行里的 git+https://TOKEN@ 也经 /health 外泄。
+    现在由每次成功部署把依赖清单写进 <app>-meta 这个 modal.Dict(任何机器部署都写),这里用 SDK 直读:
+    确定、共享、没有冷启动,也不再经 /health。拿不到(老部署还没写过)才退回本机记录。"""
+    reqs = await asyncio.to_thread(modal_volume.deployed_reqs, cfg)
+    if reqs is not None:
+        return node_sync.local_node_reqs_hash(reqs)
+    return cfg.get("local_node_reqs_deployed_hash", "")
+
+
+def _extract_input_file_name(cls: str, ins: dict) -> str | None:
+    """按节点类型取它引用的本地文件名。取不到(或那一位接的是连线而非字面量)返回 None。"""
+    keys = _INPUT_FILE_NODES.get(cls)
+    if not keys:
+        return None
+    # "filename" 是给自定义节点的兜底;连线形态是 ["3", 0] 这样的 list,必须判 str 跳过。
+    for k in (*keys, "filename"):
+        v = ins.get(k)
+        if isinstance(v, str) and v:
+            return v
+    return None
+
+
 def _extract_input_image_names(prompt: dict) -> list[str]:
-    """遍历 prompt 找所有 LoadImage 类节点引用的本地文件名(去重)。"""
+    """遍历 prompt 找所有会引用 input/ 下本地文件的节点(图 / 视频 / 音频),返回去重文件名。"""
     names: list[str] = []
     seen: set[str] = set()
     for node in prompt.values():
         if not isinstance(node, dict):
             continue
         cls = node.get("class_type", "")
-        # 常见会引用 input/ 里图片的节点类型
-        if cls in ("LoadImage", "LoadImageMask", "LoadImageOutput"):
-            ins = node.get("inputs", {}) or {}
-            name = ins.get("image") or ins.get("filename")
-            if isinstance(name, str) and name not in seen:
-                # 跳过子目录形式 "clipspace/xxx"(ComfyUI 自动 cache 那种)— 第一版只支持 input 根
-                if "/" in name or "\\" in name:
-                    print(f"[modal_bridge] WARN: subpath input ignored: {name}")
-                    continue
-                seen.add(name)
-                names.append(name)
+        name = _extract_input_file_name(cls, node.get("inputs", {}) or {})
+        if not name or name in seen:
+            continue
+        # 子目录形式("clipspace/xxx"、"refs/clip.mp4")照收 —— 它们是 input/ 下的真实文件。
+        # ⚠ 曾经是「打一行 WARN 然后 continue」,而提交流程照常往下走:用户看到的是提交成功,
+        #   实际 input_image_count=0、云端找不到素材。**漏传后继续提交**是最糟的形态 ——
+        #   控制台那行 WARN 没人看,失败原因显示在云端、看起来像工作流参数错。
+        #   (2026-09-20 codex review 抓到。)现在越界的会在 _read_input_as_b64 里抛
+        #   FileNotFoundError → /submit 回 400,失败在本地、当场可见。
+        seen.add(name)
+        names.append(name)
     return names
 
 
 def _read_input_as_b64(name: str) -> dict:
     """读 input/<name>,返回 Modal 期望的 {name, image (data uri)} 格式。
 
-    ⚠ name 来自工作流 JSON。上游 _extract_input_image_names 已挡掉子路径形态,但那只是
-    字符串检查:input 目录里放一个指向目录外的**符号链接**,exists() 照样为真、
-    read_bytes() 就把目录外内容读出来上传了。必须 resolve 后确认仍在 input 目录内
-    —— 与模型查找用的是同一份囚笼(modal_volume.is_path_within_roots)。
+    ⚠ name 来自工作流 JSON,**可以带子目录**("refs/clip.mp4"),所以这里是唯一的边界检查:
+    input 目录里放一个指向目录外的**符号链接**,exists() 照样为真、read_bytes() 就把目录外
+    内容读出来上传了;"../" 同理。必须 resolve 后确认仍在 input 目录内 —— 与模型查找用的是
+    同一份囚笼(modal_volume.is_path_within_roots)。抛错即 /submit 400,不会漏传后继续提交。
     """
     root = _input_dir()
     p = root / name
@@ -480,10 +525,12 @@ def _read_input_as_b64(name: str) -> dict:
     if not modal_volume.is_path_within_roots(p, [root]):
         raise FileNotFoundError(f"输入图越界(解析后不在 input 目录内): {name}")
     blob = p.read_bytes()
-    ext = p.suffix.lower().lstrip(".") or "png"
-    mime = {"jpg": "jpeg", "jpe": "jpeg"}.get(ext, ext)
+    # ⚠ 别硬拼 data:image/<ext> —— 视频/音频会拼出 "data:image/mp4" 这种假话。云端
+    # upload_images 只按逗号切 base64、不读 MIME,所以不会炸,但数据里不该写假的。
+    # 与 bridge_client.pack_input_images 用同一套判定(mimetypes,按扩展名)。
+    mime = mimetypes.guess_type(str(p))[0] or "image/png"
     b64 = base64.b64encode(blob).decode("ascii")
-    return {"name": name, "image": f"data:image/{mime};base64,{b64}"}
+    return {"name": name, "image": f"data:{mime};base64,{b64}"}
 
 
 async def _emit(resp: web.StreamResponse, text: str) -> None:
@@ -713,18 +760,7 @@ def _setup_routes():
     async def _get_config(request: web.Request):
         # 不把密钥送到浏览器:抹掉 token_secret 和 bridge_api_key,只给前端要的非敏感字段
         # + 一个 has_token_secret 标志(部署框据此显示"已保存,留空=沿用")。
-        cfg = dict(cfg_mod.load_config())
-        cfg["has_token_secret"] = bool(cfg.get("modal_token_secret"))
-        cfg["has_comfy_api_key"] = bool(cfg.get("comfy_api_key"))
-        cfg["has_aigc_bypass_secret"] = bool(cfg.get("aigc_bypass_secret"))
-        cfg["has_local_api_capability"] = bool(cfg.get("local_api_capability"))
-        cfg.pop("modal_token_secret", None)
-        cfg.pop("bridge_api_key", None)
-        cfg.pop("comfy_api_key", None)  # 账单凭据,不回吐浏览器(同 bridge_api_key)
-        cfg.pop("aigc_bypass_secret", None)  # Vercel 旁路密钥,同上
-        cfg.pop("local_api_capability", None)  # 本地管理 capability,永不匿名回吐
-        cfg.pop("local_node_reqs_deployed_hash", None)  # 内部部署状态
-        return web.json_response(cfg)
+        return web.json_response(contract.public_config(cfg_mod.load_config()))
 
     @routes.get("/modal_bridge/bridge_key")
     @_admin_only
@@ -748,19 +784,7 @@ def _setup_routes():
         except ValueError as e:
             return web.json_response({"error": str(e)}, status=400)
         cfg_mod.save_config(cur)
-        # 不回吐密钥(和 GET /config 一致):抹掉 token_secret / bridge_api_key
-        safe = dict(cur)
-        safe["has_token_secret"] = bool(safe.get("modal_token_secret"))
-        safe["has_comfy_api_key"] = bool(safe.get("comfy_api_key"))
-        safe["has_aigc_bypass_secret"] = bool(safe.get("aigc_bypass_secret"))
-        safe["has_local_api_capability"] = bool(safe.get("local_api_capability"))
-        safe.pop("modal_token_secret", None)
-        safe.pop("bridge_api_key", None)
-        safe.pop("comfy_api_key", None)
-        safe.pop("aigc_bypass_secret", None)
-        safe.pop("local_api_capability", None)
-        safe.pop("local_node_reqs_deployed_hash", None)
-        return web.json_response(safe)
+        return web.json_response(contract.public_config(cur))  # 与 GET /config 同一份脱敏
 
     # -------- 异步提交(返回 job_id,不阻塞)--------
     @routes.post("/modal_bridge/submit")
@@ -795,7 +819,9 @@ def _setup_routes():
 
         try:
             image_names = _extract_input_image_names(prompt)
-            input_images = [_read_input_as_b64(n) for n in image_names]
+            # 读盘 + base64 放线程里:参考视频动辄几十 MB,在事件循环里做会冻结整个 ComfyUI
+            input_images = await asyncio.to_thread(
+                lambda: [_read_input_as_b64(n) for n in image_names])
         except FileNotFoundError as e:
             return web.json_response({"error": str(e)}, status=400)
         except Exception as e:
@@ -812,7 +838,7 @@ def _setup_routes():
         local_digests = body.get("local_nodes") if isinstance(body.get("local_nodes"), dict) else None
         if local_digests is None:
             try:
-                plan = node_sync.plan_node_sync(prompt)
+                plan = await asyncio.to_thread(node_sync.plan_node_sync, prompt)   # 每个节点目录跑 git
                 # 没走前端预检的调用方也必须声明 baked 期望,否则历史本地覆盖包会在暖容器里
                 # 永久存活。digest 与 sentinel 共用一个 map,worker 能统一做版本闸门。
                 local_digests = {
@@ -821,7 +847,8 @@ def _setup_routes():
                 }
                 folders = [p["folder"] for p in plan.get("local_pack", [])]
                 if folders:
-                    local_digests.update(local_nodes.expected_digests(
+                    local_digests.update(await asyncio.to_thread(   # 对整个节点目录做哈希
+                        local_nodes.expected_digests,
                         folders, Path(node_sync._comfyui_root()) / "custom_nodes"))
             except Exception as e:
                 print(f"[modal_bridge] 本地节点指纹计算跳过: {e}")
@@ -1045,19 +1072,26 @@ def _setup_routes():
             return web.json_response({"error": "prompt required"}, status=400)
         required = extract_required_models(prompt)
         resolver = _local_model_resolver()
-        total_bytes, largest_bytes, known, unknown = 0, 0, 0, []
-        for m in required:
-            p = resolver(m["type"], m["filename"])
-            try:
-                if p and Path(p).exists():
-                    sz = Path(p).stat().st_size
-                    total_bytes += sz
-                    largest_bytes = max(largest_bytes, sz)
-                    known += 1
-                else:
-                    unknown.append(f"{m['type']}/{m['filename']}")
-            except OSError:
-                unknown.append(f"{m['type']}/{m['filename']}")
+
+        def _sizes():
+            # 放线程里:解析器找不到时会递归 rglob 整个模型目录(Desktop 按子目录归类模型时),
+            # 在事件循环里做会冻结整个 ComfyUI。
+            total, largest, kn, unk = 0, 0, 0, []
+            for m in required:
+                p = resolver(m["type"], m["filename"])
+                try:
+                    if p and Path(p).exists():
+                        sz = Path(p).stat().st_size
+                        total += sz
+                        largest = max(largest, sz)
+                        kn += 1
+                    else:
+                        unk.append(f"{m['type']}/{m['filename']}")
+                except OSError:
+                    unk.append(f"{m['type']}/{m['filename']}")
+            return total, largest, kn, unk
+
+        total_bytes, largest_bytes, known, unknown = await asyncio.to_thread(_sizes)
         # 按类别估显存。视频优先激活公式(最大模型常驻 + W×H×帧数,实测校准,见 categories.py);
         # 工作流里抠不出尺寸字面量时回退旧的「权重总和×系数」保守公式(basis 标明用的哪个)。
         category = categories.classify(prompt)
@@ -1101,6 +1135,34 @@ def _setup_routes():
 
         if not modal_volume.modal_importable():
             await _emit(resp, "✗ 本地没装 modal,无法上传\n\n__DEPLOY_DONE__ rc=1\n")
+            await resp.write_eof()
+            return resp
+
+        # ⚠ 不信请求体里的 local_path —— 用服务端带路径囚笼的解析器重新定位。以前原样交给
+        #   upload_models(只查 is_file),发一个 local_path="/Users/me/.ssh/id_ed25519" 就能把
+        #   任意本地文件传上 Volume,find_local_model / is_path_within_roots 那道囚笼等于白做
+        #   (2026-09-23 review)。正常流程里这个值本来就是 /check_models 用同一个解析器算出来的,
+        #   重新解析结果一致;解析不到的一律拒。远端路径那一半由 modal_volume.model_relpath 把关。
+        resolver = _local_model_resolver()
+
+        def _reresolve():
+            ok, bad = [], []
+            for it in items:
+                if not isinstance(it, dict):
+                    bad.append(repr(it)[:80])
+                    continue
+                p = resolver(it.get("type"), it.get("filename"))
+                if p is None:
+                    bad.append(f"{it.get('type')}/{it.get('filename')}")
+                    continue
+                ok.append({**it, "local_path": str(p)})
+            return ok, bad
+
+        items, rejected = await asyncio.to_thread(_reresolve)
+        for b in rejected:
+            await _emit(resp, f"  ✗ 本地找不到(或不在模型目录内),跳过:{b}\n")
+        if not items:
+            await _emit(resp, "\n__DEPLOY_DONE__ rc=1\n")
             await resp.write_eof()
             return resp
 
@@ -1232,11 +1294,20 @@ def _setup_routes():
                     latest_cfg = cfg_mod.load_config()
                     reqs = await asyncio.to_thread(_refresh_local_node_reqs, latest_cfg)
                     target_hash = node_sync.local_node_reqs_hash(reqs)
-                    deployed_hash = latest_cfg.get("local_node_reqs_deployed_hash", "")
+                    deployed_hash = await _deployed_reqs_hash(latest_cfg)
                     needs_redeploy = target_hash != deployed_hash and bool(reqs or deployed_hash)
                     if needs_redeploy:
                         await _emit(resp, f"== 私有节点依赖已变化({len(reqs)} 条),自动重新部署 ==\n")
-                        rc = await _ensure_modal(resp)
+                        # 同 /deploy:这里也拿本机清单当全局清单部署,先并回云端独有的节点。
+                        node_sync.ensure_baked_file()
+                        try:
+                            _back = await asyncio.to_thread(node_sync.reconcile_baked_with_cloud, latest_cfg)
+                            if _back:
+                                await _emit(resp, f"   节点清单:并回云端独有的 {len(_back)} 个 —— {', '.join(_back)}\n")
+                            rc = await _ensure_modal(resp)
+                        except node_sync.DeployBlocked as _blk:
+                            await _emit(resp, f"== ✗ {_blk} ==\n")
+                            rc = 1
                         if rc == 0:
                             rc = await _run_streamed(
                                 resp, node_sync.deploy_command(),
@@ -1247,6 +1318,7 @@ def _setup_routes():
                             final_cfg = cfg_mod.load_config()
                             final_cfg["local_node_reqs_deployed_hash"] = target_hash
                             cfg_mod.save_config(final_cfg)
+                            await asyncio.to_thread(modal_volume.record_deployed_reqs, latest_cfg, reqs)
                             await _emit(resp, "== ✓ 私有节点依赖镜像已更新 ==\n")
                         else:
                             await _emit(resp, "== ✗ 私有节点依赖部署失败,停止本次提交 ==\n")
@@ -1294,7 +1366,7 @@ def _setup_routes():
         try:
             _reqs = await asyncio.to_thread(_compute_local_node_reqs, cfg)   # 纯读,不落盘
             _target = node_sync.local_node_reqs_hash(_reqs)
-            _deployed = cfg.get("local_node_reqs_deployed_hash", "")
+            _deployed = await _deployed_reqs_hash(cfg)
             reqs_pending = _target != _deployed and bool(_reqs or _deployed)
         except Exception as e:
             # 同上:查不出来就别拦路,当作"要重建"多问一次,不会漏
@@ -1314,7 +1386,8 @@ def _setup_routes():
         cfg = cfg_mod.load_config()
         if not modal_volume.modal_importable():
             return web.json_response({"ok": False, "nodes": [], "error": "modal 未安装"})
-        return web.json_response({"ok": True, "nodes": local_nodes.list_volume_local_nodes(cfg)})
+        nodes = await asyncio.to_thread(local_nodes.list_volume_local_nodes, cfg)   # Modal SDK,同步
+        return web.json_response({"ok": True, "nodes": nodes})
 
     @routes.post("/modal_bridge/remove_local_node")
     @_admin_only
@@ -1328,7 +1401,7 @@ def _setup_routes():
         if not modal_volume.modal_importable():
             return web.json_response({"ok": False, "error": "modal 未安装,无法操作 Volume"},
                                      status=503)
-        r = local_nodes.remove_volume_local_node(cfg, folder)
+        r = await asyncio.to_thread(local_nodes.remove_volume_local_node, cfg, folder)   # Modal SDK
         return web.json_response({**r, "folder": folder},
                                  status=200 if r["ok"] else 502)
 
@@ -1345,22 +1418,22 @@ def _setup_routes():
         """
         cfg = cfg_mod.load_config()
         local_baked = {n["name"]: n for n in node_sync.read_baked_nodes()}
-        names, source = None, "local"
+        names, source, manifest = None, "local", []
         try:
             async with aiohttp.ClientSession() as session:
                 info = await modal_client.list_nodes(session, cfg)
             if isinstance(info, dict) and isinstance(info.get("custom_nodes"), list):
                 names = info["custom_nodes"]
+                manifest = info.get("custom_nodes_manifest") or []
                 source = "modal"
         except Exception as e:
             print(f"[modal_bridge] list_nodes: /health 不可达,回退本地 ({e})")
         if names is None:
             names = list(local_baked.keys())
-        nodes = []
-        for name in sorted(names):
-            b = local_baked.get(name, {})
-            nodes.append({"name": name, "url": b.get("url", ""), "commit": b.get("commit", ""),
-                          "in_local_baked": name in local_baked})
+        # url/commit 云端 manifest 优先 —— 否则别的机器加的节点在这里 url 为空,面板「移除并重部署」
+        # 会把它们连同被移除的那个一起丢掉(见 node_sync.complete_baked_entries)。
+        nodes = [{**e, "in_local_baked": e["name"] in local_baked}
+                 for e in node_sync.complete_baked_entries(sorted(names), local_baked, manifest)]
         return web.json_response({"ok": True, "source": source, "nodes": nodes})
 
     @routes.post("/modal_bridge/check_nodes")
@@ -1384,18 +1457,23 @@ def _setup_routes():
             async with aiohttp.ClientSession() as session:
                 nodes_info = await modal_client.list_nodes(session, cfg)
             if isinstance(nodes_info, dict) and isinstance(nodes_info.get("custom_nodes"), list):
-                # Modal 只给名字;url/commit 用本地清单补全(prune 只看名字,add/update 用本地 git)
+                # url/commit:云端 manifest 优先,本机清单兜底。以前只用本机清单,本机没有的节点
+                # 被填成空 url → write_baked_nodes 出口丢弃 → 下次部署从镜像里删掉(多机互删)。
                 local_baked = {n["name"]: n for n in node_sync.read_baked_nodes()}
-                baked = [local_baked.get(name, {"name": name, "url": "", "commit": ""})
-                         for name in nodes_info["custom_nodes"]]
+                baked = node_sync.complete_baked_entries(
+                    nodes_info["custom_nodes"], local_baked,
+                    nodes_info.get("custom_nodes_manifest") or [])
                 source = "modal"
         except Exception as e:
             print(f"[modal_bridge] check_nodes: /health 不可达,回退本地清单 ({e})")
 
-        result = node_sync.plan_node_sync(prompt, baked=baked)
+        # 每次点 RunModal 都会调这里:同步跑的话,每个节点目录 5 次 git 子进程(各 10s 超时)
+        # + 未命中缓存的 Modal SDK 查询 0.8~2.4s,期间 websocket 进度、别的请求、版本检查全卡住
+        # —— 注释里记过的「/version 6s 超时误判」就是这么来的(2026-09-23 review)。
+        result = await asyncio.to_thread(node_sync.plan_node_sync, prompt, baked=baked)
         # 只对 Volume 中实际存在的旧覆盖包发删除请求；expect_baked 仍保留全部应跑镜像版
         # 的节点,用于修复已解压旧包的暖容器以及列表查询暂时失败的情况。
-        volume_local = set(local_nodes.list_volume_local_nodes(cfg))
+        volume_local = set(await asyncio.to_thread(local_nodes.list_volume_local_nodes, cfg))
         result["local_remove"] = sorted(set(result.get("expect_baked", [])) & volume_local)
         result["ok"] = True
         result["source"] = source
@@ -1421,6 +1499,13 @@ def _setup_routes():
             if not name:
                 continue
             clean.append({"name": name, "url": e.get("url", ""), "commit": e.get("commit", "")})
+
+        # ⚠ 空 url 的条目以前会在 write_baked_nodes 出口被静默丢掉,随后的部署就把它从镜像里删了。
+        #   这里的 new_baked 来自 /check_nodes 的补全,补不出 url(云端太老 / 来源被脱敏 / 本机没装)
+        #   的节点必须拒绝,不能当成「用户要删它」(2026-09-24 review)。
+        _lost = [e["name"] for e in clean if not (e.get("url") or "").strip()]
+        if _lost:
+            return web.json_response({"error": node_sync.unresolved_nodes_message(_lost)}, status=409)
 
         summary = body.get("summary") or {}
         cfg = cfg_mod.load_config()
@@ -1457,6 +1542,7 @@ def _setup_routes():
                 final_cfg = cfg_mod.load_config()
                 final_cfg["local_node_reqs_deployed_hash"] = reqs_hash
                 cfg_mod.save_config(final_cfg)
+                await asyncio.to_thread(modal_volume.record_deployed_reqs, cfg, reqs)
         await _emit(resp, f"\n__DEPLOY_DONE__ rc={rc}\n")
         await resp.write_eof()
         return resp
@@ -1505,8 +1591,12 @@ def _setup_routes():
         volume_name = (body.get("volume_name") or cfg.get("modal_volume_name") or "comfyui-bridge-models").strip()
         default_gpu = (body.get("default_gpu") or cfg.get("default_gpu") or "H100").strip()
         scaledown = int(body.get("scaledown_window") or cfg.get("scaledown_window") or 12)
-        hf_token = (body.get("hf_token") or "").strip()
-        civitai_token = (body.get("civitai_token") or "").strip()
+        # ⚠ 下面 secret create 用的是 --force,会**整份替换** Modal Secret。HF / Civitai token
+        #   以前只从请求体取、从不持久化,而面板根本不发这两个字段 —— 于是用 deploy.py
+        #   --hf-token 配过的 token,点一次「推送到云端」就被抹掉,节点下 gated 权重静默失败。
+        #   现在同 comfy_api_key:留空 = 沿用已存,且写回 config(0600)。(2026-09-23 review)
+        hf_token = (body.get("hf_token") or "").strip() or cfg.get("hf_token", "")
+        civitai_token = (body.get("civitai_token") or "").strip() or cfg.get("civitai_token", "")
         # comfy.org API key(API 节点用):留空 = 沿用已存的(/config 不回显)。持久化进 config,重部署不丢。
         comfy_api_key = (body.get("comfy_api_key") or "").strip() or cfg.get("comfy_api_key", "")
         # AIGC Studio 交付(可选,网站 aigc-r2 模式)。URL 明文回显、输入框预填现值 →
@@ -1537,12 +1627,15 @@ def _setup_routes():
         # ComfyUI 版本跟随本机:检测本机版本 → 解析云端 clone tag(无对应取最接近,只警告不中止)
         comfyui_version = node_sync.detect_local_comfyui_version()
         _tags = await asyncio.to_thread(node_sync.list_comfyui_tags)
-        comfyui_tag, _tag_note = node_sync.resolve_comfyui_tag(comfyui_version, _tags)
+        comfyui_tag, _tag_note = node_sync.resolve_comfyui_tag(
+            comfyui_version, _tags, prev_tag=cfg.get("comfyui_tag", ""),
+            pin=cfg.get("comfyui_tag_pin", ""))
         # ⚠ 必须在 cfg.update 之前取:那一步会用新值覆盖 comfyui_tag,取晚了永远相等。
         _tag_change = node_sync.comfyui_tag_change_note(cfg.get("comfyui_tag"), comfyui_tag)
 
         # 合并出完整 config(用于 deploy_env + 最终落盘)
-        cfg.update({
+        _base_cfg = dict(cfg)   # 部署开始时的快照,收尾写回时做三方合并(见 contract.merge_after_deploy)
+        _deploy_updates = {
             "modal_endpoint_base": endpoint_base,
             "modal_app_name": app_name,
             "modal_workspace": workspace,
@@ -1559,9 +1652,12 @@ def _setup_routes():
             "modal_token_secret": token_secret,
             "bridge_api_key": bridge_key,
             "comfy_api_key": comfy_api_key,
+            "hf_token": hf_token,
+            "civitai_token": civitai_token,
             "aigc_studio_base_url": aigc_base_url,
             "aigc_bypass_secret": aigc_bypass,
-        })
+        }
+        cfg.update(_deploy_updates)
         env = node_sync.deploy_env(cfg)
         cwd = str(node_sync.MODAL_APP_DIR)
 
@@ -1601,6 +1697,19 @@ def _setup_routes():
 
             # 3) 部署 app(首次拉镜像 3-5 分钟)
             node_sync.ensure_baked_file()  # 本地清单是 .gitignore 状态,缺则建空,免得 modal_image 打包炸
+            # ⚠ 本机清单是被 gitignore 的本地状态,却会被当成镜像的全局清单去部署。插件被 Manager
+            #   重装、清单丢了 → 上面建出一个空清单 → 这次部署清空云端全部节点;多机时另一台加的
+            #   节点也会被删。部署前先把云端有、本机没有的并回来(只加不删)。
+            try:
+                _back = await asyncio.to_thread(node_sync.reconcile_baked_with_cloud, cfg)
+            except node_sync.DeployBlocked as _blk:
+                await _emit(resp, f"\n== ✗ {_blk} ==\n")
+                await _emit(resp, "\n__DEPLOY_DONE__ rc=1\n")
+                await resp.write_eof()
+                return resp
+            if _back:
+                await _emit(resp, f"   节点清单:云端有而本机清单缺的 {len(_back)} 个已并回"
+                                  f"(不会被这次部署删掉)—— {', '.join(_back)}\n")
             await _emit(resp, "\n== 推送到云端:比对本机与云端的差异,只推有变化的部分 ==\n")
             # 3.0) 先把**本机**的私有节点推上 Volume,再去读 manifest。
             #
@@ -1688,8 +1797,12 @@ def _setup_routes():
                 return resp
 
             # 4) 写本地 config(在 ComfyUI 进程里,路径用 folder_paths,必对)
-            cfg["local_node_reqs_deployed_hash"] = _local_reqs_hash
-            cfg_mod.save_config(cfg)
+            # ⚠ 不能整份写回 cfg:那是几分钟前的快照,会把部署期间别处的改动冲掉。三方合并。
+            _final = contract.merge_after_deploy(_base_cfg, _deploy_updates, cfg_mod.load_config())
+            _final["local_node_reqs_deployed_hash"] = _local_reqs_hash
+            cfg_mod.save_config(_final)
+            await asyncio.to_thread(modal_volume.record_deployed_reqs, _final, _local_reqs)
+            cfg = _final
             await _emit(resp, f"\n== ✓ config 已写入(endpoint={endpoint_base})==\n")
 
         # 5) 验证 health(锁外即可)

@@ -185,7 +185,7 @@ def test_redirects_never_leak_key_or_change_scheme(method, monkeypatch, tmp_path
             def call():
                 if method == "request":
                     return client._req(url, None, 3, retries=0)
-                return client._download_volume("job", "_outputs/job/a", tmp_path / "a", False)
+                return client._download_volume("job", "_outputs/job/a", tmp_path / "a")
 
             if target == "same":
                 call()

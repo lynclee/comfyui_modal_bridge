@@ -14,6 +14,11 @@ import ast
 import hashlib
 import inspect
 import json
+
+try:                                   # 插件里是包内相对导入;CLI / 测试里是顶层模块
+    from . import health_client
+except ImportError:
+    import health_client
 import os
 import re
 import subprocess
@@ -82,16 +87,37 @@ def list_comfyui_tags(repo: str = COMFYUI_REPO, timeout: int = 20) -> list[str]:
         return []
 
 
-def resolve_comfyui_tag(version: str, tags: list[str]) -> tuple[str, str]:
-    """纯函数:本机版本 + 可用 tag 列表 → (选用的 tag, 警告说明)。
+def resolve_comfyui_tag(version: str, tags: list[str], prev_tag: str = "",
+                        pin: str = "") -> tuple[str, str]:
+    """纯函数:本机版本 + 可用 tag 列表 (+ 上次部署的 tag) → (选用的 tag, 警告说明)。
     精确命中 → ('vX.Y.Z', '')。无精确 → 取 semver 距离最近的(平手取更老的 ≤ 本机,避免云端比本地新),
-    返回说明。版本测不到 / tag 列表空 → 默认 tag + 说明。"""
+    返回说明。
+
+    ⚠ 拉不到 tag 列表(本机没 git / GitHub 一时连不上 / 20s 超时)时,**绝不能退回写死的
+    DEFAULT_COMFYUI_TAG**。那是 v0.22.0,不支持 MiniMax H3、新节点全部导入失败 —— 而部署
+    rc=0、日志只多一行 ⚠,一次网络抖动就让云端大面积坏掉(2026-09-23 review 抓到)。回落顺序:
+      · 本机版本已知 → 直接用 v{本机版本}。它几乎必然是个真 tag;万一不是(开发版),
+        镜像 build 时 git clone 会**明确失败**,远好过静默装一个老版本。
+      · 本机版本未知 → 沿用上次部署的 tag(它至少是上次跑通过的)。
+      · 两者都没有 → 才用默认值,并在说明里写清楚。"""
+    # 钉住(config 的 comfyui_tag_pin):云端版本不再跟随本机。用于「本机 Desktop 还没出新版,但云端
+    # 要先升」—— 没有它,面板里下一次「推送到云端」会按本机版本把云端退回去。说明里必须写清楚,
+    # 否则这种「故意不一致」和「跟随失败」在部署日志里分不出来。
+    pinned = (pin or "").strip()
+    if pinned:
+        return pinned, (f"云端 ComfyUI 钉在 {pinned}(config 的 comfyui_tag_pin),不跟随本机 "
+                        f"{version or '未知'};要恢复跟随就清空这个字段")
     lv = _parse_ver(version)
+    prev = (prev_tag or "").strip()
     if not lv:
-        return DEFAULT_COMFYUI_TAG, f"本机 ComfyUI 版本未知 → 云端用默认 {DEFAULT_COMFYUI_TAG}"
+        if prev:
+            return prev, f"本机 ComfyUI 版本未知 → 云端沿用上次部署的 {prev}"
+        return DEFAULT_COMFYUI_TAG, f"本机 ComfyUI 版本未知、也没有上次部署记录 → 云端用默认 {DEFAULT_COMFYUI_TAG}"
     cand = [(pv, t) for t in tags if (pv := _parse_ver(t))]
     if not cand:
-        return DEFAULT_COMFYUI_TAG, f"拉不到 ComfyUI tag 列表 → 云端用默认 {DEFAULT_COMFYUI_TAG}"
+        guess = "v" + ".".join(map(str, lv))
+        return guess, (f"拉不到 ComfyUI tag 列表(网络 / git 不可用)→ 按本机版本直接用 {guess};"
+                       f"若它不是正式 tag,镜像构建会明确失败")
     exact = [t for pv, t in cand if pv == lv]
     if exact:
         return next((t for t in exact if t.startswith("v")), exact[0]), ""
@@ -228,6 +254,107 @@ def read_baked_nodes() -> list[dict]:
 
 def baked_node_names() -> set[str]:
     return {n.get("name", "") for n in read_baked_nodes() if n.get("name")}
+
+
+def complete_baked_entries(names: list[str], local_by_name: dict,
+                           manifest: list[dict] | None) -> list[dict]:
+    """云端 /health 只保证给出节点**名字**,url/commit 从哪来:**云端 manifest 优先**,本机清单兜底。
+
+    ⚠ 以前只用本机清单补,本机没有的节点被填成 {url: ""},随后 write_baked_nodes 在出口把空 url
+      条目丢掉 —— 下一次部署就把它从镜像里删了。机器 A 加的节点被机器 B 一次同步删掉;
+      插件被 Manager 重装、本机清单丢了,一次部署清空云端全部节点。设计本意是「多机取并集、
+      永不互删」(见 plan_node_sync),实现却因为云端只报名字把自己的承诺打破了(2026-09-23 review)。
+    云端优先的理由:manifest 就是镜像实际装的那份,比本机「上次从这台机器部署的」更权威。"""
+    cloud = {n["name"]: n for n in (manifest or []) if isinstance(n, dict) and n.get("name")
+             and (n.get("url") or "").strip() and not n.get("url_redacted")}
+    out = []
+    for name in names:
+        e = cloud.get(name) or local_by_name.get(name) or _local_git_entry(name) \
+            or {"name": name, "url": "", "commit": ""}
+        out.append({"name": name, "url": e.get("url", ""), "commit": e.get("commit", "")})
+    return out
+
+
+def _local_git_entry(name: str) -> dict | None:
+    """本机 custom_nodes/<name> 装着的话,用它的 git 信息补。
+
+    ⚠ 这是云端报不出来源时的兜底:云端 < 0.8.48 没有 manifest(Registry 上的 latest 还是 0.7.9,
+      所有从 Registry 升级的用户第一次部署都走这里),或 url 带凭据被 /health 脱敏了
+      (url_redacted —— 照抄脱敏后的地址会让私有仓库克隆失败)。"""
+    try:
+        g = folder_git_info(name)
+    except Exception:
+        return None
+    if g.get("has_git") and (g.get("url") or "").strip():
+        return {"name": name, "url": g["url"], "commit": g.get("commit", "")}
+    return None
+
+
+def fetch_cloud_nodes(cfg: dict, timeout: int = 20) -> tuple[list, list | None]:
+    """取云端镜像装的节点:(文件夹名列表, 带 url/commit 的 manifest)。
+    名字所有版本都报;manifest 0.8.48 起才有(老云端为 None)。
+    拿不到时抛 health_client.HealthUnavailable,kind 说明原因(未部署 / key 不对 / 网络……)。
+    同步实现,部署路径(含 CLI)共用;async 路由里请用 asyncio.to_thread 调。"""
+    info = health_client.fetch(cfg, timeout)
+    names = info.get("custom_nodes")
+    if not isinstance(names, list):
+        raise health_client.HealthUnavailable(
+            "http", f"/health 没有报节点清单: {info.get('custom_nodes_error', '字段缺失')}")
+    manifest = info.get("custom_nodes_manifest")
+    return names, (manifest if isinstance(manifest, list) else None)
+
+
+class DeployBlocked(Exception):
+    """部署前检查发现「继续部署会删掉云端节点」。调用方**必须中止**,把消息原样给用户。
+    用异常而不是返回值:忘了处理的调用方会直接失败,而不是静默继续部署 —— 失败方向是安全的。"""
+
+
+def reconcile_baked_with_cloud(cfg: dict) -> list[str]:
+    """部署前把「云端镜像里有、本机清单里没有」的节点并回本机清单。返回并回的节点名。
+
+    只加不删 —— 删除只能走「管理云端节点」面板的显式 prune(那条路径不调这里)。
+    来源优先级:云端 manifest(未脱敏的)→ 本机 custom_nodes 的 git 信息。
+
+    会抛 DeployBlocked(调用方必须中止部署),两种情况:
+      · 有节点补不出来源(云端太老报不出来源 / 来源带凭据被脱敏 / 本机也没装)——
+        部署下去就把它们从镜像删了。第一版在云端没有 manifest 时直接什么都不做,而 Registry 的
+        latest 还是 0.7.9,所有从 Registry 升级的用户第一次部署都是这种云端(2026-09-24 review)。
+      · 读不到云端装了什么(key 不对 / 网络 / 服务出错),**而本机清单又是空的** —— 这是最危险的组合:
+        多半是插件重装丢了清单,贸然部署就清空云端。以前把 401、超时、未部署统统当「拿不到」,
+        保护静默跳过(2026-09-24 review #14)。
+    云端 404(app 还没部署 / 已删)不算读不到:那是全新部署,没有可保护的东西。
+    本机清单非空时读不到云端就尽力而为、照常部署 —— 那不是丢清单的形态。"""
+    try:
+        names, manifest = fetch_cloud_nodes(cfg)
+    except health_client.HealthUnavailable as e:
+        if e.kind == "not_deployed":
+            return []
+        if not read_baked_nodes():
+            raise DeployBlocked(
+                f"读不到云端装了哪些自定义节点({e}),而本机节点清单是空的 —— 多半是插件重装丢了"
+                f"清单,继续部署可能清空云端全部自定义节点,已中止。\n"
+                f"处理:检查网络 / bridge key 后重试。若确认云端不需要任何自定义节点,可在 Modal 控制台"
+                f"删掉这个 app 再部署(会按全新部署处理)。") from None
+        return []
+    local = read_baked_nodes()
+    have = {n.get("name") for n in local}
+    missing = [n for n in names if n not in have]
+    if not missing:
+        return []
+    entries = complete_baked_entries(missing, {}, manifest)
+    back = [e for e in entries if (e.get("url") or "").strip()]
+    lost = [e["name"] for e in entries if not (e.get("url") or "").strip()]
+    if lost:
+        raise DeployBlocked(unresolved_nodes_message(lost))
+    write_baked_nodes(local + back)
+    return [e["name"] for e in back]
+
+
+def unresolved_nodes_message(unresolved: list[str]) -> str:
+    return (f"云端镜像装着 {', '.join(unresolved)},但本机清单里没有,也拿不到它们的来源"
+            f"(云端版本太旧报不出来源 / 来源带凭据被脱敏 / 本机也没装)。"
+            f"继续部署会把它们从镜像里删掉,已中止。\n"
+            f"处理:在本机装上这些节点后再部署;若确实不要它们,到「管理云端节点」里移除。")
 
 
 def ensure_baked_file() -> None:
@@ -381,15 +508,50 @@ def commit_on_remote(path: Path, commit: str) -> bool:
     return bool(out.strip())
 
 
+# 未跟踪文件里**已知的运行时垃圾**:日志、缓存、字节码、编辑器 / 系统残留。只有它们不算改动。
+_JUNK_DIRS = frozenset({"__pycache__", ".cache", "cache", "caches", "logs", "log", "tmp", "temp",
+                        ".pytest_cache", ".mypy_cache", ".ruff_cache", "node_modules",
+                        ".ipynb_checkpoints"})
+_JUNK_SUFFIXES = frozenset({".log", ".tmp", ".pyc", ".pyo", ".swp", ".bak"})
+_JUNK_NAMES = frozenset({".DS_Store", "Thumbs.db", "desktop.ini"})
+
+
+def _untracked_is_junk(rel: str) -> bool:
+    parts = [x for x in rel.strip().strip('"').rstrip("/").split("/") if x]
+    if not parts:
+        return False
+    if any(x in _JUNK_DIRS for x in parts):
+        return True
+    return parts[-1] in _JUNK_NAMES or Path(parts[-1]).suffix.lower() in _JUNK_SUFFIXES
+
+
 def worktree_dirty(path: Path) -> bool:
-    """工作树有未提交改动(含未跟踪文件)。
+    """工作树有未提交改动。
     这是自写 / 调试节点**最常见**的状态:改一行试一下,谁会先 commit 再 push?
     而云端只按 commit clone —— HEAD 没变但文件变了,镜像里跑的还是旧代码,
-    且改前改后结果一模一样、毫无线索。所以 dirty 必须当成「本地版本 ≠ 云端版本」。"""
-    out = _git(["status", "--porcelain"], path)
+    且改前改后结果一模一样、毫无线索。所以 dirty 必须当成「本地版本 ≠ 云端版本」。
+
+    ⚠ 未跟踪文件:只豁免**已知的运行时垃圾**(日志 / 缓存 / 字节码,见 _JUNK_*),其余一律算改动。
+      以前把所有未跟踪文件都算改动,运行时往自己目录写日志、缓存的公开节点被永久判 dirty
+      (2026-09-23 review)。0.8.48 改成「只有源码(.py/.js…)才算」—— **方向反了**:用户往节点里加的
+      .json 预设、.txt 通配词、提示词模板、.so/.cu 扩展照样改变云端行为,却被判成干净,云端 clone
+      里没有它们,出错或静默出不同的结果、毫无线索;而 .js/.ts 在无头的云端反而无关紧要
+      (2026-09-24 review)。误判 dirty 的代价是多传一次包、多弹一次框;误判干净是静默出错 ——
+      所以默认算改动,只豁免能确定是垃圾的。运行时生成的配置文件(如 settings.json)仍会判 dirty,
+      这类请在节点里 gitignore。已跟踪文件的任何改动照旧一律算 dirty。"""
+    out = _git(["status", "--porcelain", "--untracked-files=normal"], path)
     # 已确认是该节点自己的 repo 后,status 仍失败时按 dirty 处理:方向安全,最多多传一次包;
     # 反过来当 clean 会把本地改动静默丢掉。
-    return out is None or bool(out.strip())
+    if out is None:
+        return True
+    for line in out.splitlines():
+        if not line.strip():
+            continue
+        if not line.startswith("??"):
+            return True                       # 已跟踪文件有改动
+        if not _untracked_is_junk(line[3:]):
+            return True
+    return False
 
 
 def _is_own_git_repo(path: Path) -> bool:
@@ -812,6 +974,7 @@ def deploy_env(cfg: dict) -> dict:
     # 包在镜像里总是装好,这里只控制启动参数 → 切换不必重编译 kernel。
     env["MODAL_BRIDGE_SAGE_ATTENTION"] = "1" if cfg.get("use_sage_attention") else "0"
     env["MODAL_BRIDGE_VOLUME_THRESHOLD_MB"] = str(cfg.get("volume_threshold_mb", 8))  # 大产物走 Volume 的阈值
+    env["MODAL_BRIDGE_INLINE_TOTAL_MB"] = str(cfg.get("inline_total_mb", 24))  # 单任务内联总量上限
     env["MODAL_BRIDGE_VERSION"] = plugin_version()  # 版本契约:烤进 app,health 回传供前端比对
     if cfg.get("modal_token_id"):
         env["MODAL_TOKEN_ID"] = cfg["modal_token_id"]

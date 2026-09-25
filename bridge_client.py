@@ -238,12 +238,14 @@ class BridgeClient:
         items = images if isinstance(images, list) and images else (
             [{"filename": state.get("filename"), "data_base64": state.get("data_base64")}]
             if state.get("data_base64") else [])
+        acks = []
         for img in items:
             fn = _name(img.get("filename"))
             local = out / fn
             vp = img.get("volume_path")
             if vp:
-                size = self._download_volume(job_id, vp, local, delete_remote)
+                size = self._download_volume(job_id, vp, local)
+                acks.append(vp)
             elif img.get("data_base64"):
                 # 与大文件那条路一致:写 .part、成功后原子 rename。直接写正式名的话,
                 # 进程中断会在输出目录里留下一个**看起来完整**的截断文件。
@@ -264,16 +266,22 @@ class BridgeClient:
             results.append({"filename": fn, "path": str(local), "size_bytes": size})
         if not results:
             raise BridgeError("状态里没有可落盘的产物(images 为空)")
+        # ⚠ 等**这个任务的全部产物**都落盘之后才发 ack。逐个文件 ack 的话,后面某个文件断线失败,
+        #   重试时前面那些已被删掉的就 404,整个任务再也取不全(2026-09-24 review)。
+        #   routes._write_results 那条路径早就是「全部落盘后统一清理」,这里对齐。
+        if delete_remote:
+            for vp in acks:
+                self._ack_remote(job_id, vp)
         return results
 
-    def _download_volume(self, job_id: str, vol_path: str, local: Path,
-                         delete_remote: bool) -> int:
-        qs = urllib.parse.urlencode({"job_id": job_id, "path": vol_path,
-                                     "delete": int(delete_remote)})
+    def _download_volume(self, job_id: str, vol_path: str, local: Path) -> int:
+        # ⚠ 下载时**不**让云端删。以前带 delete=1,云端在响应交给 ingress 之后就删了,
+        #   不等这边收完:断线或大小对不上时,远端副本已没、下面 finally 又清掉 .part,
+        #   付过钱的产物两头落空。现在先完整落盘并校验,**成功之后**才发 ack 让云端删。
+        qs = urllib.parse.urlencode({"job_id": job_id, "path": vol_path})
         url = f"{self._url('fetch')}?{qs}"
         dl_req = urllib.request.Request(url, headers={"X-Bridge-Key": self.key})
-        # 先写 .part、校验后原子 rename:delete_remote 时远端边传边清,
-        # 中断若直接写终名会留下"看起来完整"的残缺文件。
+        # 先写 .part、校验后原子 rename:中断若直接写终名会留下"看起来完整"的残缺文件。
         part = local.with_name(local.name + ".part")
         try:
             with _open_http(dl_req, timeout=600) as r, open(part, "wb") as f:
@@ -298,19 +306,50 @@ class BridgeClient:
         finally:
             part.unlink(missing_ok=True)
 
-    # ── 输入图打包(LoadImage 类节点 → data uri,协议与官方插件一致)──
+    def _ack_remote(self, job_id: str, vol_path: str) -> None:
+        """本地已完整落盘并校验 → 通知云端删 Volume 副本。失败不影响结果:
+        云端 _sweep_job_state 会按 TTL 回收,最坏只是多占一会儿存储。"""
+        qs = urllib.parse.urlencode({"job_id": job_id, "path": vol_path, "ack": 1})
+        try:
+            self._req(f"{self._url('fetch')}?{qs}", None, 30)
+        except Exception:
+            pass
+
+    # ── 输入素材打包(引用 input/ 的节点 → data uri,协议与官方插件一致)──
+    # 引用 input/ 下本地文件的节点 → 各自的输入键。**键名不统一,不能一律取 "image"**:
+    # LoadVideo 是 "file"、LoadAudio 是 "audio"(ComfyUI v0.34.6 源码核实)。
+    # 漏一个键 = 那个文件根本不进 payload,云端 ComfyUI 找不到它,报错长得像工作流参数错
+    # 而不是"少传了素材"。2026-09-19 之前这里只有三个 LoadImage*,所以送不了视频/音频参考。
+    # ⚠ 这张表在 routes.py 和 bridge_client.py 各有一份(本模块是零依赖、可被下游整份 vendor
+    #   的独立客户端,不能 import routes),由 test_input_file_nodes_identical_routes_and_client 钉死。
+    _INPUT_FILE_NODES = {
+        "LoadImage": ("image",),
+        "LoadImageMask": ("image",),
+        "LoadImageOutput": ("image",),
+        "LoadVideo": ("file",),
+        "LoadAudio": ("audio",),
+    }
+
     @staticmethod
     def pack_input_images(workflow: dict, search_dirs: list[str]) -> list[dict]:
-        """扫 workflow 里 LoadImage/LoadImageMask/LoadImageOutput 引用的文件名,
-        在 search_dirs 里找到并编成 [{name, image: data uri}]。找不到的抛错(与云端报错等价但更早)。"""
+        """扫 workflow 里引用 input/ 本地文件的节点(图 / 视频 / 音频),在 search_dirs 里找到
+        并编成 [{name, image: data uri}]。找不到的抛错(与云端报错等价但更早)。
+
+        ⚠ 键仍叫 "image" 是既定协议 —— 云端 upload_images 只认这一个键,视频音频也走它
+        (ComfyUI 的 /upload/image 不校验类型,按文件名原样落进 input/)。"""
         names, out = [], []
         for node in (workflow or {}).values():
-            if isinstance(node, dict) and node.get("class_type") in (
-                    "LoadImage", "LoadImageMask", "LoadImageOutput"):
-                ins = node.get("inputs") or {}
-                n = ins.get("image") or ins.get("filename")
-                if isinstance(n, str) and n not in names:
-                    names.append(n)
+            if not isinstance(node, dict):
+                continue
+            keys = BridgeClient._INPUT_FILE_NODES.get(node.get("class_type"))
+            if not keys:
+                continue
+            ins = node.get("inputs") or {}
+            # "filename" 是给自定义节点的兜底;连线形态是 ["3", 0] 这样的 list,必须判 str 跳过。
+            n = next((ins[k] for k in (*keys, "filename")
+                      if isinstance(ins.get(k), str) and ins[k]), None)
+            if n and n not in names:
+                names.append(n)
         for n in names:
             # 工作流内容不可信:绝对路径 / ".." 会让 Path(d) / n 落到 search_dirs 之外,
             # 变成任意本地文件读取并上传。子目录相对路径(如 "sub/a.png")合法。

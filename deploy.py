@@ -70,6 +70,9 @@ def main():
     if args.token_secret:
         cfg["modal_token_secret"] = args.token_secret
     cfg["bridge_api_key"] = cfg.get("bridge_api_key") or node_sync.gen_bridge_key()
+    # 持久化 HF token:Secret 是 --force 整份重建的,这里不存,下次 GUI 部署就会把它抹掉。
+    if args.hf_token:
+        cfg["hf_token"] = args.hf_token
 
     env = node_sync.deploy_env(cfg)
 
@@ -79,7 +82,7 @@ def main():
     # ComfyUI API 节点鉴权和 aigc-r2 交付就**静默失效**(config 里明明配着)。
     rc = run(node_sync.secret_create_cmd(
                  cfg,
-                 args.hf_token,
+                 cfg.get("hf_token", ""),
                  cfg.get("civitai_token", ""),
                  cfg["bridge_api_key"],
                  cfg.get("comfy_api_key", ""),
@@ -91,6 +94,14 @@ def main():
         sys.exit(rc)
 
     print("\n== 部署(首次拉镜像约 3-5 分钟)==")
+    # 同 GUI /deploy:本机清单会被当成镜像的全局清单,先并回云端独有的节点(只加不删)。
+    node_sync.ensure_baked_file()
+    try:
+        back = node_sync.reconcile_baked_with_cloud(cfg)
+    except node_sync.DeployBlocked as e:
+        sys.exit(f"✗ {e}")
+    if back:
+        print(f"   节点清单:并回云端独有的 {len(back)} 个 —— {', '.join(back)}")
     rc = run(node_sync.deploy_command(), cwd=str(MODAL_APP_DIR), env=env)
     if rc != 0:
         print("✗ deploy 失败")

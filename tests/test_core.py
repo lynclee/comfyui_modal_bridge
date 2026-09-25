@@ -1122,6 +1122,7 @@ def _load_endpoint(name, ns):
     """把 modal_app 的某个 endpoint 函数抠出来单独跑(模块级 modal.Dict.from_name 让它 import 不进来)。
     装饰器不在 FunctionDef 的源码区间里,所以取到的就是裸函数本身。"""
     ns.setdefault("_Header", lambda default="": default)
+    ns.setdefault("_effective", lambda s, now: s)     # 默认不判死;要测判死的用 _status_ns / 显式传
     return _extract_nested(ROOT / "modal_app" / "modal_app.py", name, ns)
 
 
@@ -1133,14 +1134,23 @@ def test_status_endpoint_says_not_found_in_the_data_not_only_in_error():
     被 GC 清掉的任务被读成「还在跑」,永远不收敛 —— comfyagent 侧实测就是这么中招的。
     本仓自己的 bridge_client.wait 同样只认 completed/failed/cancelled,缺 status 就一路
     轮询到 timeout_s(默认 1 小时)。"""
-    fn = _load_endpoint("status_endpoint", {"job_state": {}, "_check": lambda k: None})
+    fn = _load_endpoint("status_endpoint", _status_ns({}))
     r = fn("ghost")
     assert r["status"] == "not_found", f"缺 status 字段,客户端只能靠猜: {r}"
     assert r.get("error"), "同时保留 error,老客户端的判据不变"
 
-    live = {"j1": {"status": "running", "progress": {"step": 3}}}
-    fn = _load_endpoint("status_endpoint", {"job_state": live, "_check": lambda k: None})
+    import time as _t
+    live = {"j1": {"status": "running", "started_at": _t.time()}}
+    fn = _load_endpoint("status_endpoint", _status_ns(live))
     assert fn("j1")["status"] == "running"
+
+
+def _fake_clock():
+    """随 sleep 推进的假时钟。⚠ 不能用固定返回 0.0 的 time 桩:按时间窗重读的循环
+    (cancel 对 not_found 的确认)会因为时间永远不走而死循环。"""
+    now = [0.0]
+    return types.SimpleNamespace(time=lambda: now[0],
+                                 sleep=lambda dt: now.__setitem__(0, now[0] + dt))
 
 
 def test_cancel_endpoint_refuses_unknown_job_instead_of_inventing_a_record():
@@ -1152,7 +1162,7 @@ def test_cancel_endpoint_refuses_unknown_job_instead_of_inventing_a_record():
     state = {}
     fn = _load_endpoint("cancel_endpoint", {
         "job_state": state, "_check": lambda k: None, "_CALL_PENDING": "pending",
-        "_call_id": lambda j: "", "time": types.SimpleNamespace(sleep=lambda s: None, time=lambda: 0.0),
+        "_call_id": lambda j: "", "time": _fake_clock(), "_CANCEL_NOT_FOUND_WAIT_S": 3.0,
     })
     r = fn({"job_id": "ghost", "auth_key": "k"})
     assert r["status"] == "not_found", f"不能报 cancelled: {r}"
@@ -1169,11 +1179,41 @@ def test_cancel_endpoint_still_waits_for_a_job_that_is_mid_spawn():
     state = {"spawning:call": "pending"}
     fn = _load_endpoint("cancel_endpoint", {
         "job_state": state, "_check": lambda k: None, "_CALL_PENDING": "pending",
-        "_call_id": lambda j: "", "time": types.SimpleNamespace(sleep=lambda s: None, time=lambda: 0.0),
+        "_call_id": lambda j: "", "time": _fake_clock(), "_CANCEL_NOT_FOUND_WAIT_S": 3.0,
     })
     r = fn({"job_id": "spawning", "auth_key": "k"})
     assert r["status"] != "not_found", f"正在提交中被误判成不存在: {r}"
     assert "提交中" in (r.get("error") or ""), r
+
+
+def test_cancel_endpoint_rereads_before_declaring_not_found():
+    """云端 cancel 不能凭一次读就回 not_found —— 那是根因,前端补丁只护得住一个调用方。
+
+    job_state 是 modal.Dict,跨容器最终一致:/run 刚在另一个容器里写完,cancel 这边可能
+    还读不到。一次读就回 not_found 且不执行取消,bridge_cli cancel / MCP cancel_job 这类
+    直调云端的调用方会据此放弃,任务照常跑满计费。(2026-09-23 review 抓到。)"""
+    class LaggyDict(dict):
+        """前 lag 次读 job_id 都读不到,之后才「同步」过来 —— 模拟跨容器的陈旧读。"""
+        def __init__(self, lag, *a, **kw):
+            super().__init__(*a, **kw)
+            self.lag = lag
+            self.reads = 0
+        def get(self, k, default=None):
+            if not k.endswith(":call"):
+                self.reads += 1
+                if self.reads <= self.lag:
+                    return default
+            return super().get(k, default)
+
+    state = LaggyDict(4, {"late": {"status": "queued"}})
+    fn = _load_endpoint("cancel_endpoint", {
+        "job_state": state, "_check": lambda k: None, "_CALL_PENDING": "pending",
+        "_call_id": lambda j: "", "time": _fake_clock(), "_CANCEL_NOT_FOUND_WAIT_S": 3.0,
+    })
+    r = fn({"job_id": "late", "auth_key": "k"})
+    assert r["status"] != "not_found", f"陈旧读被当成了不存在,取消没执行: {r}"
+    assert r["status"] == "cancelled", r
+    assert state["late"]["status"] == "cancelled", "必须真的写下取消"
 
 
 def test_wait_gives_up_on_not_found_but_tolerates_one_stale_read():
@@ -1196,6 +1236,905 @@ def test_wait_gives_up_on_not_found_but_tolerates_one_stale_read():
         assert False, "连续 not_found 必须报错,不能空转到 timeout"
     except bridge_client.BridgeError as e:
         assert "查无此 job" in str(e), e
+
+
+def _input_file_nodes(path: Path) -> dict:
+    """把 _INPUT_FILE_NODES 这张表从源码里 literal_eval 出来(routes 是模块级,client 是类属性)。"""
+    import ast
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Assign) and any(
+                isinstance(t, ast.Name) and t.id == "_INPUT_FILE_NODES" for t in n.targets):
+            return ast.literal_eval(n.value)
+    raise AssertionError(f"{path.name} 里找不到 _INPUT_FILE_NODES")
+
+
+def test_input_file_nodes_identical_routes_and_client():
+    """两份「节点 → 输入键」映射必须逐字一致,并且必须覆盖视频/音频。
+
+    bridge_client.py 是零依赖、可被下游整份 vendor 的独立客户端,不能 import routes,
+    所以只能各写一份 —— 那就必须钉死(与 _SAFE_JOB_ID、产物去重同理)。
+    ⚠ 键名不统一是这条测试存在的真正理由:LoadVideo 用 "file"、LoadAudio 用 "audio"
+    (ComfyUI v0.34.6 源码核实)。只把 class 名加进白名单、沿用 ins.get("image") 的写法
+    一个都取不到 —— 而表现是「文件没被打包」,云端报的却是工作流参数错。"""
+    r = _input_file_nodes(ROOT / "routes.py")
+    b = _input_file_nodes(ROOT / "bridge_client.py")
+    assert r == b, f"两份映射漂移:\nroutes={r}\nclient={b}"
+    assert r["LoadVideo"] == ("file",), r
+    assert r["LoadAudio"] == ("audio",), r
+    for cls in ("LoadImage", "LoadImageMask", "LoadImageOutput"):
+        assert r[cls] == ("image",), r
+
+
+def test_pack_input_images_covers_video_and_audio(tmp_path):
+    """LoadVideo/LoadAudio 引用的文件必须被打包 —— 键仍是 "image"(云端契约),但取值来源不同。
+
+    2026-09-19 之前只扫三个 LoadImage*,视频/音频参考的文件从来没进过 payload:
+    云端 ComfyUI 找不到文件,报错长得像工作流参数错,看不出是少传了素材。"""
+    import bridge_client
+    for fn, body in (("a.png", b"\x89PNG"), ("b.mp4", b"\x00\x00\x00 ftypmp42"), ("c.wav", b"RIFF")):
+        (tmp_path / fn).write_bytes(body)
+    wf = {
+        "1": {"class_type": "LoadImage", "inputs": {"image": "a.png"}},
+        "2": {"class_type": "LoadVideo", "inputs": {"file": "b.mp4"}},
+        "3": {"class_type": "LoadAudio", "inputs": {"audio": "c.wav"}},
+        # 连线形态不是文件名,必须跳过(否则会拿 ["1", 0] 去找文件)
+        "4": {"class_type": "LoadImage", "inputs": {"image": ["1", 0]}},
+        "5": {"class_type": "KSampler", "inputs": {"seed": 1}},
+    }
+    out = bridge_client.BridgeClient.pack_input_images(wf, [str(tmp_path)])
+    assert [o["name"] for o in out] == ["a.png", "b.mp4", "c.wav"], out
+    mimes = {o["name"]: o["image"].split(";", 1)[0] for o in out}
+    assert mimes == {"a.png": "data:image/png", "b.mp4": "data:video/mp4",
+                     "c.wav": "data:audio/x-wav"}, mimes
+
+
+def test_routes_extract_input_names_covers_video_and_audio():
+    """routes 那份(本地面板走的路径)与 client 同步覆盖视频/音频。"""
+    ns = {"_INPUT_FILE_NODES": _input_file_nodes(ROOT / "routes.py")}
+    pick = _extract_nested(ROOT / "routes.py", "_extract_input_file_name", ns)
+    ns2 = {"_extract_input_file_name": pick, "print": lambda *a, **k: None}
+    names = _extract_nested(ROOT / "routes.py", "_extract_input_image_names", ns2)
+    got = names({
+        "1": {"class_type": "LoadImage", "inputs": {"image": "a.png"}},
+        "2": {"class_type": "LoadVideo", "inputs": {"file": "b.mp4"}},
+        "3": {"class_type": "LoadAudio", "inputs": {"audio": "c.wav"}},
+        "4": {"class_type": "LoadVideo", "inputs": {"file": ["1", 0]}},   # 连线,跳过
+        "5": {"class_type": "LoadImage", "inputs": {"image": "clipspace/x.png"}},
+        "6": {"class_type": "LoadVideo", "inputs": {"file": "refs/clip.mp4"}},
+        "7": {"class_type": "KSampler", "inputs": {"seed": 1}},
+    })
+    # 子目录必须**收下**,不能静默跳过 —— 跳过后提交流程照常往下走,用户看到的是提交成功,
+    # 实际少传了素材(2026-09-20 codex review 抓到的 P2)。越界的由 _read_input_as_b64 抛错拦。
+    assert got == ["a.png", "b.mp4", "c.wav", "clipspace/x.png", "refs/clip.mp4"], got
+
+
+def test_container_id_is_not_baked_into_the_snapshot():
+    """容器指纹只能在 snap=False 的钩子里掷,绝不能在模块级或 boot() 里生成。
+
+    开内存快照时 `@modal.enter(snap=True)` 的 boot() 跑在**快照之前**,那时生成的值会被
+    烤进快照 —— 所有从同一份快照恢复出来的容器共享同一个指纹,日志看着像热复用其实是
+    不同容器。**假证据比没有证据更糟**:它会让人对着日志得出反的结论。
+    (2026-09-20 加指纹时的设计约束;配置里 enable_snapshot 默认就是开的。)"""
+    import ast
+    src = (ROOT / "modal_app" / "modal_app.py").read_text(encoding="utf-8")
+    tree = ast.parse(src)
+
+    # 模块级不许有 _CONTAINER_ID = <计算出来的值>,只能是空串常量
+    for n in tree.body:
+        if isinstance(n, ast.Assign) and any(
+                isinstance(t, ast.Name) and t.id == "_CONTAINER_ID" for t in n.targets):
+            assert isinstance(n.value, ast.Constant) and n.value.value == "", \
+                "模块级就把指纹算出来了 —— 会被烤进内存快照"
+
+    # 掷指纹的调用不能出现在 _worker_boot 里(那是 snap=True 阶段)
+    boot = next(n for n in ast.walk(tree)
+                if isinstance(n, ast.FunctionDef) and n.name == "_worker_boot")
+    assert "_new_container_id" not in ast.get_source_segment(src, boot), \
+        "_worker_boot 是 snap=True 阶段,在那里掷指纹会进快照"
+
+
+def test_container_id_is_rolled_before_the_snapshot_early_return():
+    """掷指纹必须排在 _worker_ensure_alive 那句 `if not _SNAPSHOT: return` 之前。
+
+    排在后面的话,**关快照时永远不会掷** —— 而关快照恰恰是最需要靠指纹分辨冷热的场景
+    (没有快照就没有恢复,每个容器都是真冷启)。这条和 deploy 那个「取上次 tag 必须早于
+    cfg.update」是同一类:顺序错了功能就永远不触发,而测试不看顺序就发现不了。"""
+    import ast
+    src = (ROOT / "modal_app" / "modal_app.py").read_text(encoding="utf-8")
+    fn = next(n for n in ast.walk(ast.parse(src))
+              if isinstance(n, ast.FunctionDef) and n.name == "_worker_ensure_alive")
+    body = ast.get_source_segment(src, fn)
+    roll = body.index("_new_container_id(")
+    early = body.index("if not _SNAPSHOT:")
+    assert roll < early, "掷指纹晚于 _SNAPSHOT 早返回,关快照时永远不会执行"
+
+
+def test_container_id_changes_per_container_and_is_stable_within_one():
+    """真跑一遍抠出来的两个函数,各自的契约分开验(隔离执行时它们不共享全局,不能串起来测)。"""
+    import uuid as _uuid
+    MOD = ROOT / "modal_app" / "modal_app.py"
+
+    roll = _extract_nested(MOD, "_new_container_id", {"uuid": _uuid, "_CONTAINER_ID": ""})
+    a, b = roll(), roll()
+    assert a != b, "每次掷必须是新值,否则换容器看不出来"
+    assert len(a) == 8 and all(c in "0123456789abcdef" for c in a), a
+    assert roll.__globals__["_CONTAINER_ID"] == b, "掷完必须写回全局,否则 _container_id 取不到"
+
+    # 已掷过 → 原样返回,不重掷(同一容器内必须稳定)
+    get = _extract_nested(MOD, "_container_id",
+                          {"_CONTAINER_ID": "abcd1234", "_new_container_id": lambda: "FRESH"})
+    assert get() == "abcd1234" and get() == "abcd1234"
+    # 没掷过 → 惰性补一个(兜底,正常路径不会走到)
+    get2 = _extract_nested(MOD, "_container_id",
+                           {"_CONTAINER_ID": "", "_new_container_id": lambda: "FRESH"})
+    assert get2() == "FRESH"
+
+
+def test_job_start_log_carries_container_and_call_id():
+    """job 起跑那行必须同时带 container= 和 call= —— 少任一个都归不了因。
+    ⚠ 断言打在真代码上(挖掉注释):这两个串在注释里也出现过,不挖注释的话删掉真代码照样绿。"""
+    body = code_only((ROOT / "modal_app" / "modal_app.py").read_text(encoding="utf-8"))
+    i = body.index('f"[bridge] job {job_id} start container=')
+    seg = body[i:i + 200]
+    assert "_container_id()" in seg, seg
+    assert "modal.current_function_call_id()" in seg, seg
+
+
+def test_upload_images_splits_subfolder_instead_of_stuffing_filename():
+    """带子目录的素材必须拆成 subfolder 字段发,不能整串塞进 filename。
+
+    ComfyUI 的 image_upload 是 open(join(input_dir, normpath(subfolder), filename)),
+    而 makedirs 只建到 subfolder 那一层 —— filename 里带 "refs/" 时 input/refs/ 根本
+    没被创建,open() 直接 FileNotFoundError → HTTP 500。
+    (2026-09-20 codex review 对着 ComfyUI v0.34.6 server.py 复现。)"""
+    import base64 as _b64
+    sys.path.insert(0, str(ROOT / "modal_app"))
+    import _comfy_ws
+    seen = []
+
+    class _Resp:
+        def raise_for_status(self): pass
+
+    orig = _comfy_ws.requests.post
+    _comfy_ws.requests.post = lambda url, files=None, timeout=None: (
+        seen.append(files) or _Resp())
+    try:
+        uri = "data:video/mp4;base64," + _b64.b64encode(b"x").decode()
+        r = _comfy_ws.upload_images([{"name": "refs/clip.mp4", "image": uri},
+                                     {"name": "plain.png", "image": uri}])
+    finally:
+        _comfy_ws.requests.post = orig
+    assert r["status"] == "success", r
+    assert seen[0]["image"][0] == "clip.mp4", f"filename 里还带着目录: {seen[0]['image'][0]}"
+    assert seen[0]["subfolder"][1] == "refs", seen[0]
+    assert seen[1]["image"][0] == "plain.png"
+    assert "subfolder" not in seen[1], "根目录素材不该带 subfolder 字段"
+
+
+def test_upload_images_rejects_path_escape():
+    """越界自己也要挡:ComfyUI 有 commonpath 兜底,但 name 来自调用方提交的工作流,
+    不该把唯一的边界检查外包给对端。"""
+    import base64 as _b64
+    sys.path.insert(0, str(ROOT / "modal_app"))
+    import _comfy_ws
+    uri = "data:image/png;base64," + _b64.b64encode(b"x").decode()
+    for evil in ("../../etc/passwd", "/etc/shadow", "a/../../b.png"):
+        r = _comfy_ws.upload_images([{"name": evil, "image": uri}])
+        assert r["status"] == "error", f"没挡住: {evil}"
+        assert "非法" in str(r["details"]), r
+
+
+MODAL_APP = ROOT / "modal_app" / "modal_app.py"
+
+
+def _status_ns(job_state, worker_timeout=1200):
+    """status_endpoint 的桩全局:它现在要判「worker 是否已被 Modal 杀掉」,依赖 _stale_reason。"""
+    import time as _t
+    stale = _extract_nested(MODAL_APP, "_stale_reason",
+                            {"WORKER_TIMEOUT": worker_timeout, "_STALE_GRACE_S": 120,
+                             "_QUEUE_STALE_S": 6 * 3600})
+    import re as _re
+    safe = _re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
+    eff = _extract_nested(MODAL_APP, "_effective", {"_stale_reason": stale})
+    return {"job_state": job_state, "_check": lambda k: None, "time": _t, "_stale_reason": stale,
+            "_effective": eff,
+            "_safe_job_id": lambda j: isinstance(j, str) and bool(safe.match(j)) and ".." not in j}
+
+
+# ── #9 ComfyUI tag 回落 ─────────────────────────────────────────────────────
+def test_tag_resolution_never_falls_back_to_stale_default_on_network_failure():
+    """拉不到 tag 列表时不能退回写死的 v0.22.0:那个版本不支持 H3、新节点全部导入失败,
+    而部署 rc=0、只多一行 ⚠ —— 一次网络抖动就让云端大面积坏掉(2026-09-23 review)。"""
+    tag, note = node_sync.resolve_comfyui_tag("0.34.6", [], prev_tag="v0.34.2")
+    assert tag == "v0.34.6", f"本机版本已知时应直接用它,实际 {tag}"
+    assert "拉不到" in note
+    tag, _ = node_sync.resolve_comfyui_tag("", [], prev_tag="v0.34.2")
+    assert tag == "v0.34.2", "本机版本未知时应沿用上次部署的 tag"
+    tag, _ = node_sync.resolve_comfyui_tag("", [], prev_tag="")
+    assert tag == node_sync.DEFAULT_COMFYUI_TAG, "两者都没有才用默认值"
+    # 正常路径不受影响
+    assert node_sync.resolve_comfyui_tag("0.34.6", ["v0.34.6", "v0.35.0"])[0] == "v0.34.6"
+
+
+# ── #13 凭据:脱敏一处、持久化、CLI 不轮换 key ─────────────────────────────
+def test_public_config_strips_every_secret_including_hf_and_civitai():
+    """脱敏只有一份清单。以前 GET/POST /config 各维护一份 pop 列表,加字段要改两处,漏一处就泄漏。"""
+    cfg = {k: f"SECRET-{k}" for k in contract.SECRET_CONFIG_FIELDS}
+    cfg.update(gpu_tier="auto", local_node_reqs_deployed_hash="h")
+    out = contract.public_config(cfg)
+    leaked = [k for k, v in out.items() if isinstance(v, str) and v.startswith("SECRET-")]
+    assert not leaked, f"凭据回吐到了浏览器: {leaked}"
+    assert "hf_token" in contract.SECRET_CONFIG_FIELDS and "civitai_token" in contract.SECRET_CONFIG_FIELDS
+    assert out["has_hf_token"] is True and out["has_civitai_token"] is True
+    assert "local_node_reqs_deployed_hash" not in out and out["gpu_tier"] == "auto"
+
+
+def test_deploy_reuses_stored_hf_and_civitai_tokens():
+    """secret create 用的是 --force(整份替换)。HF/Civitai 以前只从请求体取、从不持久化,
+    而面板根本不发这两个字段 —— 点一次「推送到云端」就把 deploy.py 配过的 token 抹掉。"""
+    body = code_only((ROOT / "routes.py").read_text(encoding="utf-8"))
+    assert 'or cfg.get("hf_token", "")' in body and 'or cfg.get("civitai_token", "")' in body
+    assert '"hf_token": hf_token,' in body and '"civitai_token": civitai_token,' in body
+
+
+def test_bridge_cli_deploy_reuses_plugin_bridge_key_instead_of_rotating():
+    """没有 cli.json 的机器上跑 bridge_cli deploy,曾经新生成一把 BRIDGE_API_KEY 并 --force 覆盖
+    Secret —— 插件 config 里那把随即失效,所有请求 401。必须先复用插件 config 里的 key。"""
+    body = code_only((ROOT / "bridge_cli.py").read_text(encoding="utf-8"))
+    i = body.index("bridge_key = (plugin.get(")
+    seg = body[i:body.index(")", body.index("gen_bridge_key()", i)) + 1]
+    assert 'plugin.get("bridge_api_key")' in seg, f"没有复用插件 config 里的 key: {seg!r}"
+    # 同一个 app 时插件的 key 必须**最先**被用 —— 过时的 cli.json key 排在前面会 --force 覆盖 Secret,
+    # 插件照样全部 401(2026-09-24 review:第一版顺序写反了)。
+    assert seg.index('plugin.get("bridge_api_key")') < seg.index('saved.get("key")') \
+        < seg.index("gen_bridge_key()"), f"优先级必须是 插件 → cli.json → 新生成: {seg!r}"
+
+
+# ── #3 取消要让 ComfyUI 停下 ────────────────────────────────────────────────
+def test_interrupt_comfy_clears_queue_before_interrupting():
+    """顺序必须是先清队列再中断 —— 反过来,中断那一刻下一个排队的 prompt 会立刻开跑。"""
+    sys.path.insert(0, str(ROOT / "modal_app"))
+    import _comfy_ws
+    calls = []
+    orig = _comfy_ws.requests.post
+    _comfy_ws.requests.post = lambda url, json=None, timeout=None: calls.append((url, json))
+    try:
+        _comfy_ws.interrupt_comfy()
+    finally:
+        _comfy_ws.requests.post = orig
+    assert [u.rsplit("/", 1)[-1] for u, _ in calls] == ["queue", "interrupt"], calls
+    assert calls[0][1] == {"clear": True}
+
+
+def test_worker_run_interrupts_comfy_on_cancellation_and_failure():
+    """取消走 Modal 的 InputCancellation,它是 BaseException —— `except Exception` 接不住。
+    以前没有 BaseException 分支,ComfyUI 子进程接着跑被取消的 prompt,暖容器的下一单排在它后面,
+    用户为已取消的任务付全部剩余 GPU 时间(2026-09-23 review)。"""
+    import ast
+    src = MODAL_APP.read_text(encoding="utf-8")
+    fn = next(n for n in ast.walk(ast.parse(src))
+              if isinstance(n, ast.FunctionDef) and n.name == "_worker_run")
+    # 只看「带 BaseException 分支」的那个主 try —— _worker_run 里还嵌着 _on_progress 等函数,
+    # 它们各有 except Exception: pass,按类型名收集会互相覆盖。
+    main = next((t for t in ast.walk(fn) if isinstance(t, ast.Try) and any(
+        isinstance(h.type, ast.Name) and h.type.id == "BaseException" for h in t.handlers)), None)
+    assert main is not None, "缺 except BaseException:取消时 ComfyUI 不会被中断"
+    handlers = {h.type.id: ast.get_source_segment(src, h)
+                for h in main.handlers if isinstance(h.type, ast.Name)}
+    for kind in ("BaseException", "Exception"):
+        assert "interrupt_comfy()" in handlers[kind], f"except {kind} 分支没有中断 ComfyUI"
+
+
+# ── #12 进度拆到独立键 ─────────────────────────────────────────────────────
+def test_progress_never_rewrites_the_whole_job_entry():
+    """_on_progress 读改写整条状态会和 cancel 竞态,把 cancelled 覆盖回 running。只能写独立键。"""
+    import ast
+    src = MODAL_APP.read_text(encoding="utf-8")
+    fn = next(n for n in ast.walk(ast.parse(src))
+              if isinstance(n, ast.FunctionDef) and n.name == "_on_progress")
+    body = code_only(ast.get_source_segment(src, fn))
+    assert 'job_state[f"{job_id}:progress"]' in body
+    assert "job_state[job_id] =" not in body, "进度写入又碰了整条状态,会和 cancel 竞态"
+
+
+def test_status_serves_progress_from_its_own_key():
+    import time as _t
+    state = {"j": {"status": "running", "started_at": _t.time()},
+             "j:progress": {"step": 3, "total": 20}}
+    out = _load_endpoint("status_endpoint", _status_ns(state))("j")
+    assert out["progress"] == {"step": 3, "total": 20}, out
+    state["j"] = {"status": "cancelled", "completed_at": _t.time()}
+    out = _load_endpoint("status_endpoint", _status_ns(state))("j")
+    assert "progress" not in out, "非 running 不该带进度"
+
+
+def test_sweep_drops_the_progress_key_too():
+    import time as _t
+    state = {"j": {"status": "completed", "completed_at": _t.time() - 7200},
+             "j:call": "fc-1", "j:progress": {"step": 1}}
+    sweep = _load_sweep(state, lambda path, recursive=False: None)
+    sweep()
+    assert state == {}, f"独立键成了孤儿: {state}"
+
+
+# ── #4 worker 被 Modal 杀掉后状态不能永远 running ──────────────────────────
+def test_status_declares_killed_worker_failed_after_timeout():
+    """超时 / OOM / 崩溃时容器里什么都执行不了,没人写终态。以前永远 running:前端空等后报错因,
+    CLI/MCP 等满 3600s,条目和产物永不回收。超过 worker 超时上限就判死。"""
+    import time as _t
+    now = _t.time()
+    state = {"dead": {"status": "running", "started_at": now - 1200 - 200},
+             "slow": {"status": "running", "started_at": now - 1000},
+             "queued": {"status": "queued", "started_at": now - 99999}}
+    fn = _load_endpoint("status_endpoint", _status_ns(state, worker_timeout=1200))
+    r = fn("dead")
+    assert r["status"] == "failed" and "强杀" in r["error"], r
+    assert state["dead"]["status"] == "failed", "必须写回,否则 GC 永远收不掉"
+    assert fn("slow")["status"] == "running", "还在超时上限内的不能误判"
+    assert fn("queued")["status"] == "queued", "排队不计费,不按超时判死"
+
+
+def test_sweep_collects_killed_workers_instead_of_keeping_them_forever():
+    import time as _t
+    state = {"dead": {"status": "running", "started_at": _t.time() - 99999}}
+    removed = []
+    sweep = _load_sweep(state, lambda path, recursive=False: removed.append(path))
+    sweep.__globals__["_stale_reason"] = _extract_nested(
+        MODAL_APP, "_stale_reason", {"WORKER_TIMEOUT": 1200, "_STALE_GRACE_S": 120,
+                                     "_QUEUE_STALE_S": 6 * 3600})
+    sweep()
+    assert removed == ["_outputs/dead"] and state == {}, (removed, state)
+
+
+# ── #6 结果写回:总量预算 + 最后一道兜底 ───────────────────────────────────
+def test_inline_outputs_spill_to_volume_past_the_total_budget(monkeypatch):
+    """逐文件阈值没有总量:16 张 7MB 的图每张都走 base64,合计 ~150MB 写 Dict 时 RequestSizeError,
+    状态卡 running、产物拿不到。超过总预算的后续产物改走 Volume。"""
+    sys.path.insert(0, str(ROOT / "modal_app"))
+    import io
+    import _comfy_ws
+    blob = b"x" * 1000
+    monkeypatch.setattr(_comfy_ws, "get_image_data", lambda *a: blob)
+    monkeypatch.setattr(_comfy_ws, "_VOL_THRESHOLD", 10_000)          # 单个都不超
+    monkeypatch.setattr(_comfy_ws, "_INLINE_TOTAL_BUDGET", 2_500)     # 只容得下 2 个
+    monkeypatch.setattr(_comfy_ws.os, "makedirs", lambda *a, **k: None)
+    monkeypatch.setattr(_comfy_ws, "open", lambda *a, **k: io.BytesIO(), raising=False)
+    refs = [{"filename": f"o{i}.png", "subfolder": "", "type": "output",
+             "node_id": "9", "key": "images"} for i in range(4)]
+    images, errors = _comfy_ws.materialize_desktop_outputs(refs, "job1")
+    assert not errors, errors
+    inline = [i for i in images if "data_base64" in i]
+    spilled = [i for i in images if "volume_path" in i]
+    assert len(inline) == 2 and len(spilled) == 2, (len(inline), len(spilled))
+
+
+def test_final_completed_write_cannot_leave_the_job_running():
+    """写 completed 那句以前在 try 外:一抛异常,没人写终态,状态卡在 running。"""
+    body = code_only(MODAL_APP.read_text(encoding="utf-8"))
+    i = body.index("        job_state[job_id] = done\n")
+    assert body[:i].rstrip().endswith("try:"), "最后的写回必须包在 try 里"
+
+
+# ── #7 下载永不删,删除走确认后的 ack ───────────────────────────────────────
+def test_fetch_only_deletes_on_explicit_ack():
+    """以前 delete=1 在响应交给 ingress 之后就删,不等客户端收完 —— 断线时付费产物彻底丢失。"""
+    import ast
+    src = MODAL_APP.read_text(encoding="utf-8")
+    fn = next(n for n in ast.walk(ast.parse(src))
+              if isinstance(n, ast.FunctionDef) and n.name == "fetch_endpoint")
+    seg = code_only(ast.get_source_segment(src, fn))
+    assert "BackgroundTask" not in seg, "下载路径又挂上了删除任务"
+    removes = [n for n in ast.walk(fn) if isinstance(n, ast.Call)
+               and ast.get_source_segment(src, n).startswith("os.remove")]
+    assert removes, "ack 分支里应当有删除"
+    ack_if = next(n for n in ast.walk(fn) if isinstance(n, ast.If)
+                  and isinstance(n.test, ast.Name) and n.test.id == "ack")
+    inside = {id(x) for x in ast.walk(ack_if)}
+    assert all(id(r) in inside for r in removes), "有删除落在 ack 分支之外"
+
+
+def test_bridge_client_acks_only_after_every_output_is_on_disk(tmp_path):
+    """ack 要等**这个任务的全部产物**都落盘并校验之后才发。
+
+    逐文件 ack 的话,后面某个文件断线失败,重试时前面已被删的文件 404,整个任务再也取不全
+    (2026-09-24 review)。大小对不上的那个文件更是绝不能 ack。"""
+    import io
+    import bridge_client as bc
+    c = bc.BridgeClient("https://ws--comfyui-bridge", "k")
+    urls, acks = [], []
+
+    class _Resp:
+        def __init__(self, body, clen):
+            self.b, self.headers = io.BytesIO(body), {"Content-Length": str(clen)}
+        def read(self, n): return self.b.read(n)
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+
+    def run(clens):
+        urls.clear()
+        acks.clear()
+        it = iter(clens)
+        orig = bc._open_http
+        bc._open_http = lambda req, timeout=None: (urls.append(req.full_url), _Resp(b"abc", next(it)))[1]
+        c._req = lambda url, body, timeout: acks.append(url) or {}
+        state = {"status": "completed", "id": "j", "images": [
+            {"filename": "a.mp4", "volume_path": "_outputs/j/a.mp4"},
+            {"filename": "b.wav", "volume_path": "_outputs/j/b.wav"}]}
+        try:
+            return c.download_outputs(state, str(tmp_path / f"out{len(clens)}"), delete_remote=True)
+        finally:
+            bc._open_http = orig
+
+    run([3, 3])
+    assert all("delete" not in u for u in urls), "下载请求不能再让云端删"
+    assert len(acks) == 2 and all("ack=1" in u for u in acks), acks
+
+    try:
+        run([3, 999])      # 第二个文件大小对不上
+        assert False, "大小不符必须报错"
+    except bc.BridgeError:
+        pass
+    assert acks == [], f"有文件没取成功,就一个都不能 ack(否则重试时前面的 404): {acks}"
+
+
+# ── #1 节点清单:多机取并集、永不互删 ──────────────────────────────────────
+def test_complete_baked_entries_prefers_cloud_manifest():
+    """云端只报名字时,以前只用本机清单补 url —— 别的机器加的节点被填成空 url,出口丢弃,
+    下次部署从镜像里删掉。云端 manifest 是镜像实际装的那份,优先用它。"""
+    local = {"A": {"name": "A", "url": "https://x/A", "commit": "old"}}
+    manifest = [{"name": "A", "url": "https://x/A", "commit": "new"},
+                {"name": "X", "url": "https://x/X", "commit": "c"}]
+    out = {e["name"]: e for e in node_sync.complete_baked_entries(["A", "X", "Z"], local, manifest)}
+    assert out["X"]["url"] == "https://x/X", "别的机器加的节点必须拿到 url,否则会被丢"
+    assert out["A"]["commit"] == "new", "云端 manifest 优先于本机「上次部署」的记录"
+    assert out["Z"]["url"] == "", "两边都没有才留空"
+
+
+def test_reconcile_adds_back_cloud_only_nodes_and_never_removes(tmp_path, monkeypatch):
+    """插件被 Manager 重装、本机清单丢了 → 一次部署清空云端全部节点。部署前并回,只加不删。"""
+    import health_client as hc
+    monkeypatch.setattr(node_sync, "DATA_FILE", tmp_path / "_custom_nodes_data.py")
+    monkeypatch.setattr(node_sync, "folder_git_info", lambda name: {"has_git": False})
+    node_sync.write_baked_nodes([{"name": "local_only", "url": "https://x/L", "commit": "1"}])
+    manifest = [{"name": "cloud_only", "url": "https://x/C", "commit": "2"},
+                {"name": "local_only", "url": "https://x/L", "commit": "1"}]
+    monkeypatch.setattr(node_sync, "fetch_cloud_nodes",
+                        lambda cfg: (["cloud_only", "local_only"], manifest))
+    assert node_sync.reconcile_baked_with_cloud({}) == ["cloud_only"]
+    assert {n["name"] for n in node_sync.read_baked_nodes()} == {"local_only", "cloud_only"}
+
+    def not_deployed(cfg):
+        raise hc.HealthUnavailable("not_deployed", "404")
+    monkeypatch.setattr(node_sync, "fetch_cloud_nodes", not_deployed)
+    assert node_sync.reconcile_baked_with_cloud({}) == [], "全新部署(404):没有可保护的,照常部署"
+
+
+def test_reconcile_protects_nodes_even_when_the_cloud_is_too_old_to_report_sources(tmp_path, monkeypatch):
+    """云端 < 0.8.48 没有 manifest —— Registry 的 latest 还是 0.7.9,所有从 Registry 升级的用户
+    第一次部署都是这种云端(2026-09-24 review)。本机装着的用本机 git 补;补不出来的必须中止部署。"""
+    monkeypatch.setattr(node_sync, "DATA_FILE", tmp_path / "_custom_nodes_data.py")
+    node_sync.write_baked_nodes([])
+    monkeypatch.setattr(node_sync, "fetch_cloud_nodes",
+                        lambda cfg: (["installed_here", "gone_everywhere"], None))
+    monkeypatch.setattr(node_sync, "folder_git_info", lambda name: (
+        {"has_git": True, "url": "https://x/installed_here", "commit": "c"} if name == "installed_here"
+        else {"has_git": False}))
+    try:
+        node_sync.reconcile_baked_with_cloud({})
+        assert False, "补不出来源的节点必须让部署中止,不能静默删掉"
+    except node_sync.DeployBlocked as e:
+        assert "gone_everywhere" in str(e)
+    assert node_sync.read_baked_nodes() == [], "中止时不能半途写清单"
+
+
+def test_reconcile_blocks_when_the_cloud_is_unreadable_and_the_local_list_is_empty(tmp_path, monkeypatch):
+    """以前把 401、超时统统当「拿不到」,保护静默跳过(review #14)。读不到云端 + 本机清单空,
+    正是「插件重装丢了清单」的形态,贸然部署就清空云端 —— 必须中止。本机有清单则照常。"""
+    import health_client as hc
+    monkeypatch.setattr(node_sync, "DATA_FILE", tmp_path / "_custom_nodes_data.py")
+    for kind in ("unauthorized", "unreachable", "http"):
+        def boom(cfg, kind=kind):
+            raise hc.HealthUnavailable(kind, kind)
+        monkeypatch.setattr(node_sync, "fetch_cloud_nodes", boom)
+        node_sync.write_baked_nodes([])
+        try:
+            node_sync.reconcile_baked_with_cloud({})
+            assert False, f"{kind} + 本机清单为空,必须中止"
+        except node_sync.DeployBlocked:
+            pass
+        node_sync.write_baked_nodes([{"name": "a", "url": "https://x/a", "commit": "1"}])
+        assert node_sync.reconcile_baked_with_cloud({}) == [], f"{kind} + 本机有清单:尽力而为,照常部署"
+
+    # 404 = app 还没部署 / 已删:全新部署,本机清单为空是正常的(用户可能根本没有自定义节点)。
+    # 把它也当「读不到」会把第一次部署挡死。
+    def not_deployed(cfg):
+        raise hc.HealthUnavailable("not_deployed", "404")
+    monkeypatch.setattr(node_sync, "fetch_cloud_nodes", not_deployed)
+    node_sync.write_baked_nodes([])
+    assert node_sync.reconcile_baked_with_cloud({}) == [], "全新部署不能被挡"
+
+
+def test_redacted_manifest_urls_are_never_copied_back(tmp_path, monkeypatch):
+    """/health 会把带凭据的 url 脱敏;照抄脱敏后的地址,私有仓库下次就克隆失败。"""
+    monkeypatch.setattr(node_sync, "folder_git_info", lambda name: {"has_git": False})
+    out = node_sync.complete_baked_entries(
+        ["priv"], {"priv": {"name": "priv", "url": "https://u:tok@x/priv", "commit": "1"}},
+        [{"name": "priv", "url": "https://x/priv", "commit": "1", "url_redacted": True}])
+    assert out[0]["url"] == "https://u:tok@x/priv", "脱敏条目应退回本机清单里的完整地址"
+
+
+def test_every_deploy_path_aborts_on_unresolvable_nodes():
+    for f, n in (("routes.py", 2), ("bridge_cli.py", 1), ("deploy.py", 1)):
+        body = code_only((ROOT / f).read_text(encoding="utf-8"))
+        assert body.count("except node_sync.DeployBlocked") == n, f"{f} 没有在 DeployBlocked 时中止部署"
+
+
+def test_every_deploy_path_reconciles_before_deploying():
+    """/deploy、/sync_local_nodes 自动重部署、bridge_cli、deploy.py 都拿本机清单当全局清单部署,
+    四处都必须先并回。只有 /sync_nodes 例外 —— 它执行的是显式计划(含面板里有意的 prune)。"""
+    import re as _re
+    for f, n in (("routes.py", 2), ("bridge_cli.py", 1), ("deploy.py", 1)):
+        body = code_only((ROOT / f).read_text(encoding="utf-8"))
+        got = len(_re.findall(r"\breconcile_baked_with_cloud\b", body))
+        assert got == n, f"{f} 部署前没有并回云端独有的节点(期望 {n} 处,实际 {got})"
+    # /sync_nodes 执行的是显式计划(可能含面板里有意的 prune),不能在那里并回
+    routes = (ROOT / "routes.py").read_text(encoding="utf-8")
+    i = routes.index('@routes.post("/modal_bridge/sync_nodes")')
+    seg = code_only(routes)[i:routes.index("@routes.", i + 10)]
+    assert "reconcile_baked_with_cloud" not in seg, "/sync_nodes 里并回会让有意的删除永远删不掉"
+
+
+# ── P2 #5 模型子目录 ────────────────────────────────────────────────────────
+def test_model_relpath_keeps_subdirs_and_rejects_escapes():
+    f = modal_volume.model_relpath
+    assert f("SDXL/sd_xl_base.safetensors") == "SDXL/sd_xl_base.safetensors"
+    assert f("SDXL\\sd_xl_base.safetensors") == "SDXL/sd_xl_base.safetensors", "反斜杠按分隔符"
+    assert f("./a//b.safetensors") == "a/b.safetensors"
+    for bad in ("../x.safetensors", "/etc/passwd", "a/../../b", "", None):
+        assert f(bad) is None, f"没挡住: {bad!r}"
+
+
+def test_listdir_names_recurses_and_keeps_relative_paths():
+    """实查过真实 Volume:recursive 返回完整卷路径 models/<type>/...,目录也作为条目出现。"""
+    from types import SimpleNamespace as NS
+    FILE, DIR = NS(name="FILE"), NS(name="DIRECTORY")
+    vol = NS(listdir=lambda path, recursive=False: [
+        NS(path="models/checkpoints/flat.safetensors", type=FILE),
+        NS(path="models/checkpoints/SDXL", type=DIR),
+        NS(path="models/checkpoints/SDXL/base.safetensors", type=FILE),
+    ] if recursive else [NS(path="models/checkpoints/flat.safetensors", type=FILE)])
+    got = modal_volume._listdir_names(vol, "checkpoints")
+    assert got == {"flat.safetensors", "SDXL/base.safetensors"}, got
+
+
+def test_check_models_does_not_treat_flattened_copy_as_present(monkeypatch, tmp_path):
+    """工作流引用 SDXL/x,Volume 上只有被拍平的 x —— 云端 ComfyUI 找不到 SDXL/x。
+    以前按 basename 判「已齐」,这个工作流就永远跑不通(先烧约 43s GPU 才失败)。"""
+    local = tmp_path / "x.safetensors"
+    local.write_bytes(b"w")
+    monkeypatch.setattr(modal_volume, "volume_files_by_type",
+                        lambda cfg, types: {"checkpoints": {"x.safetensors"}})
+    monkeypatch.setattr(modal_volume, "file_in_progress", lambda p, **k: False)
+    r = modal_volume.check_models({}, [{"type": "checkpoints", "filename": "SDXL/x.safetensors"}],
+                                  lambda t, fn: local)
+    assert not r["present"], f"拍平的同名文件被当成了已存在: {r['present']}"
+    assert [m["filename"] for m in r["missing_local"]] == ["SDXL/x.safetensors"], \
+        "上传目标必须保留子目录,否则云端路径和工作流对不上"
+
+
+def test_upload_models_validates_remote_path_before_putting():
+    """/sync_models 完全信任请求体,upload_models 是远端路径唯一的闸。"""
+    import ast
+    src = (ROOT / "modal_volume.py").read_text(encoding="utf-8")
+    fn = next(n for n in ast.walk(ast.parse(src))
+              if isinstance(n, ast.FunctionDef) and n.name == "upload_models")
+    body = code_only(ast.get_source_segment(src, fn))
+    assert body.index("model_relpath(") < body.index("put_file("), "远端路径没校验就写了"
+
+
+# ── P2 #8 部署收尾不冲掉并发改动 ───────────────────────────────────────────
+def test_merge_after_deploy_keeps_changes_made_during_the_deploy():
+    """部署要跑 3-5 分钟,这期间用户切的 GPU 档位、别的请求生成的 capability 不能被冲掉。"""
+    base = {"gpu_tier": "auto", "comfyui_tag": "v1"}
+    ours = {"gpu_tier": "auto", "comfyui_tag": "v2"}
+    theirs = {"gpu_tier": "top", "comfyui_tag": "v1", "local_api_capability": "cap-made-meanwhile"}
+    out = contract.merge_after_deploy(base, ours, theirs)
+    assert out["gpu_tier"] == "top", "部署期间用户切的档位被冲掉了"
+    assert out["comfyui_tag"] == "v2", "部署自己的结果必须写进去"
+    assert out["local_api_capability"] == "cap-made-meanwhile", "部署不管的字段必须原样保留"
+    assert contract.merge_after_deploy({"gpu_tier": "auto"}, {"gpu_tier": "cheap"},
+                                       {"gpu_tier": "auto"})["gpu_tier"] == "cheap"
+
+
+def test_merge_after_deploy_never_keeps_a_key_the_cloud_does_not_have():
+    """两个并发的首次部署(双击 / 两个 tab)各生成一把 key:A 写 Secret=K1 存 K1,B 再 --force 写
+    Secret=K2。第一版合并时对所有字段「别处改过就以别处为准」,保留了 K1 —— config 与 Secret 不一致,
+    之后所有请求 401(2026-09-24 review)。定义「刚部署出去的东西」的字段必须用部署的值。"""
+    out = contract.merge_after_deploy(
+        {"bridge_api_key": ""}, {"bridge_api_key": "K2", "modal_token_secret": "S2"},
+        {"bridge_api_key": "K1", "modal_token_secret": "S1"})
+    assert out["bridge_api_key"] == "K2" and out["modal_token_secret"] == "S2", out
+
+
+def test_deploy_writes_config_through_the_merge_not_the_stale_snapshot():
+    routes = (ROOT / "routes.py").read_text(encoding="utf-8")
+    i = routes.index("# 4) 写本地 config")
+    seg = code_only(routes)[i:i + 600]
+    assert "merge_after_deploy(" in seg and "load_config()" in seg, seg
+    assert "save_config(cfg)" not in seg, "又把部署开始时的快照整份写回了"
+
+
+# ── P2 #15 未跟踪文件只看源码 ──────────────────────────────────────────────
+def test_worktree_dirty_ignores_runtime_junk_but_catches_uncommitted_code(tmp_path):
+    """只豁免**已知的运行时垃圾**,其余未跟踪文件都算改动。
+
+    0.8.48 改成「只有源码才算」方向反了:用户往节点里加的 .json 预设、.txt 通配词会被判干净,
+    云端 clone 里没有它们,静默出错(2026-09-24 review)。误判 dirty 最多多传一次包,误判干净是静默出错。"""
+    import shutil
+    import subprocess as sp
+    def git(*a):
+        sp.run(["git", *a], cwd=tmp_path, check=True, capture_output=True)
+    git("init", "-q")
+    git("config", "user.email", "t@t")
+    git("config", "user.name", "t")
+    (tmp_path / "node.py").write_text("x = 1\n")
+    git("add", ".")
+    git("commit", "-qm", "init")
+    assert node_sync.worktree_dirty(tmp_path) is False
+
+    (tmp_path / "run.log").write_text("log")
+    (tmp_path / "cache").mkdir()
+    (tmp_path / "cache" / "blob.bin").write_bytes(b"x")
+    (tmp_path / "__pycache__").mkdir()
+    (tmp_path / "__pycache__" / "m.pyc").write_bytes(b"x")
+    (tmp_path / ".DS_Store").write_bytes(b"x")
+    assert node_sync.worktree_dirty(tmp_path) is False, "日志 / 缓存 / 字节码不该算改动"
+
+    for f in ("presets/my_style.json", "wildcards/foo.txt", "new_helper.py"):
+        (tmp_path / f).parent.mkdir(exist_ok=True)
+        (tmp_path / f).write_text("x")
+        assert node_sync.worktree_dirty(tmp_path) is True, f"用户新加的 {f} 必须算改动"
+        (tmp_path / f).unlink()
+    shutil.rmtree(tmp_path / "presets")
+    shutil.rmtree(tmp_path / "wildcards")
+    assert node_sync.worktree_dirty(tmp_path) is False
+
+    (tmp_path / "node.py").write_text("x = 2\n")
+    assert node_sync.worktree_dirty(tmp_path) is True, "已跟踪文件的任何改动照旧算"
+
+
+# ── P3 #10 GC 不再每次 /run 全量拉两遍 ─────────────────────────────────────
+class _CountingDict(dict):
+    """记录 items() 被调了几次 —— 每调一次就是把整个 Dict(含 base64 产物)拉一遍。"""
+    pulls = 0
+
+    def items(self):
+        type(self).pulls += 1
+        return super().items()
+
+
+def test_sweep_pulls_the_dict_once_even_when_the_count_cap_kicks_in():
+    import time as _time
+    _CountingDict.pulls = 0
+    state = _CountingDict({f"j{i}": {"status": "completed", "completed_at": _time.time() - i}
+                           for i in range(5)})
+    sweep = _load_sweep(state, lambda path, recursive=False: None, job_max=2)
+    sweep()
+    assert _CountingDict.pulls == 1, f"一次 sweep 拉了 {_CountingDict.pulls} 遍整个 Dict"
+    assert len(state) == 2, f"数量兜底没生效: {sorted(state)}"
+
+
+def test_sweep_is_throttled_per_container():
+    """一串连续提交时,每次 /run 都全量拉一遍 Dict 会吃掉 run_endpoint 的超时。"""
+    import time as _time
+    _CountingDict.pulls = 0
+    state = _CountingDict({"j": {"status": "completed", "completed_at": _time.time() - 99999}})
+    sweep = _load_sweep(state, lambda path, recursive=False: None)
+    sweep.__globals__["_SWEEP_EVERY_S"] = 60
+    sweep.__globals__["_last_sweep"] = [0.0]
+    sweep()
+    sweep()
+    sweep()
+    assert _CountingDict.pulls == 1, f"60s 内扫了 {_CountingDict.pulls} 次"
+
+
+def test_status_treats_non_job_keys_as_not_found():
+    """拿 "<id>:call" 这类独立键当 job_id 查,以前 {**s} 对字符串展开直接 500。"""
+    state = {"j:call": "fc-123", "j:progress": {"step": 1}}
+    fn = _load_endpoint("status_endpoint", _status_ns(state))
+    assert fn("j:call")["status"] == "not_found"
+
+
+# ── P3 #11 async 路由里不许直接做阻塞 I/O ───────────────────────────────────
+def test_async_routes_do_not_block_the_event_loop():
+    """routes 跑在 ComfyUI 的事件循环里:同步做 git / Modal SDK / 读大文件 / 递归扫目录,
+    期间 websocket 进度、别的请求、版本检查全部卡住 —— 注释里记过的「/version 6s 超时误判」
+    就是这么来的(2026-09-23 review)。这类调用必须经 asyncio.to_thread。"""
+    import ast
+    import re as _re
+    src = (ROOT / "routes.py").read_text(encoding="utf-8")
+    blocking = _re.compile(r"^(node_sync\.(plan_node_sync)|local_nodes\.(list_volume_local_nodes|"
+                           r"remove_volume_local_node|expected_digests|plan_local_uploads|"
+                           r"upload_local_nodes)|_read_input_as_b64|resolver)$")
+    offenders = []
+    for fn in ast.walk(ast.parse(src)):
+        if not isinstance(fn, ast.AsyncFunctionDef):
+            continue
+        # 嵌套的同步 def(交给线程跑的 work / do_upload / _sizes 之类)里面的调用不算
+        nested = {id(n) for d in ast.walk(fn) if isinstance(d, (ast.FunctionDef, ast.Lambda))
+                  for n in ast.walk(d)}
+        for n in ast.walk(fn):
+            if isinstance(n, ast.Call) and id(n) not in nested and blocking.match(ast.unparse(n.func)):
+                offenders.append(f"{fn.name}:{n.lineno} {ast.unparse(n.func)}()")
+    assert not offenders, "这些阻塞调用直接跑在事件循环里:\n  " + "\n  ".join(offenders)
+
+
+# ── 0.8.52:review 0.8.48–0.8.51 的修复 ─────────────────────────────────────
+def test_cancel_is_finalised_by_the_worker_itself():
+    """cancel_endpoint 写的 cancelled 会被 worker 起跑 / 交付时的读改写覆盖,之后没人写终态 ——
+    停在 running,22 分钟后被误报成「被 Modal 强杀、已计费」,而那是用户自己取消的(2026-09-24 review)。"""
+    import ast
+    src = MODAL_APP.read_text(encoding="utf-8")
+    fn = next(n for n in ast.walk(ast.parse(src))
+              if isinstance(n, ast.FunctionDef) and n.name == "_worker_run")
+    main = next(t for t in ast.walk(fn) if isinstance(t, ast.Try) and any(
+        isinstance(h.type, ast.Name) and h.type.id == "BaseException" for h in t.handlers))
+    h = next(h for h in main.handlers if isinstance(h.type, ast.Name) and h.type.id == "BaseException")
+    seg = code_only(ast.get_source_segment(src, h))
+    assert "InputCancellation" in seg and '"status": "cancelled"' in seg, "取消分支没有落定终态"
+    body = code_only(ast.get_source_segment(src, fn))
+    i = body.index('if cur.get("status") in ("cancelled", "failed"):')
+    assert i < body.index('"status": "running", "started_at"'), "起跑时会覆盖已到的取消 / 判死"
+
+
+def test_stale_check_uses_the_timeout_the_job_started_with():
+    """调小超时并重部署时,老部署上还在跑的长任务不能被新部署按新上限判死。"""
+    import time as _t
+    stale = _extract_nested(MODAL_APP, "_stale_reason", {"WORKER_TIMEOUT": 1200, "_STALE_GRACE_S": 120,
+                                                        "_QUEUE_STALE_S": 6 * 3600})
+    now = _t.time()
+    long_job = {"status": "running", "started_at": now - 2000, "timeout_s": 3600}
+    assert stale(long_job, now) == "", "按起跑时的 3600s 算它还活着"
+    assert stale({"status": "running", "started_at": now - 2000}, now), "老条目没记超时就退回当前值"
+
+
+def test_status_rejects_every_non_job_key():
+    state = {"j:progress": {"step": 1, "total": 20}, "j:call": "fc-1"}
+    fn = _load_endpoint("status_endpoint", _status_ns(state))
+    for k in ("j:progress", "j:call"):
+        assert fn(k)["status"] == "not_found", f"{k} 被当成了任务记录"
+
+
+def test_health_redacts_credentials_in_node_urls():
+    """/health 的 manifest 来自 git remote url,私有节点常带 token。bridge key 会给 AIGC Studio、
+    MCP、导出的脚本 —— 凭据不能经 /health 外泄(2026-09-24 review)。依赖清单也不再经 /health。"""
+    red = _extract_nested(MODAL_APP, "_redact_url", {})
+    assert red("https://u:ghp_x@github.com/o/r.git") == ("https://github.com/o/r.git", True)
+    assert red("https://ghp_x@github.com/o/r.git") == ("https://github.com/o/r.git", True)
+    assert red("https://github.com/o/r.git") == ("https://github.com/o/r.git", False)
+    import ast
+    src = MODAL_APP.read_text(encoding="utf-8")
+    fn = next(n for n in ast.walk(ast.parse(src))
+              if isinstance(n, ast.FunctionDef) and n.name == "health_endpoint")
+    seg = code_only(ast.get_source_segment(src, fn))
+    assert "_redact_url(" in seg, "manifest 没脱敏"
+    assert "local_node_reqs" not in seg, "依赖行可能带 git+https://TOKEN@,不能经 /health 报"
+
+
+def test_threshold_zero_still_means_everything_inline(monkeypatch):
+    """阈值 0 的约定是「关闭、全部内联」。总量预算不能绕过它(2026-09-24 review)。"""
+    sys.path.insert(0, str(ROOT / "modal_app"))
+    import _comfy_ws
+    monkeypatch.setattr(_comfy_ws, "get_image_data", lambda *a: b"x" * 1000)
+    monkeypatch.setattr(_comfy_ws, "_VOL_THRESHOLD", 0)
+    monkeypatch.setattr(_comfy_ws, "_INLINE_TOTAL_BUDGET", 10)
+    refs = [{"filename": f"o{i}.png", "subfolder": "", "type": "output", "node_id": "9", "key": "images"}
+            for i in range(3)]
+    images, _ = _comfy_ws.materialize_desktop_outputs(refs, "job1")
+    assert all("data_base64" in i for i in images), "阈值 0 时不该有任何产物走 Volume"
+
+
+def test_inline_budget_setting_actually_reaches_the_container():
+    """只在 deploy_env 里设不够 —— 不在 modal_image 的 .env 烤入清单里,容器里读不到,开关静默失效。"""
+    img = code_only((ROOT / "modal_app" / "modal_image.py").read_text(encoding="utf-8"))
+    assert '"MODAL_BRIDGE_INLINE_TOTAL_MB"' in img
+    assert node_sync.deploy_env({})["MODAL_BRIDGE_INLINE_TOTAL_MB"] == "24"
+
+
+def test_bridge_cli_never_overrides_plugin_deploy_settings_with_its_own_defaults():
+    """CLI 部署到插件的 app 上时,拿自己的默认值会把云端静默退回 v0.30.2、换 Volume、关 sage。"""
+    body = code_only((ROOT / "bridge_cli.py").read_text(encoding="utf-8"))
+    for flag in ("--comfyui-tag", "--gpu", "--cheap-gpu", "--top-gpu", "--timeout-s", "--sage"):
+        i = body.index(f'p.add_argument("{flag}"')
+        assert "default=None" in body[i:body.index(")", i)], f"{flag} 的默认值会覆盖插件配置"
+    assert 'pick(args.comfyui_tag, "comfyui_tag"' in body
+    assert '"modal_volume_name"' in body
+
+
+def test_sync_models_script_uses_relative_paths_like_the_gui():
+    body = code_only((ROOT / "sync_models.py").read_text(encoding="utf-8"))
+    assert "relative_to(" in body and "f.name in existing" not in body
+
+
+def test_deploy_paths_record_the_deployed_reqs_for_other_machines():
+    body = code_only((ROOT / "routes.py").read_text(encoding="utf-8"))
+    assert body.count("record_deployed_reqs,") == 3, "三条部署成功路径都要记下依赖清单"
+
+
+# ── 0.8.53:review #12 实际状态、#14 共享的 /health 规则 ────────────────────
+def test_queued_forever_is_eventually_declared_dead():
+    """容器在 @modal.enter 就失败时 run() 根本不执行,状态永远 queued —— 不回收、Dict 一直涨、
+    CLI / MCP 一直等(review #12)。判死线给得很宽:排队不计费,也可能只是在等 GPU。"""
+    import time as _t
+    stale = _extract_nested(MODAL_APP, "_stale_reason",
+                            {"WORKER_TIMEOUT": 1200, "_STALE_GRACE_S": 120, "_QUEUE_STALE_S": 6 * 3600})
+    now = _t.time()
+    assert stale({"status": "queued", "queued_at": now - 7 * 3600}, now), "排队 7 小时应判死"
+    assert stale({"status": "queued", "queued_at": now - 3600}, now) == "", "排队 1 小时可能只是等 GPU"
+
+
+def test_cancel_on_a_dead_worker_answers_with_the_real_outcome():
+    """去 cancel 一个早已结束的调用会报「取消失败」,前端据此提示「可能仍在计费」—— 正好说反。"""
+    import time as _t
+    cancels = []
+    ns = _status_ns({"dead": {"status": "running", "started_at": _t.time() - 99999}})
+    ns.update({"_CALL_PENDING": "pending", "_call_id": lambda j: "fc-dead",
+               "modal": types.SimpleNamespace(FunctionCall=types.SimpleNamespace(
+                   from_id=lambda cid: types.SimpleNamespace(cancel=lambda: cancels.append(cid)))),
+               "_CANCEL_NOT_FOUND_WAIT_S": 3.0})
+    r = _load_endpoint("cancel_endpoint", ns)({"job_id": "dead", "auth_key": "k"})
+    assert r["status"] == "failed" and r.get("cancel_noop"), r
+    assert cancels == [], "死任务不该再去 cancel 一个已结束的调用"
+    assert ns["job_state"]["dead"]["status"] == "failed", "要写回,否则 GC 收不掉"
+
+
+def test_run_treats_a_dead_prior_as_finished():
+    """/run 以前把死任务当活的:rerun=1 也被当成重复提交挡掉,永远重跑不了。"""
+    import ast
+    src = MODAL_APP.read_text(encoding="utf-8")
+    fn = next(n for n in ast.walk(ast.parse(src))
+              if isinstance(n, ast.FunctionDef) and n.name == "run_endpoint")
+    body = code_only(ast.get_source_segment(src, fn))
+    assert body.index("_effective(prior") < body.index('prior_status in ("queued", "running", "delivering")')
+
+
+def test_health_client_tells_why_it_could_not_read():
+    """401、404、5xx、非 JSON 以前被一律当「拿不到」,调用方无从决定该继续还是该停(review #14)。"""
+    import health_client as hc
+    for status, body, kind in ((401, '{"error":"x"}', "unauthorized"), (404, "", "not_deployed"),
+                               (502, "bad gateway", "http"), (200, "<html>", "unreachable"),
+                               (200, "[1,2]", "unreachable")):
+        try:
+            hc.interpret(status, body)
+            assert False, f"{status} {body!r} 应抛"
+        except hc.HealthUnavailable as e:
+            assert e.kind == kind, (status, body, e.kind)
+    assert hc.interpret(200, '{"healthy": true}') == {"healthy": True}
+    assert issubclass(hc.HealthUnavailable, RuntimeError), "调用方原来按 RuntimeError / Exception 接"
+
+
+def test_every_health_reader_goes_through_the_shared_rules():
+    """URL、鉴权头、状态码语义只许有一份。"""
+    mc = code_only((ROOT / "modal_client.py").read_text(encoding="utf-8"))
+    i = mc.index("async def health(")
+    seg = mc[i:mc.index("async def ", i + 10)]
+    assert "health_client.interpret(" in seg and "health_client.url(" in seg
+    ns = code_only((ROOT / "node_sync.py").read_text(encoding="utf-8"))
+    i = ns.index("def fetch_cloud_nodes(")
+    assert "health_client.fetch(" in ns[i:ns.index("\ndef ", i + 10)]
+    assert "-health.modal.run" not in ns, "node_sync 里又自己拼了一份 /health URL"
+
+
+def test_comfyui_tag_pin_overrides_following_the_local_version():
+    """本机 Desktop 还没出新版、云端要先升时用。没有钉,面板下一次部署会按本机版本把云端退回去。"""
+    tag, note = node_sync.resolve_comfyui_tag("0.34.6", ["v0.34.6", "v0.37.2"], prev_tag="v0.37.2",
+                                              pin="v0.37.2")
+    assert tag == "v0.37.2", "钉住时必须用钉的版本,不能按本机 0.34.6 退回去"
+    assert "comfyui_tag_pin" in note and "0.34.6" in note, "日志要写清是故意不一致、以及怎么恢复"
+    assert node_sync.resolve_comfyui_tag("0.34.6", ["v0.34.6"], pin="")[0] == "v0.34.6", "不钉照常跟随"
+    body = code_only((ROOT / "routes.py").read_text(encoding="utf-8"))
+    assert 'pin=cfg.get("comfyui_tag_pin", "")' in body, "GUI 部署没把钉传进去"
 
 
 def test_estimate_vram_video_v2_anchors():
@@ -1837,6 +2776,10 @@ def _load_sweep(job_state, remove_file, *, budget=10, ttl=3600, job_max=200):
         "_safe_job_id": lambda j: isinstance(j, str) and bool(safe_re.match(j)) and ".." not in j,
         "JOB_TTL_S": ttl, "JOB_MAX": job_max, "_VOL_GC_PER_SWEEP": budget,
         "print": lambda *a, **k: None,
+        "_stale_reason": lambda s, now: "",
+        "_SWEEP_EVERY_S": 0, "_last_sweep": [0.0],      # 默认关节流,节流另有专门测试
+        "_is_already_gone": _extract_nested(ROOT / "modal_app" / "modal_app.py",
+                                            "_is_already_gone", {}),
     }
     return _extract_nested(ROOT / "modal_app" / "modal_app.py", "_sweep_job_state", ns)
 
@@ -1881,6 +2824,33 @@ def test_sweep_drops_index_for_dirty_job_id_without_touching_volume():
     assert state == {}, f"两条索引都该清掉,实际剩 {sorted(state)}"
 
 
+def test_sweep_treats_server_side_no_such_file_as_already_gone():
+    """v2 Volume 对不存在的路径回 InvalidError("No such file or directory."),不是 FileNotFoundError。
+
+    0.8.42 起把「其它异常」当真失败、保留索引重试 —— 这些条目永远删不掉、每轮都吃一格预算,
+    10 个僵尸就吃光了每轮的预算,真正过期的任务一个都回收不了(2026-09-23 线上日志实证:
+    同一批 job id 每次 sweep 都在重复报错)。旧测试用 FileNotFoundError 模拟,所以一直是绿的。"""
+    import time as _time
+
+    class InvalidError(Exception):
+        pass
+
+    old = _time.time() - 7200
+    ids = [f"zombie-{i:02d}" for i in range(12)] + ["real"]
+    state = {j: {"status": "completed", "completed_at": old} for j in ids}
+    removed = []
+
+    def remove_file(path, recursive=False):
+        removed.append(path)
+        if "zombie" in path:
+            raise InvalidError("No such file or directory.")
+
+    sweep = _load_sweep(state, remove_file, budget=10)
+    sweep()
+    sweep()
+    assert state == {}, f"僵尸条目没被清掉、或挤占了真任务的预算: {sorted(state)}"
+
+
 def test_sweep_keeps_index_when_volume_delete_fails():
     """删目录失败也不能丢索引 —— 丢了就又变成一个无人认领的孤儿目录。
     FileNotFoundError 例外:那是「已经取回了」的常态,不是失败。"""
@@ -1894,7 +2864,8 @@ def test_sweep_keeps_index_when_volume_delete_fails():
             raise RuntimeError("volume rpc down")
         raise FileNotFoundError(path)
 
-    _load_sweep(state, remove_file)()
+    sweep = _load_sweep(state, remove_file)
+    sweep()
     assert "gone" not in state, "FileNotFoundError = 产物已取回,索引照清"
     assert "boom" in state, "Volume 删失败时索引必须留着,下次 sweep 重试"
 
@@ -3074,7 +4045,10 @@ def test_single_push_entry_point():
     # 而它真的会分流：推节点 + 按需重建（后端顺序由 test_deploy_syncs_... 钉死）
     py = (ROOT / "routes.py").read_text(encoding="utf-8")
     i = py.index("# 3) 部署 app")          # 锚点用原文(注释;改了会响,fail-loud)
-    seg = code_only(py)[i:i + 3000]        # 断言用挖空版(偏移相同)
+    # 截到下一个路由为止,而不是固定 3000 字符 —— 在中间插代码(2026-09-23 加了部署前并回节点)
+    # 就会把后面的调用挤出窗口,测试因为距离而不是因为行为转红。
+    j = py.index("@routes.", i)
+    seg = code_only(py)[i:j]               # 断言用挖空版(偏移相同)
     assert "plan_local_uploads" in seg, "主流程没有自动比对本机 digest"
     assert "await asyncio.to_thread(local_nodes.upload_local_nodes" in seg, \
         "主流程没有自动推送有改动的私有节点"
