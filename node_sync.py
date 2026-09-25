@@ -954,6 +954,7 @@ def deploy_env(cfg: dict) -> dict:
     """从 config 拼出 modal deploy / secret 需要的环境变量(MODAL_BRIDGE_* + 鉴权)。"""
     app_name = cfg.get("modal_app_name", "comfyui-bridge")
     env = os.environ.copy()
+    env["PYTHONIOENCODING"] = "utf-8"
     env["MODAL_BRIDGE_APP_NAME"] = app_name
     env["MODAL_BRIDGE_VOLUME"] = cfg.get("modal_volume_name", "comfyui-bridge-models")
     env["MODAL_BRIDGE_SECRET"] = f"{app_name}-secrets"
