@@ -24,6 +24,7 @@ import re
 import subprocess
 import sys
 from pathlib import Path
+from typing import NamedTuple
 
 _HERE = Path(__file__).resolve().parent
 MODAL_APP_DIR = _HERE / "modal_app"
@@ -309,8 +310,48 @@ class DeployBlocked(Exception):
     用异常而不是返回值:忘了处理的调用方会直接失败,而不是静默继续部署 —— 失败方向是安全的。"""
 
 
-def reconcile_baked_with_cloud(cfg: dict) -> list[str]:
-    """部署前把「云端镜像里有、本机清单里没有」的节点并回本机清单。返回并回的节点名。
+class Reconciled(NamedTuple):
+    added: list          # 并回本机清单的节点名(云端有、本机缺)
+    drift: list          # 同名节点与云端来源 / commit 不同的说明行 —— 这次部署会把云端换成本机这份
+    unchecked: str = ""  # 非空 = 没能读到云端清单,上面两项都没查(原因)。别让「没查」长得像「查过、没差异」
+
+
+def _norm_repo(u: str) -> str:
+    return (u or "").strip().rstrip("/").removesuffix(".git").lower()
+
+
+def _show_commit(c: str) -> str:
+    return c[:12] if c else "未钉 commit(构建时取最新)"
+
+
+def commit_drift(local: list, manifest: list | None) -> list[str]:
+    """同名节点:本机清单与云端镜像的 commit / 来源不同的,逐条写成说明。
+
+    部署以本机清单为准,这里的每一条都会在这次部署里生效。可能是有意的(本机升级 / 回滚了节点,
+    或上次同步写了清单但部署失败),也可能是本机清单陈旧(另一台机器部署过更新的版本)—— 只看
+    commit 分不出方向,所以不拦部署,只是不让它静默发生(2026-09-26 review)。
+    ⚠ 不打印 url:私有仓库的 url 常带凭据。"""
+    if not manifest:
+        return []
+    cloud = {e.get("name"): e for e in manifest if isinstance(e, dict)}
+    out = []
+    for n in local:
+        c = cloud.get(n.get("name"))
+        if not c:
+            continue
+        lc, cc = (n.get("commit") or "").strip(), (c.get("commit") or "").strip()
+        # 被 /health 脱敏的 url 比不了,只比 commit
+        same_repo = bool(c.get("url_redacted")) or _norm_repo(n.get("url")) == _norm_repo(c.get("url"))
+        if lc == cc and same_repo:
+            continue
+        line = f"{n.get('name')}: 云端 {_show_commit(cc)} → 本次部署 {_show_commit(lc)}"
+        out.append(line if same_repo else line + "(来源仓库也不同)")
+    return out
+
+
+def reconcile_baked_with_cloud(cfg: dict) -> Reconciled:
+    """部署前把「云端镜像里有、本机清单里没有」的节点并回本机清单。
+    返回 Reconciled(added=并回的节点名, drift=同名节点与云端不同的说明,见 commit_drift)。
 
     只加不删 —— 删除只能走「管理云端节点」面板的显式 prune(那条路径不调这里)。
     来源优先级:云端 manifest(未脱敏的)→ 本机 custom_nodes 的 git 信息。
@@ -328,26 +369,38 @@ def reconcile_baked_with_cloud(cfg: dict) -> list[str]:
         names, manifest = fetch_cloud_nodes(cfg)
     except health_client.HealthUnavailable as e:
         if e.kind == "not_deployed":
-            return []
+            return Reconciled([], [])
         if not read_baked_nodes():
             raise DeployBlocked(
                 f"读不到云端装了哪些自定义节点({e}),而本机节点清单是空的 —— 多半是插件重装丢了"
                 f"清单,继续部署可能清空云端全部自定义节点,已中止。\n"
                 f"处理:检查网络 / bridge key 后重试。若确认云端不需要任何自定义节点,可在 Modal 控制台"
                 f"删掉这个 app 再部署(会按全新部署处理)。") from None
-        return []
+        return Reconciled([], [], unchecked=str(e))
     local = read_baked_nodes()
+    drift = commit_drift(local, manifest)
     have = {n.get("name") for n in local}
     missing = [n for n in names if n not in have]
     if not missing:
-        return []
+        return Reconciled([], drift)
     entries = complete_baked_entries(missing, {}, manifest)
     back = [e for e in entries if (e.get("url") or "").strip()]
     lost = [e["name"] for e in entries if not (e.get("url") or "").strip()]
     if lost:
         raise DeployBlocked(unresolved_nodes_message(lost))
     write_baked_nodes(local + back)
-    return [e["name"] for e in back]
+    return Reconciled([e["name"] for e in back], drift)
+
+
+def drift_message(rec: Reconciled) -> str:
+    """reconcile 的结果 → 部署日志里的一段(多行,已含缩进和结尾换行);没差异也没跳过返回空串。"""
+    if rec.unchecked:
+        return (f"   ⚠ 读不到云端节点清单({rec.unchecked}),本次没能比对:云端独有的节点会不会被删、"
+                f"同名节点会不会被换成本机清单里的版本\n")
+    if not rec.drift:
+        return ""
+    return ("   ⚠ 同名节点与云端版本不同,本次部署以本机清单为准(若本机清单是旧的,这就是一次降级):\n"
+            + "".join(f"      {d}\n" for d in rec.drift))
 
 
 def unresolved_nodes_message(unresolved: list[str]) -> str:

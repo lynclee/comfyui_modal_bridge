@@ -12,6 +12,11 @@ import json
 import urllib.error
 import urllib.request
 
+try:
+    from .bridge_client import _open_http
+except ImportError:   # CLI / 测试把插件目录直接放进 sys.path
+    from bridge_client import _open_http
+
 
 class HealthUnavailable(RuntimeError):
     """kind:
@@ -45,6 +50,9 @@ def interpret(status: int, body: str) -> dict:
                                                 "点 [Modal Setup] 重新部署会刷新 key")
     if status == 404:
         raise HealthUnavailable("not_deployed", "Modal /health 404 — app 还没部署或已被删除")
+    if 300 <= status < 400:
+        # 异步版(aiohttp)不跟随重定向,3xx 原样到这里。别落进下面的 JSON 解析报成「不是 JSON」。
+        raise HealthUnavailable("http", f"Modal /health 返回重定向 {status},没有跟随(会把 bridge key 带过去)")
     if status >= 400:
         raise HealthUnavailable("http", f"Modal /health {status}: {body[:200]}")
     try:
@@ -62,7 +70,10 @@ def fetch(cfg: dict, timeout: float = 20) -> dict:
         raise HealthUnavailable("not_deployed", "还没有 endpoint(从未部署过)")
     req = urllib.request.Request(url(cfg), headers=headers(cfg))
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
+        # ⚠ 不能用裸 urlopen:默认的重定向处理会把 X-Bridge-Key 原样带去跳转目标,跨域也照带
+        #   (2026-09-26 review 用两个本地服务实测)。_open_http 只跟同源重定向,与 bridge_client /
+        #   mcp_server 同一道守卫。
+        with _open_http(req, timeout=timeout) as r:
             return interpret(r.status, r.read().decode("utf-8", "replace"))
     except urllib.error.HTTPError as e:
         return interpret(e.code, e.read().decode("utf-8", "replace") if e.fp else "")

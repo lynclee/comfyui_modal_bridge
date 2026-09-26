@@ -2774,7 +2774,8 @@ def run(wf, timeout=900):
     jid = None
     for _ in range(5):
         try:
-            jid = requests.post(BASE + "-run.modal.run",
+            # allow_redirects=False:KEY 是作者的计费 key,requests 跟随跨域重定向会把它带过去
+            jid = requests.post(BASE + "-run.modal.run", allow_redirects=False,
                 json={"workflow": wf, "tier": TIER, "auth_key": KEY}, timeout=60).json().get("id")
             if jid:
                 break
@@ -2788,7 +2789,7 @@ def run(wf, timeout=900):
     t0 = time.time()
     while time.time() - t0 < timeout:
         try:
-            s = requests.get(BASE + "-status.modal.run",
+            s = requests.get(BASE + "-status.modal.run", allow_redirects=False,
                              params={"job_id": jid},
                              headers={"X-Bridge-Key": KEY}, timeout=30).json()
         except Exception as e:

@@ -197,11 +197,13 @@ def interrupt_comfy() -> None:
     ⚠ 取消只会中断 worker 的 Python 线程(Modal 的 InputCancellation),**不会**碰容器里的
       ComfyUI 子进程 —— 它会继续跑被取消的 prompt。暖容器的下一单排在它后面等它跑完,
       用户为已取消的任务付了全部剩余 GPU 时间,而界面显示「✕ Cancelled」(2026-09-23 review)。
-    接口依据 ComfyUI v0.34.6 server.py:POST /queue {"clear": true}、POST /interrupt。"""
+    接口依据 ComfyUI server.py:POST /queue {"clear": true}、POST /interrupt(v0.34.6 与 v0.37.2 都核过)。
+    ⚠ 必须查状态码:ComfyUI 回 500 时请求「发出去了」,但它没停。以前只接网络异常,500 也记成
+      「已停下」,线上日志会说反(2026-09-26 review)。"""
     ok = True
     for path, body in (("/queue", {"clear": True}), ("/interrupt", {})):
         try:
-            requests.post(f"http://{COMFY_HOST}{path}", json=body, timeout=5)
+            requests.post(f"http://{COMFY_HOST}{path}", json=body, timeout=5).raise_for_status()
         except Exception as e:
             ok = False
             print(f"[bridge] ⚠ ComfyUI {path} 失败(prompt 可能仍在跑): {e}")

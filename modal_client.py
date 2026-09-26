@@ -18,6 +18,11 @@ def _endpoint(base: str, label: str) -> str:
     return f"{base.rstrip('/')}-{label}.modal.run"
 
 
+# ⚠ 所有带 key 的请求都传 allow_redirects=False:aiohttp 跨域跳转时只剥 Authorization,自定义的
+#   X-Bridge-Key 照带,307/308 还会把 body 里的 auth_key 原样重发给跳转目标(2026-09-26 review)。
+#   我们的 endpoint 超时都 ≤60s,碰不到 Modal 对 150s 以上请求才发的 303,合法流程里不会有重定向。
+
+
 def _key(cfg: dict) -> str:
     """自建鉴权 key(私有 endpoint 用)。GET 走 X-Bridge-Key 头(不进 query,避免落进
     反代 / CDN 日志),POST 走 body auth_key。云端 ≥0.8.3 认这个头。"""
@@ -66,9 +71,11 @@ async def submit_job(
     last_err: Optional[Exception] = None
     for attempt in range(max_retries + 1):
         try:
-            async with session.post(url, json=payload, headers=headers,
+            async with session.post(url, json=payload, headers=headers, allow_redirects=False,
                                     timeout=aiohttp.ClientTimeout(total=60)) as r:
                 text = await r.text()
+                if 300 <= r.status < 400:
+                    raise RuntimeError(f"Modal /run 返回重定向 {r.status},没有跟随(会把 bridge key 带过去)")
                 if r.status == 401:
                     raise RuntimeError("Modal /run 401 — bridge key 不对/缺失。点 [Modal Setup] 重新部署会刷新 key")
                 if r.status in (502, 503, 504):
@@ -101,7 +108,7 @@ async def health(session, cfg) -> dict:
     for attempt in range(3):
         try:
             async with session.get(health_client.url(cfg), headers=health_client.headers(cfg),
-                                   timeout=aiohttp.ClientTimeout(total=10)) as r:
+                                   allow_redirects=False, timeout=aiohttp.ClientTimeout(total=10)) as r:
                 return health_client.interpret(r.status, await r.text())
         except health_client.HealthUnavailable as e:
             if e.kind in ("unauthorized", "not_deployed"):
@@ -118,7 +125,7 @@ async def cancel(session, cfg, job_id) -> dict:
     url = _endpoint(cfg["modal_endpoint_base"], "cancel")
     async with session.post(
         url, json={"job_id": job_id, "auth_key": _key(cfg)},
-        headers={"Content-Type": "application/json"},
+        headers={"Content-Type": "application/json"}, allow_redirects=False,
         timeout=aiohttp.ClientTimeout(total=15),
     ) as r:
         return await r.json(content_type=None)

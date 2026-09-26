@@ -97,11 +97,12 @@ def main():
     # 同 GUI /deploy:本机清单会被当成镜像的全局清单,先并回云端独有的节点(只加不删)。
     node_sync.ensure_baked_file()
     try:
-        back = node_sync.reconcile_baked_with_cloud(cfg)
+        rec = node_sync.reconcile_baked_with_cloud(cfg)
     except node_sync.DeployBlocked as e:
         sys.exit(f"✗ {e}")
-    if back:
-        print(f"   节点清单:并回云端独有的 {len(back)} 个 —— {', '.join(back)}")
+    if rec.added:
+        print(f"   节点清单:并回云端独有的 {len(rec.added)} 个 —— {', '.join(rec.added)}")
+    print(node_sync.drift_message(rec), end="")
     rc = run(node_sync.deploy_command(), cwd=str(MODAL_APP_DIR), env=env)
     if rc != 0:
         print("✗ deploy 失败")

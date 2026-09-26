@@ -1498,7 +1498,8 @@ def test_interrupt_comfy_clears_queue_before_interrupting():
     import _comfy_ws
     calls = []
     orig = _comfy_ws.requests.post
-    _comfy_ws.requests.post = lambda url, json=None, timeout=None: calls.append((url, json))
+    ok = types.SimpleNamespace(raise_for_status=lambda: None)
+    _comfy_ws.requests.post = lambda url, json=None, timeout=None: (calls.append((url, json)), ok)[1]
     try:
         _comfy_ws.interrupt_comfy()
     finally:
@@ -1701,13 +1702,13 @@ def test_reconcile_adds_back_cloud_only_nodes_and_never_removes(tmp_path, monkey
                 {"name": "local_only", "url": "https://x/L", "commit": "1"}]
     monkeypatch.setattr(node_sync, "fetch_cloud_nodes",
                         lambda cfg: (["cloud_only", "local_only"], manifest))
-    assert node_sync.reconcile_baked_with_cloud({}) == ["cloud_only"]
+    assert node_sync.reconcile_baked_with_cloud({}).added == ["cloud_only"]
     assert {n["name"] for n in node_sync.read_baked_nodes()} == {"local_only", "cloud_only"}
 
     def not_deployed(cfg):
         raise hc.HealthUnavailable("not_deployed", "404")
     monkeypatch.setattr(node_sync, "fetch_cloud_nodes", not_deployed)
-    assert node_sync.reconcile_baked_with_cloud({}) == [], "全新部署(404):没有可保护的,照常部署"
+    assert node_sync.reconcile_baked_with_cloud({}).added == [], "全新部署(404):没有可保护的,照常部署"
 
 
 def test_reconcile_protects_nodes_even_when_the_cloud_is_too_old_to_report_sources(tmp_path, monkeypatch):
@@ -1744,7 +1745,7 @@ def test_reconcile_blocks_when_the_cloud_is_unreadable_and_the_local_list_is_emp
         except node_sync.DeployBlocked:
             pass
         node_sync.write_baked_nodes([{"name": "a", "url": "https://x/a", "commit": "1"}])
-        assert node_sync.reconcile_baked_with_cloud({}) == [], f"{kind} + 本机有清单:尽力而为,照常部署"
+        assert node_sync.reconcile_baked_with_cloud({}).added == [], f"{kind} + 本机有清单:尽力而为,照常部署"
 
     # 404 = app 还没部署 / 已删:全新部署,本机清单为空是正常的(用户可能根本没有自定义节点)。
     # 把它也当「读不到」会把第一次部署挡死。
@@ -1752,7 +1753,7 @@ def test_reconcile_blocks_when_the_cloud_is_unreadable_and_the_local_list_is_emp
         raise hc.HealthUnavailable("not_deployed", "404")
     monkeypatch.setattr(node_sync, "fetch_cloud_nodes", not_deployed)
     node_sync.write_baked_nodes([])
-    assert node_sync.reconcile_baked_with_cloud({}) == [], "全新部署不能被挡"
+    assert node_sync.reconcile_baked_with_cloud({}).added == [], "全新部署不能被挡"
 
 
 def test_redacted_manifest_urls_are_never_copied_back(tmp_path, monkeypatch):
@@ -2083,9 +2084,12 @@ def test_cancel_on_a_dead_worker_answers_with_the_real_outcome():
                "modal": types.SimpleNamespace(FunctionCall=types.SimpleNamespace(
                    from_id=lambda cid: types.SimpleNamespace(cancel=lambda: cancels.append(cid)))),
                "_CANCEL_NOT_FOUND_WAIT_S": 3.0})
+    ns["_release_stale_call"] = _extract_nested(MODAL_APP, "_release_stale_call", {
+        "_call_id": lambda j: "fc-dead", "modal": ns["modal"], "print": lambda *a, **k: None})
     r = _load_endpoint("cancel_endpoint", ns)({"job_id": "dead", "auth_key": "k"})
     assert r["status"] == "failed" and r.get("cancel_noop"), r
-    assert cancels == [], "死任务不该再去 cancel 一个已结束的调用"
+    # 判死只是推断:抢占 / 内存错误时 Modal 会自动重试 input,重试可能还在排队(2026-09-26 review)
+    assert cancels == ["fc-dead"], "要先真的取消一次原调用"
     assert ns["job_state"]["dead"]["status"] == "failed", "要写回,否则 GC 收不掉"
 
 
@@ -2135,6 +2139,502 @@ def test_comfyui_tag_pin_overrides_following_the_local_version():
     assert node_sync.resolve_comfyui_tag("0.34.6", ["v0.34.6"], pin="")[0] == "v0.34.6", "不钉照常跟随"
     body = code_only((ROOT / "routes.py").read_text(encoding="utf-8"))
     assert 'pin=cfg.get("comfyui_tag_pin", "")' in body, "GUI 部署没把钉传进去"
+
+
+# ── 0.8.55:review 0854 —— 排队判死要先放掉原调用、同名节点降级可见、重定向不带 key、中断查状态码 ──
+def _fake_modal_calls(events, fail=False):
+    def from_id(cid):
+        def cancel():
+            events.append(("cancel", cid))
+            if fail:
+                raise RuntimeError("rpc down")
+        return types.SimpleNamespace(cancel=cancel)
+    return types.SimpleNamespace(FunctionCall=types.SimpleNamespace(from_id=from_id))
+
+
+def _release_fn(state, events, fail=False):
+    call_id = _extract_nested(MODAL_APP, "_call_id", {"job_state": state, "_CALL_PENDING": "pending"})
+    return _extract_nested(MODAL_APP, "_release_stale_call",
+                           {"_call_id": call_id, "modal": _fake_modal_calls(events, fail),
+                            "print": lambda *a, **k: None})
+
+
+def test_release_cancels_every_judged_dead_call_and_never_raises():
+    """判死只是推断:排队判死的可能还在队列里,执行超时判死的可能在等抢占重试(Modal 的 timeout
+    按每次 attempt 计、不含排队)。正常终态不发 RPC。"""
+    events = []
+    rel = _release_fn({"j:call": "fc-1"}, events)
+    assert rel("j", {"status": "completed"}) == "" and events == [], "正常终态不该发取消"
+    for src in ("queued", "running"):
+        events.clear()
+        assert rel("j", {"status": "failed", "stale_from": src}) == "" and events == [("cancel", "fc-1")], src
+    assert _release_fn({"j:call": "fc-1"}, [], fail=True)("j", {"stale_from": "queued"}), "取消失败要报出来"
+
+    class NotFoundError(Exception):
+        pass
+
+    def gone(cid):
+        def cancel():
+            raise NotFoundError(f"No Function Call with ID '{cid}' found")
+        return types.SimpleNamespace(cancel=cancel)
+    rel_gone = _extract_nested(MODAL_APP, "_release_stale_call", {
+        "_call_id": lambda j: "fc-old", "print": lambda *a, **k: None,
+        "modal": types.SimpleNamespace(FunctionCall=types.SimpleNamespace(from_id=gone))})
+    assert rel_gone("j", {"stale_from": "queued"}) == "", "查不到的调用(过了保留期)不会再开跑,当作已释放"
+
+    def boom(j):
+        raise ConnectionError("dict down")
+    rel_boom = _extract_nested(MODAL_APP, "_release_stale_call", {
+        "_call_id": boom, "print": lambda *a, **k: None, "modal": _fake_modal_calls([])})
+    assert "ConnectionError" in rel_boom("j", {"stale_from": "queued"}), "Dict 读失败要报成错误,不能抛"
+
+
+def test_cancel_on_a_queue_stale_job_really_cancels_the_call():
+    """排队 6 小时判死只是推断:Modal 的 timeout 不含排队时间。以前 /cancel 直接回 cancel_noop,
+    取消次数 0,原调用留在队列里随时开跑(2026-09-26 review 隔离复现)。"""
+    import time as _t
+    events = []
+    ns = _status_ns({"q": {"status": "queued", "queued_at": _t.time() - 7 * 3600}})
+    ns.update({"_CALL_PENDING": "pending", "_call_id": lambda j: "fc-q",
+               "modal": _fake_modal_calls(events), "_CANCEL_NOT_FOUND_WAIT_S": 3.0})
+    ns["_release_stale_call"] = _extract_nested(MODAL_APP, "_release_stale_call", {
+        "_call_id": lambda j: "fc-q", "modal": ns["modal"], "print": lambda *a, **k: None})
+    r = _load_endpoint("cancel_endpoint", ns)({"job_id": "q", "auth_key": "k"})
+    assert events == [("cancel", "fc-q")], f"原调用没被取消: {r}"
+    assert r["status"] == "failed" and r.get("cancel_noop"), r
+
+    # 取消失败:如实报失败,不写回终态
+    ns = _status_ns({"q": {"status": "queued", "queued_at": _t.time() - 7 * 3600}})
+    ns.update({"_CALL_PENDING": "pending", "_call_id": lambda j: "fc-q", "_CANCEL_NOT_FOUND_WAIT_S": 3.0,
+               "_release_stale_call": lambda j, s: "RuntimeError: rpc down"})
+    r = _load_endpoint("cancel_endpoint", ns)({"job_id": "q", "auth_key": "k"})
+    assert r.get("error") and not r.get("cancel_noop"), r
+
+    # 占位句柄残留(run_endpoint 写了 pending 后被杀):照旧按终态回,不能永远报「提交中」
+    state = {"p": {"status": "queued", "queued_at": _t.time() - 7 * 3600}, "p:call": "pending"}
+    ns = _status_ns(state)
+    call_id = _extract_nested(MODAL_APP, "_call_id", {"job_state": state, "_CALL_PENDING": "pending"})
+    ns.update({"_CALL_PENDING": "pending", "_call_id": call_id, "_CANCEL_NOT_FOUND_WAIT_S": 3.0,
+               "_release_stale_call": _extract_nested(MODAL_APP, "_release_stale_call", {
+                   "_call_id": call_id, "modal": _fake_modal_calls([]), "print": lambda *a, **k: None})})
+    r = _load_endpoint("cancel_endpoint", ns)({"job_id": "p", "auth_key": "k"})
+    assert r["status"] == "failed" and r.get("cancel_noop"), f"卡在「提交中」: {r}"
+
+
+class _PutDict(dict):
+    def put(self, k, v, skip_if_exists=False):
+        if skip_if_exists and k in self:
+            return False
+        self[k] = v
+        return True
+
+
+def _run_ns(state, events, fail=False):
+    import uuid as _uuid
+
+    def spawn(*a):
+        events.append(("spawn",))
+        return types.SimpleNamespace(object_id="fc-new")
+    def worker():
+        return types.SimpleNamespace(run=types.SimpleNamespace(spawn=spawn))
+    ns = _status_ns(state)
+    ns.update({"normalize_delivery": lambda p: ({"mode": "desktop"}, None), "public_delivery": lambda d: d,
+               "uuid": _uuid, "_CHEAP_ENABLED": False, "_TOP_ENABLED": False, "ComfyWorkerCPU": worker,
+               "_TIER_WORKERS": {"40g": worker}, "_TIER_GPU_DISPLAY": {"40g": "H100"},
+               "_sweep_job_state": lambda: None, "_CALL_PENDING": "pending", "print": lambda *a, **k: None,
+               "_release_stale_call": _release_fn(state, events, fail)})
+    return ns
+
+
+def test_rerun_releases_a_queue_stale_prior_before_spawning_again():
+    """rerun 会删掉 :call(旧句柄)并写新记录。旧调用若还在队列里,开跑时读到新记录照样执行 ——
+    新旧两次都跑、都计费。必须先取消它;取消失败就不重跑。"""
+    import time as _t
+    old = {"status": "queued", "queued_at": _t.time() - 7 * 3600}
+    req = {"auth_key": "k", "job_id": "j", "workflow": {"1": {}}, "rerun": True}
+
+    events = []
+    state = _PutDict({"j": dict(old), "j:call": "fc-old"})
+    r = _load_endpoint("run_endpoint", _run_ns(state, events))(dict(req))
+    assert events == [("cancel", "fc-old"), ("spawn",)], f"必须先取消旧调用再 spawn: {events} {r}"
+    assert state["j:call"] == "fc-new"
+
+    events = []
+    state = _PutDict({"j": dict(old), "j:call": "fc-old"})
+    r = _load_endpoint("run_endpoint", _run_ns(state, events, fail=True))(dict(req))
+    assert ("spawn",) not in events and r.get("error"), f"取消失败不能重跑: {events} {r}"
+    assert state["j:call"] == "fc-old", "旧句柄不能丢,之后还要靠它取消"
+
+    events = []
+    state = _PutDict({"j": {"status": "completed", "completed_at": _t.time()}, "j:call": "fc-old"})
+    _load_endpoint("run_endpoint", _run_ns(state, events))(dict(req))
+    assert events == [("spawn",)], "正常终态重跑不该多一次取消 RPC"
+
+
+def test_sweep_releases_a_queue_stale_call_before_forgetting_it():
+    """GC 删掉记录后,旧调用开跑时读到空记录,起跑检查同样拦不住。取消失败就整条留着下次再试。"""
+    import time as _t
+    stale = _extract_nested(MODAL_APP, "_stale_reason",
+                            {"WORKER_TIMEOUT": 1200, "_STALE_GRACE_S": 120, "_QUEUE_STALE_S": 6 * 3600})
+    eff = _extract_nested(MODAL_APP, "_effective", {"_stale_reason": stale})
+    for fail in (False, True):
+        events = []
+        state = {"q": {"status": "queued", "queued_at": _t.time() - 30 * 3600}, "q:call": "fc-q"}
+        sweep = _load_sweep(state, lambda path, recursive=False: None, ttl=3600)
+        sweep.__globals__.update({"_stale_reason": stale, "_effective": eff,
+                                  "_release_stale_call": _release_fn(state, events, fail)})
+        sweep()
+        assert events == [("cancel", "fc-q")], events
+        if fail:
+            assert state.get("q:call") == "fc-q" and "q" in state, "取消失败时记录与句柄都要留着"
+        else:
+            assert state == {}, state
+
+
+def test_deploy_reports_same_name_nodes_whose_commit_differs_from_the_cloud(tmp_path, monkeypatch):
+    """部署以本机清单为准:本机清单陈旧(别的机器部署过新版)时,同名节点会被静默降级。
+    只看 commit 分不出是有意回滚还是陈旧,所以不拦,但必须在部署日志里列出来(2026-09-26 review)。"""
+    monkeypatch.setattr(node_sync, "DATA_FILE", tmp_path / "_custom_nodes_data.py")
+    node_sync.write_baked_nodes([{"name": "same", "url": "https://x/same", "commit": "old-commit"},
+                                 {"name": "equal", "url": "https://x/equal.git", "commit": "c1"},
+                                 {"name": "priv", "url": "https://u:tok@x/priv", "commit": "p1"}])
+    manifest = [{"name": "same", "url": "https://x/same", "commit": "new-commit"},
+                {"name": "equal", "url": "https://x/equal", "commit": "c1"},
+                {"name": "priv", "url": "https://x/priv", "commit": "p1", "url_redacted": True}]
+    monkeypatch.setattr(node_sync, "fetch_cloud_nodes", lambda cfg: (["same", "equal", "priv"], manifest))
+    rec = node_sync.reconcile_baked_with_cloud({})
+    assert rec.added == []
+    assert len(rec.drift) == 1 and "new-commit" in rec.drift[0] and "old-commit" in rec.drift[0], rec.drift
+    msg = node_sync.drift_message(rec)
+    assert "same" in msg and "tok" not in msg
+    assert node_sync.drift_message(node_sync.Reconciled([], [])) == ""
+    assert "来源仓库也不同" in node_sync.commit_drift(
+        [{"name": "a", "url": "https://x/fork", "commit": "1"}],
+        [{"name": "a", "url": "https://x/orig", "commit": "1"}])[0]
+
+
+def test_unreadable_cloud_is_reported_not_passed_off_as_no_drift(tmp_path, monkeypatch):
+    """读不到云端时返回的「没并回、没差异」和「查过了、确实没有」长得一样,部署日志里什么都不写。"""
+    import health_client as hc
+    monkeypatch.setattr(node_sync, "DATA_FILE", tmp_path / "_custom_nodes_data.py")
+    node_sync.write_baked_nodes([{"name": "a", "url": "https://x/a", "commit": "1"}])
+
+    def unreachable(cfg):
+        raise hc.HealthUnavailable("unreachable", "timed out")
+    monkeypatch.setattr(node_sync, "fetch_cloud_nodes", unreachable)
+    rec = node_sync.reconcile_baked_with_cloud({})
+    assert rec.unchecked and "读不到" in node_sync.drift_message(rec), rec
+
+    def not_deployed(cfg):
+        raise hc.HealthUnavailable("not_deployed", "404")
+    monkeypatch.setattr(node_sync, "fetch_cloud_nodes", not_deployed)
+    assert node_sync.drift_message(node_sync.reconcile_baked_with_cloud({})) == "", "全新部署没什么可比"
+
+
+def test_every_deploy_path_shows_the_commit_drift():
+    for f, n in (("routes.py", 2), ("bridge_cli.py", 1), ("deploy.py", 1)):
+        body = code_only((ROOT / f).read_text(encoding="utf-8"))
+        assert body.count("drift_message(") == n, f"{f} 部署前没把同名节点的版本差异报出来"
+        assert "drift_message(_rec.drift)" not in body and "drift_message(rec.drift)" not in body, \
+            f"{f}: 要传整个结果,否则「没查」会被当成「没差异」"
+
+
+def _serve(handler):
+    import http.server
+    import threading
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv
+
+
+def _redirect_pair():
+    """起两个本地服务:origin 永远 302 到 sink(另一个端口 = 另一个 origin),sink 记下收到的 key。"""
+    import http.server
+    got = []
+
+    class Sink(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def _any(self):
+            got.append(self.headers.get("X-Bridge-Key"))
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b'{"healthy": true, "custom_nodes": []}')
+        do_GET = do_POST = _any
+    sink = _serve(Sink)
+
+    class Origin(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def _any(self):
+            self.send_response(307)
+            self.send_header("Location", f"http://127.0.0.1:{sink.server_port}/foreign")
+            self.end_headers()
+        do_GET = do_POST = _any
+    return _serve(Origin), sink, got
+
+
+def test_health_readers_never_follow_a_redirect_with_the_key(monkeypatch):
+    """同步版以前用裸 urlopen,跨域 302 把 X-Bridge-Key 原样带过去、响应照收(2026-09-26 review 实测);
+    异步版(aiohttp)跨域跳转只剥 Authorization,自定义头照带。"""
+    import asyncio
+    import aiohttp
+    import health_client as hc
+    import modal_client as mc
+    for sync in (True, False):
+        origin, sink, got = _redirect_pair()
+        try:
+            monkeypatch.setattr(hc, "url", lambda cfg: f"http://127.0.0.1:{origin.server_port}/health")
+            cfg = {"modal_endpoint_base": "fixture", "bridge_api_key": "FAKE-KEY"}
+            try:
+                if sync:
+                    hc.fetch(cfg, timeout=5)
+                else:
+                    async def go():
+                        async with aiohttp.ClientSession() as s:
+                            return await mc.health(s, cfg)
+                    asyncio.run(go())
+                assert False, "跟着重定向拿到了另一个站点的响应"
+            except (hc.HealthUnavailable, RuntimeError):
+                pass
+            assert got == [], f"{'同步' if sync else '异步'}版把 key 带去了别的站点: {got}"
+        finally:
+            origin.shutdown()
+            sink.shutdown()
+    try:
+        hc.interpret(307, "")
+        assert False
+    except hc.HealthUnavailable as e:
+        assert e.kind == "http" and "重定向" in str(e), "3xx 要如实说是重定向,别报成「不是 JSON」"
+
+
+def test_every_keyed_aiohttp_request_refuses_redirects():
+    """aiohttp 默认跟随重定向;带 key 的请求(X-Bridge-Key 头 / body 里的 auth_key)一律不跟。"""
+    import re as _re
+    call_re = _re.compile(r"\.(?:get|post)\((?:[^()]|\([^()]*\))*\)\s+as r\b")   # 参数里允许一层括号
+    keyed = 0
+    for f in ("modal_client.py", "routes.py"):
+        for m in call_re.finditer(code_only((ROOT / f).read_text(encoding="utf-8"))):
+            call = m.group(0)
+            if any(k in call for k in ("_key(cfg)", "health_client.headers", "json=payload")):
+                keyed += 1
+                assert "allow_redirects=False" in call, f"{f}: 带 key 的请求会跟随重定向: {call[:120]!r}"
+    assert keyed >= 5, f"只认出 {keyed} 处带 key 的请求,匹配规则失效了"
+
+
+def test_interrupt_comfy_does_not_claim_success_on_http_errors(capsys):
+    """/queue、/interrupt 回 500 时请求「发出去了」,ComfyUI 并没停。以前只接网络异常,照样记「已停下」。"""
+    sys.path.insert(0, str(ROOT / "modal_app"))
+    import _comfy_ws
+    import requests
+
+    def bad():
+        raise requests.HTTPError("500 Server Error")
+    orig = _comfy_ws.requests.post
+    _comfy_ws.requests.post = lambda url, json=None, timeout=None: types.SimpleNamespace(raise_for_status=bad)
+    try:
+        _comfy_ws.interrupt_comfy()
+    finally:
+        _comfy_ws.requests.post = orig
+    out = capsys.readouterr().out
+    assert "已让 ComfyUI 停下" not in out, out
+    assert "/queue 失败" in out and "/interrupt 失败" in out, out
+
+
+def test_sweep_leaves_a_record_replaced_by_a_concurrent_rerun_alone():
+    """sweep 拿快照后,别的容器把这条 rerun 成了新的一次。删它 = 删掉新任务,取消更会取消掉**新**调用。"""
+    import time as _t
+    stale = _extract_nested(MODAL_APP, "_stale_reason",
+                            {"WORKER_TIMEOUT": 1200, "_STALE_GRACE_S": 120, "_QUEUE_STALE_S": 6 * 3600})
+    eff = _extract_nested(MODAL_APP, "_effective", {"_stale_reason": stale})
+    old = {"status": "queued", "queued_at": _t.time() - 30 * 3600}
+    new = {"status": "queued", "queued_at": _t.time()}
+
+    class Snapshotted(dict):
+        def items(self):
+            return [("q", old)]
+    events = []
+    state = Snapshotted({"q": new, "q:call": "fc-new"})
+    sweep = _load_sweep(state, lambda path, recursive=False: None, ttl=3600)
+    sweep.__globals__.update({"_stale_reason": stale, "_effective": eff,
+                              "_release_stale_call": _release_fn(state, events)})
+    sweep()
+    assert events == [] and state.get("q") == new and state.get("q:call") == "fc-new", (events, dict(state))
+
+
+def test_sweep_never_breaks_the_submission_and_budgets_its_rpcs():
+    """GC 在 /run 里跑:它抛异常就是用户这次提交 500;它的 RPC 也吃 /run 的 60s,要受预算约束。"""
+    import time as _t
+    stale = _extract_nested(MODAL_APP, "_stale_reason",
+                            {"WORKER_TIMEOUT": 1200, "_STALE_GRACE_S": 120, "_QUEUE_STALE_S": 6 * 3600})
+    eff = _extract_nested(MODAL_APP, "_effective", {"_stale_reason": stale})
+    rec = {"status": "queued", "queued_at": _t.time() - 30 * 3600}
+    events = []
+    state = {f"q{i:02d}": dict(rec) for i in range(30)}
+    state.update({f"q{i:02d}:call": f"fc-{i}" for i in range(30)})
+    sweep = _load_sweep(state, lambda path, recursive=False: None, ttl=3600, budget=10)
+    sweep.__globals__.update({"_stale_reason": stale, "_effective": eff,
+                              "_release_stale_call": _release_fn(state, events)})
+    sweep()
+    assert 0 < len(events) <= 10, f"一轮的取消 RPC 要受预算约束,实际 {len(events)} 次"
+
+    # 判死条目取消持续失败:不许饿死正常回收,同一条一轮内也不许重复发 RPC(count-trim 阶段)
+    events = []
+    old = _t.time() - 30 * 3600
+    state = {f"q{i:02d}": dict(rec) for i in range(10)}
+    state.update({f"q{i:02d}:call": f"fc-{i}" for i in range(10)})
+    state.update({f"c{i}": {"status": "completed", "completed_at": old} for i in range(5)})
+    removed = []
+    sweep = _load_sweep(state, lambda path, recursive=False: removed.append(path), ttl=3600, budget=10, job_max=1)
+    sweep.__globals__.update({"_stale_reason": stale, "_effective": eff,
+                              "_release_stale_call": _release_fn(state, events, fail=True)})
+    sweep()
+    assert not any(f"c{i}" in state for i in range(5)), f"正常过期条目被判死条目饿死: {sorted(state)}"
+    assert len(events) == len(set(events)), f"同一条一轮内重复取消: {events}"
+
+    class Flaky(dict):
+        def get(self, k, default=None):
+            raise ConnectionError("dict down")
+    flaky = Flaky({"q": dict(rec)})
+    sweep = _load_sweep(flaky, lambda path, recursive=False: None, ttl=3600)
+    sweep.__globals__.update({"_stale_reason": stale, "_effective": eff,
+                              "_release_stale_call": _release_fn(flaky, [])})
+    sweep()   # 不许抛
+    assert "q" in flaky
+
+
+def test_sweep_does_not_forget_a_job_that_came_back_to_life():
+    """快照里判死,之后 Modal 的自动重试(或迟到的原调用)开跑、写回 running。照快照删 = 任务在跑、在计费,
+    记录和产物却没了(2026-09-26 review 复现)。"""
+    import time as _t
+    stale = _extract_nested(MODAL_APP, "_stale_reason",
+                            {"WORKER_TIMEOUT": 1200, "_STALE_GRACE_S": 120, "_QUEUE_STALE_S": 6 * 3600})
+    eff = _extract_nested(MODAL_APP, "_effective", {"_stale_reason": stale})
+    snap = {"status": "running", "queued_at": _t.time() - 30 * 3600, "started_at": _t.time() - 29 * 3600,
+            "timeout_s": 1200}
+    alive = {**snap, "started_at": _t.time() - 60}
+
+    class Snapshotted(dict):
+        def items(self):
+            return [("x", snap), ("x:call", "fc-x")]
+    events, removed = [], []
+    state = Snapshotted({"x": alive, "x:call": "fc-x"})
+    sweep = _load_sweep(state, lambda path, recursive=False: removed.append(path), ttl=3600)
+    sweep.__globals__.update({"_stale_reason": stale, "_effective": eff,
+                              "_release_stale_call": _release_fn(state, events)})
+    sweep()
+    assert removed == [] and events == [] and state.get("x") == alive, (removed, events, dict(state))
+
+
+def test_sweep_keeps_a_finished_job_that_was_rerun_after_the_snapshot():
+    """终态记录不重读,靠 :call 认「是不是同一次提交」:快照之后别的容器把它 rerun 了,句柄就变了。"""
+    import time as _t
+    snap = {"status": "completed", "completed_at": _t.time() - 7200}
+    new = {"status": "queued", "queued_at": _t.time()}
+
+    class Snapshotted(dict):
+        def items(self):
+            return [("c", snap), ("c:call", "fc-old")]
+    removed = []
+    state = Snapshotted({"c": new, "c:call": "fc-new"})
+    _load_sweep(state, lambda path, recursive=False: removed.append(path))()
+    assert removed == [] and state.get("c") == new and state.get("c:call") == "fc-new", (removed, dict(state))
+
+
+def test_sweep_caps_cancel_rpcs_when_they_keep_failing():
+    """取消持续失败的判死条目,每轮每条都要重读 + 取消;不设额度,条目多时这一串 RPC 全压在 /run 的 60s 里。
+    同一条失败后,count-trim 阶段也不许再试一次。"""
+    import time as _t
+    stale = _extract_nested(MODAL_APP, "_stale_reason",
+                            {"WORKER_TIMEOUT": 1200, "_STALE_GRACE_S": 120, "_QUEUE_STALE_S": 6 * 3600})
+    eff = _extract_nested(MODAL_APP, "_effective", {"_stale_reason": stale})
+    rec = {"status": "queued", "queued_at": _t.time() - 30 * 3600}
+    for n, job_max in ((30, 200), (1, 0)):
+        events = []
+        state = {f"q{i:02d}": dict(rec) for i in range(n)}
+        state.update({f"q{i:02d}:call": f"fc-{i}" for i in range(n)})
+        sweep = _load_sweep(state, lambda path, recursive=False: None, ttl=3600, budget=10, job_max=job_max)
+        sweep.__globals__.update({"_stale_reason": stale, "_effective": eff,
+                                  "_release_stale_call": _release_fn(state, events, fail=True)})
+        sweep()
+        assert len(events) <= 10 and len(events) == len(set(events)), (n, job_max, events)
+
+
+def test_sweep_never_rereads_terminal_records():
+    """终态记录带着内联 base64 产物(最多 ~32MB);删之前为了核对再拉一遍,就是本函数一直在避免的全量拉取。"""
+    import time as _t
+    reads = []
+
+    class Counting(dict):
+        def get(self, k, default=None):
+            reads.append(k)
+            return super().get(k, default)
+    state = Counting({"c": {"status": "completed", "completed_at": _t.time() - 7200, "images": ["..."]},
+                      "c:call": "fc-c"})
+    _load_sweep(state, lambda path, recursive=False: None)()
+    assert "c" not in reads, f"重读了整条终态记录: {reads}"
+    assert "c" not in state
+
+
+def test_cancel_treats_an_expired_call_as_ended_not_as_still_billing():
+    """7 天前的调用 Modal 已查不到(NotFoundError)。报「取消失败、可能仍在计费」正好说反。"""
+    import time as _t
+
+    class NotFoundError(Exception):
+        pass
+
+    def gone(cid):
+        def cancel():
+            raise NotFoundError("No Function Call found")
+        return types.SimpleNamespace(cancel=cancel)
+    ns = _status_ns({"old": {"status": "completed", "completed_at": _t.time() - 8 * 86400}})
+    ns.update({"_CALL_PENDING": "pending", "_call_id": lambda j: "fc-old", "_CANCEL_NOT_FOUND_WAIT_S": 3.0,
+               "modal": types.SimpleNamespace(FunctionCall=types.SimpleNamespace(from_id=gone))})
+    r = _load_endpoint("cancel_endpoint", ns)({"job_id": "old", "auth_key": "k"})
+    assert r.get("cancel_noop") and r["status"] == "completed" and "cancel failed" not in (r.get("error") or ""), r
+
+
+def test_old_call_cancelled_by_a_rerun_does_not_cancel_the_rerun():
+    """旧调用刚开跑就被 rerun 取消:它的取消分支若照旧落定 cancelled,盖掉的是 rerun 的新记录,
+    新调用起跑时看到 cancelled 直接跳过(2026-09-26 review)。只许落定自己这次提交的记录。"""
+    import ast
+    src = MODAL_APP.read_text(encoding="utf-8")
+    fn = next(n for n in ast.walk(ast.parse(src))
+              if isinstance(n, ast.FunctionDef) and n.name == "_worker_run")
+    body = code_only(ast.get_source_segment(src, fn))
+    i = body.index('"InputCancellation"')
+    assert 'cur.get("queued_at") == run_token' in body[i:i + 900], "取消分支没核对是不是自己这次提交"
+    assert body.index('run_token = cur.get("queued_at")') < body.index("try:", body.index("run_token"))
+
+
+def test_cli_cancel_does_not_cry_billing_when_the_job_already_ended(monkeypatch):
+    """cancel_noop 时 error 是**任务的**失败原因,不是取消失败;报「仍在计费」正好说反。"""
+    import bridge_cli
+    for resp, should_exit in (({"status": "failed", "error": "OOM", "cancel_noop": True}, False),
+                              ({"status": "running", "error": "cancel failed: rpc"}, True),
+                              ({"status": "not_found", "error": "job not found"}, True)):
+        monkeypatch.setattr(bridge_cli, "_client",
+                            lambda a, resp=resp: types.SimpleNamespace(cancel=lambda jid: resp))
+        try:
+            bridge_cli.cmd_cancel(types.SimpleNamespace(job_id="j"))
+            exited, msg = False, ""
+        except SystemExit as e:
+            exited, msg = True, str(e.code)
+        assert exited == should_exit, resp
+        if resp["status"] == "not_found":
+            assert "计费" not in msg, f"查无此任务不是「仍在计费」: {msg}"
+
+
+def test_exported_script_never_follows_redirects_with_the_key():
+    """导出脚本里嵌着作者的计费 key;requests 跟随跨域重定向时自定义头照带,307/308 还重发 body。"""
+    import re as _re
+    js = (ROOT / "web" / "modal_bridge.js").read_text(encoding="utf-8")
+    calls = _re.findall(r"requests\.(?:get|post)\([^)]*", js)
+    assert len(calls) >= 2, calls
+    for c in calls:
+        assert "allow_redirects=False" in c, c
 
 
 def test_estimate_vram_video_v2_anchors():
@@ -2777,6 +3277,8 @@ def _load_sweep(job_state, remove_file, *, budget=10, ttl=3600, job_max=200):
         "JOB_TTL_S": ttl, "JOB_MAX": job_max, "_VOL_GC_PER_SWEEP": budget,
         "print": lambda *a, **k: None,
         "_stale_reason": lambda s, now: "",
+        "_effective": lambda s, now: s,
+        "_release_stale_call": lambda jid, s: "",
         "_SWEEP_EVERY_S": 0, "_last_sweep": [0.0],      # 默认关节流,节流另有专门测试
         "_is_already_gone": _extract_nested(ROOT / "modal_app" / "modal_app.py",
                                             "_is_already_gone", {}),

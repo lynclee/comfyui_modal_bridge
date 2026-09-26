@@ -890,7 +890,7 @@ def _setup_routes():
         url = modal_client._endpoint(cfg["modal_endpoint_base"], "status")
         try:
             async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as session:
-                async with session.get(url, params={"job_id": job_id},
+                async with session.get(url, params={"job_id": job_id}, allow_redirects=False,
                                        headers={"X-Bridge-Key": modal_client._key(cfg)}) as r:
                     data = await r.json(content_type=None)
         except Exception as e:
@@ -1301,9 +1301,13 @@ def _setup_routes():
                         # 同 /deploy:这里也拿本机清单当全局清单部署,先并回云端独有的节点。
                         node_sync.ensure_baked_file()
                         try:
-                            _back = await asyncio.to_thread(node_sync.reconcile_baked_with_cloud, latest_cfg)
-                            if _back:
-                                await _emit(resp, f"   节点清单:并回云端独有的 {len(_back)} 个 —— {', '.join(_back)}\n")
+                            _rec = await asyncio.to_thread(node_sync.reconcile_baked_with_cloud, latest_cfg)
+                            if _rec.added:
+                                await _emit(resp, f"   节点清单:并回云端独有的 {len(_rec.added)} 个 —— "
+                                                  f"{', '.join(_rec.added)}\n")
+                            _drift = node_sync.drift_message(_rec)
+                            if _drift:
+                                await _emit(resp, _drift)
                             rc = await _ensure_modal(resp)
                         except node_sync.DeployBlocked as _blk:
                             await _emit(resp, f"== ✗ {_blk} ==\n")
@@ -1701,15 +1705,18 @@ def _setup_routes():
             #   重装、清单丢了 → 上面建出一个空清单 → 这次部署清空云端全部节点;多机时另一台加的
             #   节点也会被删。部署前先把云端有、本机没有的并回来(只加不删)。
             try:
-                _back = await asyncio.to_thread(node_sync.reconcile_baked_with_cloud, cfg)
+                _rec = await asyncio.to_thread(node_sync.reconcile_baked_with_cloud, cfg)
             except node_sync.DeployBlocked as _blk:
                 await _emit(resp, f"\n== ✗ {_blk} ==\n")
                 await _emit(resp, "\n__DEPLOY_DONE__ rc=1\n")
                 await resp.write_eof()
                 return resp
-            if _back:
-                await _emit(resp, f"   节点清单:云端有而本机清单缺的 {len(_back)} 个已并回"
-                                  f"(不会被这次部署删掉)—— {', '.join(_back)}\n")
+            if _rec.added:
+                await _emit(resp, f"   节点清单:云端有而本机清单缺的 {len(_rec.added)} 个已并回"
+                                  f"(不会被这次部署删掉)—— {', '.join(_rec.added)}\n")
+            _drift = node_sync.drift_message(_rec)
+            if _drift:
+                await _emit(resp, _drift)
             await _emit(resp, "\n== 推送到云端:比对本机与云端的差异,只推有变化的部分 ==\n")
             # 3.0) 先把**本机**的私有节点推上 Volume,再去读 manifest。
             #
@@ -1892,7 +1899,8 @@ def _setup_routes():
         url = modal_client._endpoint(cfg["modal_endpoint_base"], "health")
         try:
             async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=6)) as s:
-                async with s.get(url, headers={"X-Bridge-Key": modal_client._key(cfg)}) as r:
+                async with s.get(url, headers={"X-Bridge-Key": modal_client._key(cfg)},
+                                 allow_redirects=False) as r:   # 不带 key 跟随重定向,见 modal_client 顶部
                     if r.status == 200:
                         h = await r.json(content_type=None)
                         if isinstance(h, dict):

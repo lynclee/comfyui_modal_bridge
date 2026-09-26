@@ -145,13 +145,42 @@ def _effective(s, now: float):
     reason = _stale_reason(s, now)
     if not reason:
         return s
-    return {**s, "status": "failed", "error": reason, "completed_at": now}
+    # stale_from:判死前的状态。判死只是推断(见 _release_stale_call),下游据此在放掉记录前先取消原调用。
+    return {**s, "status": "failed", "error": reason, "completed_at": now, "stale_from": s.get("status")}
 
 
 def _call_id(job_id: str) -> str:
     """取真实 call_id;还在占位(spawn 中)或没有则返回空串。"""
     cid = job_state.get(f"{job_id}:call")
     return "" if not cid or cid == _CALL_PENDING else str(cid)
+
+
+def _release_stale_call(job_id: str, s) -> str:
+    """被判死(_effective 标了 stale_from)的任务,在放掉它的记录之前先 cancel 原调用。
+
+    ⚠ 判死只是推断,原调用可能还会开跑:
+      · 排队判死:Modal 的 timeout 不含排队等待,它可能还在队列里;
+      · 执行超时判死:容器被抢占 / 内存错误时 Modal 会自动重试该 input,timeout 按每次 attempt 重新计,
+        重试排着队时记录就可能已经判死(2026-09-26 review)。
+      它开跑时读到的若是 rerun 写的新记录或 GC 删空的记录,起跑检查拦不住,照样执行 —— 新旧两次都跑、
+      都计费(2026-09-26 review 隔离复现)。记录还是 failed 时起跑检查会拦下它,所以「记录要被换掉 /
+      删掉 / 回给取消方」之前调这里。
+    返回错误说明;不需要处理或已释放返回空串。**从不抛异常**:GC 在 /run 里跑,抛了就让用户这次提交 500。
+    2026-09-26 实测:对已完成 / 已失败的调用 cancel() 不报错;对过了保留期的旧调用(7 天前)和不存在的
+    id 抛 NotFoundError —— 查不到的调用不可能再开跑,当作已释放,否则 rerun 被永久拒绝、GC 永远删不掉。"""
+    try:
+        if not (isinstance(s, dict) and s.get("stale_from")):
+            return ""
+        call_id = _call_id(job_id) or s.get("call_id")
+        if not call_id:
+            return ""
+        modal.FunctionCall.from_id(call_id).cancel()
+    except Exception as e:
+        if type(e).__name__ == "NotFoundError":
+            return ""
+        return f"{type(e).__name__}: {e}"
+    print(f"[bridge] job {job_id}: 判死的任务,已取消原调用 {call_id}(防止它之后开跑)")
+    return ""
 
 
 def _is_already_gone(e: BaseException) -> bool:
@@ -191,6 +220,7 @@ def _sweep_job_state():
         return
     terminal = {"completed", "failed", "cancelled"}
     finished = []
+    records = dict(items)
     for jid, s in items:
         if not isinstance(s, dict):
             continue
@@ -200,11 +230,15 @@ def _sweep_job_state():
             # worker 早被杀了 / 从没起来、没人写终态:按开始(或入队)时间当作已结束参与过期回收,否则永不 GC。
             finished.append((jid, s.get("started_at") or s.get("queued_at") or 0))
     vol_gc_budget = _VOL_GC_PER_SWEEP
+    # 判死条目的重读 + 取消 RPC 另有一份额度:它们取消持续失败时,不许占掉正常回收的 Volume 预算
+    # (判死的恰恰最旧,count-trim 也会先轮到它们)(2026-09-26 review)。
+    rpc_budget = _VOL_GC_PER_SWEEP
     dropped = set()
+    skip = set()   # 本轮已失败过的,第 2 阶段别再试(免得同一条重复发 RPC)
 
     def _drop(jid):
-        """清一个终态 job。返回 False = 本次 Volume 预算已用完,**什么都没动**(索引留着,
-        下次 sweep 再来)。
+        """清一个终态 job。返回 False = 这次没动它(预算用完 / 快照之后变了 / 原调用没取消掉 / Volume 删失败),
+        **什么都没删**(索引留着,下次 sweep 再来)。
 
         ⚠ 铁律:Volume 目录和 job_state 索引必须同生共死 —— 要么一起删,要么都不删。
         曾经是「先无条件删索引,再判预算」,于是一次 sweep 撞上 11 个过期 job 时,
@@ -212,17 +246,50 @@ def _sweep_job_state():
         这个 jid,那个目录从此无人认领。限流本意是「这次先清 10 个」,实际成了
         「超出的部分永久泄漏」(2026-09-09 seedance 侧隔离执行复现,本文件同名回归测试钉死)。
         """
-        nonlocal vol_gc_budget
+        nonlocal vol_gc_budget, rpc_budget
+        safe = _safe_job_id(jid)
+        # 限量:一次 sweep 最多删这么多个,避免某次提交撞上大批过期 job 时被一串 RPC 拖慢。
+        # 脏 id 不占预算:它不碰 Volume,索引留着只会让 Dict 白涨。
+        if (safe and vol_gc_budget <= 0) or jid in skip:
+            return False
+        snap = records.get(jid)
+        # 判死 = 快照里是非终态但 worker 必然已死(_stale_reason),或 /status 已把判死结果写回(stale_from)
+        stale = isinstance(snap, dict) and bool(snap.get("stale_from") or _stale_reason(snap, now))
+        if stale and rpc_budget <= 0:
+            return False
+        live = snap
+        try:
+            # 快照之后被别的容器 rerun 成了新的一次(句柄变了):删它 = 删掉新任务的记录,下面的取消更会
+            # 取消掉**新**调用(2026-09-26 review 隔离复现)。比 :call 而不重读记录 —— 终态记录带着内联
+            # base64 产物(最多 ~32MB),每条重读一遍正是本函数一直在避免的全量拉取。
+            if job_state.get(f"{jid}:call") != records.get(f"{jid}:call"):
+                return False
+            if stale and not snap.get("stale_from"):
+                # 快照里是「非终态、判死」:Modal 的自动重试 / 迟到的原调用可能已让它活过来(写回 running),
+                # 甚至已经跑完。只有现在仍判死才回收 —— 否则就是删掉一个正在跑、正在计费的任务的记录和产物。
+                # 判死的记录没有内联产物,重读很轻。
+                rpc_budget -= 1
+                live = job_state.get(jid)
+                if live is not None and not _stale_reason(live, now):
+                    return False
+        except Exception:
+            return False
+        if stale:
+            # 判死的任务:原调用可能还会开跑。记录一删,它开跑时起跑检查就拦不住了(见 _release_stale_call)。
+            # 取消失败就整条留着(记录是 failed,起跑检查仍会拦),下次 sweep 再试。
+            rpc_budget -= 1
+            err = _release_stale_call(jid, _effective(live if live is not None else snap, now))
+            if err:
+                skip.add(jid)
+                print(f"[bridge] ⚠ GC {jid}: 原调用取消失败,记录保留到下次: {err}")
+                return False
         # 顺带清 Volume 上的 _outputs/<job_id>/:成功取回会即删(见 modal_volume.download_volume_file
         # 和 fetch_endpoint 的 delete=1),但**失败/取消/客户端放弃**的大文件以前永久留在 Volume 上,
         # 谁也不会去删。job_state 条目都过期了,产物更没人要。
         # 二道闸:/run 已经挡住脏 id,但 Dict 里可能还留着旧版本写入的条目 ——
         # remove_file 是 recursive 删除,宁可漏删一个孤儿目录,也不能拿不可信的 id 去删 Volume。
         # 脏 id 不占预算也不阻塞索引清理:它压根不碰 Volume,索引留着只会让 Dict 白涨。
-        if _safe_job_id(jid):
-            # 限量:一次 sweep 最多删这么多个,避免某次提交撞上大批过期 job 时被一串 RPC 拖慢。
-            if vol_gc_budget <= 0:
-                return False
+        if safe:
             vol_gc_budget -= 1
             try:
                 models_vol.remove_file(f"_outputs/{jid}", recursive=True)
@@ -231,6 +298,7 @@ def _sweep_job_state():
                     # 别的异常要出声:静默失败 = GC 从来没生效过,而日志上看不出来。
                     # 索引也保留 —— 删失败还把索引丢掉,就又变成上面那种无人认领的孤儿目录。
                     print(f"[bridge] ⚠ Volume GC _outputs/{jid} 失败: {type(e).__name__}: {e}")
+                    skip.add(jid)
                     return False
                 # 目录不存在是常态(产物已取回 / 本来就是小文件走 base64)→ 照常删索引
         for k in (jid, f"{jid}:call", f"{jid}:progress"):  # 连带删独立键,不留孤儿
@@ -543,6 +611,7 @@ def _worker_run(workflow: dict, job_id: str, input_images: list | None = None,
         return {"skipped": cur.get("status")}
     job_state[job_id] = {**cur, "status": "running", "started_at": time.time(),
                          "timeout_s": WORKER_TIMEOUT}   # 按任务记超时,见 _stale_reason
+    run_token = cur.get("queued_at")   # 认「这条记录是不是我这次提交的」,见下面取消分支
     try:
         del job_state[f"{job_id}:progress"]   # rerun 复用 job_id 时别显示上一次的进度
     except Exception:
@@ -637,9 +706,12 @@ def _worker_run(workflow: dict, job_id: str, input_images: list | None = None,
             #   状态停在 running,22 分钟后被 _stale_reason 误报成「被 Modal 强杀、已计费」,
             #   而那是用户自己取消的任务(2026-09-24 review)。写的是同一个值,与 cancel_endpoint
             #   不冲突;已是终态(worker 抢先写完)就不动。
+            # ⚠ 只落定**自己这次提交**的记录:被判死的旧调用刚开跑就被 rerun 取消时,记录已经换成了
+            #   rerun 的新一次(queued),盖成 cancelled 会让新调用起跑时直接跳过(2026-09-26 review)。
             try:
                 cur = job_state.get(job_id) or {}
-                if cur.get("status") not in ("completed", "failed", "cancelled"):
+                if cur.get("status") not in ("completed", "failed", "cancelled") \
+                        and cur.get("queued_at") == run_token:
                     job_state[job_id] = {**cur, "status": "cancelled", "completed_at": time.time()}
             except Exception:
                 pass
@@ -975,6 +1047,12 @@ def run_endpoint(payload: dict):
     #    中间窗口里 cancel 看到 status=queued 却查不到 :call,会直接标 cancelled 返回成功,
     #    而函数下一毫秒就开始跑 —— 谎报成功,违反本文件的 cancel 铁律。
     if rerun:
+        # 排队判死的旧任务:先取消原调用,再覆盖记录。取消失败就不重跑 —— 下面一删 :call 就再也拿不到
+        # 它的句柄,而它开跑时读到的是新记录,照样执行,双跑双计费(2026-09-26 review)。
+        _err = _release_stale_call(job_id, prior)
+        if _err:
+            return {"id": job_id, "status": prior_status,
+                    "error": f"旧任务还在 Modal 队列里、取消没成功({_err}),为免两次都跑没有重跑。稍后再试。"}
         # rerun 要重用一个已终结的 id,旧占位/句柄必须先让位,否则下面的原子抢占永远失败。
         # ⚠ 残留窗口(已知、刻意保留):del 与 put 之间不是原子的,两个**并发** rerun
         # 理论上能各抢到一次 → 双 spawn 双计费。modal.Dict 只有 put(skip_if_exists)
@@ -1129,8 +1207,14 @@ def cancel_endpoint(payload: dict):
             return {"id": job_id, "status": "not_found", "error": "job not found"}
     eff = _effective(s, time.time()) if s else s
     if eff is not s:
-        # worker 早就死了 / 从没起来:没有正在进行的执行可取消。去 cancel 一个已结束的调用会报
-        # 「取消失败」,前端据此提示「可能仍在计费」—— 正好说反。按终态如实回,带上真因。
+        # 判死的任务:按终态如实回(cancel_noop + 真因),别报「取消失败、可能仍在计费」。
+        # 但判死只是推断,原调用可能还在排队 / 等重试(见 _release_stale_call)—— 以前这里取消次数为 0,
+        # 随后 rerun 覆盖记录,旧调用开跑时拦不住,双跑(2026-09-26 review)。所以先真的取消一次。
+        # 占位句柄(run_endpoint 写了 pending 后被杀)取不到 call_id,照旧按终态回,不会卡在「提交中」。
+        _err = _release_stale_call(job_id, eff)
+        if _err:
+            return {"id": job_id, "status": s.get("status") or "unknown",
+                    "error": f"cancel failed: {_err}", "was_running": s.get("status") == "running"}
         try:
             job_state[job_id] = eff
         except Exception:
@@ -1158,10 +1242,13 @@ def cancel_endpoint(payload: dict):
             # 并发任务被重新调度 —— 本插件主打多任务并发,不能误伤邻居。
             modal.FunctionCall.from_id(call_id).cancel()
         except Exception as e:
-            # 取消失败绝不能谎报成功:云端还在跑、还在计费,必须让调用方看见。
-            print(f"[bridge] cancel call {call_id} FAILED: {e}")
-            return {"id": job_id, "status": s.get("status") or "unknown",
-                    "error": f"cancel failed: {e}", "was_running": was_running}
+            # 查不到的调用(过了 Modal 的保留期,实测 7 天前的就查不到)不可能在跑:当作已结束,
+            # 往下按记录如实回。报「取消失败、可能仍在计费」正好说反(2026-09-26 review)。
+            if type(e).__name__ != "NotFoundError":
+                # 取消失败绝不能谎报成功:云端还在跑、还在计费,必须让调用方看见。
+                print(f"[bridge] cancel call {call_id} FAILED: {e}")
+                return {"id": job_id, "status": s.get("status") or "unknown",
+                        "error": f"cancel failed: {e}", "was_running": was_running}
     # ⚠ 重新读一次再 merge:上面等占位 call_id 可能花了两秒、cancel() 本身也是一次 RPC,
     # worker 在这期间会把状态写成 running(带 started_at/progress),甚至直接写完 completed。
     # 拿函数开头那份快照无条件盖成 cancelled 有两种害:轻则冲掉 worker 写的进度,

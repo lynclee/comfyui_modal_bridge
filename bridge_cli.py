@@ -113,7 +113,11 @@ def cmd_fetch(args):
 def cmd_cancel(args):
     r = _client(args).cancel(args.job_id)
     print(json.dumps(r, ensure_ascii=False))
-    if r.get("error"):
+    if r.get("status") == "not_found":
+        sys.exit("云端查无此任务 —— id 不对,或早已结束并被回收;没有在跑")
+    # cancel_noop:任务已先一步结束(完成 / 失败 / 被判死),error 是**任务的**失败原因,不是取消失败 ——
+    # 按「取消失败、仍在计费」报正好说反(同前端 settleCancel)。
+    if r.get("error") and not r.get("cancel_noop"):
         sys.exit("⚠ 取消失败 — 云端仍在跑、仍在计费,去 Modal 控制台确认")
 
 
@@ -192,11 +196,12 @@ def cmd_deploy(args):
     # 否则在清单丢失 / 别的机器加过节点时,这次部署会把它们从镜像里删掉。
     node_sync.ensure_baked_file()
     try:
-        back = node_sync.reconcile_baked_with_cloud({**cfg, **plugin, "bridge_api_key": bridge_key})
+        rec = node_sync.reconcile_baked_with_cloud({**cfg, **plugin, "bridge_api_key": bridge_key})
     except node_sync.DeployBlocked as e:
         sys.exit(f"✗ {e}")
-    if back:
-        print(f"      节点清单:并回云端独有的 {len(back)} 个 —— {', '.join(back)}")
+    if rec.added:
+        print(f"      节点清单:并回云端独有的 {len(rec.added)} 个 —— {', '.join(rec.added)}")
+    print(node_sync.drift_message(rec), end="")
     print(f"[2/2] modal deploy(ComfyUI tag {cfg['comfyui_tag']},首次要构建镜像,10 分钟级)…")
     proc = subprocess.Popen(node_sync.deploy_command(), cwd=str(_HERE / "modal_app"), env=env,
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
