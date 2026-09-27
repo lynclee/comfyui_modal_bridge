@@ -372,3 +372,57 @@ def test_sync_nodes_refuses_entries_without_a_source(monkeypatch):
     assert st == 409, text
     assert "no_source" in text and wrote == [] and touched == [], \
         f"必须在写清单、碰云端之前拒绝(写了 {wrote},碰了 {touched})"
+
+
+def test_auto_deploy_never_changes_public_nodes_behind_your_back(monkeypatch, tmp_path):
+    """上传私有节点、依赖变了触发的自动部署,以前会把同名公共节点从云端的新 commit 换成本机清单里的
+    旧 commit,rc=0(2026-09-27 review 用真实路由复现)。上传私有节点不等于同意回退公共节点。"""
+    import comfyui_modal_bridge.routes as rt
+    ns_ = rt.node_sync
+    monkeypatch.setattr(ns_, "DATA_FILE", tmp_path / "_custom_nodes_data.py")
+    cloud = [{"name": "public-node", "url": "https://x/node", "commit": "new-commit"}]
+    monkeypatch.setattr(ns_, "fetch_cloud_nodes", lambda cfg: (["public-node"], cloud))
+    installed = {"commit": "old-commit"}
+    monkeypatch.setattr(ns_, "folder_git_info", lambda name: {
+        "has_git": True, "url": "https://x/node", "commit": installed["commit"]})
+    monkeypatch.setattr(ns_, "deploy_env", lambda cfg: {})
+    monkeypatch.setattr(rt.modal_volume, "modal_importable", lambda: True)
+    monkeypatch.setattr(rt.modal_volume, "record_deployed_reqs", lambda *a: None)
+    builds = []
+
+    async def upload(resp, work):
+        return {"uploaded": [], "failed": [], "digests": {"private-node": "d"}}
+    monkeypatch.setattr(rt, "_run_blocking_streamed", upload)
+    monkeypatch.setattr(rt, "_refresh_local_node_reqs", lambda cfg: ["new-dep==1"])
+
+    async def deployed(cfg):
+        return "old-hash"
+    monkeypatch.setattr(rt, "_deployed_reqs_hash", deployed)
+
+    async def ensure(resp):
+        return 0
+    monkeypatch.setattr(rt, "_ensure_modal", ensure)
+
+    async def deploy(resp, cmd, **kw):          # 截住,绝不真的 modal deploy
+        builds.append(ns_.read_baked_nodes())
+        return 0
+    monkeypatch.setattr(rt, "_run_streamed", deploy)
+
+    async def go(c):
+        r = await c.post("/modal_bridge/sync_local_nodes", json={"folders": ["private-node"]})
+        return await r.text()
+
+    ns_.write_baked_nodes([{**cloud[0], "commit": "old-commit"}])
+    text = _run(go)
+    assert builds == [] and "rc=1" in text, text[-400:]
+    # 前端弹窗取的是最后一行带 ✗ 的内容:必须是阻断说明本身(点名 + 出路),不能被通用的
+    # 「依赖部署失败」盖掉 —— 那句会把人引去查 requirements(2026-09-27 review)
+    last = [ln for ln in text.splitlines() if "✗" in ln][-1]
+    assert "自动部署已中止" in last and "public-node" in last and "推送到云端" in last, last
+
+    # 清单只是陈旧(本机实际装的 = 云端):更正后照常自动部署,公共节点不动
+    installed["commit"] = "new-commit"
+    ns_.write_baked_nodes([{**cloud[0], "commit": "old-commit"}])
+    text = _run(go)
+    assert builds and builds[-1][0]["commit"] == "new-commit" and "rc=0" in text, text[-400:]
+

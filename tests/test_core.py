@@ -2094,13 +2094,13 @@ def test_cancel_on_a_dead_worker_answers_with_the_real_outcome():
 
 
 def test_run_treats_a_dead_prior_as_finished():
-    """/run 以前把死任务当活的:rerun=1 也被当成重复提交挡掉,永远重跑不了。"""
+    """/run 以前把死任务当活的:对重复提交回 queued / running,而不是真实结局(失败)。"""
     import ast
     src = MODAL_APP.read_text(encoding="utf-8")
     fn = next(n for n in ast.walk(ast.parse(src))
               if isinstance(n, ast.FunctionDef) and n.name == "run_endpoint")
     body = code_only(ast.get_source_segment(src, fn))
-    assert body.index("_effective(prior") < body.index('prior_status in ("queued", "running", "delivering")')
+    assert body.index("_effective(prior") < body.index("if prior_status:")
 
 
 def test_health_client_tells_why_it_could_not_read():
@@ -2246,31 +2246,25 @@ def _run_ns(state, events, fail=False):
     return ns
 
 
-def test_rerun_releases_a_queue_stale_prior_before_spawning_again():
-    """rerun 会删掉 :call(旧句柄)并写新记录。旧调用若还在队列里,开跑时读到新记录照样执行 ——
-    新旧两次都跑、都计费。必须先取消它;取消失败就不重跑。"""
+def test_a_job_id_runs_once_and_rerun_is_gone():
+    """rerun=1 复用终态 id 要删旧句柄、覆盖记录,和判死任务的原调用、并发 rerun、GC 各有一个竞态窗口,
+    多轮 review 反复抓到,而没有任何调用方用过它(2026-09-27 删除)。重跑用新 id。"""
     import time as _t
-    old = {"status": "queued", "queued_at": _t.time() - 7 * 3600}
     req = {"auth_key": "k", "job_id": "j", "workflow": {"1": {}}, "rerun": True}
-
+    for prior in ({"status": "completed", "completed_at": _t.time()},
+                  {"status": "queued", "queued_at": _t.time() - 7 * 3600}):
+        events = []
+        state = _PutDict({"j": dict(prior), "j:call": "fc-old"})
+        r = _load_endpoint("run_endpoint", _run_ns(state, events))(dict(req))
+        assert events == [] and r.get("duplicate"), f"不许复用 id 重跑,也不该去取消旧调用: {events} {r}"
+        assert state["j:call"] == "fc-old"
+    assert r["status"] == "failed", "判死的按真实结局回,不是 queued"
     events = []
-    state = _PutDict({"j": dict(old), "j:call": "fc-old"})
-    r = _load_endpoint("run_endpoint", _run_ns(state, events))(dict(req))
-    assert events == [("cancel", "fc-old"), ("spawn",)], f"必须先取消旧调用再 spawn: {events} {r}"
-    assert state["j:call"] == "fc-new"
-
-    events = []
-    state = _PutDict({"j": dict(old), "j:call": "fc-old"})
-    r = _load_endpoint("run_endpoint", _run_ns(state, events, fail=True))(dict(req))
-    assert ("spawn",) not in events and r.get("error"), f"取消失败不能重跑: {events} {r}"
-    assert state["j:call"] == "fc-old", "旧句柄不能丢,之后还要靠它取消"
-
-    events = []
-    state = _PutDict({"j": {"status": "completed", "completed_at": _t.time()}, "j:call": "fc-old"})
-    _load_endpoint("run_endpoint", _run_ns(state, events))(dict(req))
-    assert events == [("spawn",)], "正常终态重跑不该多一次取消 RPC"
-
-
+    state = _PutDict({})
+    _load_endpoint("run_endpoint", _run_ns(state, events))({**req, "job_id": "fresh"})
+    assert events == [("spawn",)], "新 id 照常提交"
+    src = code_only(MODAL_APP.read_text(encoding="utf-8"))
+    assert 'payload.get("rerun")' not in src
 def test_sweep_releases_a_queue_stale_call_before_forgetting_it():
     """GC 删掉记录后,旧调用开跑时读到空记录,起跑检查同样拦不住。取消失败就整条留着下次再试。"""
     import time as _t
@@ -2291,26 +2285,63 @@ def test_sweep_releases_a_queue_stale_call_before_forgetting_it():
             assert state == {}, state
 
 
-def test_deploy_reports_same_name_nodes_whose_commit_differs_from_the_cloud(tmp_path, monkeypatch):
-    """部署以本机清单为准:本机清单陈旧(别的机器部署过新版)时,同名节点会被静默降级。
-    只看 commit 分不出是有意回滚还是陈旧,所以不拦,但必须在部署日志里列出来(2026-09-26 review)。"""
+def test_deploy_resolves_same_name_drift_against_what_is_actually_installed(tmp_path, monkeypatch):
+    """部署以本机清单为准;清单陈旧时同名节点会被换成旧 commit。只看清单和云端分不出方向,
+    再对照本机实际装的:= 云端 → 清单陈旧,就地更正、不降级;否则留作差异(显式部署照推、自动部署停)。"""
     monkeypatch.setattr(node_sync, "DATA_FILE", tmp_path / "_custom_nodes_data.py")
-    node_sync.write_baked_nodes([{"name": "same", "url": "https://x/same", "commit": "old-commit"},
+    node_sync.write_baked_nodes([{"name": "stale", "url": "https://x/stale", "commit": "old"},
+                                 {"name": "rolled", "url": "https://x/rolled", "commit": "old"},
+                                 {"name": "gone", "url": "https://x/gone", "commit": "old"},
                                  {"name": "equal", "url": "https://x/equal.git", "commit": "c1"},
                                  {"name": "priv", "url": "https://u:tok@x/priv", "commit": "p1"}])
-    manifest = [{"name": "same", "url": "https://x/same", "commit": "new-commit"},
-                {"name": "equal", "url": "https://x/equal", "commit": "c1"},
-                {"name": "priv", "url": "https://x/priv", "commit": "p1", "url_redacted": True}]
-    monkeypatch.setattr(node_sync, "fetch_cloud_nodes", lambda cfg: (["same", "equal", "priv"], manifest))
+    manifest = [{"name": n, "url": f"https://x/{n}", "commit": "new"} for n in ("stale", "rolled", "gone")]
+    manifest += [{"name": "equal", "url": "https://x/equal", "commit": "c1"},
+                 {"name": "priv", "url": "https://x/priv", "commit": "p1", "url_redacted": True}]
+    monkeypatch.setattr(node_sync, "fetch_cloud_nodes", lambda cfg: ([m["name"] for m in manifest], manifest))
+    installed = {"stale": "new", "rolled": "old"}
+    monkeypatch.setattr(node_sync, "folder_git_info", lambda name: (
+        {"has_git": True, "url": f"https://x/{name}", "commit": installed[name]} if name in installed
+        else {"has_git": False}))
     rec = node_sync.reconcile_baked_with_cloud({})
-    assert rec.added == []
-    assert len(rec.drift) == 1 and "new-commit" in rec.drift[0] and "old-commit" in rec.drift[0], rec.drift
+    assert [c.split(":")[0] for c in rec.corrected] == ["stale"], rec
+    assert sorted(d.split(":")[0] for d in rec.drift) == ["gone", "rolled"], rec
+    baked = {n["name"]: n for n in node_sync.read_baked_nodes()}
+    assert baked["stale"]["commit"] == "new", "清单陈旧的要按实际安装更正,不能拿旧 commit 去部署"
+    assert baked["rolled"]["commit"] == "old" and baked["priv"]["url"] == "https://u:tok@x/priv"
     msg = node_sync.drift_message(rec)
-    assert "same" in msg and "tok" not in msg
+    assert "stale" in msg and "rolled" in msg and "tok" not in msg
     assert node_sync.drift_message(node_sync.Reconciled([], [])) == ""
-    assert "来源仓库也不同" in node_sync.commit_drift(
-        [{"name": "a", "url": "https://x/fork", "commit": "1"}],
-        [{"name": "a", "url": "https://x/orig", "commit": "1"}])[0]
+    assert node_sync.auto_deploy_blocker(rec), "有判断不了的差异,自动部署必须停"
+    assert node_sync.auto_deploy_blocker(node_sync.Reconciled([], [], ["x"])) == "", "只有更正的照常"
+    assert node_sync.auto_deploy_blocker(node_sync.Reconciled([], [], unchecked="timeout")), "没读到云端也要停"
+    assert "来源仓库也不同" in node_sync._drift_line({"name": "a", "url": "https://x/fork", "commit": "1"},
+                                                   {"name": "a", "url": "https://x/orig", "commit": "1"})
+def test_drift_ignores_credentials_and_names_registry_installs_correctly(tmp_path, monkeypatch):
+    """一台机器带 token 克隆、另一台不带:不是「来源仓库不同」,否则永远更正不了、自动部署永远被挡。
+    Registry / 压缩包装的节点有来源但没有 commit,不能说成「没装」。"""
+    assert node_sync._norm_repo("https://ghp_x@github.com/o/p.git/") == node_sync._norm_repo("https://github.com/O/p")
+    assert node_sync._norm_repo("https://u:pw@github.com/o/p") == "https://github.com/o/p"
+    monkeypatch.setattr(node_sync, "DATA_FILE", tmp_path / "_custom_nodes_data.py")
+    node_sync.write_baked_nodes([{"name": "tok", "url": "https://tok@github.com/o/p", "commit": "N"},
+                                 {"name": "cnr", "url": "https://github.com/o/cnr", "commit": "old"}])
+    manifest = [{"name": "tok", "url": "https://github.com/o/p", "commit": "N"},
+                {"name": "cnr", "url": "https://github.com/o/cnr", "commit": "new"}]
+    monkeypatch.setattr(node_sync, "fetch_cloud_nodes", lambda cfg: (["tok", "cnr"], manifest))
+    monkeypatch.setattr(node_sync, "folder_git_info", lambda name: {"has_git": True, "url": "https://github.com/o/cnr",
+                                                                   "commit": ""})
+    rec = node_sync.reconcile_baked_with_cloud({})
+    assert [d.split(":")[0] for d in rec.drift] == ["cnr"], rec
+    assert "已装" in rec.drift[0] and "没装" not in rec.drift[0], rec.drift
+    stop = node_sync.auto_deploy_blocker(rec)
+    assert "\n" not in stop and "cnr" in stop and "推送到云端" in stop, "阻断说明要单行、点名、给出路"
+
+
+def test_frontend_gives_the_blocked_auto_deploy_its_own_explanation():
+    js = (ROOT / "web" / "modal_bridge.js").read_text(encoding="utf-8")
+    i = js.index("const res = await syncLocalNodes(")
+    seg = js[i:i + 900]
+    assert "自动部署已中止" in seg and "node.auto_deploy_blocked" in seg, "被阻断时不能落到「查 requirements」的通用文案"
+    assert "requirements" not in js[js.index('"node.auto_deploy_blocked"'):js.index('"node.local_fail":')]
 
 
 def test_unreadable_cloud_is_reported_not_passed_off_as_no_drift(tmp_path, monkeypatch):
@@ -2443,27 +2474,6 @@ def test_interrupt_comfy_does_not_claim_success_on_http_errors(capsys):
     assert "/queue 失败" in out and "/interrupt 失败" in out, out
 
 
-def test_sweep_leaves_a_record_replaced_by_a_concurrent_rerun_alone():
-    """sweep 拿快照后,别的容器把这条 rerun 成了新的一次。删它 = 删掉新任务,取消更会取消掉**新**调用。"""
-    import time as _t
-    stale = _extract_nested(MODAL_APP, "_stale_reason",
-                            {"WORKER_TIMEOUT": 1200, "_STALE_GRACE_S": 120, "_QUEUE_STALE_S": 6 * 3600})
-    eff = _extract_nested(MODAL_APP, "_effective", {"_stale_reason": stale})
-    old = {"status": "queued", "queued_at": _t.time() - 30 * 3600}
-    new = {"status": "queued", "queued_at": _t.time()}
-
-    class Snapshotted(dict):
-        def items(self):
-            return [("q", old)]
-    events = []
-    state = Snapshotted({"q": new, "q:call": "fc-new"})
-    sweep = _load_sweep(state, lambda path, recursive=False: None, ttl=3600)
-    sweep.__globals__.update({"_stale_reason": stale, "_effective": eff,
-                              "_release_stale_call": _release_fn(state, events)})
-    sweep()
-    assert events == [] and state.get("q") == new and state.get("q:call") == "fc-new", (events, dict(state))
-
-
 def test_sweep_never_breaks_the_submission_and_budgets_its_rpcs():
     """GC 在 /run 里跑:它抛异常就是用户这次提交 500;它的 RPC 也吃 /run 的 60s,要受预算约束。"""
     import time as _t
@@ -2505,6 +2515,36 @@ def test_sweep_never_breaks_the_submission_and_budgets_its_rpcs():
     assert "q" in flaky
 
 
+def test_sweep_cancels_the_handle_it_checked_not_whatever_is_there_now():
+    """GC 核对的是快照里的那次提交。取消时若现读句柄,核对之后、取消之前被换掉的话取消的就是新调用
+    (2026-09-27 review 复现:cancel(old) → spawn(new) → cancel(new))。"""
+    import time as _t
+    stale = _extract_nested(MODAL_APP, "_stale_reason",
+                            {"WORKER_TIMEOUT": 1200, "_STALE_GRACE_S": 120, "_QUEUE_STALE_S": 6 * 3600})
+    eff = _extract_nested(MODAL_APP, "_effective", {"_stale_reason": stale})
+    rec = {"status": "queued", "queued_at": _t.time() - 30 * 3600}
+
+    class Snapshotted(dict):
+        def items(self):
+            return [("q", rec), ("q:call", "fc-old")]
+    events = []
+    state = Snapshotted({"q": dict(rec), "q:call": "fc-new"})
+    sweep = _load_sweep(state, lambda path, recursive=False: None, ttl=3600)
+    sweep.__globals__.update({"_stale_reason": stale, "_effective": eff,
+                              "_release_stale_call": _release_fn(state, events)})
+    sweep()
+    assert events == [("cancel", "fc-old")], events
+
+    # 占位句柄(run_endpoint 写了 pending 后被杀,spawn 没成):没有可取消的,别拿 "pending" 去发 RPC
+    events = []
+    state = {"p": dict(rec), "p:call": "pending"}
+    sweep = _load_sweep(state, lambda path, recursive=False: None, ttl=3600)
+    sweep.__globals__.update({"_stale_reason": stale, "_effective": eff,
+                              "_release_stale_call": _release_fn(state, events)})
+    sweep()
+    assert events == [] and state == {}, (events, state)
+
+
 def test_sweep_does_not_forget_a_job_that_came_back_to_life():
     """快照里判死,之后 Modal 的自动重试(或迟到的原调用)开跑、写回 running。照快照删 = 任务在跑、在计费,
     记录和产物却没了(2026-09-26 review 复现)。"""
@@ -2526,21 +2566,6 @@ def test_sweep_does_not_forget_a_job_that_came_back_to_life():
                               "_release_stale_call": _release_fn(state, events)})
     sweep()
     assert removed == [] and events == [] and state.get("x") == alive, (removed, events, dict(state))
-
-
-def test_sweep_keeps_a_finished_job_that_was_rerun_after_the_snapshot():
-    """终态记录不重读,靠 :call 认「是不是同一次提交」:快照之后别的容器把它 rerun 了,句柄就变了。"""
-    import time as _t
-    snap = {"status": "completed", "completed_at": _t.time() - 7200}
-    new = {"status": "queued", "queued_at": _t.time()}
-
-    class Snapshotted(dict):
-        def items(self):
-            return [("c", snap), ("c:call", "fc-old")]
-    removed = []
-    state = Snapshotted({"c": new, "c:call": "fc-new"})
-    _load_sweep(state, lambda path, recursive=False: removed.append(path))()
-    assert removed == [] and state.get("c") == new and state.get("c:call") == "fc-new", (removed, dict(state))
 
 
 def test_sweep_caps_cancel_rpcs_when_they_keep_failing():
@@ -2594,19 +2619,6 @@ def test_cancel_treats_an_expired_call_as_ended_not_as_still_billing():
                "modal": types.SimpleNamespace(FunctionCall=types.SimpleNamespace(from_id=gone))})
     r = _load_endpoint("cancel_endpoint", ns)({"job_id": "old", "auth_key": "k"})
     assert r.get("cancel_noop") and r["status"] == "completed" and "cancel failed" not in (r.get("error") or ""), r
-
-
-def test_old_call_cancelled_by_a_rerun_does_not_cancel_the_rerun():
-    """旧调用刚开跑就被 rerun 取消:它的取消分支若照旧落定 cancelled,盖掉的是 rerun 的新记录,
-    新调用起跑时看到 cancelled 直接跳过(2026-09-26 review)。只许落定自己这次提交的记录。"""
-    import ast
-    src = MODAL_APP.read_text(encoding="utf-8")
-    fn = next(n for n in ast.walk(ast.parse(src))
-              if isinstance(n, ast.FunctionDef) and n.name == "_worker_run")
-    body = code_only(ast.get_source_segment(src, fn))
-    i = body.index('"InputCancellation"')
-    assert 'cur.get("queued_at") == run_token' in body[i:i + 900], "取消分支没核对是不是自己这次提交"
-    assert body.index('run_token = cur.get("queued_at")') < body.index("try:", body.index("run_token"))
 
 
 def test_cli_cancel_does_not_cry_billing_when_the_job_already_ended(monkeypatch):
@@ -3278,7 +3290,8 @@ def _load_sweep(job_state, remove_file, *, budget=10, ttl=3600, job_max=200):
         "print": lambda *a, **k: None,
         "_stale_reason": lambda s, now: "",
         "_effective": lambda s, now: s,
-        "_release_stale_call": lambda jid, s: "",
+        "_release_stale_call": lambda jid, s, call_id=None: "",
+        "_CALL_PENDING": "pending",
         "_SWEEP_EVERY_S": 0, "_last_sweep": [0.0],      # 默认关节流,节流另有专门测试
         "_is_already_gone": _extract_nested(ROOT / "modal_app" / "modal_app.py",
                                             "_is_already_gone", {}),

@@ -1300,6 +1300,7 @@ def _setup_routes():
                         await _emit(resp, f"== 私有节点依赖已变化({len(reqs)} 条),自动重新部署 ==\n")
                         # 同 /deploy:这里也拿本机清单当全局清单部署,先并回云端独有的节点。
                         node_sync.ensure_baked_file()
+                        _blocked = False
                         try:
                             _rec = await asyncio.to_thread(node_sync.reconcile_baked_with_cloud, latest_cfg)
                             if _rec.added:
@@ -1308,7 +1309,18 @@ def _setup_routes():
                             _drift = node_sync.drift_message(_rec)
                             if _drift:
                                 await _emit(resp, _drift)
-                            rc = await _ensure_modal(resp)
+                            # 自动部署不替用户决定公共节点的版本:有判断不了的差异 / 没读到云端就停,
+                            # 交给显式的「推送到云端」(2026-09-27 review)。
+                            # ⚠ 前端弹窗取的是**最后一行**带 ✗ 的内容:阻断说明必须是单行、且之后不能再
+                            #   落到下面那句通用的「依赖部署失败」—— 那句会把用户引去查 requirements。
+                            _stop = node_sync.auto_deploy_blocker(_rec)
+                            if _stop:
+                                _blocked = True
+                                print(f"[modal_bridge] ✗ {_stop}\n{_drift}", end="")
+                                await _emit(resp, f"== ✗ {_stop} ==\n")
+                                rc = 1
+                            else:
+                                rc = await _ensure_modal(resp)
                         except node_sync.DeployBlocked as _blk:
                             await _emit(resp, f"== ✗ {_blk} ==\n")
                             rc = 1
@@ -1324,7 +1336,7 @@ def _setup_routes():
                             cfg_mod.save_config(final_cfg)
                             await asyncio.to_thread(modal_volume.record_deployed_reqs, latest_cfg, reqs)
                             await _emit(resp, "== ✓ 私有节点依赖镜像已更新 ==\n")
-                        else:
+                        elif not _blocked:
                             await _emit(resp, "== ✗ 私有节点依赖部署失败,停止本次提交 ==\n")
                 except Exception as e:
                     rc = 1

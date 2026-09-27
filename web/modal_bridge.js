@@ -131,6 +131,8 @@ const I18N = {
                         en: "{n} private node(s) changed and must be pushed to the cloud first:\n\n  {list}\n\nPushing the code is instant; but if their requirements.txt also changed, the image has to be rebuilt (~3-5 min).\n\nOK: push now and continue submitting.\nCancel: abort this submission — running without pushing means the cloud uses stale code, producing results that differ from your edits with no error at all." },
   "node.local_push_cancelled":{ zh: "已取消 —— 未推送私有节点,本次提交中止(避免云端静默跑旧代码)",
                         en: "Cancelled — private nodes were not pushed and the submission was aborted (prevents the cloud silently running stale code)." },
+  "node.auto_deploy_blocked": { zh: "已停止提交:\n\n{msg}\n\n上传私有节点触发的自动部署不会替你改公共节点的版本。在 Modal 面板里点「推送到云端」确认部署,完成后再提交即可。",
+                        en: "Submission stopped:\n\n{msg}\n\nThe automatic deploy triggered by uploading private nodes will not change public node versions for you. Click \"Push to cloud\" in the Modal panel to confirm the deploy, then submit again." },
   "node.local_fail":  { zh: "本地节点上传失败,已停止提交,避免云端静默运行旧版本。请修复上面的上传错误后重试。",
                         en: "Local node upload failed. Submission was stopped to prevent the cloud from silently running stale code. Fix the upload error above and retry." },
   "node.local_rm_fail": { zh: "旧的本地节点覆盖包清理失败: {list}",
@@ -847,8 +849,11 @@ async function ensureNodesAvailable(prompt, ctx) {
     // 要覆盖本次工作流用到的**全部**私有节点(提交时要带上完整版本契约)。
     const res = await syncLocalNodes(local_pack, ctx);
     if (!res.ok) {
-      throw new Error(res.message
-        ? t("node.local_fail_detail", { msg: res.message })
+      // 自动部署被阻断(同名公共节点版本与云端不同 / 读不到云端):出路是「推送到云端」,
+      // 不是查 requirements —— 通用文案会把人引错方向(2026-09-27 review)。
+      const blocked = (res.message || "").includes("自动部署已中止");
+      throw new Error(blocked ? t("node.auto_deploy_blocked", { msg: res.message })
+        : res.message ? t("node.local_fail_detail", { msg: res.message })
         : t("node.local_fail"));
     }
   }
