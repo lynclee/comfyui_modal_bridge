@@ -2882,6 +2882,17 @@ def test_classify_asset_type():
     assert cw.classify_asset_type("noext", "images") == "image"  # 再兜底 image
 
 
+def test_discover_outputs_never_returns_the_input_media():
+    """v0.37.2 的 LoadVideo 返回 ui=preview_input_video(...),history outputs 里多一条 type="input" 的视频。
+    只跳 temp 的话,参考视频被当成产物、还排在真产物前面(2026-09-27 comfyagent h3_r2v 实测)。"""
+    sys.path.insert(0, str(ROOT / "modal_app"))
+    import _comfy_ws as cw
+    outputs = {"12": {"images": [{"filename": "e5952147c218d7ea.mp4", "subfolder": "", "type": "input"}],
+                      "animated": [True]},
+               "92": {"images": [{"filename": "MiniMax_H3_00001_.mp4", "subfolder": "", "type": "output"}]}}
+    assert [r["filename"] for r in cw.discover_outputs(outputs)] == ["MiniMax_H3_00001_.mp4"]
+
+
 def test_discover_outputs_dict_and_bare_string():
     """dict 形态照收;裸文件名按扩展名筛(camera_info 等非文件串不收);temp 跳过;去重。"""
     cw = _comfy_ws()

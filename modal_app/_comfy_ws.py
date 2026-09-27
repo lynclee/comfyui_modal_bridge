@@ -339,7 +339,7 @@ def get_image_data(filename: str, subfolder: str, image_type: str) -> bytes | No
 
 
 def discover_outputs(outputs: dict) -> list[dict]:
-    """从 history 的 outputs 里「发现」所有非 temp 产物 —— 只返回引用,不读文件内容。
+    """从 history 的 outputs 里「发现」所有产物(跳过 temp / input)—— 只返回引用,不读文件内容。
     纯函数(可单测)。每条:{filename, subfolder, type, node_id, key, asset_type}。
     扫每个输出节点的每个输出键:
       - dict 形态({filename,...},images/gifs/videos 等):按原样收
@@ -366,7 +366,10 @@ def discover_outputs(outputs: dict) -> list[dict]:
                     filename, subfolder, img_type = item, "", "output"
                 else:
                     continue
-                if img_type == "temp":
+                # temp = 预览图;input = 用户上传的输入素材。v0.37.2 起 LoadVideo 会把输入视频作为 ui 预览
+                # 放进 outputs(type="input"),以前只跳 temp,参考视频就被当成产物返回、还排在真产物前面,
+                # 取「第一个 mp4」的调用方拿到的是参考视频(2026-09-27 comfyagent 在 h3_r2v 上撞到)。
+                if img_type in ("temp", "input"):
                     continue
                 dkey = (str(node_id), filename, subfolder)
                 if dkey in seen:
