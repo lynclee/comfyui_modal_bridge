@@ -29,3 +29,6 @@ node.zip
 # 一个 `git add -A` 就会把上百个第三方文件塞进仓库、进而进 Registry 包。
 .venv/
 venv/
+
+# uv 在插件目录里生成的锁文件(本仓库不用 uv 管依赖,ComfyUI 按 requirements.txt 装)
+uv.lock
