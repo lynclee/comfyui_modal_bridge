@@ -426,3 +426,9 @@ def test_auto_deploy_never_changes_public_nodes_behind_your_back(monkeypatch, tm
     text = _run(go)
     assert builds and builds[-1][0]["commit"] == "new-commit" and "rc=0" in text, text[-400:]
 
+    # 云端报了名字却没报版本(老云端 / 读清单失败):比对不了,同样不能替用户推
+    monkeypatch.setattr(ns_, "fetch_cloud_nodes", lambda cfg: (["public-node"], None))
+    ns_.write_baked_nodes([{**cloud[0], "commit": "old-commit"}])
+    n = len(builds)
+    text = _run(go)
+    assert len(builds) == n and "rc=1" in text, text[-400:]

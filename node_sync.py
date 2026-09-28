@@ -320,7 +320,8 @@ class Reconciled(NamedTuple):
 def _norm_repo(u: str) -> str:
     """同一仓库的不同写法归一:去掉 URL 里的凭据(https://tok@host/...)、结尾的 / 和 .git、大小写。
     不去凭据的话,一台机器带 token 克隆、另一台不带,就被当成「来源仓库不同」,永远更正不了。"""
-    u = re.sub(r"^([a-z][a-z0-9+.-]*://)[^/@]*@", r"\1", (u or "").strip(), flags=re.I)
+    # 按**最后一个** @ 切(同 urlsplit / 云端 _redact_url):密码里有未转义的 @ 时,只切到第一个会留下半截凭据
+    u = re.sub(r"^([a-z][a-z0-9+.-]*://)[^/]*@", r"\1", (u or "").strip(), flags=re.I)
     return u.rstrip("/").removesuffix(".git").lower()
 
 
@@ -328,16 +329,28 @@ def _show_commit(c: str) -> str:
     return c[:12] if c else "未钉 commit(构建时取最新)"
 
 
+def _same_repo(a: str, b: str) -> bool:
+    """去掉凭据后比 scheme / host / path。任一边为空 = 来源未知,不算同一仓库。
+
+    ⚠ /health 的脱敏只去掉 userinfo,host / path 都还在,照样能比。以前见 url_redacted 就跳过仓库比较,
+      自动更正会拼出「清单里的旧仓库地址 + 云端新仓库的 commit」,commit 不在旧仓库时构建失败
+      (2026-09-28 review)。脱敏时解析失败会回空串,落到「未知」,不会被当成相同。"""
+    na, nb = _norm_repo(a), _norm_repo(b)
+    return bool(na) and na == nb
+
+
 def _same_source(entry: dict, cloud: dict) -> bool:
-    """同一仓库 + 同一 commit。被 /health 脱敏的 url 比不了,只比 commit。"""
-    same_repo = bool(cloud.get("url_redacted")) or _norm_repo(entry.get("url")) == _norm_repo(cloud.get("url"))
-    return same_repo and (entry.get("commit") or "").strip() == (cloud.get("commit") or "").strip()
+    """同一仓库 + 同一 commit。"""
+    return _same_repo(entry.get("url"), cloud.get("url")) and \
+        (entry.get("commit") or "").strip() == (cloud.get("commit") or "").strip()
 
 
 def _drift_line(n: dict, c: dict) -> str:
     lc, cc = (n.get("commit") or "").strip(), (c.get("commit") or "").strip()
     line = f"{n.get('name')}: 云端 {_show_commit(cc)} → 本次部署 {_show_commit(lc)}"
-    if not (c.get("url_redacted") or _norm_repo(n.get("url")) == _norm_repo(c.get("url"))):
+    if not (c.get("url") or "").strip():
+        line += "(云端没报来源,确认不了是不是同一仓库)"
+    elif not _same_repo(n.get("url"), c.get("url")):
         line += "(来源仓库也不同)"
     return line
 
@@ -355,22 +368,32 @@ def commit_drift(local: list, manifest: list | None) -> list[tuple[dict, dict]]:
             if n.get("name") in cloud and not _same_source(n, cloud[n.get("name")])]
 
 
-def resolve_drift(local: list, manifest: list | None) -> tuple[list[str], list[str]]:
+def resolve_drift(local: list, manifest: list | None, names: list | None = None) -> tuple[list[str], list[str]]:
     """对照本机 custom_nodes 实际装的版本,把 commit_drift 的每一条分成两类:(drift, corrected)。
 
     · 本机实际装的 == 云端:本机清单只是陈旧(云端已是本机在用的版本)。**就地更正 local 里的条目**,
       这次部署不会改动云端 —— 最常见的情况,零摩擦。
-    · 其它(本机装的就是清单里那个、没装、没 git、读不到):判断不了谁对,原样留作 drift。
+    · 其它(本机装的就是清单里那个、没装、没 git、读不到、云端来源未知):判断不了谁对,原样留作 drift。
       显式部署照推(「推送到云端」= 把本机状态推上去)并逐条列出;自动部署必须停下(见 routes)。
+    · names(云端实际装的节点名)里有、manifest 里却没有它的版本:同样比不了,列为 drift。
+      manifest 整个缺失的情况由调用方标 unchecked(reconcile_baked_with_cloud)。
     ⚠ 说明行不打印 url:私有仓库的 url 常带凭据。"""
     drift, corrected = [], []
+    if manifest is not None and names:
+        reported = {e.get("name") for e in manifest if isinstance(e, dict)}
+        drift += [f"{n.get('name')}: 云端装着它,但没报它的版本,比对不了" for n in local
+                  if n.get("name") in names and n.get("name") not in reported]
     for n, c in commit_drift(local, manifest):
         try:
             g = folder_git_info(n.get("name"))
         except Exception:
             g = {}
         inst = {"url": g.get("url") or "", "commit": (g.get("commit") or "").strip()}
-        if g.get("has_git") and inst["commit"] and _same_source(inst, c):
+        # 要连地址一起换(仓库搬过家),而云端那条是带凭据的私有仓库、本机地址却没带凭据(ssh / 凭据助手克隆):
+        # 换过去的地址构建时克隆不下来,整个镜像构建失败(2026-09-28 review)。这种不自动更正,留作差异。
+        moved_private = c.get("url_redacted") and not _same_repo(n.get("url"), c.get("url")) \
+            and "@" not in inst["url"].split("://", 1)[-1].split("/", 1)[0]
+        if g.get("has_git") and inst["commit"] and _same_source(inst, c) and not moved_private:
             old = (n.get("commit") or "").strip()
             n["commit"] = inst["commit"]
             if not _same_source(n, c):          # 仓库也变了(清单里是旧地址)→ 连地址一起更正
@@ -384,6 +407,8 @@ def resolve_drift(local: list, manifest: list | None) -> tuple[list[str], list[s
                 installed = "已装,但没有 git 记录的 commit(Registry / 压缩包安装)"
             else:
                 installed = "没装,或读不到来源"
+            if moved_private and g.get("has_git") and _same_source(inst, c):
+                installed += "(与云端一致,但云端是带凭据的私有仓库、本机地址不带凭据,没有自动改地址)"
             drift.append(f"{_drift_line(n, c)};本机实际装的:{installed}")
     return drift, corrected
 
@@ -415,9 +440,14 @@ def reconcile_baked_with_cloud(cfg: dict) -> Reconciled:
                 f"清单,继续部署可能清空云端全部自定义节点,已中止。\n"
                 f"处理:检查网络 / bridge key 后重试。若确认云端不需要任何自定义节点,可在 Modal 控制台"
                 f"删掉这个 app 再部署(会按全新部署处理)。") from None
-        return Reconciled([], [], unchecked=str(e))
+        return Reconciled([], [], unchecked=f"读不到云端节点清单:{e};云端独有的节点也没法并回")
     local = read_baked_nodes()
-    drift, corrected = resolve_drift(local, manifest)   # 更正会就地改 local 的条目,下面一并写回
+    # 云端报了名字却没报版本(云端早于 0.8.48,或它读清单失败):同名节点一个都比不了。
+    # 以前当成「没差异」,自动部署照推本机的旧 commit(2026-09-28 review)。
+    unchecked = ""
+    if manifest is None and any(n.get("name") in names for n in local):
+        unchecked = "云端没报节点版本(云端早于 0.8.48,或它读取清单失败),同名节点比对不了"
+    drift, corrected = resolve_drift(local, manifest, names)   # 更正会就地改 local 的条目,下面一并写回
     have = {n.get("name") for n in local}
     missing = [n for n in names if n not in have]
     back = []
@@ -429,14 +459,14 @@ def reconcile_baked_with_cloud(cfg: dict) -> Reconciled:
             raise DeployBlocked(unresolved_nodes_message(lost))   # 中止时什么都不写
     if back or corrected:
         write_baked_nodes(local + back)
-    return Reconciled([e["name"] for e in back], drift, corrected)
+    return Reconciled([e["name"] for e in back], drift, corrected, unchecked)
 
 
 def drift_message(rec: Reconciled) -> str:
     """reconcile 的结果 → 部署日志里的一段(多行,已含缩进和结尾换行);没差异也没跳过返回空串。"""
     if rec.unchecked:
-        return (f"   ⚠ 读不到云端节点清单({rec.unchecked}),本次没能比对:云端独有的节点会不会被删、"
-                f"同名节点会不会被换成本机清单里的版本\n")
+        return (f"   ⚠ 没能比对云端节点({rec.unchecked})。本次部署以本机清单为准,"
+                f"同名节点可能被换成清单里的版本\n")
     out = ""
     if rec.corrected:
         out += ("   ✓ 本机节点清单陈旧,已按本机实际装的版本更正(与云端一致,这次不会改动它们):\n"
@@ -457,7 +487,7 @@ def auto_deploy_blocker(rec: Reconciled) -> str:
         return ""
     # ⚠ 必须是**单行**:前端弹窗只取最后一行带 ✗ 的内容,明细在上面几行里用户看不到,所以点名写进来
     if rec.unchecked:
-        why = f"读不到云端节点清单({rec.unchecked}),确认不了这次会不会改动公共节点"
+        why = f"没能比对云端节点({' '.join(rec.unchecked.split())}),确认不了这次会不会改动公共节点"
     else:
         names = [d.split(":", 1)[0] for d in rec.drift]
         shown = "、".join(names[:5]) + (f" 等 {len(names)} 个" if len(names) > 5 else "")

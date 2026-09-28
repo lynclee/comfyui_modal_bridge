@@ -2366,6 +2366,69 @@ def test_drift_ignores_credentials_and_names_registry_installs_correctly(tmp_pat
     assert "\n" not in stop and "cnr" in stop and "推送到云端" in stop, "阻断说明要单行、点名、给出路"
 
 
+def test_missing_versions_are_never_passed_off_as_no_drift(tmp_path, monkeypatch):
+    """云端报了节点名却没报版本(云端早于 0.8.48 / 它读清单失败),以前当成「没差异」,自动部署照推本机的
+    旧 commit(2026-09-28 review)。整份缺 → unchecked;缺个别 → 那一条列为 drift。"""
+    monkeypatch.setattr(node_sync, "DATA_FILE", tmp_path / "_custom_nodes_data.py")
+    monkeypatch.setattr(node_sync, "folder_git_info", lambda name: {"has_git": False})
+    node_sync.write_baked_nodes([{"name": "pub", "url": "https://x/pub", "commit": "old"},
+                                 {"name": "other", "url": "https://x/other", "commit": "o1"}])
+    monkeypatch.setattr(node_sync, "fetch_cloud_nodes", lambda cfg: (["pub", "other"], None))
+    rec = node_sync.reconcile_baked_with_cloud({})
+    assert rec.unchecked and node_sync.auto_deploy_blocker(rec), rec
+    assert "\n" not in node_sync.auto_deploy_blocker(rec)
+
+    monkeypatch.setattr(node_sync, "fetch_cloud_nodes", lambda cfg: (["cloud_only"], None))
+    monkeypatch.setattr(node_sync, "folder_git_info", lambda name: (
+        {"has_git": True, "url": "https://x/cloud_only", "commit": "c"} if name == "cloud_only" else {"has_git": False}))
+    rec = node_sync.reconcile_baked_with_cloud({})
+    assert rec.added == ["cloud_only"] and rec.unchecked == "", "没有同名节点就没什么可比,别挡"
+    node_sync.write_baked_nodes([{"name": "pub", "url": "https://x/pub", "commit": "old"},
+                                 {"name": "other", "url": "https://x/other", "commit": "o1"}])
+
+    monkeypatch.setattr(node_sync, "fetch_cloud_nodes", lambda cfg: (
+        ["pub", "other"], [{"name": "other", "url": "https://x/other", "commit": "o1"}]))
+    rec = node_sync.reconcile_baked_with_cloud({})
+    assert [d.split(":")[0] for d in rec.drift] == ["pub"] and "没报它的版本" in rec.drift[0], rec
+
+
+def test_redacted_cloud_url_still_compares_host_and_path(tmp_path, monkeypatch):
+    """脱敏只去掉 userinfo,host / path 都在。以前见 url_redacted 就跳过仓库比较,自动更正拼出
+    「清单里的旧仓库地址 + 云端新仓库的 commit」,commit 不在旧仓库时构建失败(2026-09-28 review)。"""
+    monkeypatch.setattr(node_sync, "DATA_FILE", tmp_path / "_custom_nodes_data.py")
+    node_sync.write_baked_nodes([{"name": "moved", "url": "https://tok@x/old-repo", "commit": "old"}])
+    manifest = [{"name": "moved", "url": "https://x/new-repo", "commit": "new", "url_redacted": True}]
+    monkeypatch.setattr(node_sync, "fetch_cloud_nodes", lambda cfg: (["moved"], manifest))
+    monkeypatch.setattr(node_sync, "folder_git_info", lambda name: {
+        "has_git": True, "url": "https://tok@x/new-repo", "commit": "new"})
+    rec = node_sync.reconcile_baked_with_cloud({})
+    baked = node_sync.read_baked_nodes()[0]
+    assert rec.corrected and baked["commit"] == "new" and node_sync._norm_repo(baked["url"]) == "https://x/new-repo", \
+        f"commit 和地址必须一起更正: {baked}"
+
+    # 云端地址解析不了(脱敏时回空串)= 来源未知:不许自动更正
+    node_sync.write_baked_nodes([{"name": "moved", "url": "https://x/old-repo", "commit": "old"}])
+    monkeypatch.setattr(node_sync, "fetch_cloud_nodes", lambda cfg: (
+        ["moved"], [{"name": "moved", "url": "", "commit": "new", "url_redacted": True}]))
+    rec = node_sync.reconcile_baked_with_cloud({})
+    assert not rec.corrected and rec.drift and "云端没报来源" in rec.drift[0], rec
+    assert node_sync.read_baked_nodes()[0]["commit"] == "old"
+    assert not node_sync._same_repo("", ""), "两边都不知道来源,不能算同一仓库"
+
+    # 密码里有未转义的 @:要按最后一个 @ 切,否则留下半截凭据、每次都判成「来源不同」
+    assert node_sync._norm_repo("https://u:p@ss@host/o/p") == "https://host/o/p"
+
+    # 私有仓库搬家 + 本机地址不带凭据:换过去的地址构建时克隆不下来,不许自动更正
+    node_sync.write_baked_nodes([{"name": "moved", "url": "https://tok@github.com/o/p-old", "commit": "old"}])
+    monkeypatch.setattr(node_sync, "fetch_cloud_nodes", lambda cfg: (
+        ["moved"], [{"name": "moved", "url": "https://github.com/o/p-new", "commit": "NEW", "url_redacted": True}]))
+    monkeypatch.setattr(node_sync, "folder_git_info", lambda name: {
+        "has_git": True, "url": "https://github.com/o/p-new", "commit": "NEW"})
+    rec = node_sync.reconcile_baked_with_cloud({})
+    assert not rec.corrected and rec.drift and "没有自动改地址" in rec.drift[0], rec
+    assert node_sync.read_baked_nodes()[0]["url"] == "https://tok@github.com/o/p-old"
+
+
 def test_frontend_gives_the_blocked_auto_deploy_its_own_explanation():
     js = (ROOT / "web" / "modal_bridge.js").read_text(encoding="utf-8")
     i = js.index("const res = await syncLocalNodes(")
