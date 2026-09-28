@@ -529,6 +529,30 @@ def _container_id() -> str:
     return _CONTAINER_ID or _new_container_id()
 
 
+# 实际卡型。worker 声明的是 gpu=list(Modal 按顺序 fallback),job 的 gpu 字段只是候选列表
+# (如 "H100→A100-80GB"),不是这单跑在哪张卡上。同 seed 对比、性能归因都要它:sm80 与 sm90 走不同的
+# attention kernel,comfyagent 同 seed 两单 PSNR 26.8 dB、卡型查不到,就没法归因(2026-09-28)。
+# 与容器指纹同理:只在 snap=False 的钩子里探测,别烤进内存快照(恢复到的可能是另一种卡)。
+_GPU_NAME = ""
+
+
+def _detect_gpu_name() -> str:
+    """nvidia-smi 读本容器的显卡型号(如 "NVIDIA H100 80GB HBM3"),CPU 容器 / 探测失败返回 ""。
+    同 _gpu_compute_cap,不为一个字符串付 torch 冷 import 的钱。"""
+    global _GPU_NAME
+    try:
+        out = subprocess.run(["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+                             capture_output=True, text=True, timeout=10).stdout.strip().splitlines()
+        _GPU_NAME = out[0].strip() if out else ""
+    except Exception:
+        _GPU_NAME = ""
+    return _GPU_NAME
+
+
+def _gpu_name() -> str:
+    return _GPU_NAME or _detect_gpu_name()
+
+
 def _worker_ensure_alive(self):
     """快照恢复路径上的正确性闸门 + 自愈(GPU/CPU worker 共用):快照关时直接返回;开时探活失败
     就原地重启子进程(退化为一次普通 boot,不比无快照更糟),而非 raise 杀容器进重试循环。
@@ -537,7 +561,8 @@ def _worker_ensure_alive(self):
     入口。那一行必须在下面的 _SNAPSHOT 早返回**之前**,否则关快照时永远不会掷。"""
     # 这行是容器级标记:一个真实容器恰好打一次,比 "ComfyUI ready" 可靠
     # (开快照时恢复的容器根本不 boot ComfyUI,那行不会出现)。
-    print(f"[bridge] container {_new_container_id()} up (snapshot={'on' if _SNAPSHOT else 'off'})")
+    print(f"[bridge] container {_new_container_id()} up gpu={_detect_gpu_name() or '-'} "
+          f"(snapshot={'on' if _SNAPSHOT else 'off'})")
     if not _SNAPSHOT:
         return
     import requests
@@ -601,7 +626,8 @@ def _worker_run(workflow: dict, job_id: str, input_images: list | None = None,
     # 归属标记:container= 与上面那行 "container <id> up" 对得上就能确定这单跑在哪个容器,
     # 从而直接读出冷/热。call= 是 Modal 的 function call id,把日志行连回提交方的句柄
     # (我们自己存在 job_state 的 "<job_id>:call" 里),便于两边对账。
-    print(f"[bridge] job {job_id} start container={_container_id()} "
+    gpu_actual = _gpu_name()
+    print(f"[bridge] job {job_id} start container={_container_id()} gpu={gpu_actual or '-'} "
           f"call={modal.current_function_call_id() or '?'}")
     cur = job_state.get(job_id) or {}
     if cur.get("status") in ("cancelled", "failed"):
@@ -613,7 +639,9 @@ def _worker_run(workflow: dict, job_id: str, input_images: list | None = None,
         print(f"[bridge] job {job_id}: 起跑前已是 {cur.get('status')},不执行")
         return {"skipped": cur.get("status")}
     job_state[job_id] = {**cur, "status": "running", "started_at": time.time(),
-                         "timeout_s": WORKER_TIMEOUT}   # 按任务记超时,见 _stale_reason
+                         "timeout_s": WORKER_TIMEOUT,   # 按任务记超时,见 _stale_reason
+                         # 实际卡型(gpu 字段只是候选列表,见 _GPU_NAME)。之后的写入都是 {**现有记录} 合并,会一路带到终态
+                         **({"gpu_actual": gpu_actual} if gpu_actual else {})}
     try:
         del job_state[f"{job_id}:progress"]   # 同 id 被回收后再提交时,别显示上一次的进度
     except Exception:

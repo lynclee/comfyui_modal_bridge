@@ -1371,6 +1371,36 @@ def test_container_id_changes_per_container_and_is_stable_within_one():
     assert get2() == "FRESH"
 
 
+def test_job_records_the_card_it_actually_ran_on():
+    """gpu 字段是候选列表(H100→A100-80GB),不是实际卡型;同 seed 对比、性能归因都要知道到底跑在哪张卡上
+    (sm80 / sm90 走不同 attention kernel,2026-09-28 comfyagent 同 seed 两单 26.8 dB 查不下去)。"""
+    import ast
+    src = MODAL_APP.read_text(encoding="utf-8")
+    tree = ast.parse(src)
+    for n in tree.body:   # 同容器指纹:模块级只能是空串,否则会被烤进快照
+        if isinstance(n, ast.Assign) and any(isinstance(x, ast.Name) and x.id == "_GPU_NAME" for x in n.targets):
+            assert isinstance(n.value, ast.Constant) and n.value.value == ""
+    def fn(name):
+        return next(x for x in ast.walk(tree) if isinstance(x, ast.FunctionDef) and x.name == name)
+    boot = ast.get_source_segment(src, fn("_worker_boot"))
+    assert "_detect_gpu_name" not in boot and "_gpu_name" not in boot, "snap=True 阶段探测会被烤进快照"
+    alive = ast.get_source_segment(src, fn("_worker_ensure_alive"))
+    assert alive.index("_detect_gpu_name(") < alive.index("if not _SNAPSHOT:"), "关快照时永远不会探测"
+    run = code_only(ast.get_source_segment(src, fn("_worker_run")))
+    i = run.index('"status": "running"')
+    assert '"gpu_actual"' in run[i:i + 400], "running 记录里没有实际卡型"
+
+    det = _extract_nested(MODAL_APP, "_detect_gpu_name", {"_GPU_NAME": "", "subprocess": types.SimpleNamespace(
+        run=lambda *a, **k: types.SimpleNamespace(stdout="NVIDIA A100-SXM4-80GB\n"))})
+    assert det() == "NVIDIA A100-SXM4-80GB" and det.__globals__["_GPU_NAME"] == "NVIDIA A100-SXM4-80GB"
+
+    def no_smi(*a, **k):
+        raise FileNotFoundError("nvidia-smi")
+    det_cpu = _extract_nested(MODAL_APP, "_detect_gpu_name", {"_GPU_NAME": "", "subprocess": types.SimpleNamespace(
+        run=no_smi)})
+    assert det_cpu() == "", "CPU 容器没有 nvidia-smi,返回空串而不是抛"
+
+
 def test_job_start_log_carries_container_and_call_id():
     """job 起跑那行必须同时带 container= 和 call= —— 少任一个都归不了因。
     ⚠ 断言打在真代码上(挖掉注释):这两个串在注释里也出现过,不挖注释的话删掉真代码照样绿。"""
