@@ -22,9 +22,12 @@
 
 ## 方式 A:GUI 部署(推荐,零终端)
 
-0.8.36 起，本机/远程浏览器都需首次配对 `local_api_capability`，之后才可管理或运行。
-它在服务器插件用户配置 `config.json` 中，首次管理请求会生成并在日志提示路径；
-用文件管理器打开，复制到配对弹窗即可，不要发送到聊天中。与 Modal Token ID/Secret 是两套凭据。
+ComfyUI 本机上的浏览器不需要配对(0.8.40 起);经局域网 / 反代 / 容器访问时,首次配对 `local_api_capability`。
+它在服务器插件用户配置 `config.json` 中,首次管理请求会生成并在日志提示路径;
+用文件管理器打开,复制到配对弹窗即可,不要发送到聊天中。与 Modal Token ID/Secret 是两套凭据。
+
+`config.json` 手改出错(比如多一个逗号)时,插件会报「config.json 第 N 行解析失败」并**拒绝写入**,
+不会再用默认值把它整份覆盖、清掉里面的 key 和 token。修好或删除该文件即可。
 
 点右上角 **[⚙️ Modal Setup]** → 填 Workspace / Token ID / Token Secret → **部署**。
 背后:ComfyUI Manager 安装声明依赖 → 建 Secret(随机生成私有鉴权 key `BRIDGE_API_KEY`)→ `modal deploy` → 写 config → 验证 health。手动 clone 需先安装一次 `requirements.txt`;首次拉镜像约 3-5 分钟。
@@ -101,6 +104,16 @@ bridge 扫工作流**所有输出节点**取产物并回填画板:
 
 点 [RunModal] 自动加工作流需要的节点。多台电脑各装一部分时:**只增不删,镜像 = 各机并集**,互不干扰。
 想清理:Setup →「管理云端节点」→ 勾选要移除的 → 移除并重部署(带"别的机器用到会失败"二次确认)。
+**删除只有这一个入口**:自动同步读不到云端节点清单时不会同步(提示稍后重试或点「推送到云端」),
+不会再按本机清单把云端独有的节点删掉。
+
+- **从 Comfy Registry(Manager)装的节点**:云端按你本机装的 **Registry 版本**下载安装,不再克隆 GitHub 最新代码
+  (两者经常不是同一版,例如 ComfyUI-GGUF 的 Registry 1.x 与 GitHub main 的 2.0)。
+- **同名节点版本与云端不同**:部署前对照本机实际装的版本。只是清单旧了(本机装的就是云端那版)会自动更正;
+  判断不了时,「推送到云端」照推并在日志列出,上传私有节点触发的自动部署会中止,提示你手动推送。
+- **多台机器部署同一个 app**:先把第一台 `config.json` 里的 `bridge_api_key` 抄到另一台的同一文件
+  (CLI 用 `bridge_cli configure --key`),再部署 —— 否则另一台会生成新 key,第一台和所有调用方会 401。
+  Modal Secret 现在按合并语义更新,一台机器部署不会抹掉另一台写进去的 HF / Civitai / comfy.org 凭据。
 
 ## ComfyUI 版本跟随 + 节点兼容自检
 
@@ -108,20 +121,27 @@ bridge 扫工作流**所有输出节点**取产物并回填画板:
 - 本机版本无对应 git tag(Desktop 偶尔跑在两个 tag 之间)→ **取最接近的 tag(平手取更老,不让云端比本地新)+ 部署日志警告**,不中止。
 - 本机升级 ComfyUI 后 → 点 RunModal 会**警告提示重新部署**让云端跟上(非硬拦,本次照常出图)。
 - health 回报 `deployed_comfyui_tag`;改 tag 会重 build clone 层及之后。兜底默认 `v0.22.0`。
+- **钉版本**:`config.json` 的 `comfyui_tag_pin` 非空时,云端固定用这个 tag,不再跟随本机(本机 Desktop 还没出新版、云端想先升时用);清空即恢复跟随。
 
 **节点兼容自检**:每次部署成功后,自动在云端**同一镜像**(便宜 GPU)里 boot 一次 ComfyUI,解析 ComfyUI 自己打印的 `(IMPORT FAILED)` 标记,逐个报告自定义节点导入成功 / 失败。
 - 失败 = 与当前 ComfyUI 版本不兼容 / 缺依赖 / commit 坏。
 - **只警告不阻断**:结果串进部署日志,坏节点不影响其它工作流;修好(本地换版本 / commit)后重新部署即可。
 - 也可手动跑:`cd modal_app && python -m modal run node_compat_check.py`。
 
-## Modal 端 endpoint(4 个,私有,自建 key 鉴权)
+## Modal 端 endpoint(5 个,私有,自建 key 鉴权)
 
 ```
 https://<ws>--comfyui-bridge-run.modal.run     (POST 跑 workflow)
 https://<ws>--comfyui-bridge-status.modal.run  (GET 查状态)
+https://<ws>--comfyui-bridge-fetch.modal.run   (GET 下载大文件产物,确认收齐后 ack 才删)
 https://<ws>--comfyui-bridge-cancel.modal.run  (POST 取消)
 https://<ws>--comfyui-bridge-health.modal.run  (GET 健康 + 已装 custom_nodes)
 ```
+
+协议细节(job_id 规则、状态值、取消语义、产物校验)见 [API.md](./API.md)。
+
+工作流里某个输出分支在云端校验失败(比如那一支用到的模型云端没有)时,**整单失败**并报出原因,
+不会只跑剩下的分支、静默少一份产物还照常计费。
 
 模型查/传全走本地 modal SDK,所以不需要 list/check/seed 这些 endpoint。
 
@@ -197,9 +217,13 @@ Push the current ComfyUI workflow to a Modal Serverless GPU (H100) with one clic
 
 ## Option A: GUI deploy (recommended, no terminal)
 
-Since 0.8.36, local and remote browsers must first pair using `local_api_capability` from the plugin's
-user `config.json` on the ComfyUI machine. The first management request generates it and logs its path.
-Open it in a file manager and copy the value into the prompt, not into chat. This is separate from your Modal credentials.
+Browsers on the ComfyUI machine itself need no pairing (since 0.8.40); over the LAN / a reverse proxy / a container,
+pair once using `local_api_capability` from the plugin's user `config.json` on the ComfyUI machine. The first
+management request generates it and logs its path. Open it in a file manager and copy the value into the prompt,
+not into chat. This is separate from your Modal credentials.
+
+If a hand edit breaks `config.json` (e.g. a stray comma), the plugin reports "config.json line N failed to parse"
+and **refuses to write** it, instead of overwriting it with defaults and wiping your keys and tokens. Fix or delete the file.
 
 Click **[⚙️ Modal Setup]** → fill Workspace / Token ID / Token Secret → **Deploy**.
 Behind the scenes: dependencies are installed by ComfyUI Manager → create Secret (random `BRIDGE_API_KEY`) → `modal deploy` → write config → verify health. A manual git clone must install `requirements.txt` once. First image pull ~3-5 min.
@@ -276,6 +300,18 @@ Workflows with API nodes need a comfy.org API key (generated at platform.comfy.o
 
 Clicking [RunModal] auto-adds nodes the workflow needs. Across machines that each install a subset: **add-only, image = union**, no cross-deletion.
 To clean up: Setup → "Manage cloud nodes" → check the ones to remove → remove & redeploy (with a "other machines using it will fail" confirmation).
+**That panel is the only way nodes get removed**: when auto-sync cannot read the cloud node list it does not sync
+(it asks you to retry or click "Push to cloud"), instead of deleting cloud-only nodes based on the local list.
+
+- **Nodes installed from the Comfy Registry (Manager)**: the cloud installs the same **Registry version** you have
+  locally, instead of cloning the latest GitHub code (often a different release, e.g. ComfyUI-GGUF Registry 1.x vs GitHub main 2.0).
+- **Same-name node, different version in the cloud**: before deploying, the plugin checks what is actually installed
+  locally. A merely stale local list (you have the cloud's version installed) is corrected automatically; when it cannot
+  tell, "Push to cloud" pushes and lists the differences, while the automatic deploy triggered by private-node uploads stops and asks you to push manually.
+- **Deploying one app from several machines**: copy `bridge_api_key` from the first machine's `config.json` into the same
+  file on the other machine (CLI: `bridge_cli configure --key`) before deploying, otherwise the other machine generates a new
+  key and everything else gets 401. The Modal Secret is now merged on update, so one machine's deploy no longer wipes the
+  HF / Civitai / comfy.org credentials another machine wrote.
 
 ## ComfyUI version follow + node compatibility self-check
 
@@ -289,14 +325,20 @@ To clean up: Setup → "Manage cloud nodes" → check the ones to remove → rem
 - **Warn-only, never blocks**: results stream into the deploy log; a broken node doesn't affect other workflows; fix it (bump version / commit locally) and redeploy.
 - Run manually too: `cd modal_app && python -m modal run node_compat_check.py`.
 
-## Modal endpoints (4, private, self-issued key auth)
+## Modal endpoints (5, private, self-issued key auth)
 
 ```
 https://<ws>--comfyui-bridge-run.modal.run     (POST run workflow)
 https://<ws>--comfyui-bridge-status.modal.run  (GET status)
+https://<ws>--comfyui-bridge-fetch.modal.run   (GET download large outputs; deleted only after an ack)
 https://<ws>--comfyui-bridge-cancel.modal.run  (POST cancel)
 https://<ws>--comfyui-bridge-health.modal.run  (GET health + installed custom_nodes)
 ```
+
+Protocol details (job_id rules, statuses, cancel semantics, output checks) are in [API.md](./API.md).
+
+If one output branch of a workflow fails validation in the cloud (e.g. a model it needs is missing there),
+the **whole job fails** with the reason, instead of silently running the other branches and billing for a partial result.
 
 Model list/upload all go through the local modal SDK, so no list/check/seed endpoints are needed.
 

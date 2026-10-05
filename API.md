@@ -25,7 +25,7 @@
 | 本地 HTTP 脚本 / MCP(直连 loopback) | 不需要请求头 |
 | MCP 经 `host.docker.internal` / 局域网 | 每次请求携带上述请求头；用 `MODAL_BRIDGE_LOCAL_CONFIG` 指向 0600 的 config.json，不要提交含真实值的配置 |
 | 直连云端的 standalone CLI / MCP cloud | 不受影响，仍使用 `bridge_api_key` |
-| 公开只读端点 | GET `/config`(脱敏)、`/health`、`/platform_status`、`/version` 不要求 capability |
+| 公开只读端点 | GET `/config`(脱敏)、`/health`、`/platform_status`、`/version` 不要求 capability。`/health` 对非本机、又没带有效 capability 的请求只回最小字段(见下文) |
 
 缺失/错误 token 返回 403 和 `X-Modal-Bridge-Auth: capability-required`，在解析请求体、
 写配置、上传、创建 Secret 或启动部署之前拒绝。本机跨站拒绝不发起配对。
@@ -57,7 +57,12 @@ curl -X POST http://127.0.0.1:8000/modal_bridge/submit \
 ```json
 {"ok": true, "job_id": "uuid", "gpu": "L40S", "input_image_count": 1, "worker_timeout_sec": 3600}
 ```
-`worker_timeout_sec` 是云端单任务上限——调用方的等待窗应 ≥ 它 + 3 分钟尾巴(decode/回传)。
+`worker_timeout_sec` 是云端单任务**执行**上限,从 worker 开始执行算起,不含排队和冷启动。
+调用方的截止线应从**第一次看到 `running`** 起算:那一刻 + `worker_timeout_sec` + 3 分钟尾巴(decode/回传)。
+从提交时刻起算的话,排队加冷启动一长,就会在任务完成前误判超时(2026-10-05 修过的前端 bug)。
+
+**提交结果未知**:HTTP 502 且正文带 `"outcome": "unknown"` 和 `job_id` 时,任务**可能已经在云端跑了**
+(网关超时、响应丢失)。不要重新提交,用这个 `job_id` 去 poll:查到就照常跟进,连续 not_found 才说明没落地。
 
 ### GET /modal_bridge/poll?job_id=…
 
@@ -65,9 +70,20 @@ curl -X POST http://127.0.0.1:8000/modal_bridge/submit \
 ```json
 {"status": "running", "progress": {"step": 4, "total": 20, "s_it": 50.6, "n_samples": 3, "elapsed": 210.5}}
 ```
-`status` ∈ `queued / running / completed / failed / cancelled`;`failed` 带 `error` 字符串;
+`status` 取值:
+
+| status | 含义 |
+|---|---|
+| `queued` / `running` / `delivering` | 进行中(`delivering` = 产物正在写回 / 交付) |
+| `completed` / `failed` / `cancelled` | 终态;`failed` 带 `error` 字符串 |
+| `not_found` | 云端查无此任务(已被回收,或 id 不对)。单次可能是跨容器读的延迟,**连续多次**(建议 5 次、间隔 ≥2s)才作数 |
+| `auth_failed` | 本机路由附加:bridge key 与云端不一致(云端 401)。终态,重新部署会刷新 key |
+| `unknown` | 本机路由附加:云端回了其它 HTTP 错误,带 `http_status`。按瞬态处理,继续 poll |
+
 `completed` 的完整对象作为下一步的 `modal_state` 原样传回。
+`gpu` 是部署时的**候选卡型链**(如 `H100→A100-80GB`),实际跑在哪张卡看 `gpu_actual`(如 `NVIDIA H100 80GB HBM3`)。
 `progress.s_it` 是滑窗中位数(≥3 个采样点才可信),可用于投影是否会撞 `worker_timeout_sec`。
+终态记录在云端只保留 1 小时(超过 200 条时更早裁剪),之后 poll 会得到 `not_found`。
 
 ### POST /modal_bridge/fetch_result
 
@@ -92,7 +108,14 @@ curl -X POST http://127.0.0.1:8000/modal_bridge/submit \
 
 ### POST /modal_bridge/cancel
 
-`{"job_id": "..."}` → 请求云端取消。**必须检查返回的 `ok`**:`ok:false` 表示云端还在跑、还在计费。
+`{"job_id": "..."}` → 请求云端取消。看 `still_billing`(`ok` 恒等于 `!still_billing`):
+
+| 返回 | 含义 |
+|---|---|
+| `still_billing: false`,`status: "cancelled"` | 取消成功 |
+| `still_billing: false`,`cancel_noop: true` | 任务早已结束(`status` 是真实结局:completed / failed / cancelled);completed 的产物照常取回(先 poll 拿完整状态) |
+| `still_billing: false`,`status: "not_found"` | 云端查无此任务,没有在跑 |
+| `still_billing: true` | **取消失败或结果未知,云端可能还在跑、还在计费**;`error` 说明原因,稍后重试取消 |
 
 ## 预检与估算
 
@@ -101,29 +124,28 @@ curl -X POST http://127.0.0.1:8000/modal_bridge/submit \
 | `/modal_bridge/estimate_vram` | POST | `{prompt}` | 返回 `{est_vram_gb, est_basis, category, total_mb, unknown[]}`。视频类在能从工作流抠出 分辨率×帧数 字面量时走激活公式(`est_basis:"activation"`,实测校准),否则回退权重×系数(`"legacy"`,偏保守) |
 | `/modal_bridge/check_required_inputs` | POST | `{prompt}` | 找出缺必填输入的节点(老工作流 × 新节点定义),`{missing:[{node_id, class_type, missing[]}]}` |
 | `/modal_bridge/check_models` | POST | `{prompt}` | 对比工作流所需模型 vs 云端 Volume,返回缺失清单 |
-| `/modal_bridge/check_nodes` | POST | `{prompt}` | 对比工作流 custom_node vs 云端镜像清单。分流:`add`/`update`(有 git 且已推送 → 进镜像,要重部署)、`local_pack`(自写节点或 commit 未推送 → 代码走 Volume；仅依赖变化时自动重部署)、`missing_no_git`(本地连目录都没有 → 补不了) |
+| `/modal_bridge/check_nodes` | POST | `{prompt}` | 对比工作流 custom_node vs 云端镜像清单。分流:`add`/`update`(有 git 且已推送,或从 Comfy Registry 装的 → 进镜像,要重部署;Registry 节点带 `version` / `old_version`)、`local_pack`(自写节点、commit 未推送、或云端克隆不了的地址 → 代码走 Volume;仅依赖变化时自动重部署;`reason: "unclonable"` 时带 `detail`)、`missing_no_git`(本地连目录都没有 → 补不了)。读不到云端、退回本机清单时带 `cloud_unchecked`(此时不要据此同步);读不到 Volume 上的私有节点名单时带 `volume_unchecked` |
 
 ## 同步与部署(耗时操作,内部有互斥锁)
 
 | 端点 | 方法 | 说明 |
 |---|---|---|
-| `/modal_bridge/sync_models` | POST | 本地模型 → Modal Volume(SDK batch_upload,CAS 去重) |
-| `/modal_bridge/sync_nodes` | POST | custom_node 清单同步 + 触发重新部署 |
+| `/modal_bridge/sync_models` | POST | 本地模型 → Modal Volume(SDK batch_upload,CAS 去重)。同路径大小不同会覆盖;最后一行汇总已同步 / 已存在跳过 / 被拒,有被拒的项 rc≠0 |
+| `/modal_bridge/sync_nodes` | POST | `{new_baked, summary?, prune?}` → custom_node 清单同步 + 重新部署。**删除必须显式**:只有 `prune` 里点名的节点会从镜像移除;云端有、`new_baked` 里没写、也不在 `prune` 里的节点会被自动并回。补不出来源、或读不到云端且这次会少掉节点时,返回 409 `{error, cloud_unchecked?, vanish?}` |
 | `/modal_bridge/sync_local_nodes` | POST | `{folders:[...]}` → 自写节点打包传 Volume；代码变化只重传,`requirements.txt` 变化会自动重建依赖层。每个包携带 manifest,支持多机恢复 |
-| `/modal_bridge/list_local_nodes` | GET | Volume 上现存的本地节点包名单 |
+| `/modal_bridge/list_local_nodes` | GET | Volume 上现存的本地节点包名单;读不到 Volume 时 `{ok:false, error}`,不会冒充「没有」 |
 | `/modal_bridge/remove_local_node` | POST | `{folder}` → 从 Volume 删掉某个本地节点包 |
-| `/modal_bridge/deploy` | POST | 重新部署云端 app(drain 语义:在跑的任务在旧版本上跑完) |
+| `/modal_bridge/deploy` | POST | 重新部署云端 app(drain 语义:在跑的任务在旧版本上跑完)。workspace / app 名不合规返回 rc=2;部署后 `/health` 仍 404 判失败 |
 | `/modal_bridge/list_nodes` | GET | 云端镜像当前的 custom_node 清单 |
 
 ## 状态与配置
 
 | 端点 | 方法 | 说明 |
 |---|---|---|
-| `/modal_bridge/health` | GET | 云端 app 健康(`{ok, modal:{...}}`) |
-| `/modal_bridge/version` | GET | 版本契约:`{local, deployed, match, reachable}`,不匹配应引导重新部署 |
+| `/modal_bridge/health` | GET | 云端 app 健康(`{ok, modal:{...}}`)。非本机、又没带有效 capability 的请求只回 `{ok, healthy, limited:true, detail}`:`healthy` 是最近一次完整检查的结论,不会为此唤醒云端容器,也不回节点清单 |
+| `/modal_bridge/version` | GET | 版本契约:`{local, deployed, match, reachable, err_kind}`。`err_kind` ∈ `not_deployed / unauthorized / http_error / timeout / unreachable / local_busy`;只有 `not_deployed` 和 `unauthorized` 应拦截提交 |
 | `/modal_bridge/platform_status` | GET | Modal 官方状态页聚合态(`operational/degraded/...`),区分平台故障 vs 未部署 |
-| `/modal_bridge/config` | GET/POST | GET 返回脱敏配置；POST 只接受 GPU/高级设置 allowlist,不能改凭据或管理鉴权字段 |
-| `/modal_bridge/bridge_key` | GET | 取回 bridge_api_key；本机同源直连放行，其余须持有效 admin capability |
+| `/modal_bridge/config` | GET/POST | GET 返回脱敏配置;POST 只接受 GPU/高级设置 allowlist,不能改凭据或管理鉴权字段。config.json 损坏(解析失败)时各路由返回 500 `{error, code:"config_corrupt"}`,并**拒绝写入** —— 修好或删除该文件后再用,插件不会用默认值覆盖它 |
 | `/modal_bridge/job_event` | POST | 前端/调用方上报客户端侧结局(`{job_id, event, detail}`)进后端日志留痕 |
 
 ## 无 ComfyUI 直连云端(standalone)
@@ -135,11 +157,19 @@ curl -X POST http://127.0.0.1:8000/modal_bridge/submit \
 
 | label | 方法 | 说明 |
 |---|---|---|
-| `-run` | POST | `{workflow, images?, gpu_class?, needs_gpu?, delivery?, auth_key}` → `{id, status, gpu}` |
-| `-status` | GET | `?job_id=&key=` → 状态对象(同上文 poll 的透传源) |
-| `-fetch` | GET | `?job_id=&path=<volume_path>&key=&delete=1` → **流式下载大文件产物**(路径囚笼在该 job 目录;这是外部消费者不需要 modal token 的关键) |
-| `-cancel` | POST | `{job_id, auth_key}` |
-| `-health` | GET | `?key=` → 部署版本/卡型/已装节点 |
+| `-run` | POST | `{workflow, job_id?, images?, gpu_class?, needs_gpu?, tier?, local_nodes?, delivery?, auth_key}` → `{id, status, gpu}`。`job_id` 是幂等键:同一 id 已有记录时回 `{id, status, gpu, duplicate:true}`,不会重复开任务 |
+| `-status` | GET | `?job_id=`,请求头 `X-Bridge-Key` → 状态对象(同上文 poll 的透传源;云端本身不回 `auth_failed` / `unknown`,那是本机路由加的) |
+| `-fetch` | GET | `?job_id=&path=<volume_path>`,请求头 `X-Bridge-Key` → **流式下载大文件产物**(路径囚笼在该 job 目录;这是外部消费者不需要 modal token 的关键)。下载**永不删除**;客户端确认所有文件完整落盘后再带 `ack=1` 请求一次,云端才删副本。旧的 `delete=1` 已停用(无操作) |
+| `-cancel` | POST | `{job_id, auth_key}` → 取消成功回 `status:"cancelled"`;任务早已结束回字段子集 `{id, status, error?, gpu, gpu_actual, completed_at, cancel_noop:true, was_running}`(不含产物);取消失败回 `{error}` |
+| `-health` | GET | 请求头 `X-Bridge-Key` → 部署版本/卡型/已装节点(节点来源地址里的凭据已脱敏) |
+
+GET 的 `?key=` 仍兼容,但会进反代 / CDN 日志,新客户端请用请求头。
+
+**job_id 规则**:`^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$`,不得含 `..`;**一次性,不要复用** —— 要重跑就用新 id
+(旧的 `rerun=1` 已删除)。记录被回收后复用同一 id 提交,服务端拦不住,而且和回收之间有竞态,不受支持。
+
+**产物**:`images[]` 每项带 `filename / node_id / key / size_bytes`,小文件带 `data_base64`,大文件带 `volume_path`
+(走 `-fetch`)。客户端用 `size_bytes` 校验下载完整性;核对不了时不要 ack,交给云端按保留期回收。
 
 **三种消费方式**(都基于 `bridge_client.py`,纯 stdlib 零依赖):
 
@@ -151,7 +181,8 @@ curl -X POST http://127.0.0.1:8000/modal_bridge/submit \
 
 ## 给 agent 的注意事项
 
-- **等待窗**:用 submit 返回的 `worker_timeout_sec` + 180s 做轮询 deadline,别硬编码
+- **等待窗**:从第一次看到 `running` 起算 `worker_timeout_sec` + 180s;排队阶段不要自己判超时(云端排队 6 小时才判死)
+- **提交结果未知**:拿到 job_id 的 `outcome:"unknown"` / `SubmitUnknown` 时去 poll 这个 id,别换新 id 重提
 - **配置生效链路**:`gpu_tier` 改完即生效;`default_gpu`/`cheap_gpu`/`use_sage_attention`/`worker_timeout_sec` 等要 `/deploy` 后生效
-- **取消要核验**:`cancel` 返回 `ok:false` 时任务仍在计费
+- **取消要核验**:`cancel` 返回 `still_billing:true` 时任务可能仍在计费;`cancel_noop` / `not_found` 都不是取消失败
 - **显存不足的形态**是静默降速不是报错:`progress.s_it` 显著高于同配置基线即是信号

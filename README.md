@@ -6,9 +6,9 @@
 
 > Registry: `comfyui_modal_bridge` (publisher `lynclee`) · Search **Modal Bridge** in ComfyUI Manager to install.
 
-0.8.36 security migration: all management requests require browser pairing, including localhost.
-Copy `local_api_capability` from the plugin's user config on the ComfyUI machine; never send it in chat.
-Existing valid pairings keep working. Local HTTP scripts/MCP must supply the token too. See [API.md](./API.md).
+Pairing: browsers on the ComfyUI machine itself (`127.0.0.1` / `localhost`) need no pairing (since 0.8.40).
+Browsers and MCP reaching it over the LAN, a reverse proxy or `host.docker.internal` pair once with
+`local_api_capability` from the plugin's user config on the ComfyUI machine; never send it in chat. See [API.md](./API.md).
 
 ## ✨ Why use it
 
@@ -92,8 +92,9 @@ MIT
 
 > Registry: `comfyui_modal_bridge`(publisher `lynclee`)· 在 ComfyUI Manager 搜 **Modal Bridge** 即可安装。
 
-0.8.36 安全迁移：本机浏览器也须首次配对。从服务器插件用户配置复制 `local_api_capability`，
-不要发到聊天中；已有有效配对继续使用。本地 HTTP 脚本/MCP 同样必须带 token，见 [API.md](./API.md)。
+配对:ComfyUI 本机上的浏览器(`127.0.0.1` / `localhost`)不需要配对(0.8.40 起)。经局域网、反向代理或
+`host.docker.internal` 访问的浏览器和 MCP,首次用服务器插件用户配置里的 `local_api_capability` 配对一次,
+不要发到聊天中。见 [API.md](./API.md)。
 
 ## ✨ 核心优势
 
