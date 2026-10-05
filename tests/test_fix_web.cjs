@@ -9,6 +9,9 @@ const { test } = require("node:test");
 
 const source = fs.readFileSync(path.join(__dirname, "../web/modal_bridge.js"), "utf8");
 const NOT_FOUND_STREAK = Number(/const NOT_FOUND_STREAK = (\d+);/.exec(source)[1]);
+// 排队阶段兜底线 = 6 小时 + 10 分钟余量(2026-10-05 第二轮)。故意写死:6 小时是和云端 _QUEUE_STALE_S
+// 的契约,前端单方面改了它,这里要红。
+const QUEUE_DEADLINE_MS = 6 * 3600 * 1000 + 10 * 60 * 1000;
 
 // 从 startMarker 截到下一个分节线(源码按 `// =====` 分节)
 function chunk(startMarker) {
@@ -51,6 +54,7 @@ function domEl(tag = "div") {
 function makeRunSandbox(opts = {}) {
   const clock = { t: 1_000_000_000 };
   let saved = opts.saved ? JSON.parse(JSON.stringify(opts.saved)) : [];
+  const kv = opts.kv || {};
   const observed = { polls: 0, cancels: 0, fetches: 0, alerts: [], notifies: [], events: [],
                      fetchBodies: [], cancelBodies: [], submitted: 0 };
   const sandbox = {
@@ -58,8 +62,11 @@ function makeRunSandbox(opts = {}) {
     parseInt, encodeURIComponent, Map, setTimeout: () => 0,
     setInterval: () => 1, clearInterval: () => {},
     LS_KEYS: { activeJob: "jobs", progressPos: "pos" },
-    loadLS: (k, d = null) => (k === "jobs" ? JSON.parse(JSON.stringify(saved)) : d),
-    saveLS: (k, v) => { if (k === "jobs") saved = JSON.parse(JSON.stringify(v)); },
+    // 恢复记录走 saved;其它键(第二轮起的标签页心跳 modal_bridge.tab_hb.*)走 kv
+    loadLS: (k, d = null) => (k === "jobs" ? JSON.parse(JSON.stringify(saved))
+      : (k in kv ? JSON.parse(JSON.stringify(kv[k])) : d)),
+    saveLS: (k, v) => { if (k === "jobs") saved = JSON.parse(JSON.stringify(v)); else kv[k] = JSON.parse(JSON.stringify(v)); },
+    clearLS: (k) => { if (k === "jobs") saved = []; else delete kv[k]; },
     getSetting: (k, d) => (opts.settings && k in opts.settings ? opts.settings[k] : d),
     getVramTier: () => "80g",
     sleep: async (ms) => { clock.t += ms; },
@@ -80,7 +87,7 @@ function makeRunSandbox(opts = {}) {
   vm.runInContext(chunk("const NOT_FOUND_STREAK ="), sandbox);   // STAGE_LABELS / newProgress
   vm.runInContext(chunk("function addActiveJob("), sandbox);      // 持久化 / 截止线 / 取消 / 轮询 / 取回
   vm.runInContext(chunk("async function recoverPendingJob("), sandbox);
-  return { sb: sandbox, observed, clock, saved: () => saved, setSaved: (v) => { saved = v; } };
+  return { sb: sandbox, observed, clock, kv, saved: () => saved, setSaved: (v) => { saved = v; } };
 }
 
 // 模拟云端:提交后排队 queueS 秒才变 running(started_at=那一刻),跑 runS 秒完成。
@@ -186,7 +193,8 @@ test("F-P1-1 云端 started_at 变了(抢占后重跑):runSeenAt 跟着重置,�
   h.sb.noteRunning(rec, { status: "running", started_at: 1100, timeout_s: 1200 });
   assert.equal(rec.runSeenAt, h.clock.t, "换了一次执行要重置");
   assert.equal(h.saved()[0].runSeenAt, h.clock.t, "并写进恢复记录");
-  assert.equal(h.sb.jobDeadline({ startedAt: 0 }, 1200), Infinity, "没见过 running = 排队阶段,不截止");
+  // 第二轮起排队阶段有兜底线:提交 + 6 小时(云端 _QUEUE_STALE_S)+ 10 分钟余量,不再是 Infinity
+  assert.equal(h.sb.jobDeadline({ startedAt: 0 }, 1200), QUEUE_DEADLINE_MS, "没见过 running = 排队阶段,只按 6 小时兜底");
 });
 
 test("F-P1-1 刷新恢复同口径:提交 1385s 前、running 1145s 前的任务不被当过期丢掉,也不被提前取消", async () => {
@@ -217,12 +225,13 @@ test("F-P1-1 刷新恢复同口径:提交 1385s 前、running 1145s 前的任务
   assert.equal(h2.observed.fetches, 1);
 });
 
-test("F-P1-1 刷新恢复:没见过 running 的老记录(排队阶段)不过期;恢复时看到 running 补记 runSeenAt", async () => {
+test("F-P1-1 刷新恢复:没见过 running 的老记录(排队阶段)在 6 小时兜底线内不过期;恢复时看到 running 补记 runSeenAt", async () => {
   const now = 1_000_000_000;
   const job = { jobId: "job-1", startedAt: now - 7_200_000, workerTimeoutSec: 1200 };
   const h = makeRunSandbox({ saved: [job], fetch: () => json(200, {}) });
   h.clock.t = now;
-  assert.equal(h.sb.recoveryDeadline(job, 1200), Infinity);
+  assert.equal(h.sb.recoveryDeadline(job, 1200), job.startedAt + QUEUE_DEADLINE_MS);
+  assert(h.sb.recoveryDeadline(job, 1200) > now, "提交 2 小时的排队记录不能过期");
   let n = 0;
   h.sb.bridgeFetch = async (u) => {
     if (u.includes("/poll?")) {
@@ -631,15 +640,18 @@ test("C3 /submit 回 outcome=unknown + job_id:不当失败,按这个 id 轮询�
   assert(labels.some((s) => s.startsWith("run.submit_unknown_stage")));
 });
 
-test("C3 结果未知且连续 not_found:报『提交没有落地』并清记录", async () => {
+test("C3 结果未知且持续 not_found:报『提交多半没有落地』并清记录", async () => {
+  // 第二轮(2026-10-05):结果未知时确认窗口拉到 2 分钟(run_endpoint 冷启动可能晚落地),不再是 5 次
   const h = makeRunSandbox({ fetch: (url, o, obs) => {
     if (url.endsWith("/submit")) return json(502, { error: "x", job_id: "job-u", outcome: "unknown" });
     if (url.includes("/poll?")) { obs.polls++; return json(200, { status: "not_found", error: "job not found" }); }
     return json(200, { ok: true });
   } });
+  const t0 = h.clock.t;
   await assert.rejects(h.sb.runOnceOnModal({}, ["9"], h.sb.newProgress("submitting", "wf"), null),
                        /run\.submit_not_landed/);
-  assert.equal(h.observed.polls, NOT_FOUND_STREAK);
+  assert(h.observed.polls > NOT_FOUND_STREAK, `polls=${h.observed.polls}`);
+  assert(h.clock.t - t0 >= 120_000, "确认窗口要到分钟级");
   assert.equal(h.saved().length, 0);
 });
 
@@ -710,35 +722,37 @@ test("F-P3-10 主流程取回失败:文案带『刷新页面可恢复』,原因�
   assert.equal(h.saved().length, 1, "记录保留,刷新才真能恢复");
 });
 
-test("F-P3-10 恢复记录带 tabId / 心跳;别的标签页心跳新鲜的不接手,过期的和老记录接手", async () => {
+test("F-P3-10 恢复记录带 tabId;别的标签页正在跟踪(心跳键里有、没过期)的不接手,其余接手", async () => {
+  // 第二轮(2026-10-05):心跳从记录里的 hb 字段改成每个标签页自己的键 {t, jobs},
+  // 只列本页正在轮询 / 取回的 jobId;阈值 120 秒。更细的场景见 test_fix_r2_web.cjs。
   const now = 1_000_000_000;
-  const h = makeRunSandbox({ fetch: () => json(200, {}) });
+  const HB = "modal_bridge.tab_hb.";
+  const h = makeRunSandbox({ fetch: () => json(200, {}), kv: {
+    [HB + "other-tab"]: { t: now - 60_000, jobs: ["busy"] },        // 后台标签页,定时器被节流到每分钟一次
+    [HB + "dead-tab"]: { t: now - 200_000, jobs: ["orphan"] },      // 那个标签页早关了 / 崩了
+    [HB + "idle-tab"]: { t: now - 1000, jobs: [] },                 // 活着,但已经不跟踪这条(取回失败保留)
+  } });
   h.clock.t = now;
   h.sb.addActiveJob({ jobId: "mine", startedAt: now });
   const mine = h.saved()[0];
-  assert(mine.tabId && mine.hb === now, JSON.stringify(mine));
+  assert(mine.tabId && !("hb" in mine), JSON.stringify(mine));
   h.setSaved([
-    { jobId: "busy", startedAt: now, tabId: "other-tab", hb: now - 3000 },        // 另一标签页正在跟
-    { jobId: "orphan", startedAt: now, tabId: "dead-tab", hb: now - 60_000 },     // 那个标签页早关了
-    { jobId: "legacy", startedAt: now },                                           // 升级前的老记录
-    { jobId: "released", startedAt: now, tabId: "refreshed-tab", hb: 0 },         // pagehide 清零
+    { jobId: "busy", startedAt: now, tabId: "other-tab" },
+    { jobId: "orphan", startedAt: now, tabId: "dead-tab" },
+    { jobId: "kept", startedAt: now, tabId: "idle-tab" },
+    { jobId: "legacy", startedAt: now },                               // 升级前的老记录
+    { jobId: "released", startedAt: now, tabId: "refreshed-tab" },     // pagehide 删了心跳键
+    { jobId: "r1", startedAt: now, tabId: "r1-tab", hb: now },         // 第一轮格式:记录里的 hb 不再算数
   ]);
   const recovered = [];
   h.sb.recoverOne = (j) => recovered.push(j.jobId);
   await h.sb.recoverPendingJob();
-  assert.deepEqual(recovered.sort(), ["legacy", "orphan", "released"]);
+  assert.deepEqual(recovered.sort(), ["kept", "legacy", "orphan", "r1", "released"]);
   const after = Object.fromEntries(h.saved().map((j) => [j.jobId, j]));
-  assert.equal(Object.keys(after).length, 4, "别的标签页的记录不能删");
+  assert.equal(Object.keys(after).length, 6, "别的标签页的记录不能删");
   assert.equal(after.busy.tabId, "other-tab");
   assert.equal(after.orphan.tabId, mine.tabId, "接手后归到本标签页");
-  // 心跳只续本标签页的;release 清零
-  h.clock.t = now + 5000;
-  h.sb.heartbeatActiveJobs();
-  const hb = Object.fromEntries(h.saved().map((j) => [j.jobId, j.hb]));
-  assert.equal(hb.orphan, now + 5000);
-  assert.equal(hb.busy, now - 3000);
-  h.sb.heartbeatActiveJobs(true);
-  assert.equal(h.saved().find((j) => j.jobId === "orphan").hb, 0);
+  assert(!("hb" in after.r1), "第一轮的 hb 字段接手时去掉");
 });
 
 // 配对:只实现 askCapability 用到的 DOM;overlay 一挂上就「点取消」

@@ -188,8 +188,24 @@ const I18N = {
   "run.submit_unknown": { zh: "提交结果不确定(job {id}):没拿到明确回应,但任务可能已经在云端。正在按这个 id 核实,别重复提交。",
                         en: "Submission outcome unknown (job {id}): no clear response, but the job may already be on the cloud. Verifying by this id — don't resubmit." },
   "run.submit_unknown_stage": { zh: "{prefix}提交结果不确定,正在核实(job {id})", en: "{prefix}Submission outcome unknown — verifying (job {id})" },
-  "run.submit_not_landed": { zh: "提交没有落地:云端查无此任务 {id}(已连续确认),可以重新提交",
-                        en: "The submission did not land: job {id} not found on the cloud (confirmed repeatedly); you can resubmit" },
+  // 结果未知时 run_endpoint 可能还在冷启动,任务可能晚一两分钟才落地 —— 只能说「多半」,
+  // 让用户先核实再重交(2026-10-05 深度 review 第二轮)。
+  "run.submit_not_landed": { zh: "提交多半没有落地:云端持续 {min} 分钟查无此任务 {id}。先到 Modal 控制台核实(看有没有这个任务在跑),再决定是否重新提交",
+                        en: "The submission most likely did not land: job {id} has been not found on the cloud for {min} min. Check the Modal dashboard for this job before deciding whether to resubmit" },
+  // 批量里点过取消、但没能确认(2026-10-05 深度 review 第二轮):当前这一单跟踪到底,后面的不再提交
+  "run.batch_stopped": { zh: "批量已停止:第 {cur}/{total} 单点过取消(没能确认),这一单已跟踪到结束,后面 {left} 单不再提交。",
+                        en: "Batch stopped: you clicked cancel on run {cur}/{total} (not confirmed); that run was tracked to the end and the remaining {left} will not be submitted." },
+  // 排队阶段的兜底截止 / 连续查不到状态(2026-10-05 深度 review 第二轮)
+  "run.queue_timeout": { zh: "排队超过 {h} 小时仍没看到它开始运行,云端也一直没给出结局", en: "no sign of it starting after {h} h in the queue, and the cloud never reported an outcome" },
+  "run.poll_unreachable": { zh: "⚠ 已连续 {min} 分钟查不到云端状态({why})。任务可能仍在排队或运行,继续等待;一直这样的话,检查网络 / bridge key,或到 Modal 控制台看 app 是否还在。",
+                        en: "⚠ No cloud status for {min} min in a row ({why}). The job may still be queued or running; still waiting. If this persists, check the network / bridge key, or whether the app still exists in the Modal dashboard." },
+  // 看到过它在跑、取消又都回「查无此任务」之后,轮询连续 not_found:只报矛盾,不删记录
+  "run.gone_contradicted": { zh: "云端连续查无任务 {id},但之前看到过它在运行、取消也都回「查无此任务」—— 两边矛盾,无法确认它是否已停,可能仍在计费。恢复记录已保留(刷新页面会接着查);请到 Modal 控制台确认,必要时手动停止容器。",
+                        en: "Job {id} keeps coming back as not found, yet it was seen running and the cancels also said 'not found' — the answers contradict each other, so whether it stopped (and stopped billing) is unknown. The recovery record is kept (reload to keep checking); check the Modal dashboard and stop the container manually if needed." },
+  "recover.contradicted": { zh: "⚠ 状态矛盾 —— 请到 Modal 控制台确认", en: "⚠ Contradictory state — check the Modal dashboard" },
+  // 契约 D1:任务完成但有被剔除的输出分支等非致命问题
+  "run.warnings": { zh: "⚠ {wf}任务 {id} 完成了,但云端报告了 {n} 条警告(部分输出可能没有生成):\n{list}",
+                        en: "⚠ {wf}job {id} completed, but the cloud reported {n} warning(s) (some outputs may be missing):\n{list}" },
   // C4:/poll 的 auth_failed 是终态
   "run.auth_failed":  { zh: "bridge key 不匹配(云端拒绝了状态查询),重新部署会刷新 key。恢复记录已保留,修好后刷新页面可接着取回。",
                         en: "Bridge key mismatch (the cloud rejected the status query); redeploying refreshes the key. The recovery record is kept — reload after fixing to resume." },
@@ -212,6 +228,9 @@ const I18N = {
   // 取消没确认、卡片继续跟踪时的提示(2026-10-05 深度 review F-P2-2)
   "cancel.retry_hint":{ zh: "\n\n进度卡片会继续跟踪这个任务,可以在卡片上再点 ✕ 重试取消。",
                         en: "\n\nThe progress card keeps tracking this job; click ✕ on it to retry the cancel." },
+  // 取消在途时用户把卡片关了:卡片上已经没有 ✕ 可点(2026-10-05 深度 review 第二轮)
+  "cancel.retry_hint_closed":{ zh: "\n\n卡片已经关掉了,但后台仍在跟踪这个任务。要再次取消,请刷新页面,在恢复出来的卡片上点 ✕。",
+                        en: "\n\nThe card was closed, but the job is still tracked in the background. To cancel again, reload the page and click ✕ on the recovered card." },
   "cancel.failed_retry":{ zh: "⚠ 取消失败,云端可能仍在运行 —— 仍在跟踪这个任务,可再点 ✕ 重试取消",
                         en: "⚠ Cancel failed; the job may still be running — still tracking it, click ✕ to retry" },
   "mdl.no_source":    { zh: "下面这些模型 Modal Volume 没有,本地也找不到,无法自动同步:\n\n{list}\n\n解决:先在本地 ComfyUI 里把这些模型下到对应 models/<类型>/ 目录,再跑。\n\n仍然继续提交?(大概率失败)",
@@ -278,6 +297,11 @@ const I18N = {
                         en: "✗ Failed to remove these local packs (they will load again on next cold start): {list}" },
   "mn.load_fail":     { zh: "✗ 加载失败:{e}", en: "✗ Load failed: {e}" },
   "mn.local_list_fail":{ zh: "⚠ 读不到 Volume 上的私有节点包:{e}", en: "⚠ Couldn't list private node packs on the Volume: {e}" },
+  // C6 / /list_nodes 的 cloud_unchecked(2026-10-05 深度 review 第二轮):列表是本机清单,别让它看起来像「云端就这些」
+  "mn.cloud_unchecked":{ zh: "⚠ 读不到云端节点清单({why}),上面是本机清单,可能缺别的机器加的节点",
+                        en: "⚠ Couldn't read the cloud node list ({why}); the list above is this machine's, and may lack nodes added from other machines" },
+  "mn.confirm_unchecked":{ zh: "\n\n⚠ 加载列表时读不到云端节点清单({why})。部署时如果仍读不到,这次部署以本机清单为准:别的机器加的节点没法并回,会从镜像里消失。",
+                        en: "\n\n⚠ The cloud node list couldn't be read when loading ({why}). If it still can't be read during the deploy, this deploy follows this machine's list: nodes added from other machines can't be merged back and will disappear from the image." },
   "mn.none_checked":  { zh: "没勾选任何节点", en: "Nothing selected" },
   "mn.confirm":       { zh: "确定从云端镜像移除这 {n} 个节点并重部署?\n\n{list}\n\n⚠ 别的电脑若用到这些节点会失败,需要时重新加。",
                         en: "Remove these {n} nodes from the cloud image & redeploy?\n\n{list}\n\n⚠ Other machines using them will fail and need re-add." },
@@ -526,13 +550,14 @@ function getSetting(id, def) {
 // =====================================================================
 // 通知封装(右上角 toast)
 // =====================================================================
-function notify(message, severity = "info") {
+// life:显示时长(ms),不给按严重程度取默认。多行的警告清单(契约 D1)4 秒读不完,调用方可以放长。
+function notify(message, severity = "info", life = null) {
   try {
     app.extensionManager?.toast?.add?.({
       severity,
       summary: "Modal Bridge",
       detail: message,
-      life: severity === "error" ? 8000 : 4000,
+      life: life || (severity === "error" ? 8000 : 4000),
     });
     return;
   } catch (e) {}
@@ -1183,11 +1208,15 @@ function newProgress(initialStage = "preparing", wfName = null) {
     els.card.remove();
   };
 
-  // 卡片上一行常驻警告(取消失败后「仍在跟踪,可重试」)。stage 换阶段时不清,finish 时清。
-  ctx.setWarn = (text) => {
+  // 卡片上一行常驻警告(取消失败后「仍在跟踪,可重试」、连续查不到状态)。stage 换阶段时不清,finish 时清。
+  // kind 标明是谁写的:状态恢复正常时只撤掉自己那条,不误撤取消失败的警告(2026-10-05 深度 review 第二轮)。
+  ctx.warnKind = null;
+  ctx.setWarn = (text, kind = null) => {
+    ctx.warnKind = text ? kind : null;
     els.warn.textContent = text || "";
     els.warn.style.display = text ? "block" : "none";
   };
+  ctx.clearWarn = (kind) => { if (ctx.warnKind === kind) ctx.setWarn(null); };
 
   ctx.stage = (stageKey, detail = null, cancelable = null) => {
     // ⚠ 结束后的卡片不再接受阶段更新:点取消时恰好有一个 /poll 在途,它回来后
@@ -1257,7 +1286,7 @@ function newProgress(initialStage = "preparing", wfName = null) {
       els.errToggle.textContent = "▶ Show error details";
       els.errDetail.style.display = "none";
     }
-    ctx.setWarn(warn);
+    ctx.setWarn(warn, "cancel");
   };
 
   ctx.stage(initialStage);
@@ -1277,21 +1306,68 @@ function getVramTier(_prompt) {
   return "80g";
 }
 
-// 未完成 job 持久化(支持多个并发):LS 存数组,刷新后逐个尝试恢复
+// 未完成 job 持久化(支持多个并发):LS 存数组,刷新后逐个尝试恢复。tabId 记下是哪个标签页提交的,
+// 归属判定见下面的标签页心跳。
 function addActiveJob(j) {
   const a = loadActiveJobs();
-  a.push({ ...j, tabId: TAB_ID, hb: Date.now() });
+  a.push({ ...j, tabId: TAB_ID });
   saveLS(LS_KEYS.activeJob, a);
 }
 
 // 恢复记录的归属标签页 + 心跳(2026-10-05 深度 review F-P3-10):第二个标签页打开时,以前会把
 // 第一个标签页正在跑的 job 也「恢复」一遍 —— 两张卡片、两条 toast、两路轮询和取回。
-// 现在每条记录带 tabId 和心跳 hb:owner 每 ACTIVE_JOB_HB_MS 刷新一次(见 setup 里的定时器),
-// 页面关闭 / 刷新(pagehide)时把自己的心跳清零,刷新后的新页面能立刻接手;别的标签页只接手
-// 心跳过期(或没有归属)的记录。
+// 别的标签页只接手「没有活着的标签页正在跟踪」的记录。
+// 第二轮(2026-10-05 深度 review 第二轮)改了三处:
+//   - 心跳只覆盖本页**正在轮询或取回**的 jobId(_trackedJobs)。以前按记录的 tabId 续约:A 取回失败、
+//     主循环已结束、记录保留,A 的心跳却一直给它续,B 标签页永远不接手,只有刷新 A 本身才能恢复。
+//   - 心跳存每个标签页自己的键(TAB_HB_PREFIX + TAB_ID = {t, jobs}),不再每 5 秒读改写共享数组 ——
+//     那会和别的标签页的写入互相覆盖(B 刚 push 的记录被 A 用旧数组写回去就没了)。
+//   - 接手阈值从 20 秒放宽到 120 秒:Chrome 88 起,隐藏超过 5 分钟的标签页里链式定时器每分钟最多
+//     醒一次,20 秒阈值下后台标签页会被别的标签页当成死了、重复接手。
+// 页面关闭 / 刷新(pagehide)时删掉自己的心跳键,刷新后的新页面能立刻接手。
 const TAB_ID = Math.random().toString(36).slice(2, 10) + Date.now().toString(36);
+const TAB_HB_PREFIX = "modal_bridge.tab_hb.";
 const ACTIVE_JOB_HB_MS = 5000;
-const ACTIVE_JOB_HB_STALE_MS = 20000;
+const ACTIVE_JOB_HB_STALE_MS = 120000;
+const _trackedJobs = new Set();   // 本页正在轮询 / 取回的 jobId
+
+function writeTabHeartbeat() {
+  const key = TAB_HB_PREFIX + TAB_ID;
+  if (_trackedJobs.size) saveLS(key, { t: Date.now(), jobs: [..._trackedJobs] });
+  else clearLS(key);
+}
+function trackJob(jobId) {
+  _trackedJobs.add(jobId);
+  writeTabHeartbeat();
+}
+// 主循环 / 恢复轮询结束时调(无论记录是否保留):保留下来的记录立刻可以被别的标签页接手
+function untrackJob(jobId) {
+  if (_trackedJobs.delete(jobId)) writeTabHeartbeat();
+}
+// pagehide:页面要卸载(或进 bfcache),本页跟踪的 job 立即放手;从 bfcache 回来时定时器会重新写上
+function releaseTabHeartbeat() {
+  clearLS(TAB_HB_PREFIX + TAB_ID);
+}
+// 这条记录是否正被另一个活着的标签页跟踪
+function trackedByLiveTab(j, now) {
+  if (!j || !j.tabId || j.tabId === TAB_ID) return false;
+  const hb = loadLS(TAB_HB_PREFIX + j.tabId);
+  return !!(hb && Array.isArray(hb.jobs) && hb.jobs.includes(j.jobId)
+            && now - (Number(hb.t) || 0) < ACTIVE_JOB_HB_STALE_MS);
+}
+// 崩溃 / 被杀的标签页来不及 pagehide,心跳键会一直留着。过期的顺手删掉(过期 = 已经不算数了)。
+function sweepTabHeartbeats(now) {
+  try {
+    const dead = [];
+    for (let i = 0; i < localStorage.length; i++) {
+      const k = localStorage.key(i);
+      if (!k || !k.startsWith(TAB_HB_PREFIX) || k === TAB_HB_PREFIX + TAB_ID) continue;
+      const hb = loadLS(k);
+      if (!hb || now - (Number(hb.t) || 0) >= ACTIVE_JOB_HB_STALE_MS) dead.push(k);
+    }
+    for (const k of dead) clearLS(k);
+  } catch (e) {}
+}
 
 function loadActiveJobs() {
   const a = loadLS(LS_KEYS.activeJob);
@@ -1304,13 +1380,6 @@ function removeActiveJob(jobId) {
 function updateActiveJob(jobId, patch) {
   saveLS(LS_KEYS.activeJob, loadActiveJobs().map((j) => (j.jobId === jobId ? { ...j, ...patch } : j)));
 }
-// 刷新本标签页名下记录的心跳;release=true(pagehide)时清零,让刷新后的页面立即接手
-function heartbeatActiveJobs(release = false) {
-  const a = loadActiveJobs();
-  if (!a.some((j) => j && j.tabId === TAB_ID)) return;
-  const now = Date.now();
-  saveLS(LS_KEYS.activeJob, a.map((j) => (j && j.tabId === TAB_ID ? { ...j, hb: release ? 0 : now } : j)));
-}
 
 function markJobFetching(jobId) {
   saveLS(LS_KEYS.activeJob, loadActiveJobs().map((j) => j.jobId === jobId
@@ -1319,8 +1388,12 @@ function markJobFetching(jobId) {
 
 // C8 运行截止线(主轮询、刷新恢复的列表过滤、恢复轮询三处同一口径):
 //   截止线 = max(提交时刻 + 前端设置, runSeenAt + worker 上限 + 尾巴)
-// runSeenAt = 前端**第一次看到 running** 的本地时刻。排队 / 冷启动阶段前端不截止(Infinity),
-// 交给云端 6 小时判死(modal_app._QUEUE_STALE_S)。
+// runSeenAt = 前端**第一次看到 running** 的本地时刻。排队 / 冷启动阶段交给云端 6 小时判死
+// (modal_app._QUEUE_STALE_S),前端只留一条更晚的兜底线:提交时刻 + 6 小时 + 余量。
+// ⚠ 兜底线是第二轮加的(2026-10-05 深度 review 第二轮):以前排队阶段返回 Infinity,而 unknown / 502
+//   都按瞬态重试 —— 提交后云端 /status 一直 404(app 被停)、本机 /poll 一直回 unknown 时,主轮询
+//   永远不结束;没见过 running 的旧恢复记录也永不过期。正常情况下云端在 6 小时整判 failed,前端
+//   先看到它,轮不到兜底线;兜底线只罩「云端一直不给结局」。
 // ⚠ 以前从提交时刻起算 max(设置, worker 上限 + 3 分钟):排队 + 冷启动吃掉超过 3 分钟的尾巴时,
 //   前端会在 worker 到上限**之前**主动取消一个正常任务 —— 实测排队 240s、执行 1150s 的任务
 //   在提交后第 1380s 被取消,比完成早 10 秒(2026-10-05 深度 review F-P1-1)。Modal 的 worker
@@ -1328,8 +1401,10 @@ function markJobFetching(jobId) {
 // 尾巴罩住 decode / 编码 / 写回,也罩住云端判死的 _STALE_GRACE_S(120s):正常情况下前端先看到
 // 云端的 failed,轮不到自己截止。
 const RUN_DEADLINE_TAIL_MS = 180000;
+const QUEUE_STALE_MS = 6 * 3600 * 1000;          // 与云端 _QUEUE_STALE_S 对齐
+const QUEUE_DEADLINE_TAIL_MS = 10 * 60 * 1000;   // 余量:云端判死要等有人读状态,前端轮询间隔也要算上
 function jobDeadline(j, settingSec) {
-  if (j.runSeenAt == null) return Infinity;
+  if (j.runSeenAt == null) return (j.startedAt || 0) + QUEUE_STALE_MS + QUEUE_DEADLINE_TAIL_MS;
   const limitSec = j.runTimeoutSec || j.workerTimeoutSec || settingSec;
   return Math.max((j.startedAt || j.runSeenAt) + settingSec * 1000,
                   j.runSeenAt + limitSec * 1000 + RUN_DEADLINE_TAIL_MS);
@@ -1381,6 +1456,61 @@ async function probeJobStatus(jobId) {
   } catch (e) {
     return { transient: true, error: e };
   }
+}
+
+// 连续「没看清」的计时与提示(主轮询、刷新恢复共用;2026-10-05 深度 review 第二轮)。
+// 瞬态一律重试是对的,但一直重试、一句话都不说,用户看到的就是卡片永远停在 Queued / Running ——
+// 和「真在排队」分不出来。连续超过 POLL_TRANSIENT_WARN_MS 就在卡片上挂一行警告、弹一次提示;
+// 看清一次就撤掉(只撤自己那条,见 ctx.clearWarn)。
+const POLL_TRANSIENT_WARN_MS = 5 * 60 * 1000;
+// 提交结果未知(C3)、又从没看到过这个任务时,「没落地」的确认窗口(见 runOnceTracked;与 NOT_FOUND_STREAK 同时满足)
+const SUBMIT_UNKNOWN_NOT_FOUND_MS = 120000;
+function transientWatch(jobId, ctx) {
+  let since = null;
+  let warned = false;
+  return {
+    transient(probe) {
+      const now = Date.now();
+      if (since == null) { since = now; return; }
+      if (warned || now - since < POLL_TRANSIENT_WARN_MS) return;
+      warned = true;
+      const d = probe && probe.data;
+      const why = String((d && (d.error || (d.http_status && `HTTP ${d.http_status}`)))
+                         || (probe && probe.error && (probe.error.message || probe.error)) || "?").slice(0, 120);
+      const msg = t("run.poll_unreachable", { min: Math.round(POLL_TRANSIENT_WARN_MS / 60000), why });
+      if (ctx && ctx.setWarn) ctx.setWarn(msg, "transient");
+      notify(msg, "warn");
+      reportJobEvent(jobId, "poll_unreachable", why);
+    },
+    seen() {
+      since = null;
+      if (warned) { warned = false; if (ctx && ctx.clearWarn) ctx.clearWarn("transient"); }
+    },
+  };
+}
+
+// 「看到过它活着、取消却都回查无此任务」的标记(2026-10-05 深度 review 第二轮,F-P1-2 变体)。
+// 存在恢复记录上(值是当时看到的状态),主轮询、刷新恢复、再次取消都认它:有标记时,连续 not_found
+// 只报矛盾、**不删记录** —— 否则复核遇到一次瞬态 → 恢复轮询 → 随后 5 次 not_found 就按「已过保留期」
+// 删掉记录,F-P1-2 要避免的事换条路又发生了。
+function cancelContradiction(jobId) {
+  const j = loadActiveJobs().find((x) => x && x.jobId === jobId);
+  return (j && j.cancelContradicted) || null;
+}
+
+// 契约 D1:任务 completed、状态里带非空 warnings(被 ComfyUI 剔除的输出分支等非致命问题)时提示。
+// 在取回成功后调(fetchJobResultOnce),主流程、刷新恢复、取消没赶上三条路径一起覆盖;
+// 取回去重之后同一个 job 只提示一次。
+const JOB_WARNINGS_SHOWN = 3;
+function notifyJobWarnings(jobId, state, wfName) {
+  const w = (Array.isArray(state && state.warnings) ? state.warnings : [])
+    .map((x) => String(x ?? "").trim()).filter(Boolean);
+  if (!w.length) return;
+  log("job warnings", jobId, w);
+  const list = w.slice(0, JOB_WARNINGS_SHOWN).map((x) => "• " + (x.length > 200 ? x.slice(0, 200) + "…" : x)).join("\n")
+    + (w.length > JOB_WARNINGS_SHOWN ? `\n… +${w.length - JOB_WARNINGS_SHOWN}` : "");
+  notify(t("run.warnings", { wf: wfName ? `「${wfName}」` : "", id: jobId.slice(0, 8), n: w.length, list }),
+         "warn", 12000);
 }
 
 // 复核「云端确实没有这条记录」。返回**判决**而不是 true/false —— 复查看到的东西本身有用:
@@ -1463,13 +1593,15 @@ async function onCancelNotFound(jobId, ctx, wfName, aliveStatus, opts = {}) {
   // 卡片此刻停在乐观的 "✕ Cancelled" 上,复核要好几秒 —— 如实显示「确认中」,
   // 别让用户看到 Cancelled 就关卡片走人,然后被几十秒后的弹窗吓一跳。
   if (ctx) ctx.finish(false, t("cancel.confirming"));
+  // 之前某一轮已经记下了矛盾(见 cancelContradiction):用户在恢复后的卡片上再点取消也一样不能判「没了」
+  const marked = cancelContradiction(jobId);
   const v = await confirmJobGone(jobId);
 
   // ⚠ 只有**从没**看到它活着时,连续 not_found 才能解读成「已经没了」。之前一轮复核已经看到它
   //   在 running、两次取消又都回「查无此任务」—— 两次取消都没被执行,它此刻多半还在跑;这时
   //   复核全 not_found 只说明读不到它,不说明它停了。以前在这里宣布「不会继续计费」并删掉恢复
   //   记录(2026-10-05 深度 review F-P1-2)。现在按矛盾处理:弹窗、保留记录。
-  if (v.verdict === "gone" && !aliveStatus) {
+  if (v.verdict === "gone" && !aliveStatus && !marked) {
     removeActiveJob(jobId);
     reportJobEvent(jobId, "cancel_job_gone", "取消时云端查无此任务,已连续确认");
     if (ctx) ctx.finish(false, t("cancel.gone"));
@@ -1498,16 +1630,26 @@ async function onCancelNotFound(jobId, ctx, wfName, aliveStatus, opts = {}) {
   // 下次加载会丢掉这条记录 —— 所以必须让用户知道要自己去控制台看。
   const why = v.verdict === "unknown"
     ? t("cancel.state_unknown")
-    : t("cancel.state_inconsistent", { status: aliveStatus || v.data?.status || "?" });
+    : t("cancel.state_inconsistent", { status: aliveStatus || marked || v.data?.status || "?" });
   err("cancel not_found unresolved", jobId, v.verdict);
   reportJobEvent(jobId, "cancel_unconfirmed", why);
+  // 看到过它活着、重发的取消又回「查无此任务」:在恢复记录上记下矛盾。之后的轮询(这一页继续跟踪、
+  // 刷新恢复、别的标签页接手)遇到连续 not_found 都只报矛盾、不删记录(2026-10-05 深度 review 第二轮:
+  // 以前复核遇到一次瞬态就恢复轮询,随后 5 次 not_found 按「已过保留期」把记录删了)。
+  if (aliveStatus && !marked) updateActiveJob(jobId, { cancelContradicted: aliveStatus });
   if (ctx) ctx.finish(false, t("cancel.failed"));
   // 卡片继续跟踪:没看清(unknown)或看到它还活着(alive)时,接着轮询才知道它的结局,用户也能再取消。
-  // 「看到过活着、随后又读不到」不接着轮询:轮询的 not_found 判死会把记录删掉,正是 F-P1-2 要避免的。
+  // 复核刚连续确认过 not_found(gone)就不必再轮询一遍了 —— 记录保留,刷新会接着查。
   const keepTracking = typeof opts.onUnconfirmed === "function" && v.verdict !== "gone";
   if (keepTracking) opts.onUnconfirmed(v.verdict);
-  alert(t("cancel.failed_msg", { msg: why }) + (keepTracking ? t("cancel.retry_hint") : ""));
+  alert(t("cancel.failed_msg", { msg: why }) + (keepTracking ? cancelRetryHint(ctx) : ""));
   return false;
+}
+
+// 取消没确认、继续跟踪时附在弹窗末尾的一句。取消在途时用户可能已经把卡片关了(✕ 先乐观地变成了
+// 「关闭」)—— 那时再说「在卡片上再点 ✕」是指向一个不存在的按钮(2026-10-05 深度 review 第二轮)。
+function cancelRetryHint(ctx) {
+  return t(ctx && ctx.closed ? "cancel.retry_hint_closed" : "cancel.retry_hint");
 }
 
 // 请求取消云端任务并**校验结果**。主流程和刷新恢复共用一份 —— 两处行为必须一致,
@@ -1521,7 +1663,7 @@ async function requestCancel(jobId, ctx, wfName = null, aliveStatus = null, opts
     err("cancel failed", msg);
     if (ctx) ctx.finish(false, t("cancel.failed"));
     if (keepTracking) opts.onUnconfirmed("failed");
-    alert(t("cancel.failed_msg", { msg }) + (keepTracking ? t("cancel.retry_hint") : ""));
+    alert(t("cancel.failed_msg", { msg }) + (keepTracking ? cancelRetryHint(ctx) : ""));
     return false;
   };
   let d;
@@ -1559,8 +1701,10 @@ async function requestCancel(jobId, ctx, wfName = null, aliveStatus = null, opts
 //   (2026-10-05 深度 review F-P2-2)。现在:取消在途时轮询**等它出结果**而不是直接退出;
 //   确认停了才退出,没确认就恢复卡片、继续跟踪、允许再点一次。
 // 返回 gate:轮询每次 await 回来都调 `await gate.settled()`,true = 已确认停了,循环该退出。
+// gate.requested:用户点过取消(不论是否确认)。批量提交据此在当前这一单结束后停下,不再提交后面的
+// (2026-10-05 深度 review 第二轮:以前取消没确认时,当前单照常跟踪到底,随后批量接着提交第 2、3 单)。
 function attachCancel(ctx, jobId, wfName, beforeCancel = null) {
-  const gate = { task: null, stopped: false };
+  const gate = { task: null, stopped: false, requested: false };
   const run = async () => {
     let unconfirmed = null;
     try {
@@ -1583,6 +1727,7 @@ function attachCancel(ctx, jobId, wfName, beforeCancel = null) {
   ctx.setCancel(jobId, async () => {
     if (gate.task || gate.stopped) return;
     if (!confirm(`Cancel Modal job ${jobId.slice(0, 8)}?`)) return;
+    gate.requested = true;
     const p = run();
     gate.task = p;
     await p;
@@ -1599,7 +1744,19 @@ function attachCancel(ctx, jobId, wfName, beforeCancel = null) {
   return gate;
 }
 
+// 单次跑的外壳:只负责「本页在跟踪这个 job」的登记(见 _trackedJobs)。提交成功后登记,
+// 不论怎么结束(取回成功 / 失败保留记录 / 超时 / 取消 / 异常)都在这里撤销,保留下来的记录
+// 立刻可以被别的标签页接手(2026-10-05 深度 review 第二轮)。
 async function runOnceOnModal(workflowPrompt, outputNodeIds, ctx, submitGuard, batchInfo = null) {
+  const track = { jobId: null };
+  try {
+    return await runOnceTracked(workflowPrompt, outputNodeIds, ctx, submitGuard, batchInfo, track);
+  } finally {
+    if (track.jobId) untrackJob(track.jobId);
+  }
+}
+
+async function runOnceTracked(workflowPrompt, outputNodeIds, ctx, submitGuard, batchInfo, track) {
   // batchInfo: {current, total}
   const batchSuffix = batchInfo ? `[${batchInfo.current}/${batchInfo.total}] ` : "";
 
@@ -1617,7 +1774,8 @@ async function runOnceOnModal(workflowPrompt, outputNodeIds, ctx, submitGuard, b
   });
   const sub = await subRes.json().catch(() => ({}));
   // C3:提交结果未知(重试全失败,但 /run 可能已经落地)。不能当成提交失败:那单可能已经在云端跑、
-  //   在计费,用户再点一次就是双跑。按这个 job_id 进正常轮询,not_found 照常按连续 N 次判定。
+  //   在计费,用户再点一次就是双跑。按这个 job_id 进正常轮询;「没落地」的判定见轮询里的 not_found 分支
+  //   (从没看到过它时窗口拉到分钟级,第二轮)。
   const submitUnknown = !!(sub && sub.outcome === "unknown" && typeof sub.job_id === "string" && sub.job_id);
   if (!submitUnknown && (!subRes.ok || !sub.ok)) {
     throw new Error(sub.error || `HTTP ${subRes.status}`);
@@ -1630,6 +1788,9 @@ async function runOnceOnModal(workflowPrompt, outputNodeIds, ctx, submitGuard, b
   const rec = { jobId, gpu, wfName: ctx.wfName, startedAt: Date.now(),
                 workerTimeoutSec: sub.worker_timeout_sec || null,
                 runSeenAt: null, runStartedAt: null, runTimeoutSec: null };
+  // 先登记「本页在跟踪」再写记录:别的标签页恰好在这一刻启动时,不会把这条当成无主记录接走
+  track.jobId = jobId;
+  trackJob(jobId);
   addActiveJob(rec);
   // 这张卡的取消只取消这个 job(各 job 互不影响)
   const gate = attachCancel(ctx, jobId, ctx.wfName,
@@ -1670,7 +1831,9 @@ async function runOnceOnModal(workflowPrompt, outputNodeIds, ctx, submitGuard, b
   let final = null;
   let lastStatus = "queued";
   let gone = 0;                 // 连续看到 not_found 的次数(见下面的判据)
+  let goneSince = 0;            // 这一串 not_found 从何时开始
   let sawStatus = false;        // 看到过 not_found 以外的状态(提交结果未知时据此区分「没落地」)
+  const watch = transientWatch(jobId, ctx);
   try {
     while (Date.now() < jobDeadline(rec, settingSec)) {
       // ⚠ 每次 await 回来都要重查取消(2026-10-05 深度 review F-P2-1):点取消时恰好有一个 /poll
@@ -1687,8 +1850,10 @@ async function runOnceOnModal(workflowPrompt, outputNodeIds, ctx, submitGuard, b
       if (await gate.settled()) return { jobId, gpu, cancelled: true };
       if (probe.transient) {
         log("poll transient (will retry):", probe.data || probe.error);
+        watch.transient(probe);
         continue;
       }
+      watch.seen();
       const pData = probe.data;
       // C4:云端 401 —— key 不对,再轮询也看不到。终态失败,但保留恢复记录:
       //   修好 key 之后刷新页面还能接着取回(任务本身可能正常跑完了)。
@@ -1756,12 +1921,22 @@ async function runOnceOnModal(workflowPrompt, outputNodeIds, ctx, submitGuard, b
       // 再轮询下去就是白等到超时,然后去"取消"一个不存在的任务、弹一个吓人的假警报。
       // ⚠ 第一次看见不能判死:job_state 是 modal.Dict,跨容器最终一致,/run 刚返回时
       //   另一个容器可能还读不到这条。阈值与 Python 客户端 bridge_client.wait 同口径。
+      // ⚠ 提交结果未知、又从没看到过它时,判「没落地」要把窗口拉到分钟级(2026-10-05 深度 review 第二轮):
+      //   /submit 放弃时 run_endpoint 可能还在冷启动,任务一两分钟后才写进 job_state;几秒的连续 not_found
+      //   只说明「还没落地」,不说明「不会落地」。看到过任何状态之后照常按 NOT_FOUND_STREAK 判。
+      // ⚠ 恢复记录上带矛盾标记(cancelContradiction)时,连续 not_found 只报矛盾、不删记录。
       if (pData.status === "not_found") {
-        if (++gone >= NOT_FOUND_STREAK) {
-          final = { ...pData, status: "failed",
-                    error: submitUnknown && !sawStatus
-                      ? t("run.submit_not_landed", { id: jobId })
-                      : t("run.job_gone", { id: jobId }) };
+        if (gone === 0) goneSince = Date.now();
+        gone++;
+        const unlanded = submitUnknown && !sawStatus;
+        if (gone >= NOT_FOUND_STREAK
+            && (!unlanded || Date.now() - goneSince >= SUBMIT_UNKNOWN_NOT_FOUND_MS)) {
+          final = cancelContradiction(jobId)
+            ? { status: "contradicted", error: t("run.gone_contradicted", { id: jobId }) }
+            : { ...pData, status: "failed",
+                error: unlanded
+                  ? t("run.submit_not_landed", { id: jobId, min: Math.round(SUBMIT_UNKNOWN_NOT_FOUND_MS / 60000) })
+                  : t("run.job_gone", { id: jobId }) };
           break;
         }
         continue;
@@ -1778,13 +1953,20 @@ async function runOnceOnModal(workflowPrompt, outputNodeIds, ctx, submitGuard, b
   }
   if (await gate.settled()) return { jobId, gpu, cancelled: true };
   if (!final) {
-    reportJobEvent(jobId, "polling_timed_out", `前端等待超时,已请求取消云端任务`);
+    // 排队阶段的兜底截止线(见 jobDeadline):云端 6 小时判死也一直没给出结局,说清楚是哪种超时
+    const queueNote = rec.runSeenAt == null
+      ? t("run.queue_timeout", { h: Math.round(QUEUE_STALE_MS / 3600000) }) + " · " : "";
+    reportJobEvent(jobId, "polling_timed_out", `${queueNote}前端等待超时,已请求取消云端任务`);
     // 主动放弃轮询时请求取消止损；确认失败则保留恢复记录。
     // 走共享的 requestCancel:取消失败会弹到用户面前(以前只 err 到 console),
     // 且如果超时那一刻云端恰好跑完(cancel_noop),产物会被取回落盘而不是白丢。
     // 仍然 throw —— 这条路径上工作流回填已经不可能了,如实报超时,产物在 output/ 里。
     await requestCancel(jobId, null, ctx.wfName);
-    throw new Error(`[job ${jobId}] Polling timed out(前端等待超时,已请求取消云端任务)`);
+    throw new Error(`[job ${jobId}] Polling timed out(${queueNote}前端等待超时,已请求取消云端任务)`);
+  }
+  if (final.status === "contradicted") {
+    reportJobEvent(jobId, "poll_gone_contradicted", "看到过 running、取消都回 not_found,轮询又连续 not_found");
+    throw new Error(`[job ${jobId}] ${final.error}`);
   }
   if (final.status === "auth_failed") {
     reportJobEvent(jobId, "poll_auth_failed", final.error || "");
@@ -1820,7 +2002,7 @@ async function runOnceOnModal(workflowPrompt, outputNodeIds, ctx, submitGuard, b
     notify(t("toast.bg_done", { sf }), "info");
   }
   if (has3d) notify(t("toast.saved_3d", { sf }), "info");
-  return { jobId, gpu, outputs: fetched.outputs };
+  return { jobId, gpu, outputs: fetched.outputs, cancelRequested: gate.requested };
 }
 
 // 同一个 job 同一时刻只取回一次(2026-10-05 深度 review F-P2-1):取消没赶上(cancel_noop)和主轮询
@@ -1910,6 +2092,7 @@ async function fetchJobResultOnce(jobId, final, ctx, batchSuffix = "") {
     throw new Error(`[job ${jobId}] ${fetched.error || `fetch HTTP ${fetchRes.status}`}`);
   }
   removeActiveJob(jobId);
+  notifyJobWarnings(jobId, final, ctx.wfName);   // 契约 D1:取回成功后再提示,三条路径一处覆盖
   return fetched;
 }
 
@@ -2167,6 +2350,13 @@ async function queueOnModal() {
       );
       if (result?.cancelled) return;  // 用户取消:卡片已 finish,别再 finish(true) 覆盖
       allOutputs.push(result);
+      // 这一单点过取消、但没能确认(云端回「正在提交中」/ 超时等),于是照常跟踪到了结束 ——
+      // 用户的意思是「别跑了」,后面的不再提交(2026-10-05 深度 review 第二轮:以前接着提交第 2、3 单)。
+      if (result?.cancelRequested && i + 1 < batchCount) {
+        ctx.finish(true, `✓ ${i + 1}/${batchCount} done · batch stopped`);
+        notify(t("run.batch_stopped", { cur: i + 1, total: batchCount, left: batchCount - i - 1 }), "warn", 8000);
+        return;
+      }
     }
 
     ctx.finish(true, batchCount > 1 ? `✓ ${batchCount} done` : "✓ Done");
@@ -2228,23 +2418,25 @@ async function refreshRunReady() {
 
 async function recoverPendingJob() {
   // 丢弃过期的,其余各自恢复(并行,每个一张卡)。过期线与主轮询同一口径(jobDeadline,C8):
-  // 没见过 running 的不过期(排队交给云端判死),见过的按 runSeenAt + worker 上限 + 尾巴;
-  // 已开始取回的保留到首次取回后 1 小时；仍受云端状态保留期限制。
-  // 别的标签页正在跟踪(心跳没过期)的记录原样保留、不接手 —— 否则两边各一张卡、各取回一遍。
+  // 没见过 running 的按提交时刻 + 6 小时 + 余量(排队交给云端判死,这里只兜底),见过的按
+  // runSeenAt + worker 上限 + 尾巴;已开始取回的保留到首次取回后 1 小时；仍受云端状态保留期限制。
+  // 别的标签页正在跟踪(它的心跳键里有这个 jobId 且没过期,见 trackedByLiveTab)的记录原样保留、
+  // 不接手 —— 否则两边各一张卡、各取回一遍。
   const settingSec = getSetting("ModalBridge.timeoutSec", 1200);
   const now = Date.now();
   const keep = [];
   const mine = [];
   for (const j of loadActiveJobs()) {
     if (!j?.jobId) continue;
-    const ownedElsewhere = j.tabId && j.tabId !== TAB_ID && now - (j.hb || 0) < ACTIVE_JOB_HB_STALE_MS;
-    if (ownedElsewhere) { keep.push(j); continue; }
+    if (trackedByLiveTab(j, now)) { keep.push(j); continue; }
     if (now > recoveryDeadline(j, settingSec)) continue;
-    const adopted = { ...j, tabId: TAB_ID, hb: now };
+    const adopted = { ...j, tabId: TAB_ID };
+    delete adopted.hb;   // 第一轮把心跳写在记录里,现在改存每个标签页自己的键
     keep.push(adopted);
     mine.push(adopted);
   }
   saveLS(LS_KEYS.activeJob, keep);
+  sweepTabHeartbeats(now);
   for (const j of mine) recoverOne(j, settingSec);
 }
 
@@ -2253,7 +2445,17 @@ async function recoverPendingJob() {
 // removeActiveJob —— 任务继续在云端跑到底、继续计费,而前端把它从恢复名单里删了,
 // 再没有任何人会来取结果。产物就这么烂在 Volume 上直到 TTL 被 GC。
 // 网络抖动那条路更糟:catch 完同样删记录,一次瞬时失败 = 永久失联。
+// 外壳同 runOnceOnModal:恢复期间登记「本页在跟踪」,结束(含失败保留记录)就撤销。
 async function recoverOne(pending, settingSec) {
+  trackJob(pending.jobId);
+  try {
+    return await recoverOneTracked(pending, settingSec);
+  } finally {
+    untrackJob(pending.jobId);
+  }
+}
+
+async function recoverOneTracked(pending, settingSec) {
   const jobId = pending.jobId;
   const short = jobId.slice(0, 8);
   log("recovering pending job:", jobId);
@@ -2270,6 +2472,7 @@ async function recoverOne(pending, settingSec) {
 
   let final = null;
   let gone = 0;                 // 连续 not_found 计数,同主轮询
+  const watch = transientWatch(jobId, ctx);   // 连续查不到状态的提示,同主轮询
   while (Date.now() < recoveryDeadline(rec, settingSec)) {
     if (await gate.settled()) return;
     // 临时错误只能重试,绝不能借机结束这张卡(见函数头注释)。判据与主轮询同一份:
@@ -2278,9 +2481,11 @@ async function recoverOne(pending, settingSec) {
     if (await gate.settled()) return;   // 取消时在途的 poll 回来:别再改卡片(F-P2-1)
     if (probe.transient) {
       log("recover poll transient (will retry)", probe.data || probe.error);
+      watch.transient(probe);
       await sleep(interval);
       continue;
     }
+    watch.seen();
     const pData = probe.data;
     if (pData.status === "auth_failed") {
       // C4:key 不对,再轮询也看不到。结束这张卡,但保留记录 —— 修好 key 再刷新还能接着取。
@@ -2291,6 +2496,14 @@ async function recoverOne(pending, settingSec) {
     if (pData.status === "not_found") {
       // 同主轮询:恢复记录里的 job 可能早被 GC 清了,连续确认后如实结束,别一直转。
       if (++gone >= NOT_FOUND_STREAK) {
+        // 记录上带矛盾标记(看到过它在跑、取消都回「查无此任务」):只报矛盾、保留记录,同主轮询
+        if (cancelContradiction(jobId)) {
+          const msg = t("run.gone_contradicted", { id: jobId });
+          reportJobEvent(jobId, "recover_gone_contradicted", "看到过 running、取消都回 not_found,恢复轮询又连续 not_found");
+          ctx.finish(false, t("recover.contradicted"), msg);
+          notify(msg, "error");
+          return;
+        }
         removeActiveJob(jobId);
         ctx.finish(false, t("recover.gone"));
         return;
@@ -2378,20 +2591,35 @@ let _advReady = false;
 // C10:文本设置项每敲一个键 onChange 就触发一次 —— 以前每键一次 POST /config,半截 URL 也逐个
 // 写进 config、每次还弹一条「已保存」(2026-10-05 深度 review F-P2-5)。停止输入 800ms 后才写,只写最后的值。
 const TEXT_SETTING_DEBOUNCE_MS = 800;
-const _textSettingTimers = {};
+const _textSettingPending = {};   // field -> {timer, value}:还没写出去的最后一次输入
 function syncAigcFieldToConfig(field, value) {
   if (!_advReady) return;   // 启动期回填触发的 onChange 不回写(判断放在这里:回填那一刻就该挡掉)
-  clearTimeout(_textSettingTimers[field]);
-  _textSettingTimers[field] = setTimeout(() => {
-    delete _textSettingTimers[field];
+  const prev = _textSettingPending[field];
+  if (prev) clearTimeout(prev.timer);
+  const timer = setTimeout(() => {
+    delete _textSettingPending[field];
     writeAigcFieldToConfig(field, value);
   }, TEXT_SETTING_DEBOUNCE_MS);
+  _textSettingPending[field] = { timer, value };
 }
-async function writeAigcFieldToConfig(field, value) {
+// pagehide 时把还在防抖窗口里的值立即发出去(2026-10-05 深度 review 第二轮):输完 800ms 内刷新或关页面,
+// 定时器跟着页面没了,最后一次输入就丢了 —— 下次启动 setup 又拿 config 里的旧值把设置项覆盖回去。
+// keepalive:页面卸载后请求仍会发完(浏览器保证,body 上限 64KB,这里只有一个 URL)。
+function flushTextSettings() {
+  for (const field of Object.keys(_textSettingPending)) {
+    const { timer, value } = _textSettingPending[field];
+    clearTimeout(timer);
+    delete _textSettingPending[field];
+    writeAigcFieldToConfig(field, value, { keepalive: true });
+  }
+}
+async function writeAigcFieldToConfig(field, value, { keepalive = false } = {}) {
   try {
     const r = await bridgeFetch("/modal_bridge/config", {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ [field]: String(value ?? "") }),
+      // 卸载时发的:不在冷却期外弹配对框(页面都要没了)
+      ...(keepalive ? { keepalive: true, background: true } : {}),
     });
     if (!r.ok) throw await httpError(r, "config");
     log(`${field} → ${field.endsWith("secret") ? "(已更新)" : String(value ?? "")}`);
@@ -2887,6 +3115,7 @@ async function openDeployDialog() {
   const nodesStatusEl = panel.querySelector("#mb-nodes-status");
   const nodesLogEl = panel.querySelector("#mb-nodes-log");
   let loadedNodes = [];  // [{name,url,commit}]
+  let loadedUnchecked = "";   // 加载列表时 /list_nodes 带的 cloud_unchecked(读不到云端、退回本机清单的原因)
 
   nodesLoadBtn.onclick = async () => {
     nodesLoadBtn.disabled = true;
@@ -2926,9 +3155,13 @@ async function openDeployDialog() {
            </label>`).join("");
         nodesPruneBtn.style.display = "inline-block";
       }
+      // C6:读不到云端时列表是本机清单 —— 说出来,别让「没查到」看起来像「云端就这些」
+      //   (2026-10-05 深度 review 第二轮:以前只显示「来源:local」,原因丢了)。
+      loadedUnchecked = d.cloud_unchecked ? String(d.cloud_unchecked) : "";
       nodesStatusEl.textContent = t("mn.installed", { n: loadedNodes.length, src: d.source })
+        + (loadedUnchecked ? " · " + t("mn.cloud_unchecked", { why: loadedUnchecked }) : "")
         + (localErr ? " · " + t("mn.local_list_fail", { e: localErr }) : "");
-      nodesStatusEl.style.color = localErr ? "#fbbf24" : "#9aa";
+      nodesStatusEl.style.color = (localErr || loadedUnchecked) ? "#fbbf24" : "#9aa";
     } catch (e) {
       nodesStatusEl.textContent = t("mn.load_fail", { e: e.message || e });
       nodesStatusEl.style.color = "#f87171";
@@ -2942,7 +3175,11 @@ async function openDeployDialog() {
       .map((cb) => loadedNodes[parseInt(cb.dataset.i, 10)]);
     if (!checked.length) { nodesStatusEl.textContent = t("mn.none_checked"); return; }
     const list = checked.map((n) => "  • " + n.name).join("\n");
-    if (!confirm(t("mn.confirm", { n: checked.length, list }))) return;
+    // 读不到云端时,服务端只能拿本机清单对账:别的机器加的节点并不回来(C6),确认前说清楚。
+    // 只勾了 Volume 上的本地包时不重部署,不涉及镜像清单,不加这句。
+    const uncheckedNote = loadedUnchecked && checked.some((n) => n.kind !== "local")
+      ? t("mn.confirm_unchecked", { why: loadedUnchecked }) : "";
+    if (!confirm(t("mn.confirm", { n: checked.length, list }) + uncheckedNote)) return;
 
     // 两类节点删法不同:镜像里 clone 的要改清单 + 重部署;Volume 上的本地包直接删文件即可
     // (下次容器启动就不会解压它了),不必为此重 build 一次镜像。
@@ -3194,9 +3431,14 @@ app.registerExtension({
 
     // history 持久化:启动时检查未完成 job
     recoverPendingJob();
-    // 恢复记录的归属心跳(见 TAB_ID):本标签页在跟踪的 job 定期续约;页面关闭 / 刷新时清零,
-    // 刷新后的页面立刻接手,其它标签页在心跳过期前不会重复接手。
-    setInterval(() => heartbeatActiveJobs(), ACTIVE_JOB_HB_MS);
-    try { window.addEventListener("pagehide", () => heartbeatActiveJobs(true)); } catch (e) {}
+    // 恢复记录的归属心跳(见 TAB_ID / _trackedJobs):本页正在轮询或取回的 job 定期续约,写在本页自己的
+    // 键里;页面关闭 / 刷新时删掉,刷新后的页面立刻接手,其它标签页在心跳过期前不会重复接手。
+    setInterval(() => { if (_trackedJobs.size) writeTabHeartbeat(); }, ACTIVE_JOB_HB_MS);
+    try {
+      window.addEventListener("pagehide", () => {
+        releaseTabHeartbeat();
+        flushTextSettings();   // 防抖窗口里还没写出去的设置值(C10)
+      });
+    } catch (e) {}
   },
 });
