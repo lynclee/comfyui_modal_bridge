@@ -90,12 +90,15 @@ _CALL_PENDING = "pending"
 # ⚠ 刻意内联而不 import contract.is_safe_job_id:contract 不在镜像的
 # add_local_python_source 名单里,容器内根本没有这个模块(和 modal_image.py 内联
 # 目录哈希是同一个理由)。两处规则必须保持一致,改一边记得改另一边。
-_SAFE_JOB_ID = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
+# ⚠ 首字符必须是字母数字(契约 C1,2026-10-05 深度 review):以前 "." 能过,GC 就会发出
+#   remove_file("_outputs/.", recursive=True) —— 递归删的是整个 _outputs/,所有人没取回的产物一起没。
+_SAFE_JOB_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 
 
 def _safe_job_id(job_id) -> bool:
+    # fullmatch 而不是 match:`$` 会放过结尾的换行("abc\n")
     return (isinstance(job_id, str)
-            and bool(_SAFE_JOB_ID.match(job_id))
+            and bool(_SAFE_JOB_ID.fullmatch(job_id))
             and ".." not in job_id)
 
 
@@ -119,8 +122,11 @@ def _stale_reason(s, now: float) -> str:
     if s.get("status") == "queued":
         t0 = s.get("queued_at") or 0
         if t0 and now - t0 > _QUEUE_STALE_S:
+            # ⚠ 别写「排队期间不计费」:正是这种「启动阶段就失败」的情形最费钱 —— Modal 按容器时长计费,
+            #   @modal.enter 也算,容器反复拉起、反复失败,每一次都在计费(2026-10-05 深度 review)。
             return (f"排队超过 {_QUEUE_STALE_S // 3600} 小时仍未开始执行 —— worker 多半在启动阶段就失败了"
-                    f"(镜像 / 依赖 / ComfyUI 起不来),排队期间不计费。可在 Modal 控制台看该调用的日志。")
+                    f"(镜像 / 依赖 / ComfyUI 起不来)。单纯排队等 GPU 不计费,但每次容器启动(含失败的启动)"
+                    f"都按容器时长计费。可在 Modal 控制台看该调用的日志。")
         return ""
     if s.get("status") not in ("running", "delivering"):
         return ""
@@ -324,6 +330,71 @@ def _sweep_job_state():
                 _drop(jid)
     except Exception:
         pass
+    # 3) 没有索引的 _outputs 目录(见 _sweep_orphan_outputs)。复用本轮快照,不再拉一遍 Dict。
+    try:
+        _sweep_orphan_outputs(records, now)
+    except Exception as e:
+        print(f"[bridge] ⚠ 孤儿产物扫描失败(忽略): {type(e).__name__}: {e}")
+
+
+# 孤儿产物兜底扫描:最多每 _ORPHAN_SWEEP_EVERY_S 秒一次(每个 run_endpoint 容器各自计),一次最多
+# _VOL_GC_PER_SWEEP 个 Volume RPC。模块级节流,理由同 _last_sweep。
+_ORPHAN_SWEEP_EVERY_S = 3600
+_last_orphan_sweep = [0.0]
+
+
+def _dir_entry_is_dir(ent) -> bool:
+    t = getattr(ent, "type", None)
+    return getattr(t, "name", None) == "DIRECTORY" or t == 2   # modal.volume.FileEntryType.DIRECTORY
+
+
+def _sweep_orphan_outputs(records: dict, now: float) -> None:
+    """删掉 job_state 里已经没有索引的 `_outputs/<jid>/` 目录。
+
+    为什么需要:_drop 让目录和索引同生共死,前提是索引还在。Modal Dict 的条目 7 天没有读写就会过期,
+    如果最后一批任务之后超过 7 天不再有人提交(GC 只在 /run 里跑),没取回的大文件目录的索引先过期了,
+    之后再也没人认领它们,Volume 一直付存储钱(2026-10-05 深度 review)。
+
+    判据(全部满足才删):
+      · Volume 上的目录名是合法 job_id(脏名字一律不碰,remove_file 是递归删);
+      · 本轮 Dict 快照里 `jid` / `jid:call` / `jid:progress` 都不存在;
+      · 最后修改时间早于 2 × JOB_TTL_S。正常任务写完产物、commit 时索引早已存在,哪怕跨容器最终一致
+        有延迟也是秒级;目录 2 小时没动过还查不到索引,只能是索引过期 / 被删后留下的。
+    mtime 取目录项自己的(FileEntry.mtime,秒);目录项报 0 时退一步列它里面的文件取最大 mtime,
+    仍拿不到就不删 —— 宁可漏删,不可错删。"""
+    if now - _last_orphan_sweep[0] < _ORPHAN_SWEEP_EVERY_S:
+        return
+    _last_orphan_sweep[0] = now
+    try:
+        entries = models_vol.listdir("_outputs", recursive=False)
+    except Exception as e:
+        if not _is_already_gone(e):        # 还没有任何大文件产物时 _outputs 本来就不存在
+            print(f"[bridge] ⚠ 孤儿产物扫描:列 _outputs 失败: {type(e).__name__}: {e}")
+        return
+    budget = _VOL_GC_PER_SWEEP
+    horizon = 2 * JOB_TTL_S
+    for ent in entries:
+        if budget <= 0:
+            break
+        jid = str(getattr(ent, "path", "") or "").rstrip("/").rsplit("/", 1)[-1]
+        if not _dir_entry_is_dir(ent) or not _safe_job_id(jid):
+            continue
+        if any(k in records for k in (jid, f"{jid}:call", f"{jid}:progress")):
+            continue
+        mtime = getattr(ent, "mtime", 0) or 0
+        try:
+            if not mtime:
+                budget -= 1
+                inner = models_vol.listdir(f"_outputs/{jid}", recursive=True)
+                mtime = max((getattr(x, "mtime", 0) or 0 for x in inner), default=0)
+            if not mtime or now - mtime <= horizon:
+                continue
+            budget -= 1
+            models_vol.remove_file(f"_outputs/{jid}", recursive=True)
+            print(f"[bridge] GC 孤儿产物 _outputs/{jid}(无索引,{int((now - mtime) // 3600)}h 未改动)")
+        except Exception as e:
+            if not _is_already_gone(e):
+                print(f"[bridge] ⚠ 孤儿产物 _outputs/{jid} 清理失败: {type(e).__name__}: {e}")
 
 
 # ============================================================================
@@ -404,6 +475,13 @@ def _gpu_compute_cap() -> str:
         return ""
 
 
+# 本容器里正在运行的 ComfyUI 进程**启动时**加载的本地节点指纹({folder: digest})。每次拉起 ComfyUI 前,
+# 从磁盘 marker 照一张像存这里 —— ComfyUI 只在启动时扫一次 custom_nodes,所以「启动那一刻的磁盘」
+# 就是「内存里在跑的代码」。暖容器纠偏判断过期必须比它,不能比磁盘(见 _refresh_local_nodes_if_stale)。
+# None = 还没记过 / 记失败,退回比磁盘(旧行为)。
+_LOADED_LOCAL_DIGESTS: dict | None = None
+
+
 def _worker_boot(self, cpu: bool = False, load_local_nodes: bool = True):
     # cpu=True:CPU-only 容器(无 GPU)→ 给 ComfyUI 传 --cpu 强制 CPU 模式,根本不碰 CUDA 初始化,
     # 避免 CUDA 版 torch 在无驱动机器上自动探测的边角风险。GPU 容器走默认(自动用 CUDA)。
@@ -457,6 +535,13 @@ def _worker_boot(self, cpu: bool = False, load_local_nodes: bool = True):
     # ⚠ stdout=PIPE 就必须持续读:不读的话管道缓冲区满了,ComfyUI 会阻塞在 write 上。
     #   所以下面那个 pump 线程是硬要求,不是优化。任何一步出问题都退化成不捕获。
     _BOOT_LOG[:] = []
+    global _LOADED_LOCAL_DIGESTS
+    try:
+        from _local_nodes_boot import current_digests
+        _LOADED_LOCAL_DIGESTS = current_digests()
+    except Exception as e:
+        _LOADED_LOCAL_DIGESTS = None
+        print(f"[bridge] ⚠ 记录已加载的本地节点版本失败(纠偏退回比磁盘): {e}")
     try:
         self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                      text=True, bufsize=1, errors="replace")
@@ -465,7 +550,8 @@ def _worker_boot(self, cpu: bool = False, load_local_nodes: bool = True):
         print(f"[bridge] ⚠ 无法捕获 ComfyUI 输出({e}),退化为直连 stdout(诊断信息会少一些)")
         self.proc = subprocess.Popen(cmd)
     from _comfy_ws import wait_comfy_ready
-    wait_comfy_ready(timeout_s=180)
+    # 把进程句柄传进去:启动即崩时立刻失败,不对着死进程空等 180s(enter 阶段同样计费)
+    wait_comfy_ready(timeout_s=180, proc=self.proc)
     if cpu:
         mode = "CPU"
     else:
@@ -503,6 +589,90 @@ def _worker_shutdown(self, wait_s: float = 20.0):
         except Exception as e:
             # 不能确认旧进程已退出就绝不能在同一端口启动新的；否则 readiness 可能误命中旧进程。
             raise RuntimeError(f"旧 ComfyUI 进程未能退出: {e}") from e
+
+
+# ── 暖容器探活 / 退役(2026-10-05 深度 review)───────────────────────────────────
+# ComfyUI 子进程死掉(OOM kill / segfault)或 CUDA 进了黏性错误态之后,暖容器以前既不探活也不退役:
+# 之后每一单都秒失败(WS 连不上 / 每个 CUDA 调用都报同一个错),直到空闲回收 —— 一串排队的任务
+# 全部白白失败。所以:每单开跑前探活,不健康就原地重启;遇到不可达或 CUDA 黏性错误,当前单结束后
+# 让容器不再接单(Modal 换一个新容器来跑后面的)。
+# 黏性错误的典型文本:"CUDA error: an illegal memory access was encountered"(之后同进程的 CUDA 调用都失败)。
+# 普通的显存不足("CUDA out of memory")不黏,不在此列。
+_STICKY_CUDA = re.compile(r"CUDA error|illegal memory access", re.IGNORECASE)
+
+
+def _comfy_unhealthy_reason(self) -> str:
+    """ComfyUI 子进程不健康的原因;健康返回空串。进程已退出是确定的;HTTP 探活给两次机会,
+    别因为一次偶发超时就把显存里的模型全丢掉重启。"""
+    proc = getattr(self, "proc", None)
+    rc = proc.poll() if proc is not None else None
+    if rc is not None:
+        return f"ComfyUI 子进程已退出(returncode={rc})"
+    import requests
+    why = ""
+    for i in range(2):
+        try:
+            r = requests.get("http://127.0.0.1:8188/system_stats", timeout=10)
+            if r.ok:
+                return ""
+            why = f"/system_stats HTTP {r.status_code}"
+        except Exception as e:
+            why = f"/system_stats 不可达: {type(e).__name__}: {e}"
+        if i == 0:
+            time.sleep(1)
+    return why
+
+
+def _ensure_comfy_healthy(self) -> None:
+    """每单开跑前调用:不健康(或上一单标记了要重启)就原地重启 ComfyUI。重启失败照常抛,由调用方记 failed。"""
+    why = ("上一单遇到不可恢复的错误,已标记重启" if getattr(self, "_restart_before_next", False)
+           else _comfy_unhealthy_reason(self))
+    if not why:
+        return
+    print(f"[bridge] ⚠ ComfyUI 不健康({why})→ 原地重启后再跑这一单")
+    self._restart_before_next = False
+    _worker_shutdown(self)
+    # 等价于一次冷启动:重新 reload Volume、重新解压本地节点(并重新记下已加载的版本)
+    _worker_boot(self, cpu=getattr(self, "_cpu", False))
+
+
+def _retire_container(self, why: str) -> None:
+    """让本容器跑完当前单后不再接单。
+
+    用的是 modal.experimental.stop_fetching_inputs()(本机 SDK 1.4.3 有;容器里的版本以镜像为准,所以 getattr 防御;
+    实现见 modal/_runtime/container_io_manager.py:_generate_inputs —— 置 _fetching_inputs=False,
+    max_inputs=1 的同步 worker 在当前 input 返回后不再取下一个,容器优雅退出、照常走 @modal.exit)。
+    SDK 没有这个 API 或调用失败时,退化为「下一单开跑前原地重启」(_restart_before_next)。
+    两条都设上:万一已经有下一单在途,它开跑前也会先重启。"""
+    self._restart_before_next = True
+    stop = None
+    try:
+        import importlib
+        stop = getattr(importlib.import_module("modal.experimental"), "stop_fetching_inputs", None)
+    except Exception:
+        stop = None
+    if stop is not None:
+        try:
+            stop()
+            print(f"[bridge] ⚠ 容器 {_container_id()} 跑完当前单后退役、不再接单: {why}")
+            return
+        except Exception as e:
+            print(f"[bridge] ⚠ stop_fetching_inputs 失败({type(e).__name__}: {e})")
+    print(f"[bridge] ⚠ {why} —— 无法让容器退役,下一单开跑前原地重启 ComfyUI")
+
+
+def _retire_if_broken(self, err: BaseException) -> None:
+    """任务失败后判断容器还能不能接着用:CUDA 黏性错误 / ComfyUI 不可达 → 退役。
+    **从不抛异常**:调用方正在处理原始异常,这里抛了会把真因盖掉。"""
+    try:
+        if _STICKY_CUDA.search(str(err)):
+            _retire_container(self, "CUDA 黏性错误,同一进程里后续的 CUDA 调用都会失败")
+            return
+        why = _comfy_unhealthy_reason(self)
+        if why:
+            _retire_container(self, f"ComfyUI 不可达({why})")
+    except Exception as e:
+        print(f"[bridge] ⚠ 失败后的容器体检出错(忽略): {type(e).__name__}: {e}")
 
 
 # 容器指纹:同一容器里所有日志行带同一个值 —— 数不同值 = 数容器;几单共享一个值 = 那几单
@@ -586,30 +756,72 @@ def _refresh_local_nodes_if_stale(self, expected: dict | None) -> bool:
     返回是否真的重装过。"""
     if not expected:
         return False
-    from _local_nodes_boot import BAKED_SENTINEL, extract_all, needs_refresh, restore_baked
-    stale = needs_refresh(expected)
+    from _local_nodes_boot import BAKED_SENTINEL, extract_all, needs_refresh, node_target, restore_baked
+    # 名字先校验再动任何东西:非法名(如 ".")直接让这一单失败,别为一个坏请求白白重启 ComfyUI
+    for folder in expected:
+        node_target(folder)
+    # ⚠ 比的是 ComfyUI **启动时加载的**版本,不是磁盘 marker:纠偏失败后磁盘已是新版、内存里还是旧代码,
+    #   比磁盘会判「不过期」,下一单静默跑旧节点(2026-10-05 深度 review)。
+    stale = needs_refresh(expected, _LOADED_LOCAL_DIGESTS)
     if not stale:
         return False
-    print(f"[bridge] 暖容器的本地节点已过期 {stale} → reload + 重装 + 重启 ComfyUI")
-    models_vol.reload()   # 别处 commit 的 Volume 变更,运行中容器必须 reload 才看得到
-    extract_all()
-    # Volume 里可能仍留有历史覆盖包(清理失败/多机最终一致性),所以先统一解压,
-    # 再按本次任务声明把应跑 baked 的目录恢复。纯本地节点无备份时会删除覆盖目录。
-    restore_baked([f for f, d in expected.items() if d == BAKED_SENTINEL])
-    # ⚠ 复核,别只当提示:extract_all 对坏包 / 解压失败 / marker 写失败都是「打日志继续」,
-    #   Volume 上的包也可能压根不是这一版(上传失败/最终一致性没追上)。不复核就会
-    #   **静默跑旧节点代码** —— 用户改完节点跑一遍,结果和没改一样,零线索。宁可让任务明确失败。
-    still = needs_refresh(expected)
-    if still:
-        raise RuntimeError(
-            f"本地节点版本对不上,拒绝用旧代码跑: {still}。"
-            f"云端拿到的不是本次提交声明的那版(上传没成功?包损坏?)——请重试提交;"
-            f"仍不行就在「管理云端节点」里删掉这些包再跑一次。")
+    print(f"[bridge] 暖容器的本地节点已过期 {stale} → 停 ComfyUI + reload + 重装 + 重启")
+    # ⚠ 先停 ComfyUI 再 reload:Modal 文档写明 Volume 上有打开的文件时 reload 会失败,而 ComfyUI 可能
+    #   正持有卷上模型文件的句柄(以前是先 reload 后停,2026-10-05 深度 review)。反正后面要重启它。
     _worker_shutdown(self)
-    # 上面已经 reload + 解压 + 复核过。这里若再让 boot 解压一次,另一台机器恰好上传新包
+    err = None
+    try:
+        models_vol.reload()   # 别处 commit 的 Volume 变更,运行中容器必须 reload 才看得到
+        extract_all()
+        # Volume 里可能仍留有历史覆盖包(清理失败/多机最终一致性),所以先统一解压,
+        # 再按本次任务声明把应跑 baked 的目录恢复。纯本地节点无备份时会删除覆盖目录。
+        restore_baked([f for f, d in expected.items() if d == BAKED_SENTINEL])
+        # ⚠ 复核,别只当提示:extract_all 对坏包 / 解压失败 / marker 写失败都是「打日志继续」,
+        #   Volume 上的包也可能压根不是这一版(上传失败/最终一致性没追上)。不复核就会
+        #   **静默跑旧节点代码** —— 用户改完节点跑一遍,结果和没改一样,零线索。宁可让任务明确失败。
+        #   ComfyUI 此刻停着,下一次启动装的就是磁盘这版,所以这里比磁盘(loaded=None)。
+        still = needs_refresh(expected)
+        if still:
+            err = RuntimeError(
+                f"本地节点版本对不上,拒绝用旧代码跑: {still}。"
+                f"云端拿到的不是本次提交声明的那版(上传没成功?包损坏?)——请重试提交;"
+                f"仍不行就在「管理云端节点」里删掉这些包再跑一次。")
+    except Exception as e:
+        err = e
+    # 无论复核成败都要把 ComfyUI 拉起来:失败时磁盘已被改动,不重启的话「内存里的旧代码」和
+    # 「磁盘上的新 marker」分叉;重启后两者一致,_LOADED_LOCAL_DIGESTS 也随之更新,下一单判断才对。
+    # 上面已经 reload + 解压过。这里若再让 boot 解压一次,另一台机器恰好上传新包
     # 就会在复核之后偷换版本；解压失败也会被 boot 的冷启动容错吞掉。因此只重启进程。
-    _worker_boot(self, cpu=getattr(self, "_cpu", False), load_local_nodes=False)
+    try:
+        _worker_boot(self, cpu=getattr(self, "_cpu", False), load_local_nodes=False)
+    except Exception as boot_err:
+        if err is not None:   # 两个错误都要让用户看见:真因是前一个,后一个决定了这个容器还能不能用
+            raise RuntimeError(f"{err}(随后重启 ComfyUI 也失败了: {boot_err})") from boot_err
+        raise
+    if err is not None:
+        raise err
     return True
+
+
+def _claim_pending_call_id(job_id: str) -> bool:
+    """`<job_id>:call` 还是占位值时,用本次调用自己的 function call id 补上。返回是否补了。
+
+    run_endpoint 在 spawn 之后、写回真实 call_id 之前被杀(60s 超时 / 容器回收),占位值就永远留着:
+    /cancel 一直回「提交中、稍等再点」,而任务照常在跑、在计费(2026-10-05 深度 review)。
+    worker 自己的 call id 和 spawn 返回的 call.object_id 是同一个值,和 run_endpoint 并发写也无害。
+    只在读到占位值时才写:键不存在(GC 已回收)时写进去会留下一个永远没人清的孤儿键。best-effort。"""
+    try:
+        if job_state.get(f"{job_id}:call") != _CALL_PENDING:
+            return False
+        cid = modal.current_function_call_id()
+        if not cid:
+            return False
+        job_state[f"{job_id}:call"] = cid
+        print(f"[bridge] job {job_id}: :call 仍是占位(提交方没写回),已用本调用的 {cid} 补上")
+        return True
+    except Exception as e:
+        print(f"[bridge] ⚠ job {job_id}: 补写 call_id 失败(忽略): {e}")
+        return False
 
 
 def _worker_run(workflow: dict, job_id: str, input_images: list | None = None,
@@ -618,8 +830,9 @@ def _worker_run(workflow: dict, job_id: str, input_images: list | None = None,
     # aigc-r2 = 直传 R2 + 回调 AIGC Studio。⚠ delivery 里的 token 是敏感的:不进 job_state、不打日志。
     # call_id 现在存独立 key(见 run_endpoint);等它出现仅为让 cancel 可用,等不到也继续。
     # ⚠ 等的是**真实** call_id:run_endpoint 会先写占位值,认占位就等于没等。
+    # 占位值说明 run_endpoint 还没写回(或已经死了写不回了)→ 自己补上,不必干等(见 _claim_pending_call_id)。
     for _ in range(50):  # 最多 ~5s
-        if _call_id(job_id):
+        if _call_id(job_id) or _claim_pending_call_id(job_id):
             break
         time.sleep(0.1)
     mode = (delivery or {}).get("mode", "desktop")
@@ -638,16 +851,21 @@ def _worker_run(workflow: dict, job_id: str, input_images: list | None = None,
         # 别写 running 把它覆盖掉,也别开跑烧 GPU。
         print(f"[bridge] job {job_id}: 起跑前已是 {cur.get('status')},不执行")
         return {"skipped": cur.get("status")}
-    job_state[job_id] = {**cur, "status": "running", "started_at": time.time(),
-                         "timeout_s": WORKER_TIMEOUT,   # 按任务记超时,见 _stale_reason
-                         # 实际卡型(gpu 字段只是候选列表,见 _GPU_NAME)。之后的写入都是 {**现有记录} 合并,会一路带到终态
-                         **({"gpu_actual": gpu_actual} if gpu_actual else {})}
-    try:
-        del job_state[f"{job_id}:progress"]   # 同 id 被回收后再提交时,别显示上一次的进度
-    except Exception:
-        pass
     from _comfy_ws import interrupt_comfy     # 放在 try 外:下面两个异常分支都要用
+    # ⚠ try 必须从写 running **之前**开始:取消信号(SIGUSR1 → InputCancellation)可以落在主线程的任意一行。
+    #   以前 try 从写完 running、删完 :progress 之后才开始,信号恰好落在这两次 Dict RPC 上时,
+    #   BaseException 分支接不到它,终态停在 running,22 分钟后被 _stale_reason 误报成「被 Modal 强杀、
+    #   已计费」(2026-10-05 深度 review 复现)。下面的分支对「还没写 running」也是对的:取消分支只在
+    #   非终态时落 cancelled,失败分支照常落 failed。
     try:
+        job_state[job_id] = {**cur, "status": "running", "started_at": time.time(),
+                             "timeout_s": WORKER_TIMEOUT,   # 按任务记超时,见 _stale_reason
+                             # 实际卡型(gpu 字段只是候选列表,见 _GPU_NAME)。之后的写入都是 {**现有记录} 合并,会一路带到终态
+                             **({"gpu_actual": gpu_actual} if gpu_actual else {})}
+        try:
+            del job_state[f"{job_id}:progress"]   # 同 id 被回收后再提交时,别显示上一次的进度
+        except Exception:
+            pass
         # ⚠ 不在这里 free/reload!曾经"每 job 跑前 free+reload"会把 warm 容器显存里的模型卸掉,
         # 导致每个 job 都得重新从 Volume 加载 flux2(~163s),彻底毁掉 warm 复用。
         # 正确策略:正常直接跑(模型在显存,秒级);只有验证失败(模型不在列表)时,queue_workflow
@@ -668,10 +886,14 @@ def _worker_run(workflow: dict, job_id: str, input_images: list | None = None,
             now = time.time()
             if m <= 1 or v <= 0:
                 return
-            if m != _prog["m"]:          # 新一段进度条(换了节点)→ 全部重置
+            # 新一段进度条 → 全部重置。判据有两个:总步数变了(换了节点),或者步数回退了。
+            # ⚠ 只看总步数的话,两段步数相同的采样(base + refiner、两段式视频采样)第二段永远进不来 ——
+            #   v 回到 1 后一直 <= 上一段末尾的 v,被下面那句当成重复事件丢掉,:progress 冻结在第一段末尾,
+            #   前端的投影式超时预警整段失效(2026-10-05 深度 review 复现)。
+            if m != _prog["m"] or v < _prog["v"]:
                 _prog.update(m=m, v=v, t_last=now, win=[])
                 return
-            if v <= _prog["v"]:
+            if v == _prog["v"]:
                 return
             itv = (now - _prog["t_last"]) / (v - _prog["v"])
             _prog.update(v=v, t_last=now)
@@ -790,6 +1012,33 @@ def _worker_run(workflow: dict, job_id: str, input_images: list | None = None,
     return result
 
 
+def _worker_entry(self, workflow: dict, job_id: str, input_images: list | None,
+                  delivery: dict | None, local_nodes: dict | None) -> dict:
+    """四个 worker 类的 run() 共用的入口:探活 → 本地节点纠偏 → 跑任务 → 失败后决定容器去留。"""
+    # 尽早补上占位的 :call(见 _claim_pending_call_id):下面的探活 / 纠偏可能要重启 ComfyUI、花上几分钟,
+    # 这段时间里 /cancel 也得拿得到句柄。
+    _claim_pending_call_id(job_id)
+    try:
+        # 子进程死了 / CUDA 坏了 / 上一单标记要重启 → 原地重启,别让这一单秒失败(见 _STICKY_CUDA 上方注释)
+        _ensure_comfy_healthy(self)
+        # 暖容器可能装着上一版自写节点。刷不到期望版本会抛错 —— 必须写进 job_state,
+        # 否则前端只看到 queued 一直转(spawn 的异常传不回轮询侧)。
+        _refresh_local_nodes_if_stale(self, local_nodes)
+    except Exception as e:
+        cur = job_state.get(job_id) or {}
+        # 终态优先:用户在这之前已经取消 / 已被判死的,别拿「重启失败」去覆盖真实结局
+        if cur.get("status") not in ("completed", "failed", "cancelled"):
+            job_state[job_id] = {**cur, "status": "failed",
+                                 "error": str(e), "completed_at": time.time()}
+        _retire_if_broken(self, e)
+        raise
+    try:
+        return _worker_run(workflow, job_id, input_images, delivery)
+    except Exception as e:
+        _retire_if_broken(self, e)
+        raise
+
+
 # GPU 在部署时由 config.default_gpu 决定(deploy_env 传 MODAL_BRIDGE_DEFAULT_GPU)。
 # ⚠ Modal 的 gpu 是部署时固定的,运行时不可变 —— 换显卡需重新部署。
 # 每档带 Modal 原生 fallback(排不到主卡自动降级到链里下一个)。
@@ -839,15 +1088,7 @@ class ComfyWorker:
     @modal.method()
     def run(self, workflow: dict, job_id: str, input_images: list | None = None,
             delivery: dict | None = None, local_nodes: dict | None = None) -> dict:
-        # 暖容器可能装着上一版自写节点。刷不到期望版本会抛错 —— 必须写进 job_state,
-        # 否则前端只看到 queued 一直转(spawn 的异常传不回轮询侧)。
-        try:
-            _refresh_local_nodes_if_stale(self, local_nodes)
-        except Exception as e:
-            job_state[job_id] = {**job_state.get(job_id, {}), "status": "failed",
-                                 "error": str(e), "completed_at": time.time()}
-            raise
-        return _worker_run(workflow, job_id, input_images, delivery)
+        return _worker_entry(self, workflow, job_id, input_images, delivery, local_nodes)
 
 
 # 省钱档 worker:估算显存放得下便宜卡(默认 L40S)且非视频的 GPU 工作流路由到这。
@@ -870,15 +1111,7 @@ class ComfyWorkerCheap:
     @modal.method()
     def run(self, workflow: dict, job_id: str, input_images: list | None = None,
             delivery: dict | None = None, local_nodes: dict | None = None) -> dict:
-        # 暖容器可能装着上一版自写节点。刷不到期望版本会抛错 —— 必须写进 job_state,
-        # 否则前端只看到 queued 一直转(spawn 的异常传不回轮询侧)。
-        try:
-            _refresh_local_nodes_if_stale(self, local_nodes)
-        except Exception as e:
-            job_state[job_id] = {**job_state.get(job_id, {}), "status": "failed",
-                                 "error": str(e), "completed_at": time.time()}
-            raise
-        return _worker_run(workflow, job_id, input_images, delivery)
+        return _worker_entry(self, workflow, job_id, input_images, delivery, local_nodes)
 
 
 # 顶配档 worker:估算显存超过主卡的工作流(如 >80G)升到这(默认 B200 180G),防 OOM。
@@ -901,15 +1134,7 @@ class ComfyWorkerTop:
     @modal.method()
     def run(self, workflow: dict, job_id: str, input_images: list | None = None,
             delivery: dict | None = None, local_nodes: dict | None = None) -> dict:
-        # 暖容器可能装着上一版自写节点。刷不到期望版本会抛错 —— 必须写进 job_state,
-        # 否则前端只看到 queued 一直转(spawn 的异常传不回轮询侧)。
-        try:
-            _refresh_local_nodes_if_stale(self, local_nodes)
-        except Exception as e:
-            job_state[job_id] = {**job_state.get(job_id, {}), "status": "failed",
-                                 "error": str(e), "completed_at": time.time()}
-            raise
-        return _worker_run(workflow, job_id, input_images, delivery)
+        return _worker_entry(self, workflow, job_id, input_images, delivery, local_nodes)
 
 
 # CPU-only worker:无 GPU 需求的工作流(纯 API / 无本地模型节点)走这,GPU 账单≈0。
@@ -935,15 +1160,7 @@ class ComfyWorkerCPU:
     @modal.method()
     def run(self, workflow: dict, job_id: str, input_images: list | None = None,
             delivery: dict | None = None, local_nodes: dict | None = None) -> dict:
-        # 暖容器可能装着上一版自写节点。刷不到期望版本会抛错 —— 必须写进 job_state,
-        # 否则前端只看到 queued 一直转(spawn 的异常传不回轮询侧)。
-        try:
-            _refresh_local_nodes_if_stale(self, local_nodes)
-        except Exception as e:
-            job_state[job_id] = {**job_state.get(job_id, {}), "status": "failed",
-                                 "error": str(e), "completed_at": time.time()}
-            raise
-        return _worker_run(workflow, job_id, input_images, delivery)
+        return _worker_entry(self, workflow, job_id, input_images, delivery, local_nodes)
 
 
 # tier 入参保留兼容(前端仍可能传 80g/40g),但 GPU 由部署时的 default_gpu 决定,不再按 tier 分档。
@@ -1186,6 +1403,19 @@ def fetch_endpoint(job_id: str, path: str, key: str = "", delete: int = 0, ack: 
     return FileResponse(str(local), filename=Path(path).name)
 
 
+def _cancel_noop_view(job_id: str, rec: dict, was_running: bool) -> dict:
+    """cancel_noop(任务已先一步结束)的响应:只回字段子集。
+
+    以前回 {**记录}:completed 记录里带着整份 base64 产物(实测 8 MB),取消一个刚好跑完的任务,
+    响应就把产物白传一遍;要完整结果走 /status(2026-10-05 深度 review)。"""
+    out = {"id": job_id}
+    for k in ("status", "error", "gpu", "gpu_actual", "completed_at"):
+        if k in rec:
+            out[k] = rec[k]
+    out.update(cancel_noop=True, was_running=was_running)
+    return out
+
+
 @app.function(image=cuda_image, secrets=[bridge_secret], timeout=15)
 @modal.fastapi_endpoint(method="POST", label=f"{APP_NAME}-cancel")
 def cancel_endpoint(payload: dict):
@@ -1195,6 +1425,11 @@ def cancel_endpoint(payload: dict):
     job_id = payload.get("job_id")
     if not job_id:
         return {"error": "Missing 'job_id'"}
+    # 和 /status 同一道闸:"<id>:progress" / "<id>:call" 这类独立键不是任务记录。以前不校验,
+    # "abc:progress" 的值是个 dict,被当成任务记录、回一个假的 cancelled(还把进度键改写了);
+    # "abc:call" 的值是字符串,{**s} 直接 500(2026-10-05 深度 review)。不合法的 id 不可能有任务,回 not_found。
+    if not _safe_job_id(job_id):
+        return {"id": str(job_id)[:64], "status": "not_found", "error": "job not found"}
     s = job_state.get(job_id) or {}
     # ⚠ 不存在的 job 必须在这里就如实报,不能往下走:底下那句 merge 会**凭空建一条 cancelled
     #   记录**并返回 status: cancelled —— 对调用方是一次假成功(取消了一个根本不存在的任务),
@@ -1233,7 +1468,7 @@ def cancel_endpoint(payload: dict):
             job_state[job_id] = eff
         except Exception:
             pass
-        return {"id": job_id, **eff, "cancel_noop": True, "was_running": False}
+        return _cancel_noop_view(job_id, eff, was_running=False)
     was_running = s.get("status") == "running"
     call_id = _call_id(job_id) or s.get("call_id")  # 新独立 key,兼容旧字段
     # 占位状态 = run_endpoint 正在 spawn,真实 call_id 还没写回来。这时既不能当"没有 call_id"
@@ -1271,7 +1506,7 @@ def cancel_endpoint(payload: dict):
     cur = job_state.get(job_id)
     if isinstance(cur, dict) and cur.get("status") in ("completed", "failed"):
         print(f"[bridge] cancel {job_id}: worker 已先写 {cur['status']},保留终态不覆盖")
-        return {"id": job_id, **cur, "cancel_noop": True, "was_running": was_running}
+        return _cancel_noop_view(job_id, cur, was_running=was_running)
     job_state[job_id] = {**(cur if isinstance(cur, dict) else s), "status": "cancelled",
                          "completed_at": time.time()}
     return {"id": job_id, "status": "cancelled", "was_running": was_running}

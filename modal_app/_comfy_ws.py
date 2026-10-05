@@ -32,21 +32,30 @@ WS_IDLE_PROBE_S = 60
 _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}
 _VIDEO_EXTS = {".mp4", ".webm", ".mov", ".mkv", ".avi", ".flv", ".m4v", ".apng"}
 _MODEL3D_EXTS = {".glb", ".gltf", ".obj", ".fbx", ".stl", ".ply", ".splat", ".spz", ".ksplat"}
+# 音频(SaveAudio / SaveAudioMP3 / SaveAudioOpus 等)。以前不认识,一律兜底成 image,
+# aigc-r2 拿 "image" 去 intake,对端按图片类别校验 content-type,错得没有线索(2026-10-05 深度 review)。
+# ⚠ 刻意不并进 _OUTPUT_EXTS:那个集合只用于从「裸字符串」里认文件名,音频节点都是 dict 形态,
+#   并进去只会让文本类输出里恰好以 .mp3 结尾的字符串被误当成产物、取不到再整单失败。
+_AUDIO_EXTS = {".flac", ".mp3", ".wav", ".ogg", ".opus", ".m4a", ".aac"}
 _OUTPUT_EXTS = _IMAGE_EXTS | _VIDEO_EXTS | _MODEL3D_EXTS
 
 
 def classify_asset_type(filename: str, out_key: str = "") -> str:
-    """按扩展名归类产物:image / video / model3d。
-    扩展名不认识时用输出键兜底(gifs/videos 这类键都是视频容器),再兜底 image。"""
+    """按扩展名归类产物:image / video / model3d / audio。
+    扩展名不认识时用输出键兜底(gifs/videos 这类键都是视频容器,audio 键是音频),再兜底 image。"""
     ext = os.path.splitext(filename or "")[1].lower()
     if ext in _VIDEO_EXTS:
         return "video"
     if ext in _MODEL3D_EXTS:
         return "model3d"
+    if ext in _AUDIO_EXTS:
+        return "audio"
     if ext in _IMAGE_EXTS:
         return "image"
     if out_key in ("gifs", "videos"):
         return "video"
+    if out_key == "audio":
+        return "audio"
     return "image"
 
 # 大于此字节数的产物走 Volume 直连取回(本地 SDK 读),小的仍 base64。0 = 关(全 base64)。
@@ -59,10 +68,18 @@ _VOL_THRESHOLD = int(os.environ.get("MODAL_BRIDGE_VOLUME_THRESHOLD_MB", "8")) * 
 _INLINE_TOTAL_BUDGET = int(os.environ.get("MODAL_BRIDGE_INLINE_TOTAL_MB", "24")) * 1024 * 1024
 
 
-def wait_comfy_ready(timeout_s: int = 180) -> None:
-    """轮询 /system_stats 直到 ComfyUI HTTP 起来,超时 raise。"""
+def wait_comfy_ready(timeout_s: int = 180, proc=None) -> None:
+    """轮询 /system_stats 直到 ComfyUI HTTP 起来,超时 raise。
+
+    proc:ComfyUI 子进程句柄。传了就每轮先看它还活着没有 —— 子进程启动即崩(依赖坏 / CUDA 初始化失败)
+    时立刻失败,而不是对着一个死进程空等满 timeout_s(2026-10-05 深度 review:每次白烧 180s,
+    而 enter 阶段同样按容器时长计费)。"""
     deadline = time.time() + timeout_s
     while time.time() < deadline:
+        rc = proc.poll() if proc is not None else None
+        if rc is not None:
+            raise RuntimeError(f"ComfyUI 进程启动后就退出了(returncode={rc}),"
+                               f"看容器日志里它最后几行输出")
         try:
             r = requests.get(f"http://{COMFY_HOST}/system_stats", timeout=2)
             if r.ok:
@@ -121,24 +138,48 @@ def _history_settled(prompt_id: str) -> tuple[bool, list[str]]:
     except Exception as e:
         print(f"[bridge] history probe failed: {e}")
         return False, []
+    return _history_verdict(h)
+
+
+def _history_verdict(h) -> tuple[bool, list[str]]:
+    """history 里**一条** prompt 记录的终态判定:(已终结, 错误列表)。纯函数。
+
+    ⚠ WS 收尾(executing node=None)和 history 兜底两条路径都必须经过这里,结论才一致。
+    以前 WS 那条只认「收到完成事件」:被 interrupt 的 prompt 照样会推 executing node=None
+    (v0.37.2 main.py:prompt_worker 无论成败都发),中断前落盘的半成品就被当 completed 返回、
+    照常计费;同一个 prompt 走 history 却判 error —— 两条路径对同一件事给出相反结论
+    (2026-10-05 深度 review)。
+    v0.37.2 的 status:status_str 只有 success / error,completed == (status_str == success)。
+    另外 execution.py 在「节点排程阶段出错」那条分支只发 execution_error、不把 success 置 False,
+    所以 messages 里出现 execution_error / execution_interrupted 一律按失败算,不只看 status_str。"""
     if not isinstance(h, dict):
         return False, []
     st = h.get("status") if isinstance(h.get("status"), dict) else None
     if st is None:
         # 老版 ComfyUI 没有 status 字段:有 outputs 就算跑完
         return (True, []) if h.get("outputs") else (False, [])
-    if st.get("status_str") == "error":
-        detail = ""
-        for m in st.get("messages") or []:
-            if isinstance(m, (list, tuple)) and len(m) >= 2 and m[0] == "execution_error":
-                d = m[1] if isinstance(m[1], dict) else {}
-                detail = (f"Node {d.get('node_id')} ({d.get('node_type')}): "
-                          f"{d.get('exception_message')}")
-                break
+    detail = ""
+    for m in st.get("messages") or []:
+        if not (isinstance(m, (list, tuple)) and len(m) >= 2):
+            continue
+        d = m[1] if isinstance(m[1], dict) else {}
+        if m[0] == "execution_error":
+            detail = (f"Node {d.get('node_id')} ({d.get('node_type')}): "
+                      f"{d.get('exception_message')}")
+            break
+        if m[0] == "execution_interrupted":
+            detail = _interrupted_text(d)
+            break
+    if st.get("status_str") == "error" or detail:
         return True, [f"(from history) {detail or str(st.get('messages'))[:200]}"]
     if st.get("completed"):
         return True, []
     return False, []
+
+
+def _interrupted_text(d: dict) -> str:
+    return (f"执行被中断 —— Node {d.get('node_id')} ({d.get('node_type')}) 处停下,"
+            f"产物不完整,不算成功")
 
 
 def upload_images(images: list[dict]) -> dict:
@@ -236,18 +277,37 @@ def free_comfy_models() -> None:
 # 不需要也没有"主动 refresh"接口。之前那个 refresh_model_list 试的三个路径都不存在,已删。
 
 
+# reload 撞上「还有打开的文件」时的退避(秒)。/free 只是在 ComfyUI 的队列上置个标志、立刻回 200,
+# 真正的卸载由它的 prompt_worker 线程异步做(v0.37.2 server.py post_free → main.py prompt_worker
+# 读 flags 后才 unload_all_models + gc)。所以 free 之后紧跟的第一次 reload 可能正好撞上句柄
+# 还没关(2026-10-05 深度 review)。总共最多多等 7s,只发生在「模型不在列表」的重试路径上。
+_RELOAD_BACKOFF_S = [1, 2, 4]
+
+
 def _reload_volume_in_worker() -> None:
     """worker 内 reload Volume(拿最新文件视图 + 更新挂载点 mtime → ComfyUI 自动重扫)。
-    先 free 卸载模型关句柄,否则 reload 撞 'open files'。失败不致命。"""
+    先 free 卸载模型关句柄,否则 reload 撞 'open files'。free 是异步的,reload 失败就短暂退避重试。
+    全部失败也不致命(本轮重试照样提交,ComfyUI 看到的只是旧视图)。"""
     free_comfy_models()
     try:
         import modal
-        modal.Volume.from_name(
-            os.environ.get("MODAL_BRIDGE_VOLUME", "comfyui-bridge-models")
-        ).reload()
-        print("[bridge] volume reloaded (retry path)")
+        vol = modal.Volume.from_name(
+            os.environ.get("MODAL_BRIDGE_VOLUME", "comfyui-bridge-models"))
     except Exception as e:
         print(f"[bridge] retry reload 失败(忽略): {e}")
+        return
+    for i in range(len(_RELOAD_BACKOFF_S) + 1):
+        try:
+            vol.reload()
+            print("[bridge] volume reloaded (retry path)")
+            return
+        except Exception as e:
+            if i >= len(_RELOAD_BACKOFF_S):
+                print(f"[bridge] retry reload 失败(忽略): {e}")
+                return
+            wait = _RELOAD_BACKOFF_S[i]
+            print(f"[bridge] reload 失败({e}),可能 /free 还没卸完模型,{wait}s 后再试")
+            time.sleep(wait)
 
 
 # 按需重试:正常 job 不 free/reload(模型留显存,秒级)。只有验证失败(模型不在列表 = 刚上传
@@ -276,11 +336,35 @@ def _parse_validation_error(err: dict):
     return details, is_missing_value
 
 
+class ValidationError(ValueError):
+    """ComfyUI 拒收(400)或只收了一部分(2xx + node_errors)的工作流。继承 ValueError,老的捕获点不受影响。"""
+
+
+def _withdraw_prompt(prompt_id: str) -> None:
+    """撤掉一个已入队的 prompt:先从队列里删,已经开跑的再按 prompt_id 定向中断。best-effort。
+
+    ⚠ 顺序是先删后断:删在 ComfyUI 的队列锁里做,要么删掉(还在排队),要么它已被取走在跑 / 跑完;
+      随后的定向中断只对「正在跑的就是它」生效(v0.37.2 server.py post_interrupt 先查 currently_running),
+      不会误伤别的 prompt。中断标志在每个 prompt 开跑时被重置(execution.py execute_async),
+      所以即使它在中断前刚好跑完,标志也不会漏到我们接下来重新提交的那个 prompt 上。"""
+    for path, body in (("/queue", {"delete": [prompt_id]}), ("/interrupt", {"prompt_id": prompt_id})):
+        try:
+            requests.post(f"http://{COMFY_HOST}{path}", json=body, timeout=5).raise_for_status()
+        except Exception as e:
+            print(f"[bridge] ⚠ 撤回 prompt {prompt_id} 时 {path} 失败(它可能仍在跑): {e}")
+
+
 def queue_workflow(workflow: dict, client_id: str) -> dict:
     """提交 workflow 到 ComfyUI /prompt。
     若验证失败是"模型不在列表"(value_not_in_list)→ reload Volume + 等待 + 重试(最多 _RETRY_MAX 次):
     覆盖"模型刚上传、worker 容器还没看到"的最终一致/全新目录场景,直到 ComfyUI 看到模型或重试用尽。
-    其它验证错误(真缺节点/参数错)立即抛,不重试。"""
+    其它验证错误(真缺节点/参数错)立即抛,不重试。
+
+    ⚠ 「部分通过」也是验证失败:v0.37.2 只要还有一个输出分支合法,/prompt 就回 200、只把合法分支入队,
+      被剔除的分支写在响应的 node_errors 里(server.py post_prompt / execution.py validate_prompt)。
+      以前只看状态码:缺一个输出分支照样报 completed、照样计费,专为「模型刚上传、暖容器还没看到」
+      写的 value_not_in_list 重试也被绕过 —— 而那恰好是最常见的部分失败(新传的 LoRA 只挂在一条分支上)
+      (2026-10-05 深度 review)。所以 2xx 带 node_errors 时先撤回已入队的残缺 prompt,再和 400 走同一条路。"""
     # API 节点(comfy_api_nodes)鉴权:把 comfy.org API key 通过 /prompt 的 extra_data 传进去
     # (ComfyUI 从 extra_data.api_key_comfy_org 取,见 execution.py)。没配 key 就不带,普通工作流不受影响。
     body = {"prompt": workflow, "client_id": client_id}
@@ -296,14 +380,27 @@ def queue_workflow(workflow: dict, client_id: str) -> dict:
             headers={"Content-Type": "application/json"},
             timeout=30,
         )
+        partial = False
         if r.status_code != 400:
             r.raise_for_status()
-            return r.json()
-        # 400: 解析验证错误
-        try:
-            err = r.json()
-        except json.JSONDecodeError:
-            raise ValueError(f"ComfyUI 400: {r.text}")
+            resp = r.json()
+            node_errors = resp.get("node_errors") if isinstance(resp, dict) else None
+            if not node_errors:
+                return resp
+            # 2xx 但有分支被剔除:残缺的那个 prompt 已经入队(甚至已开跑),先撤回,别让它白烧 GPU
+            partial = True
+            pid = resp.get("prompt_id")
+            if pid:
+                _withdraw_prompt(pid)
+            err = resp
+            print(f"[bridge] /prompt 只收了部分输出分支(已撤回 {pid or '?'}),"
+                  f"被剔除的节点: {sorted(node_errors) if isinstance(node_errors, dict) else node_errors}")
+        else:
+            # 400: 解析验证错误
+            try:
+                err = r.json()
+            except json.JSONDecodeError:
+                raise ValidationError(f"ComfyUI 400: {r.text}")
         details, is_missing_value = _parse_validation_error(err)
         # 只对"模型不在列表"重试(可能是刚上传没看到);其它错误立即抛
         if is_missing_value and attempt < _RETRY_MAX:
@@ -314,9 +411,13 @@ def queue_workflow(workflow: dict, client_id: str) -> dict:
             _reload_volume_in_worker()
             time.sleep(wait)
             continue
+        head = ("Workflow validation(部分输出分支没通过校验,ComfyUI 只会执行其余分支 —— "
+                "已撤回,不当成功): " if partial else "Workflow validation: ")
         if details:
-            raise ValueError("Workflow validation: " + "; ".join(details))
-        raise ValueError(f"ComfyUI 400: {r.text}")
+            raise ValidationError(head + "; ".join(details))
+        if partial:
+            raise ValidationError(head + str(err.get("node_errors"))[:500])
+        raise ValidationError(f"ComfyUI 400: {r.text}")
 
 
 def get_history(prompt_id: str) -> dict:
@@ -394,7 +495,10 @@ def materialize_desktop_outputs(refs: list[dict], job_id: str) -> tuple[list[dic
         if not image_bytes:
             errors.append(f"failed to fetch {ref['filename']}")
             continue
-        rec = {"filename": ref["filename"], "node_id": ref["node_id"], "key": ref["key"]}
+        # size_bytes:原始字节数(不是 base64 长度)。客户端取 Volume 产物时拿它校验是否收全;
+        # 拿不到期望大小又没有 Content-Length 时不 ack、不删远端(契约 C12,2026-10-05 深度 review)。
+        rec = {"filename": ref["filename"], "node_id": ref["node_id"], "key": ref["key"],
+               "size_bytes": len(image_bytes)}
         over_file = _VOL_THRESHOLD and len(image_bytes) > _VOL_THRESHOLD
         # 阈值为 0 的约定是「关闭、全部内联」,总量预算也必须跟着关 —— 否则破坏既有契约
         over_total = (_VOL_THRESHOLD and _INLINE_TOTAL_BUDGET
@@ -502,6 +606,12 @@ def run_workflow(workflow: dict, job_id: str, input_images: list[dict] | None = 
                             f"{data.get('exception_message')}"
                         )
                         break
+                elif t == "execution_interrupted":
+                    # 被中断的 prompt 之后照样会推 executing node=None(见 _history_verdict),
+                    # 不在这里截住就会当成完成,把中断前落盘的半成品作为 completed 返回。
+                    if data.get("prompt_id") == prompt_id:
+                        errors.append(_interrupted_text(data))
+                        break
             except websocket.WebSocketTimeoutException:
                 # 静默超过阈值 → 查 history 兜底(可能完成事件在某次抖动里丢了)
                 if time.time() - last_msg_at >= WS_IDLE_PROBE_S:
@@ -534,6 +644,15 @@ def run_workflow(workflow: dict, job_id: str, input_images: list[dict] | None = 
         history = get_history(prompt_id)
         if prompt_id not in history:
             raise ValueError(f"Prompt {prompt_id} not in history")
+        # 终态以 history 为准(和 _history_settled 走同一个判定):WS 说完成不算数,history 里该 prompt
+        # 的 status 必须是成功。WS 的完成事件在 task_done 写完 history 之后才发,这里读到的就是终值。
+        # 老版 ComfyUI 没有 status 字段时 verdict 只看 outputs,下面「没有产物」那条照样会挡。
+        settled, herrs = _history_verdict(history[prompt_id])
+        if herrs:
+            raise RuntimeError("工作流执行出错: " + "; ".join(herrs))
+        if not settled and isinstance(history[prompt_id].get("status"), dict):
+            raise ValueError(f"WS 报告完成,但 history 里 prompt {prompt_id} 没有标记成功: "
+                             f"{str(history[prompt_id].get('status'))[:300]}")
 
         # 拆两步:先「发现」产物引用(不读内容),再按交付模式「读取」。
         # desktop = materialize(base64/Volume);aigc-r2 由 caller 拿 output_refs 走流式直传 R2。

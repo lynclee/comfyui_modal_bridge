@@ -11,6 +11,7 @@ _local_nodes_boot.py — worker 启动时把 Volume 上的「本地自写节点�
 一个 ../../ 就能写到 /comfyui 之外。这里逐条校验规范化后的目标路径仍在目标目录内。
 """
 import os
+import re
 import shutil
 import zipfile
 import tempfile
@@ -30,6 +31,29 @@ BAKED_SENTINEL = "__modal_bridge_baked__"
 # 写成一个永远对不上任何真实 digest 的值,expected 是 BAKED_SENTINEL 就触发回退 baked、
 # 是具体指纹就触发重装 —— 两条路都能自愈。
 UNKNOWN_DIGEST = "__modal_bridge_unknown__"
+
+# 节点目录名白名单。名字会拼成 DEST_DIR / name 再拿去 rmtree / copytree,以前只挡 "/"、"\\"、".."
+# 三种子串 —— "." 本身就漏过去了:restore_baked(["."]) 的 target 就是 custom_nodes 整个目录,
+# 备份目录存在时会被 rmtree 掉、再拿备份根整个盖回来(2026-10-05 深度 review)。
+# 首字符必须是字母数字下划线(\w 含 CJK,本地 safe_folder 允许的中文目录名照样能用),排除 "." / ".." /
+# 隐藏目录 / 以 "-" 开头;其余只放行常见的目录名标点。本地那侧(local_nodes.safe_folder)更宽,
+# 极少数带奇怪字符的目录在这里会被跳过、任务按「版本对不上」明确失败,而不是静默跑错。
+_FOLDER_RE = re.compile(r"^\w[\w .+()\[\]@,-]{0,127}$")
+
+
+def node_target(folder, base: Path | None = None) -> Path:
+    """校验节点目录名并返回 base(默认 DEST_DIR)下的目标路径;不合法抛 ValueError。
+
+    两道闸:白名单正则 + 规范化后的父目录必须恰好是 base(防正则以后被放宽时漏掉某种写法)。"""
+    base = DEST_DIR if base is None else base
+    # fullmatch 而不是 match:`$` 会放过结尾的换行("foo\n")
+    if not isinstance(folder, str) or not _FOLDER_RE.fullmatch(folder) or ".." in folder:
+        raise ValueError(f"非法节点名: {folder!r}")
+    root = Path(os.path.normpath(str(base)))
+    target = Path(os.path.normpath(str(root / folder)))
+    if target.parent != root or target == root:
+        raise ValueError(f"非法节点名(越出 {root}): {folder!r}")
+    return target
 
 
 def safe_members(names: list[str], dest: Path) -> tuple[list[str], list[str]]:
@@ -85,9 +109,14 @@ def current_digests() -> dict:
     return out
 
 
-def needs_refresh(expected: dict) -> list[str]:
-    """提交方声明的指纹 vs 容器内实际的 → 哪些节点过期了(纯函数,可单测)。"""
-    cur = current_digests()
+def needs_refresh(expected: dict, loaded: dict | None = None) -> list[str]:
+    """提交方声明的指纹 vs 容器内实际的 → 哪些节点过期了(纯函数,可单测)。
+
+    loaded:ComfyUI 进程**启动时**加载的那批指纹(modal_app 在每次拉起 ComfyUI 前记下)。
+    判断「这一单会不会跑旧代码」必须比它,不能比磁盘 marker:纠偏失败时磁盘已经是新版、
+    内存里还是旧代码,比磁盘会得出「不过期」,下一单就静默跑旧节点(2026-10-05 深度 review)。
+    None = 比磁盘(ComfyUI 停着、要复核「下次启动会装哪版」时就该比磁盘)。"""
+    cur = current_digests() if loaded is None else loaded
     stale = []
     for folder, digest in (expected or {}).items():
         if digest == BAKED_SENTINEL:
@@ -101,7 +130,7 @@ def needs_refresh(expected: dict) -> list[str]:
 
 def _remember_baked(target: Path, folder: str) -> None:
     """首次用本地包覆盖镜像目录前保存 baked 副本；后续重复解压不覆盖这份基线。"""
-    backup = BACKUP_DIR / folder
+    backup = node_target(folder, BACKUP_DIR)
     if backup.exists() or not target.is_dir() or (target / ".mb_local_digest").exists():
         return
     BACKUP_DIR.mkdir(parents=True, exist_ok=True)
@@ -116,10 +145,8 @@ def restore_baked(folders: list[str]) -> list[str]:
     """
     restored = []
     for folder in folders or []:
-        if not folder or "/" in folder or "\\" in folder or ".." in folder:
-            raise ValueError(f"非法节点名: {folder!r}")
-        target = DEST_DIR / folder
-        backup = BACKUP_DIR / folder
+        target = node_target(folder)
+        backup = node_target(folder, BACKUP_DIR)
         marker = target / ".mb_local_digest"
         if backup.is_dir():
             if target.exists():
@@ -140,11 +167,12 @@ def extract_all() -> list[str]:
     installed = []
     for zp in sorted(VOL_DIR.glob("*.zip")):
         folder = zp.stem
-        # 目录名消毒:folder 来自 Volume 上的文件名,同样不可信
-        if not folder or "/" in folder or "\\" in folder or ".." in folder:
+        # 目录名消毒:folder 来自 Volume 上的文件名,同样不可信(".zip" 的 stem 就是 "")
+        try:
+            target = node_target(folder)
+        except ValueError:
             print(f"[bridge] ⚠ 跳过非法的本地节点包名: {zp.name}")
             continue
-        target = DEST_DIR / folder
         try:
             with zipfile.ZipFile(zp) as z:
                 ok, bad = safe_members(z.namelist(), target)
