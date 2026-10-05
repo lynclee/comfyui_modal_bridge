@@ -3,8 +3,8 @@ config.py — 配置文件管理
 路径:ComfyUI/user/default/modal_bridge/config.json
 """
 import json
-import os
 import secrets
+import sys
 import threading
 from pathlib import Path
 
@@ -123,35 +123,68 @@ def _config_path() -> Path:
     return user_dir / "default" / "modal_bridge" / "config.json"
 
 
+class ConfigCorrupt(RuntimeError):
+    """config.json 存在,但读不出一个 JSON 对象(语法错 / 顶层不是对象 / 读不了)。
+
+    ⚠ 以前解析失败就静默退回默认值,而之后任何一次写配置(非 loopback 请求触发的 capability
+    生成、设置页切一次 GPU 档位、部署收尾)都会拿这份默认值**整份覆盖**原文件 —— 用户手改
+    config.json 多打一个尾逗号,bridge_api_key / modal_token_secret / hf_token / comfy_api_key
+    就全没了,而且没有任何报错指向真实原因(2026-10-05 深度 review)。
+    现在读失败一律抛它:读的一侧报清楚,写的一侧拒绝覆盖。只有文件**不存在**才用默认值。"""
+
+    def __init__(self, path: Path, detail: str, lineno: int | None = None):
+        self.path = path
+        self.lineno = lineno
+        super().__init__(f"config.json {detail},请修好或删除该文件"
+                         f"(删除 = 回到默认配置,要重新填 token 并部署):{path}")
+
+
+def _read_config_file(p: Path) -> dict | None:
+    """读 config.json:不存在返回 None;存在但读不出 JSON 对象抛 ConfigCorrupt。
+
+    ⚠ 错误信息只带行号和解析器的说明,不带文件内容 —— 里面是凭据。"""
+    try:
+        raw = p.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError) as e:   # ValueError:UnicodeDecodeError(不是 UTF-8)
+        raise ConfigCorrupt(p, f"读取失败({type(e).__name__})") from None
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as e:
+        raise ConfigCorrupt(p, f"第 {e.lineno} 行解析失败({e.msg})", lineno=e.lineno) from None
+    if not isinstance(data, dict):
+        raise ConfigCorrupt(p, f"顶层不是 JSON 对象(是 {type(data).__name__})")
+    return data
+
+
 def ensure_config() -> Path:
     """首次启动时自动生成默认 config.json,后续不覆盖。"""
     p = _config_path()
     if p.exists():
         return p
-    p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps(DEFAULT_CONFIG, indent=2, ensure_ascii=False), encoding="utf-8")
-    try:
-        os.chmod(p, 0o600)
-    except Exception:
-        pass
+    # 走原子写 + 创建即 0600:以前是 write_text,写一半崩会留下半个 JSON,
+    # 而现在半个 JSON 会被当成损坏、拒绝一切写入(2026-10-05 深度 review)。
+    atomic_write_json(p, DEFAULT_CONFIG)
     print(f"[modal_bridge] generated default config: {p}")
     return p
 
 
 def load_config() -> dict:
-    """读取 config,缺字段用默认值兜底。"""
+    """读取 config,缺字段用默认值兜底。文件存在但损坏时抛 ConfigCorrupt,**不**退回默认值。"""
     p = ensure_config()
-    try:
-        data = json.loads(p.read_text(encoding="utf-8"))
-    except Exception:
-        data = {}
-    merged = {**DEFAULT_CONFIG, **data}
-    return merged
+    data = _read_config_file(p)
+    return {**DEFAULT_CONFIG, **(data or {})}
 
 
 def save_config(new_data: dict) -> None:
-    """覆盖写完整配置：独立随机临时文件、创建即私有、原子替换，失败抛出。"""
-    atomic_write_json(_config_path(), new_data)
+    """覆盖写完整配置：独立随机临时文件、创建即私有、原子替换，失败抛出。
+
+    原文件损坏时拒绝写入(抛 ConfigCorrupt),不替用户「修复」:调用方手里的 dict 可能来自
+    损坏之前读到的旧值,也可能是默认值,覆盖下去就是把用户正在手改的那份连同凭据一起抹掉。"""
+    p = _config_path()
+    _read_config_file(p)
+    atomic_write_json(p, new_data)
 
 
 _CAPABILITY_LOCK = threading.Lock()
@@ -160,17 +193,26 @@ _CAPABILITY_LOCK = threading.Lock()
 def read_local_capability_file(path: str) -> str:
     """从插件 config.json 读 local_api_capability;文件不存在 / 不是 JSON / 没这个键 → 返回空串。
 
-    给 MCP 本地模式用(mcp_server.py):0.8.36 起管理路由含 localhost 都要 capability,
-    而 MCP 进程和 ComfyUI 在同一台机器上,让它**直接读 0600 的 config.json**比把 token
+    给 MCP 本地模式用(mcp_server.py):本机 127.0.0.1 / localhost 直连免 capability(0.8.40 起),
+    但 MCP 经 host.docker.internal / 局域网 / 反向代理访问 ComfyUI 时仍然要带。MCP 进程和
+    ComfyUI 在同一台机器(或共享这份文件)时,让它**直接读 0600 的 config.json**比把 token
     写进 .mcp.json / 环境变量 / 聊天记录都干净 —— 值不经过任何中间人。
     只读这一个键,不回吐其它字段。
+
+    只读、从不写,所以文件损坏时返回空串不会覆盖任何东西;但要往 stderr 说一声 —— 否则
+    MCP 只会收到一个「缺 capability」的 403,看不出真实原因是 config.json 坏了
+    (2026-10-05 深度 review)。stderr 不占 MCP 的 stdio 协议通道。
     """
+    p = Path(path)
     try:
-        data = json.loads(Path(path).read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+        data = _read_config_file(p)
+    except ConfigCorrupt as e:
+        print(f"[modal_bridge] ⚠ 读不到 local_api_capability:{e}", file=sys.stderr)
         return ""
-    v = data.get("local_api_capability") if isinstance(data, dict) else None
-    return str(v).strip() if isinstance(v, str) else ""
+    if data is None:
+        return ""
+    v = data.get("local_api_capability")
+    return v.strip() if isinstance(v, str) else ""
 
 
 def ensure_local_api_capability() -> str:
@@ -178,6 +220,8 @@ def ensure_local_api_capability() -> str:
 
     不在模块 import 时生成，避免只读安装/打包流程无故改配置。第一次管理请求
     才需要它；生成后放在 0600 config 中，调用方从服务器本机读取并在浏览器配对。
+    config.json 损坏时 load_config 直接抛 ConfigCorrupt —— 既不生成也不写:以前这里是
+    「默认值 + 新 capability」整份覆盖原文件的入口之一,任何一个非 loopback 请求都能触发。
     """
     cfg = load_config()
     value = str(cfg.get("local_api_capability") or "").strip()

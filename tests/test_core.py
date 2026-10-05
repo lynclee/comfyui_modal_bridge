@@ -3658,22 +3658,24 @@ def raises(exc):
 
 
 def test_aigc_secret_can_actually_be_cleared():
-    """停用 AIGC 集成必须能把旁路密钥**清掉**,不能只允许更新。
+    """停用 AIGC 集成必须能把旁路密钥**清掉**,不能只允许更新 —— 但清理只在部署时做。
 
     2026-09-02 codex 抓到:密码框留空 = 沿用已存(密码框的标准语义),而后端也是
     `new or stored` —— 于是密钥**只能被更新、无法被删除**。用户清掉 URL 停用集成后,
     密钥仍躺在本地 config.json 里,并被烤进下一次创建的 Modal Secret。
 
-    密钥不在 PUBLIC_CONFIG_WRITE_FIELDS 里(那道闸挡的是"改配置再取密钥"的两步绕过),
-    所以清除入口只能挂在"显式把 URL 置空"这个动作上 —— 只清、不读、不回吐,不构成绕过。
+    当时的做法是设置页把 URL 置空就连带清密钥。2026-10-05 深度 review(契约 C10)改成**不**清:
+    设置页边输边存,删空 URL 准备重填 / 全选粘贴新地址的中间那次保存,就会把不回显的密钥无声抹掉。
+    清理统一交给部署:URL 为空时 /deploy 不把它写进 Secret、并从 config 里清掉
+    (见 test_deploy_aigc_secret_three_states)。
     """
     cur = {"aigc_studio_base_url": "https://x.example", "aigc_bypass_secret": "byp-1",
            "gpu_tier": "auto"}
 
-    # ① 显式停用 → 密钥必须跟着没
+    # ① 设置页置空 URL(可能只是在重填)→ 密钥原样保留,清理留给部署
     out = contract.merge_public_config(cur, {"aigc_studio_base_url": ""})
     assert out["aigc_studio_base_url"] == ""
-    assert out["aigc_bypass_secret"] == "", "停用了集成,密钥却还留在 config 里"
+    assert out["aigc_bypass_secret"] == "byp-1", "改 URL 的中间态把不回显的密钥无声抹掉了"
 
     # ② 改别的字段不能有副作用 —— 用户可能先填了密钥还没填 URL
     cur2 = {"aigc_studio_base_url": "", "aigc_bypass_secret": "byp-1", "gpu_tier": "auto"}
@@ -4532,9 +4534,8 @@ def test_admin_capability_closes_bridge_key_and_config_bypass():
             merge_public_config(cur, {forbidden: "attacker"})
 
     src = (ROOT / "routes.py").read_text(encoding="utf-8")
-    i = src.index('@routes.get("/modal_bridge/bridge_key")')
-    body = src[i:src.index("@routes.", i + 10)]
-    assert "@_admin_only" in body
+    # /modal_bridge/bridge_key 已整段删除(契约 C9,2026-10-05):回吐 key 的入口一个都不留。
+    assert '"/modal_bridge/bridge_key"' not in src, "回吐 bridge key 的路由又回来了"
 
     i = src.index('@routes.post("/modal_bridge/config")')
     config_body = src[i:src.index("@routes.", i + 10)]
@@ -5003,7 +5004,8 @@ def test_push_fails_closed_on_node_upload_failure():
     assert "raise RuntimeError" in seg[seg.index("if _pfail:"):seg.index("_todo = ")], \
         "打包失败分支没有抛错"
     assert "raise RuntimeError" in seg[seg.index("if _ufail:"):], "上传失败分支没有抛错"
-    assert "__DEPLOY_DONE__ rc=1" in seg, "异常分支没有以失败码结束"
+    # 2026-10-05 起流式路由由 routes._stream_run 统一收尾输出 __DEPLOY_DONE__,分支里返回 rc 即可
+    assert "return 1" in seg[seg.index("except Exception as _e:"):], "异常分支没有以失败码结束"
     # 并发保护：与 /sync_local_nodes 争同一把锁
     assert "_UPLOAD_LOCK" in seg, "部署路径的上传绕过了 _UPLOAD_LOCK，会与其它上传竞态"
 

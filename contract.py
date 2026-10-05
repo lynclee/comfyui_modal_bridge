@@ -71,9 +71,12 @@ def merge_after_deploy(base: dict, ours: dict, theirs: dict) -> dict:
 
 
 # 部署期间可能被用户在别处改掉的运行时偏好(不决定部署出去的东西,以用户最新意图为准)。
-# aigc_bypass_secret 与 URL 成对:设置页清空 URL 时会连带清掉它,不能被部署写回旧值。
+# ⚠ aigc_bypass_secret 以前也在这里:设置页清空 URL 会连带清掉它。2026-10-05 起设置页不再动它,
+#   能改它的只剩部署本身,而部署刚把它写进了 Modal Secret —— 它和 bridge_api_key 一样定义「刚部署
+#   出去的东西」,必须用部署的值;留在这里的话,两次排队的部署会让 config 记着前一次的值、Secret
+#   里却是后一次的(深度 review)。
 _PREFER_LATEST_ON_DEPLOY = frozenset({
-    "gpu_tier", "auto_downgrade", "aigc_studio_base_url", "aigc_bypass_secret",
+    "gpu_tier", "auto_downgrade", "aigc_studio_base_url",
 })
 
 
@@ -84,8 +87,9 @@ def is_safe_job_id(job_id) -> bool:
     仍不能依赖鉴权。filename 一直有 basename 防逃逸,job_id 以前没有 —— {"job_id": "../../x"}
     就能把 base64 内容写到 output 目录之外。插件对 folders / path / blend_path 都做了囚笼,
     这里是漏的那个。"""
+    # ⚠ fullmatch 而不是 match:`$` 会放过结尾的 "\n","abc\n" 用 match 是合法的(深度 review)。
     return (isinstance(job_id, str)
-            and bool(_SAFE_JOB_ID.match(job_id))
+            and bool(_SAFE_JOB_ID.fullmatch(job_id))
             and ".." not in job_id)
 
 
@@ -171,15 +175,11 @@ def merge_public_config(current: dict, body: dict) -> dict:
         body = {**body, "aigc_studio_base_url": v.rstrip("/")}
     out = dict(current)
     out.update({k: body[k] for k in PUBLIC_CONFIG_WRITE_FIELDS if k in body})
-    # 清空 URL = 停用这个集成 → 旁路密钥一并清掉。
-    # ⚠ 密钥不在 PUBLIC_CONFIG_WRITE_FIELDS 里(那道闸挡的是"改配置再取密钥"的两步绕过),
-    #   所以它此前**只能被更新、无法被清除**:密码框留空按"沿用已存"处理,后端也没有删除入口。
-    #   结果是停用集成之后,密钥仍留在本地 config、并被烤进下一次创建的 Modal Secret
-    #   (2026-09-02 codex 抓到)。这里是清除的唯一入口 —— 只清、不读、不回吐,不构成绕过。
-    # 只认**显式置空**这个动作,不能写成"URL 为空就清":用户可能先填了密钥还没填 URL,
-    # 那时改个 gpu_tier 就会把密钥无声抹掉。遗留残留由 /setup 那条路径在部署时清理。
-    if body.get("aigc_studio_base_url", None) == "" and current.get("aigc_bypass_secret"):
-        out["aigc_bypass_secret"] = ""
+    # ⚠ URL 置空**不再**连带清掉旁路密钥(2026-10-05 深度 review)。设置页的文本框是边输边存的:
+    #   用户把 URL 删空准备重填、或者全选粘贴新地址,中间那一次保存就把密钥无声抹掉了,而密钥
+    #   不回显、页面上只看得到「已保存」消失。停用集成后密钥的清理交给部署:/deploy 在 URL 为空时
+    #   不把它写进 Modal Secret、并从 config 里清掉(见 routes._deploy 的密钥三态),那条兜底一直都在。
+    #   密钥本身仍不在 PUBLIC_CONFIG_WRITE_FIELDS 里 —— 这里既不能写它,也不再动它。
     return out
 
 

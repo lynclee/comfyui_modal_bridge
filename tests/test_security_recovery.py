@@ -209,7 +209,7 @@ def test_partial_download_retry_and_lost_response(monkeypatch, tmp_path):
     calls, removed = [], []
     fail = [True]
 
-    def download(_cfg, vp, local):
+    def download(_cfg, vp, local, expected_size=None):   # 契约 C14 的签名
         calls.append(vp)
         if vp.endswith("second") and fail[0]:
             fail[0] = False

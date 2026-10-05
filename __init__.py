@@ -22,7 +22,12 @@ try:
     from . import routes  # noqa: F401
     from . import config as _cfg
     _cfg.ensure_config()
-    print("[modal_bridge] ✓ loaded — endpoint:", _cfg.load_config().get("modal_endpoint_base"))
+    try:
+        print("[modal_bridge] ✓ loaded — endpoint:", _cfg.load_config().get("modal_endpoint_base"))
+    except _cfg.ConfigCorrupt as e:
+        # 路由已经注册好了,只是配置读不出来:说清楚,别报成「插件加载失败」再甩一屏 traceback。
+        # 修好之前所有要读配置的操作都会报同一句错,而且不会覆盖这个文件(2026-10-05 深度 review)。
+        print(f"[modal_bridge] ⚠ loaded, but {e}")
 except Exception as e:
     print(f"[modal_bridge] ✗ load failed: {e}")
     import traceback
