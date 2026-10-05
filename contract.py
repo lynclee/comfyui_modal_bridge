@@ -32,7 +32,11 @@ SECRET_CONFIG_FIELDS = (
     "modal_token_secret", "bridge_api_key", "comfy_api_key", "aigc_bypass_secret",
     "local_api_capability", "hf_token", "civitai_token",
 )
-_INTERNAL_CONFIG_FIELDS = ("local_node_reqs_deployed_hash",)
+# 这台机器上次部署往 Modal Secret 里写过哪些 AIGC 字段(["aigc_base_url", "aigc_bypass_secret"] 的子集)。
+# /deploy 据此判断「config 里是空的」是用户清掉了(要 --clear)还是这台机器压根没配过(别动别的机器写的)
+# (2026-10-05 深度 review 第二轮)。
+AIGC_PUSHED_FIELD = "aigc_secret_pushed"
+_INTERNAL_CONFIG_FIELDS = ("local_node_reqs_deployed_hash", AIGC_PUSHED_FIELD)
 
 
 def public_config(cfg: dict) -> dict:
@@ -158,6 +162,28 @@ def is_safe_local_origin(origin: str | None, scheme: str, host: str,
         return False
 
 
+AIGC_URL_HTTPS_HINT = ("AIGC Studio 地址必须是 https://,请填跳转后的最终地址(浏览器打开后地址栏里那个,"
+                       "例如带 www 的)。云端只跟随同一主机内的 307/308 跳转(含 http→https 升级),跨主机的"
+                       "跳转(如不带 www → 带 www)会被拒;而 http:// 的第一跳就已经把旁路密钥和任务 token 明文发出去了")
+
+
+def aigc_url_problem(url) -> str:
+    """AIGC Studio 地址能不能用:空串 = 停用(合法);非空必须是 https://<host>。不合法返回说明,合法返回 ""。
+
+    ⚠ 以前 http:// 也收(2026-10-05 深度 review 第二轮,来自 r2cloud):worker 往这个地址 POST 交付回调时,
+      请求头带 Vercel Protection 旁路密钥、body 带 job token —— 第一跳是明文,云端只能事后打一条提醒日志。
+      所以在本机挡:/config、/deploy、deploy.py、bridge_cli 都走这一条。"""
+    v = (url or "").strip() if isinstance(url, str) else ""
+    if not v:
+        return ""
+    try:
+        u = urlsplit(v)
+        ok = u.scheme.lower() == "https" and bool(u.hostname)
+    except ValueError:
+        ok = False
+    return "" if ok else AIGC_URL_HTTPS_HINT     # 不回显收到的值:地址里可能带 userinfo
+
+
 def merge_public_config(current: dict, body: dict) -> dict:
     """应用设置页可写字段；凭据、部署状态和未知字段一律拒绝。"""
     unknown = sorted(set(body) - PUBLIC_CONFIG_WRITE_FIELDS)
@@ -173,8 +199,9 @@ def merge_public_config(current: dict, body: dict) -> dict:
         if not isinstance(v, str):
             raise ValueError("aigc_studio_base_url 必须是字符串")
         v = v.strip()
-        if v and not (v.startswith("http://") or v.startswith("https://")):
-            raise ValueError("aigc_studio_base_url 必须以 http:// 或 https:// 开头")
+        problem = aigc_url_problem(v)
+        if problem:
+            raise ValueError(problem)
         body = {**body, "aigc_studio_base_url": v.rstrip("/")}
     out = dict(current)
     out.update({k: body[k] for k in PUBLIC_CONFIG_WRITE_FIELDS if k in body})
