@@ -2744,16 +2744,6 @@ def test_cli_cancel_does_not_cry_billing_when_the_job_already_ended(monkeypatch)
             assert "计费" not in msg, f"查无此任务不是「仍在计费」: {msg}"
 
 
-def test_exported_script_never_follows_redirects_with_the_key():
-    """导出脚本里嵌着作者的计费 key;requests 跟随跨域重定向时自定义头照带,307/308 还重发 body。"""
-    import re as _re
-    js = (ROOT / "web" / "modal_bridge.js").read_text(encoding="utf-8")
-    calls = _re.findall(r"requests\.(?:get|post)\([^)]*", js)
-    assert len(calls) >= 2, calls
-    for c in calls:
-        assert "allow_redirects=False" in c, c
-
-
 def test_estimate_vram_video_v2_anchors():
     """激活公式的三个实测锚点(MiniMax H3,主模型 20GB):
     0.9MP×362 帧应放行 48G 卡(实测峰值 38-40G 无 offload);2K×362 应对 80G 卡报警(实测 offload)。

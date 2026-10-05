@@ -40,7 +40,10 @@ const I18N = {
   "dlg.ver.deployed": { zh: "云端部署:", en: "Deployed: " },
   "dlg.ver.aligned":  { zh: "✓ 已对齐", en: "✓ aligned" },
   "dlg.ver.mismatch": { zh: "⚠ 不一致,请点「部署」更新云端", en: "⚠ mismatch — click Deploy to update" },
-  "dlg.ver.unreach":  { zh: "云端未部署 / 连不上", en: "not deployed / unreachable" },
+  // /version 的 err_kind 分开说(2026-10-05 深度 review F-P3-5 / C7):401 是 key 不一致,不是「没部署」。
+  "dlg.ver.unreach":  { zh: "连不上云端", en: "unreachable" },
+  "dlg.ver.notdeployed":  { zh: "云端未部署", en: "not deployed" },
+  "dlg.ver.unauthorized": { zh: "⚠ bridge key 与云端不一致(重新推送会刷新)", en: "⚠ bridge key mismatch (push again to refresh)" },
   "dlg.ver.notconn":  { zh: "未连接", en: "not connected" },
   "dlg.ws.hint":      { zh: "(modal.com 个人主页 URL 那段,如 your-workspace)",
                         en: "(the segment in your modal.com profile URL, e.g. your-workspace)" },
@@ -98,6 +101,8 @@ const I18N = {
                         en: "✓ Connected (cloud {ver}, warm={warm}, nodes={nodes})" },
   "test.fail":        { zh: "✗ 连不上:{why} — app 可能没部署/被删,请点「部署」",
                         en: "✗ Unreachable: {why} — app may be undeployed/deleted, click Deploy" },
+  "test.unauthorized":{ zh: "✗ bridge key 与云端不一致:{why} —— 点「推送到云端」重新部署会刷新 key",
+                        en: "✗ Bridge key mismatch: {why} — click \"Push to cloud\" to refresh the key" },
   "test.err":         { zh: "✗ 测试失败:{e}", en: "✗ Test failed: {e}" },
   "test.unreach":     { zh: "endpoint 不可达", en: "endpoint unreachable" },
   // —— 部署按钮 / 节点管理动作 ——
@@ -109,9 +114,15 @@ const I18N = {
   "dep.ok":           { zh: "✓ 已推送到云端!可以关掉这个窗口去出资产了",
                         en: "✓ Deployed! Close this window and start generating." },
   "dep.ok.toast":     { zh: "✓ 已推送到云端", en: "✓ Pushed to cloud" },
-  "dep.fail":         { zh: "✗ 部署失败(rc={rc})—— 云端保持原样,本次改动未生效。上方版本徽标已刷新为云端真实版本;失败原因见日志(常见是某个私有节点的依赖在云端装不上)。",
-                        en: "✗ Deploy failed (rc={rc}) — the cloud is unchanged; this attempt did not take effect. The version badge above now shows the real deployed version. See the log for the cause (commonly a private node's dependency failing to install)." },
+  // 「云端保持原样」不准:镜像没换,但这次已经跑完的步骤(写 Secret、推私有节点代码)不会回滚
+  // (2026-10-05 深度 review F-P3-8)。如实说。
+  "dep.fail":         { zh: "✗ 部署失败(rc={rc})。云端镜像没有换成这次的版本,但部署中已经完成的步骤不会回滚 —— 云端 Secret(token / key 等)和私有节点代码可能已经更新。上方版本徽标已刷新为云端真实版本;失败原因见日志(常见是某个私有节点的依赖在云端装不上)。",
+                        en: "✗ Deploy failed (rc={rc}). The cloud image was not replaced with this version, but steps that already ran are not rolled back — the cloud Secret (token / keys) and private node code may already be updated. The version badge above now shows the real deployed version. See the log for the cause (commonly a private node's dependency failing to install)." },
   "dep.fail.toast":   { zh: "Modal 部署失败 rc={rc}", en: "Modal deploy failed rc={rc}" },
+  // C5:保护性中止(DeployBlocked / 自动部署被阻断)不是依赖装不上,别落到上面那句。
+  "dep.aborted":      { zh: "✗ 部署被保护性中止(不是依赖装不上),云端镜像没有改动。原因见下方日志里「已中止」那一行;处理后再点「推送到云端」。",
+                        en: "✗ Deploy stopped by a safety check (not a dependency failure); the cloud image is unchanged. The reason is on the \"aborted\" line in the log below; fix it, then click \"Push to cloud\" again." },
+  "dep.aborted.toast":{ zh: "Modal 部署被保护性中止(见部署日志)", en: "Modal deploy stopped by a safety check (see deploy log)" },
   "nodes.redeploying":{ zh: "重部署中(约 1-3 分钟,别关窗口)...", en: "Redeploying (~1-3 min, keep window open)..." },
   // —— 节点同步 ——
   "node.scan":        { zh: "扫描工作流 custom nodes...", en: "Scanning workflow custom nodes..." },
@@ -131,8 +142,16 @@ const I18N = {
                         en: "{n} private node(s) changed and must be pushed to the cloud first:\n\n  {list}\n\nPushing the code is instant; but if their requirements.txt also changed, the image has to be rebuilt (~3-5 min).\n\nOK: push now and continue submitting.\nCancel: abort this submission — running without pushing means the cloud uses stale code, producing results that differ from your edits with no error at all." },
   "node.local_push_cancelled":{ zh: "已取消 —— 未推送私有节点,本次提交中止(避免云端静默跑旧代码)",
                         en: "Cancelled — private nodes were not pushed and the submission was aborted (prevents the cloud silently running stale code)." },
-  "node.auto_deploy_blocked": { zh: "已停止提交:\n\n{msg}\n\n上传私有节点触发的自动部署不会替你改公共节点的版本。在 Modal 面板里点「推送到云端」确认部署,完成后再提交即可。",
-                        en: "Submission stopped:\n\n{msg}\n\nThe automatic deploy triggered by uploading private nodes will not change public node versions for you. Click \"Push to cloud\" in the Modal panel to confirm the deploy, then submit again." },
+  // C5:所有保护性中止(DeployBlocked、自动部署被阻断 —— 最后一行 ✗ 含「已中止」)共用这一条。
+  // ⚠ 文案里别提 requirements(test_frontend_gives_the_blocked_auto_deploy_its_own_explanation 钉着):
+  //   出路是处理原因后「推送到云端」,不是去查依赖清单。
+  "node.auto_deploy_blocked": { zh: "部署被保护性中止(不是依赖装不上),已停止提交:\n\n{msg}\n\n这是插件为防止误删 / 误改云端节点而主动停下的,云端镜像没有改动。按上面的原因处理后,在 Modal 面板点「推送到云端」,完成后再提交。",
+                        en: "Deploy stopped by a safety check (not a dependency failure); submission stopped:\n\n{msg}\n\nThe plugin stopped on purpose to avoid removing or changing cloud nodes by mistake; the cloud image is unchanged. Fix the cause above, click \"Push to cloud\" in the Modal panel, then submit again." },
+  // C6:读不到云端节点清单时,按过期清单自动部署可能删掉别的机器加的节点。
+  "node.cloud_unchecked": { zh: "读不到云端节点清单({why}),为免误删云端节点,这次不自动同步,本次提交已中止。稍后重试,或到 Modal 面板点「推送到云端」。",
+                        en: "Couldn't read the cloud node list ({why}). To avoid removing cloud nodes by mistake, nodes are not auto-synced this time and the submission was stopped. Retry later, or click \"Push to cloud\" in the Modal panel." },
+  "node.volume_unchecked": { zh: "读不到 Volume 上的私有节点包({why}),这次跳过旧覆盖包清理(不影响结果,下次冷启动可能多花十几秒)",
+                        en: "Couldn't read private node packs on the Volume ({why}); skipping stale override cleanup this time (results unaffected; the next cold start may take a little longer)" },
   "node.local_fail":  { zh: "本地节点上传失败,已停止提交,避免云端静默运行旧版本。请修复上面的上传错误后重试。",
                         en: "Local node upload failed. Submission was stopped to prevent the cloud from silently running stale code. Fix the upload error above and retry." },
   "node.local_rm_fail": { zh: "旧的本地节点覆盖包清理失败: {list}",
@@ -161,8 +180,18 @@ const I18N = {
                         en: "{prefix}inference {step}/{total} steps · {sit}s/step (gpu={gpu})" },
   "run.eta_overrun":  { zh: "⚠ 按当前速度({sit}s/步)预计还需 {eta} 分钟,会超过 {limit} 分钟的 worker 上限被强杀、白付全程费用 —— 建议取消,换更大显存 GPU 档或降低分辨率/时长(显存不足会被静默 offload 拖慢几倍)",
                         en: "⚠ At {sit}s/step this needs ~{eta} more min and will overrun the {limit}-min worker limit (killed, fully billed, no output) — cancel and use a bigger-VRAM tier or lower res/duration (VRAM starvation silently slows jobs several-fold)" },
-  "run.slow":         { zh: "⚠ 已跑 {min} 分钟,快到等待上限了(gpu={gpu}) — 常见原因是显存不足被 offload 拖慢:换更大显存的 GPU 档,或降低分辨率 / 时长 / 帧数",
-                        en: "⚠ {min} min elapsed, approaching the wait limit (gpu={gpu}) — usually VRAM starvation causing offload: pick a larger GPU tier, or lower resolution / duration / frames" },
+  "run.slow":         { zh: "⚠ 已跑 {min} 分钟,快到 worker 单任务上限了(gpu={gpu}) — 常见原因是显存不足被 offload 拖慢:换更大显存的 GPU 档,或降低分辨率 / 时长 / 帧数",
+                        en: "⚠ {min} min elapsed, approaching the worker job limit (gpu={gpu}) — usually VRAM starvation causing offload: pick a larger GPU tier, or lower resolution / duration / frames" },
+  // C3:/submit 重试全失败、但 /run 可能已经落地 —— 不当失败,按 job_id 核实
+  "run.submit_unknown": { zh: "提交结果不确定(job {id}):没拿到明确回应,但任务可能已经在云端。正在按这个 id 核实,别重复提交。",
+                        en: "Submission outcome unknown (job {id}): no clear response, but the job may already be on the cloud. Verifying by this id — don't resubmit." },
+  "run.submit_unknown_stage": { zh: "{prefix}提交结果不确定,正在核实(job {id})", en: "{prefix}Submission outcome unknown — verifying (job {id})" },
+  "run.submit_not_landed": { zh: "提交没有落地:云端查无此任务 {id}(已连续确认),可以重新提交",
+                        en: "The submission did not land: job {id} not found on the cloud (confirmed repeatedly); you can resubmit" },
+  // C4:/poll 的 auth_failed 是终态
+  "run.auth_failed":  { zh: "bridge key 不匹配(云端拒绝了状态查询),重新部署会刷新 key。恢复记录已保留,修好后刷新页面可接着取回。",
+                        en: "Bridge key mismatch (the cloud rejected the status query); redeploying refreshes the key. The recovery record is kept — reload after fixing to resume." },
+  "run.fetch_failed": { zh: "取回失败(刷新页面可恢复):", en: "Fetch failed (reload the page to resume): " },
   // ⚠ 下面两条只描述「没能确认的原因」,计费警告由外层 cancel.failed_msg 统一给,别再写一遍。
   "cancel.confirming":        { zh: "… 云端回「查无此任务」,正在确认", en: "… Cloud says job not found — confirming" },
   "cancel.state_unknown":     { zh: "云端对取消回了「查无此任务」,但随后复查没能拿到状态(网络或云端暂时不可达),无法确认任务是否已停。",
@@ -178,6 +207,11 @@ const I18N = {
   "cancel.failed":    { zh: "⚠ 取消失败 — 云端可能仍在运行", en: "⚠ Cancel failed — job may still be running" },
   "cancel.failed_msg":{ zh: "取消失败:{msg}\n\n云端任务可能仍在运行并继续计费。请到 Modal 控制台确认,必要时手动停止容器。",
                         en: "Cancel failed: {msg}\n\nThe cloud job may still be running and billing. Check the Modal dashboard and stop the container manually if needed." },
+  // 取消没确认、卡片继续跟踪时的提示(2026-10-05 深度 review F-P2-2)
+  "cancel.retry_hint":{ zh: "\n\n进度卡片会继续跟踪这个任务,可以在卡片上再点 ✕ 重试取消。",
+                        en: "\n\nThe progress card keeps tracking this job; click ✕ on it to retry the cancel." },
+  "cancel.failed_retry":{ zh: "⚠ 取消失败,云端可能仍在运行 —— 仍在跟踪这个任务,可再点 ✕ 重试取消",
+                        en: "⚠ Cancel failed; the job may still be running — still tracking it, click ✕ to retry" },
   "mdl.no_source":    { zh: "下面这些模型 Modal Volume 没有,本地也找不到,无法自动同步:\n\n{list}\n\n解决:先在本地 ComfyUI 里把这些模型下到对应 models/<类型>/ 目录,再跑。\n\n仍然继续提交?(大概率失败)",
                         en: "These models are on neither the Volume nor locally, can't auto-sync:\n\n{list}\n\nFix: download them locally into models/<type>/ first, then run.\n\nSubmit anyway? (likely to fail)" },
   "mdl.cancel_miss":  { zh: "Cancelled — 缺本地模型", en: "Cancelled — missing local models" },
@@ -186,6 +220,9 @@ const I18N = {
                         en: "These models exist locally but not on the Volume, need a one-time upload (~{mb} MB):\n\n{list}\n\nOK = upload to Volume (block dedup: common big models are instant; one-time, instant after).\nCancel = skip and submit." },
   "mdl.uploading":    { zh: "上传 {n} 个模型到 Volume...", en: "Uploading {n} models to Volume..." },
   "mdl.upload_fail":  { zh: "模型上传失败(看进度窗日志 / ComfyUI 控制台)", en: "Model upload failed (see progress log / ComfyUI console)" },
+  // F-P3-9:被拒 / 失败的项要点名,不能一律报「N 个已同步 ✓」
+  "mdl.upload_fail_detail":{ zh: "模型上传失败:\n{list}\n\n完整日志见 ComfyUI 控制台。", en: "Model upload failed:\n{list}\n\nFull log in the ComfyUI console." },
+  "mdl.rejected":     { zh: "部分模型没有上传(被拒 / 找不到):\n{list}", en: "Some models were not uploaded (rejected / not found):\n{list}" },
   "mdl.synced":       { zh: "{n} 个模型已同步 ✓", en: "{n} models synced ✓" },
   // —— 通知 / 版本契约 / 恢复 ——
   "toast.saved_no_node":{ zh: "图已存到 output/{sf}/(没找到对应输出节点)", en: "Image saved to output/{sf}/ (no matching output node)" },
@@ -201,26 +238,20 @@ const I18N = {
   "toast.recover_to": { zh: "⚠ Job {id} 恢复等待超时,已请求取消云端任务", en: "⚠ Job {id} recovery timed out; cancel requested" },
   "cancel.noop":      { zh: "取消没赶上 —— 云端已跑完(费用已产生),正在取回结果",
                         en: "Too late to cancel — the job already finished (already billed); fetching the result" },
-  // ⚠ 走到这两条时,状态页已确认 Modal 平台正常(见 checkVersionOrBlock 的第 ② 档),
-  // 所以措辞里不提平台故障、也不引导去 status.modal.com。
-  "ver.unreach_toast":{ zh: "云端连不上,但 Modal 平台正常 —— 多半是本机网络慢,或云端 app 没部署/被删。点 [⚙️ Modal Setup] 重新部署",
-                        en: "Cloud unreachable while Modal itself is healthy — likely slow local network, or the app was never deployed / was deleted. Click [⚙️ Modal Setup] to redeploy." },
+  // C7:timeout / unreachable / http_error 只是「这一次没问到」,不拦提交,只给这条非阻断提示。
+  // 走到这条时状态页没报故障(报了走 ver.platform_toast),所以不提平台故障。
+  "ver.unreach_toast":{ zh: "云端版本检查没有回应({kind}),照常提交 —— 若随后提交失败,再到 [⚙️ Modal Setup] 点「测试连接」",
+                        en: "Cloud version check got no answer ({kind}); submitting anyway — if the submission then fails, use \"Test connection\" in [⚙️ Modal Setup]" },
+  "ver.unauthorized_toast":{ zh: "bridge key 与云端不一致(云端回 401)。点 [⚙️ Modal Setup] 重新推送会刷新 key",
+                        en: "Bridge key doesn't match the cloud (401). Push again in [⚙️ Modal Setup] to refresh the key." },
+  "ver.unauthorized_msg":{ zh: "云端拒绝了本机的 bridge key(401):两边的 key 不一致,提交了也会被拒。\n\n常见原因:在别的机器上重新部署过,或 config.json 被替换。重新「推送到云端」会把本机的 key 写进云端。\n\n点「确定」打开部署窗口。",
+                        en: "The cloud rejected this machine's bridge key (401): the keys differ, so a submission would be rejected too.\n\nUsually the app was redeployed from another machine or config.json was replaced. Pushing to the cloud again writes this machine's key to the cloud.\n\nOK to open the deploy dialog." },
   "ver.local_busy_toast":{ zh: "本地 ComfyUI 正忙,版本检查跳过 —— 照常提交到云端(本地采样会阻塞检查,与 Modal 无关)",
                         en: "Local ComfyUI is busy, version check skipped — submitting to the cloud anyway (local sampling blocks the check; unrelated to Modal)." },
   "ver.mismatch_toast":{ zh: "插件版本 {local} 与云端部署的 {deployed} 不一致,需重新部署。",
                         en: "Plugin {local} differs from deployed {deployed}; redeploy needed." },
-  "ver.unreach_msg":  { zh: "连不上云端,但 Modal 官方状态页显示平台正常。\n\n可能是本机网络较慢,或云端 app 没部署过 / 已被删。\n\n点「确定」打开部署窗口;只是网络抖动的话,直接关掉重试即可。",
-                        en: "Can't reach the cloud, but Modal's status page reports the platform is healthy.\n\nLikely a slow local network, or the app was never deployed / was deleted.\n\nOK to open the deploy dialog; if it was just a network blip, close this and retry." },
   "ver.mismatch_msg": { zh: "⚠ 版本不一致:\n  插件(本地):{local}\n  云端部署:{deployed}\n\n你升级了插件但还没把新版本推上去,云端跑的是旧代码,会出问题。\n\n点「确定」打开推送窗口。\n\n(「推送到云端」会自动比对差异:有改动的私有节点先推上去,依赖变了才重建镜像 —— 不必自己判断这次改的是代码还是依赖。)",
                         en: "⚠ Version mismatch:\n  Plugin (local): {local}\n  Deployed: {deployed}\n\nYou upgraded the plugin but haven't pushed it yet; the cloud runs old code.\n\nOK to open the push dialog.\n\n(\"Push to cloud\" diffs your machine against the cloud automatically: changed private nodes are pushed first, and the image is rebuilt only if their dependencies changed.)" },
-  "export.done":      { zh: "已导出 {name}_modal.py —— 给别人:让他装 requests、填 KEY、python 跑即可(模型/节点需已同步过)。",
-                        en: "Exported {name}_modal.py — share it: recipient installs requests, fills KEY, runs python (models/nodes must be already synced)." },
-  "export.fail":      { zh: "导出失败:取当前工作流出错", en: "Export failed: couldn't read the current workflow" },
-  "export.key.title": { zh: "要把你的 API KEY 写进导出文件吗?", en: "Write your API KEY into the exported file?" },
-  "export.key.body":  { zh: "这把 key = 你的 Modal 账单:谁拿到都能花你的钱,泄露只能整把换 key。\n\n【嵌入 KEY】文件直接能跑,但 key 明文写在里面 —— 只发可信的人 / 自己后端。\n【用占位符(推荐)】文件不含 key,对方用你私下给的 key 自己填 —— 对外分享选这个。", en: "This key = your Modal billing: anyone who has it can spend your money; a leak means rotating the key.\n\n[Embed KEY] Runs as-is, but the key sits in the file in plaintext — trusted people / your own backend only.\n[Use placeholder (recommended)] No key in the file; the recipient fills in the key you give them privately — pick this for sharing." },
-  "export.key.embed": { zh: "嵌入 KEY", en: "Embed KEY" },
-  "export.key.placeholder":{ zh: "用占位符(推荐)", en: "Use placeholder (recommended)" },
-  "export.key.fail":  { zh: "取 KEY 失败,已改用占位符(需重启 ComfyUI 加载新后端)", en: "Couldn't fetch KEY; fell back to placeholder (restart ComfyUI to load the new backend)" },
   "ver.gpu_mismatch_toast":{ zh: "显卡已改为 {local},但云端部署的是 {deployed},必须重新部署才生效。",
                         en: "GPU changed to {local}, but cloud is deployed on {deployed}; redeploy required." },
   "ver.gpu_mismatch_msg": { zh: "⚠ 显卡不一致:\n  你选的:{local}\n  云端实际在跑:{deployed}\n\nModal 的显卡是部署时固定的,换卡必须重新部署才生效——否则会继续在旧卡 {deployed} 上跑。\n\n点「确定」打开部署窗口重新部署。",
@@ -230,9 +261,8 @@ const I18N = {
   "ver.checking":     { zh: "检查云端中…", en: "Checking cloud…" },
   "ver.platform_startup":{ zh: "⚠ Modal 平台当前异常(status.modal.com),出资产可能失败,等平台恢复",
                            en: "⚠ Modal platform is currently degraded (status.modal.com); jobs may fail until it recovers" },
-  "ver.platform_toast":{ zh: "⚠ 连不上 Modal,可能是平台故障", en: "⚠ Can't reach Modal — possible platform outage" },
-  "ver.platform_msg": { zh: "连不上 Modal 云端(超时)。\n\n这很可能是 Modal 平台故障,不是你的问题——重新部署也会失败。\n\n点「确定」打开 status.modal.com 查看平台状态;若显示故障,等恢复后再试即可。",
-                        en: "Can't reach Modal cloud (timeout).\n\nThis is likely a Modal platform outage, not your fault — redeploying would also fail.\n\nOK to open status.modal.com; if it shows an outage, just wait for recovery." },
+  "ver.platform_toast":{ zh: "⚠ Modal 平台当前异常(status.modal.com),本次照常提交,可能失败",
+                         en: "⚠ Modal platform is degraded (status.modal.com); submitting anyway, it may fail" },
   "ver.notdeployed_toast":{ zh: "云端 app 未部署。点 [⚙️ Modal Setup] 部署", en: "Cloud app not deployed. Click [⚙️ Modal Setup]" },
   "ver.notdeployed_msg":{ zh: "云端 Modal app 不存在(没部署 / 被删)。\n\n点「确定」打开部署窗口。",
                           en: "Cloud Modal app not found (undeployed / deleted).\n\nOK to open the deploy dialog." },
@@ -245,6 +275,7 @@ const I18N = {
   "mn.local_rm_fail": { zh: "✗ 这些本地包没能删掉(下次冷启动仍会装上): {list}",
                         en: "✗ Failed to remove these local packs (they will load again on next cold start): {list}" },
   "mn.load_fail":     { zh: "✗ 加载失败:{e}", en: "✗ Load failed: {e}" },
+  "mn.local_list_fail":{ zh: "⚠ 读不到 Volume 上的私有节点包:{e}", en: "⚠ Couldn't list private node packs on the Volume: {e}" },
   "mn.none_checked":  { zh: "没勾选任何节点", en: "Nothing selected" },
   "mn.confirm":       { zh: "确定从云端镜像移除这 {n} 个节点并重部署?\n\n{list}\n\n⚠ 别的电脑若用到这些节点会失败,需要时重新加。",
                         en: "Remove these {n} nodes from the cloud image & redeploy?\n\n{list}\n\n⚠ Other machines using them will fail and need re-add." },
@@ -256,8 +287,9 @@ const I18N = {
   "toast.done_n":     { zh: "✓ {wf} {n} 张完成", en: "✓ {wf} {n} done" },
   "set.batch":        { zh: "一次点击跑几次(自动改 seed)", en: "How many runs per click (auto-reseed)" },
   "set.poll":         { zh: "查询状态频率", en: "Status polling interval" },
-  "set.timeout":      { zh: "前端等出资产的最长时间(秒),默认 1200=20分钟,和 worker 单任务上限一致——worker 最多跑多久前端就等多久。出资产后立刻返回,不会真等满;设大只是给冷启动+大模型留足空间。⚠ 别设得比 worker 上限小:那样前端会先放弃,而云端还在跑、还在计费(超时后会自动请求取消)。",
-                        en: "Max seconds the frontend waits for a result. Default 1200=20min, matching the worker job limit. Returns instantly when done; large values just allow cold start + big models. Do not set it below the worker limit: the frontend would give up first while the cloud job keeps running and billing (a cancel is requested on timeout)." },
+  // C8 之后的真实语义(2026-10-05 深度 review F-P3-7):它只是从提交起算的保底,不再需要和 worker 上限手动对齐。
+  "set.timeout":      { zh: "前端等出资产的保底时长(秒,从提交起算),默认 1200。实际截止线自动取「本设置」与「任务开始运行 + 云端 worker 单任务上限 + 3 分钟」中较晚的那个;排队 / 冷启动期间前端不计时(云端排队 6 小时仍没开始会判失败)。所以一般不用改,设小也不会把正常任务提前取消;只有想比 worker 上限等得更久时才调大。到截止线仍未结束,会自动请求取消云端任务。",
+                        en: "Minimum time (seconds, from submission) the frontend waits for a result; default 1200. The actual deadline is the later of this value and \"run start + the cloud worker's per-job limit + 3 min\"; queueing / cold start is not timed by the frontend (the cloud fails a job that hasn't started after 6 h in the queue). You rarely need to change it — a small value won't cancel healthy jobs early; raise it only to wait longer than the worker limit. If the deadline passes, a cancel is requested." },
   "set.autosync_models":{ zh: "提交前检查 Modal Volume,工作流要、Volume 没、但本地有的模型自动上传(块级去重,通用大模型秒过)",
                           en: "Before submit, auto-upload models the workflow needs that are missing on the Volume but present locally (block dedup, common big models instant)" },
   "set.autosync_nodes": { zh: "提交前把工作流用到的 custom_node 与本地双向同步到 Modal:缺的加、commit 变的更新、本地已卸载的移除,再重部署",
@@ -313,6 +345,12 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 // 所以配对成功后安全重试一次即可。
 const LOCAL_CAP_KEY = "modal_bridge.local_api_capability";
 let _capabilityPairing = null;
+// 用户取消配对后的冷却期:带 background 标记的请求(轮询 / 取回进度 / 事件上报)在这段时间里
+// 遇到 403 直接返回,不再弹窗。以前取消之后,恢复轮询每一拍(默认 1.2s)都会把配对框重新弹出来,
+// 用户等于没法拒绝(2026-10-05 深度 review F-P3-10)。用户自己点的操作(部署 / 测试连接 / RunModal)
+// 不受冷却限制 —— 那是用户此刻明确要做的事,该让他配对。
+const PAIR_DECLINE_COOLDOWN_MS = 60000;
+let _pairDeclinedAt = 0;
 
 // 配对输入用插件自己的 DOM,**不用 window.prompt**:Electron(ComfyUI Desktop)不支持它,
 // 一调用就抛 "prompt() is not supported." —— 0.8.36~0.8.38 在 Desktop 上所有管理操作
@@ -395,21 +433,26 @@ function fmtDur(sec) {
 }
 
 async function bridgeFetch(path, options = {}) {
+  // background:非用户直接触发的请求(见 PAIR_DECLINE_COOLDOWN_MS),不传给 fetchApi
+  const { background = false, ...fetchOptions } = options;
   const pairingAtStart = _capabilityPairing;
   const call = async (allowPair) => {
-    const headers = new Headers(options.headers || {});
+    const headers = new Headers(fetchOptions.headers || {});
     let saved = (localStorage.getItem(LOCAL_CAP_KEY) || "").trim();
     if (saved && !/^[\x21-\x7e]+$/.test(saved)) {
       localStorage.removeItem(LOCAL_CAP_KEY);  // 旧的误粘值不能让 Headers.set 永久抛错。
       saved = "";
     }
     if (saved) headers.set("X-Modal-Bridge-Capability", saved);
-    const res = await api.fetchApi(path, { ...options, headers });
+    const res = await api.fetchApi(path, { ...fetchOptions, headers });
     if (allowPair && res.status === 403 &&
         res.headers.get("X-Modal-Bridge-Auth") === "capability-required") {
       // 旧请求的 403 不能删掉另一个请求刚配好的 token。
       const current = (localStorage.getItem(LOCAL_CAP_KEY) || "").trim();
       if (current && current !== saved) return call(false);
+      // 后台请求在用户刚拒绝配对后的冷却期里不弹窗(见 PAIR_DECLINE_COOLDOWN_MS)
+      if (background && !(_capabilityPairing && _capabilityPairing.pending) &&
+          Date.now() - _pairDeclinedAt < PAIR_DECLINE_COOLDOWN_MS) return res;
       // 同一批在途请求只配对一次；取消/输错后也不连环弹窗。
       if (!_capabilityPairing || (!_capabilityPairing.pending && _capabilityPairing === pairingAtStart)) {
         const pairing = { pending: true, promise: null };
@@ -418,6 +461,7 @@ async function bridgeFetch(path, options = {}) {
           localStorage.removeItem(LOCAL_CAP_KEY);
           const value = await askCapability();
           if (value) localStorage.setItem(LOCAL_CAP_KEY, value);
+          else _pairDeclinedAt = Date.now();
           return value;
         }).finally(() => { pairing.pending = false; });
       }
@@ -438,6 +482,7 @@ function reportJobEvent(jobId, event, detail) {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ job_id: jobId, event, detail: detail || "" }),
+      background: true,
     }).catch(() => {});
   } catch (e) {}
 }
@@ -639,14 +684,40 @@ function storePendingResult(wfKey, outputNodeIds, outputs) {
 // 和 Modal /health 的 custom_nodes 权威比对,算出 加/改/删 plan;确认后走 /sync_nodes
 // 写回清单 + 重部署。本地始终是真源。全程在 ComfyUI 里完成,不用开终端。
 // =====================================================================
+// 非 2xx 响应 → Error。后端的 JSON 正文里通常带着写好的 error(/sync_nodes 409 的处理说明、
+// /config 400 的校验原因);只报「HTTP 409」等于把那段话丢掉(2026-10-05 深度 review F-P2-4)。
+// 读不到正文才退回「<label> HTTP <status>」。
+async function httpError(res, label) {
+  let msg = "";
+  try {
+    const d = await res.json();
+    if (d && typeof d.error === "string") msg = d.error;
+  } catch (e) {}
+  const e = new Error(msg || `${label} HTTP ${res.status}`);
+  e.httpStatus = res.status;
+  return e;
+}
+
+// 流式日志里 ✗ 行去掉两侧的 == 装饰
+function failLine(line) {
+  return String(line || "").replace(/^[=\s]+|[=\s]+$/g, "").trim();
+}
+
+// C5:保护性中止(DeployBlocked / 自动部署被阻断)在流里只输出一行 `== ✗ 部署已中止:<原因> ==`;
+// auto_deploy_blocker 的消息以「自动部署已中止」开头。两者都含「已中止」。
+// 它不是依赖装不上,出路是处理原因后「推送到云端」—— 文案必须和构建失败分开。
+function isProtectiveAbort(line) {
+  return typeof line === "string" && line.includes("✗") && line.includes("已中止");
+}
+
 async function checkNodesOnModal(prompt) {
   const res = await bridgeFetch("/modal_bridge/check_nodes", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ prompt }),
   });
-  if (!res.ok) throw new Error(`check_nodes HTTP ${res.status}`);
-  return res.json(); // {add, update, prune, missing_no_git, unresolved, new_baked, needs_deploy, ok_*, source}
+  if (!res.ok) throw await httpError(res, "check_nodes");
+  return res.json(); // {add, update, prune, missing_no_git, unresolved, new_baked, needs_deploy, ok_*, source, cloud_unchecked?, volume_unchecked?}
 }
 
 // 流式 POST(/deploy、/add_nodes 共用):逐行回调 onLine,返回 __DEPLOY_DONE__ 的 rc(无则 null)
@@ -656,7 +727,9 @@ async function streamPost(path, body, onLine) {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
   });
-  if (!res.ok || !res.body) throw new Error(`${path} HTTP ${res.status}`);
+  // 流开始(prepare)之前的拒绝是 JSON {error}(/sync_nodes 409 等),要原样带给用户
+  if (!res.ok) throw await httpError(res, path);
+  if (!res.body) throw new Error(`${path}: empty response body`);
   const reader = res.body.getReader();
   const decoder = new TextDecoder();
   let buf = "", rc = null;
@@ -678,10 +751,14 @@ async function streamPost(path, body, onLine) {
   return rc;
 }
 
-// 调 /sync_nodes,把新清单写回并重部署,流式推进 deploying 进度条,返回是否成功
+// 调 /sync_nodes,把新清单写回并重部署,流式推进 deploying 进度条。
+// 返回 {ok, lastError}:lastError 是最后一行 ✗(保护性中止要换专门文案,见 isProtectiveAbort)。
+// ⚠ C6:这是 RunModal 的自动同步路径,**从不传 prune** —— 删除节点只能由用户在「管理云端节点」
+//   面板里显式勾选。服务端会把云端有、new_baked 里没有的节点并回,不会因为本机清单过期而删掉。
 async function syncNodes(plan, ctx) {
   const [a, b] = STATUS_PROGRESS.deploying;
   let tick = 0;
+  let lastError = "";
   const rc = await streamPost(
     "/modal_bridge/sync_nodes",
     {
@@ -690,12 +767,13 @@ async function syncNodes(plan, ctx) {
     },
     (line) => {
       log("deploy:", line);
+      if (line.includes("✗")) lastError = failLine(line);
       tick++;
       ctx.bar(a + Math.min(b - a - 1, tick * 0.4));
       ctx.stage("deploying", line.length > 72 ? line.slice(0, 72) + "…" : line);
     },
   );
-  return rc === 0;
+  return { ok: rc === 0, lastError };
 }
 
 // 节点名来自本地文件夹名 / Volume 上的包名 —— 进 innerHTML 前必须转义
@@ -727,7 +805,7 @@ async function syncLocalNodes(localPack, ctx) {
           try { syncedDigests = JSON.parse(m[1]); } catch (e) { log("digest parse:", e); }
           return;
         }
-        if (line.includes("✗")) lastError = line.replace(/^[=\s]+|[=\s]+$/g, "").trim();
+        if (line.includes("✗")) lastError = failLine(line);
         log("local-node:", line);
         ctx.stage("uploading", line.length > 72 ? line.slice(0, 72) + "…" : line, false);
       },
@@ -796,6 +874,17 @@ async function ensureNodesAvailable(prompt, ctx) {
     if (!confirm(t("node.confirm_skip"))) return false;
   }
 
+  // C6:读不到云端节点清单时,/check_nodes 退回本机清单并带 cloud_unchecked。这时算出的「要部署」
+  //   可能基于过期清单,照着部署可能把别的机器加的节点从镜像里删掉。RunModal 的自动同步是用户
+  //   没盯着的路径,不在这里冒险:直接中止,让用户稍后重试或去面板显式推送。放在推私有节点之前,
+  //   免得中止前已经产生副作用(2026-10-05 深度 review)。
+  if (plan.cloud_unchecked && plan.needs_deploy) {
+    throw new Error(t("node.cloud_unchecked", { why: plan.cloud_unchecked }));
+  }
+  // C13:读不到 Volume 上的私有节点包时 local_remove 为空 —— 只是这次清理不了旧覆盖包,
+  //   正确性由下面随任务下发的 baked sentinel 保证,不拦提交,提示一句即可。
+  if (plan.volume_unchecked) notify(t("node.volume_unchecked", { why: plan.volume_unchecked }), "warn");
+
   // 本地自写节点(无 git remote / commit 未推送)→ 打包传 Volume,worker 启动时解压。
   // 放在部署之前:即使同一批还要重部署,本地节点也已经在 Volume 上,一次提交全齐。
   if (local_pack.length) {
@@ -849,9 +938,11 @@ async function ensureNodesAvailable(prompt, ctx) {
     // 要覆盖本次工作流用到的**全部**私有节点(提交时要带上完整版本契约)。
     const res = await syncLocalNodes(local_pack, ctx);
     if (!res.ok) {
-      // 自动部署被阻断(同名公共节点版本与云端不同 / 读不到云端):出路是「推送到云端」,
-      // 不是查 requirements —— 通用文案会把人引错方向(2026-09-27 review)。
-      const blocked = (res.message || "").includes("自动部署已中止");
+      // 保护性中止:出路是处理原因后「推送到云端」,不是查 requirements —— 通用文案会把人
+      // 引错方向(2026-09-27 review)。以前只认 auto_deploy_blocker 的「自动部署已中止」,
+      // DeployBlocked 的「部署已中止」照样落到「requirements 装不上」;C5 起两者统一按
+      // 「✗ 行含『已中止』」判(2026-10-05 深度 review F-P3-1)。
+      const blocked = isProtectiveAbort(res.message);
       throw new Error(blocked ? t("node.auto_deploy_blocked", { msg: res.message })
         : res.message ? t("node.local_fail_detail", { msg: res.message })
         : t("node.local_fail"));
@@ -877,8 +968,11 @@ async function ensureNodesAvailable(prompt, ctx) {
     if (shouldDeploy) {
       ctx.stage("deploying", t("node.redeploy"), false);
       ctx.bar(STATUS_PROGRESS.deploying[0]);
-      const ok = await syncNodes(plan, ctx);
-      if (!ok) throw new Error(t("node.deploy_fail"));
+      const sr = await syncNodes(plan, ctx);
+      if (!sr.ok) {
+        throw new Error(isProtectiveAbort(sr.lastError)
+          ? t("node.auto_deploy_blocked", { msg: sr.lastError }) : t("node.deploy_fail"));
+      }
       ctx.stage("deploying", t("node.updated"), false);
     }
   }
@@ -1017,6 +1111,7 @@ function newProgress(initialStage = "preparing", wfName = null) {
       <div class="mb-bar" style="height:100%;width:0%;background:linear-gradient(90deg,#6366f1,#8b5cf6);border-radius:2px;transition:width 0.4s cubic-bezier(0.4,0,0.2,1);"></div>
     </div>
     <div class="mb-detail" style="margin-top:6px;opacity:0.6;font-size:11px;word-break:break-all;"></div>
+    <div class="mb-warn" style="display:none;margin-top:4px;color:#fbbf24;font-size:11px;word-break:break-all;"></div>
     <div class="mb-errtoggle" style="display:none;margin-top:4px;font-size:10px;color:#fca5a5;cursor:pointer;text-decoration:underline;">▶ Show error details</div>
     <pre class="mb-errdetail" style="display:none;margin:4px 0 0;padding:6px;background:rgba(0,0,0,0.3);border-radius:4px;font-size:10px;max-height:160px;overflow:auto;white-space:pre-wrap;"></pre>
   `;
@@ -1029,6 +1124,7 @@ function newProgress(initialStage = "preparing", wfName = null) {
     time: card.querySelector(".mb-time"),
     bar: card.querySelector(".mb-bar"),
     detail: card.querySelector(".mb-detail"),
+    warn: card.querySelector(".mb-warn"),
     cancel: card.querySelector(".mb-cancel"),
     errToggle: card.querySelector(".mb-errtoggle"),
     errDetail: card.querySelector(".mb-errdetail"),
@@ -1040,6 +1136,8 @@ function newProgress(initialStage = "preparing", wfName = null) {
     wfName: wfName,
     cancelable: false,
     finished: false,
+    closed: false,
+    lastStage: initialStage,
     onCancel: null,
     startMs: Date.now(),
     timer: null,
@@ -1047,9 +1145,10 @@ function newProgress(initialStage = "preparing", wfName = null) {
     els,
   };
 
-  ctx.timer = setInterval(() => {
+  const tickTime = () => {
     els.time.textContent = `${((Date.now() - ctx.startMs) / 1000).toFixed(1)}s`;
-  }, 100);
+  };
+  ctx.timer = setInterval(tickTime, 100);
 
   els.cancel.onclick = async (ev) => {
     ev.stopPropagation();
@@ -1066,12 +1165,24 @@ function newProgress(initialStage = "preparing", wfName = null) {
   ctx.bar = (pct) => { els.bar.style.width = `${pct}%`; };
 
   ctx.closeCard = () => {
+    ctx.closed = true;
     if (ctx.timer) { clearInterval(ctx.timer); ctx.timer = null; }
     if (ctx.runTimer) { clearInterval(ctx.runTimer); ctx.runTimer = null; }
     els.card.remove();
   };
 
+  // 卡片上一行常驻警告(取消失败后「仍在跟踪,可重试」)。stage 换阶段时不清,finish 时清。
+  ctx.setWarn = (text) => {
+    els.warn.textContent = text || "";
+    els.warn.style.display = text ? "block" : "none";
+  };
+
   ctx.stage = (stageKey, detail = null, cancelable = null) => {
+    // ⚠ 结束后的卡片不再接受阶段更新:点取消时恰好有一个 /poll 在途,它回来后
+    //   stage("running") 会把已经显示 Cancelled 的卡片改回 Running、还重启进度条动画
+    //   (2026-10-05 深度 review F-P2-1)。要重新进行中必须显式 reopen。
+    if (ctx.finished) return;
+    ctx.lastStage = stageKey;
     els.label.textContent = `☁️ ${ctx.wfName || "Modal"} · ${STAGE_LABELS[stageKey] || stageKey}`;
     if (detail !== null) els.detail.textContent = detail;
     if (cancelable !== null) {
@@ -1097,6 +1208,7 @@ function newProgress(initialStage = "preparing", wfName = null) {
     ctx.finished = true;
     if (ctx.timer) { clearInterval(ctx.timer); ctx.timer = null; }
     if (ctx.runTimer) { clearInterval(ctx.runTimer); ctx.runTimer = null; }
+    ctx.setWarn(null);
     ctx.bar(100);
     els.bar.style.background = success
       ? "linear-gradient(90deg,#10b981,#22c55e)"
@@ -1115,6 +1227,25 @@ function newProgress(initialStage = "preparing", wfName = null) {
     }
     // 成功 4s 后自动移除;失败/取消留着让用户看,点 × 关
     if (success) setTimeout(() => els.card.remove(), 4000);
+  };
+
+  // 撤销 finish,回到进行中。两种场景:取消没确认(云端可能还在跑 → 继续跟踪、✕ 恢复成取消,
+  // 带一行警告);取消没赶上、要取回已付费的产物(下载可能几十分钟,得让取回进度照常显示)。
+  // 以前取消一失败卡片就永久变成「关闭」,任务没人跟、也没法再取消(2026-10-05 深度 review F-P2-2)。
+  ctx.reopen = (warn = null) => {
+    if (ctx.closed) return;   // 用户已经手动关掉卡片:不再复活(后台照常跟踪,结局走 toast)
+    if (ctx.finished) {
+      ctx.finished = false;
+      if (!ctx.timer) ctx.timer = setInterval(tickTime, 100);
+      els.bar.style.background = "linear-gradient(90deg,#6366f1,#8b5cf6)";
+      els.cancel.textContent = "✕";
+      els.cancel.title = "Cancel";
+      els.cancel.style.color = "#ef4444";
+      els.errToggle.style.display = "none";
+      els.errToggle.textContent = "▶ Show error details";
+      els.errDetail.style.display = "none";
+    }
+    ctx.setWarn(warn);
   };
 
   ctx.stage(initialStage);
@@ -1136,28 +1267,85 @@ function getVramTier(_prompt) {
 
 // 未完成 job 持久化(支持多个并发):LS 存数组,刷新后逐个尝试恢复
 function addActiveJob(j) {
-  let a = loadLS(LS_KEYS.activeJob);
-  a = Array.isArray(a) ? a : (a ? [a] : []);
-  a.push(j);
+  const a = loadActiveJobs();
+  a.push({ ...j, tabId: TAB_ID, hb: Date.now() });
   saveLS(LS_KEYS.activeJob, a);
 }
+
+// 恢复记录的归属标签页 + 心跳(2026-10-05 深度 review F-P3-10):第二个标签页打开时,以前会把
+// 第一个标签页正在跑的 job 也「恢复」一遍 —— 两张卡片、两条 toast、两路轮询和取回。
+// 现在每条记录带 tabId 和心跳 hb:owner 每 ACTIVE_JOB_HB_MS 刷新一次(见 setup 里的定时器),
+// 页面关闭 / 刷新(pagehide)时把自己的心跳清零,刷新后的新页面能立刻接手;别的标签页只接手
+// 心跳过期(或没有归属)的记录。
+const TAB_ID = Math.random().toString(36).slice(2, 10) + Date.now().toString(36);
+const ACTIVE_JOB_HB_MS = 5000;
+const ACTIVE_JOB_HB_STALE_MS = 20000;
+
+function loadActiveJobs() {
+  const a = loadLS(LS_KEYS.activeJob);
+  return Array.isArray(a) ? a : (a ? [a] : []);
+}
+
 function removeActiveJob(jobId) {
-  let a = loadLS(LS_KEYS.activeJob);
-  a = Array.isArray(a) ? a : (a ? [a] : []);
-  saveLS(LS_KEYS.activeJob, a.filter((x) => x.jobId !== jobId));
+  saveLS(LS_KEYS.activeJob, loadActiveJobs().filter((x) => x.jobId !== jobId));
+}
+function updateActiveJob(jobId, patch) {
+  saveLS(LS_KEYS.activeJob, loadActiveJobs().map((j) => (j.jobId === jobId ? { ...j, ...patch } : j)));
+}
+// 刷新本标签页名下记录的心跳;release=true(pagehide)时清零,让刷新后的页面立即接手
+function heartbeatActiveJobs(release = false) {
+  const a = loadActiveJobs();
+  if (!a.some((j) => j && j.tabId === TAB_ID)) return;
+  const now = Date.now();
+  saveLS(LS_KEYS.activeJob, a.map((j) => (j && j.tabId === TAB_ID ? { ...j, hb: release ? 0 : now } : j)));
 }
 
 function markJobFetching(jobId) {
-  let a = loadLS(LS_KEYS.activeJob);
-  a = Array.isArray(a) ? a : (a ? [a] : []);
-  saveLS(LS_KEYS.activeJob, a.map((j) => j.jobId === jobId
+  saveLS(LS_KEYS.activeJob, loadActiveJobs().map((j) => j.jobId === jobId
     ? { ...j, fetchStartedAt: j.fetchStartedAt || Date.now() } : j));
 }
 
-function recoveryDeadline(j, maxAgeSec) {
-  // 取回不消耗 worker 的运行时限，刷新也不会无限续期。
-  return Math.max((j.startedAt || Date.now()) + maxAgeSec * 1000,
-    j.fetchStartedAt ? j.fetchStartedAt + 3600000 : 0);
+// C8 运行截止线(主轮询、刷新恢复的列表过滤、恢复轮询三处同一口径):
+//   截止线 = max(提交时刻 + 前端设置, runSeenAt + worker 上限 + 尾巴)
+// runSeenAt = 前端**第一次看到 running** 的本地时刻。排队 / 冷启动阶段前端不截止(Infinity),
+// 交给云端 6 小时判死(modal_app._QUEUE_STALE_S)。
+// ⚠ 以前从提交时刻起算 max(设置, worker 上限 + 3 分钟):排队 + 冷启动吃掉超过 3 分钟的尾巴时,
+//   前端会在 worker 到上限**之前**主动取消一个正常任务 —— 实测排队 240s、执行 1150s 的任务
+//   在提交后第 1380s 被取消,比完成早 10 秒(2026-10-05 深度 review F-P1-1)。Modal 的 worker
+//   超时从 run() 开始算、不含排队,前端必须和它对齐。
+// 尾巴罩住 decode / 编码 / 写回,也罩住云端判死的 _STALE_GRACE_S(120s):正常情况下前端先看到
+// 云端的 failed,轮不到自己截止。
+const RUN_DEADLINE_TAIL_MS = 180000;
+function jobDeadline(j, settingSec) {
+  if (j.runSeenAt == null) return Infinity;
+  const limitSec = j.runTimeoutSec || j.workerTimeoutSec || settingSec;
+  return Math.max((j.startedAt || j.runSeenAt) + settingSec * 1000,
+                  j.runSeenAt + limitSec * 1000 + RUN_DEADLINE_TAIL_MS);
+}
+function recoveryDeadline(j, settingSec) {
+  // 已开始取回 = 任务已终结:取回不消耗 worker 的运行时限,给首次取回后 1 小时,刷新也不续期。
+  // (没见过 running 的快任务没有 runSeenAt,运行截止线对它不适用。)
+  if (j.fetchStartedAt) {
+    return Math.max(j.fetchStartedAt + 3600000, j.runSeenAt == null ? 0 : jobDeadline(j, settingSec));
+  }
+  return jobDeadline(j, settingSec);
+}
+
+// 轮询看到 running(或已过 running 的 delivering)时调:第一次看到就记 runSeenAt 并写进恢复记录。
+// 云端 started_at 变了 = 换了一次执行(抢占后重跑,worker 上限从头算),runSeenAt 跟着重置 ——
+// 往晚了偏只会多等,不会提前取消。timeout_s 是云端按任务记下的 worker 上限,优先于提交时的估计。
+function noteRunning(rec, pData) {
+  const sa = typeof pData.started_at === "number" ? pData.started_at : null;
+  const limit = Number(pData.timeout_s) > 0 ? Number(pData.timeout_s) : null;
+  const restarted = sa != null && rec.runStartedAt != null && sa !== rec.runStartedAt;
+  const first = rec.runSeenAt == null;
+  if (!first && !restarted && (limit == null || limit === rec.runTimeoutSec)
+      && (sa == null || rec.runStartedAt != null)) return;
+  if (first || restarted) rec.runSeenAt = Date.now();
+  if (sa != null) rec.runStartedAt = sa;
+  if (limit != null) rec.runTimeoutSec = limit;
+  updateActiveJob(rec.jobId, { runSeenAt: rec.runSeenAt, runStartedAt: rec.runStartedAt ?? null,
+                               runTimeoutSec: rec.runTimeoutSec ?? null });
 }
 
 // 一次状态探测,把「看到了状态」和「这一拍没看清」分开 —— 主轮询、刷新恢复、取消复核三处共用。
@@ -1168,11 +1356,15 @@ function recoveryDeadline(j, maxAgeSec) {
 // job 执行失败的响应也带 error,但同时有 status:"failed" —— 那是终态,如实返回,不当瞬态。
 async function probeJobStatus(jobId) {
   try {
-    const r = await bridgeFetch(`/modal_bridge/poll?job_id=${encodeURIComponent(jobId)}`);
+    const r = await bridgeFetch(`/modal_bridge/poll?job_id=${encodeURIComponent(jobId)}`,
+                                { background: true });
     const d = await r.json().catch(() => ({}));
     if (!r.ok || !d || typeof d.status !== "string" || !d.status) {
       return { transient: true, data: d };
     }
+    // C4:本机 /poll 对云端其它 HTTP ≥ 400 回 {status:"unknown", http_status} —— 这一拍没看清,
+    //   按瞬态重试,不计入也不打断 not_found 连续计数。auth_failed(云端 401)是终态,如实返回。
+    if (d.status === "unknown") return { transient: true, data: d };
     return { status: d.status, data: d };
   } catch (e) {
     return { transient: true, error: e };
@@ -1195,6 +1387,8 @@ async function confirmJobGone(jobId) {
     await sleep(interval);
     const p = await probeJobStatus(jobId);
     if (p.transient) return { verdict: "unknown", detail: p };
+    // key 不对就看不到它的真实状态 —— 不是「活着」,也不是「没了」,是没看清
+    if (p.status === "auth_failed") return { verdict: "unknown", detail: p };
     if (p.status === "not_found") continue;
     if (p.status === "completed" || p.status === "failed" || p.status === "cancelled") {
       return { verdict: "terminal", data: p.data };
@@ -1209,10 +1403,27 @@ async function confirmJobGone(jobId) {
 async function settleCancel(jobId, d, ctx, wfName) {
   if (d.cancel_noop && d.status === "completed") {
     notify(t("cancel.noop"), "warn");
+    // 卡片此刻停在乐观的 "✕ Cancelled" 上,而取回可能要下载几十分钟 —— 恢复成进行中,
+    // 让取回进度照常显示(结束后的卡片不接受 stage 更新,见 newProgress)。
+    if (ctx && ctx.reopen) ctx.reopen();
     try {
-      const fd = await fetchJobResult(jobId, d, ctx);
+      // ⚠ cancel_noop 的响应只是字段子集(id/status/error/gpu/…),云端 2026-10-05 起**不带 images**
+      //   —— 完整响应带着整份 base64,实测 8 MB。拿它当 modal_state 去取回,本机 /fetch_result 会回
+      //   502「no image in modal_state」。先 /poll 一次拿完整终态再取;这一拍没看清就按取回失败收尾、
+      //   保留恢复记录(刷新会接着取)。已经带 images 的(复核路径传进来的本来就是 /poll 的结果、
+      //   或老云端)直接用。
+      let full = d;
+      if (!(Array.isArray(d.images) && d.images.length)) {
+        const p = await probeJobStatus(jobId);
+        if (p.transient || p.status !== "completed") {
+          throw new Error(`[job ${jobId}] 取消没赶上、任务已完成,但随后查询完整结果没成功` +
+                          `(${p.transient ? "暂时连不上" : p.status})`);
+        }
+        full = p.data;
+      }
+      const fd = await fetchJobResult(jobId, full, ctx);
       const sf = fd.outputs?.[0]?.subfolder || "modal_results";
-      // 卡片此刻停在乐观的 "✕ Cancelled" 上,但结果其实拿到了 —— 改成如实的。
+      // 结果其实拿到了 —— 卡片如实显示。
       if (ctx) ctx.finish(true, "✓ Done (cancel too late)");
       notify(t("toast.recovered", { wf: wfName ? "「" + wfName + "」" : "", sf }), "success");
     } catch (e) {
@@ -1222,8 +1433,12 @@ async function settleCancel(jobId, d, ctx, wfName) {
     }
   } else if (d.status === "cancelled" || d.status === "failed") {
     removeActiveJob(jobId);
-    // 取消没赶上、任务其实是失败的:如实显示失败原因,别停在乐观的 "✕ Cancelled" 上
-    if (d.cancel_noop && d.status === "failed" && ctx) ctx.finish(false, "✗ Failed", d.error || "");
+    // 确认停了就显式收尾,不靠点击时那次乐观的 finish:在途的 poll 可能已经把卡片改回过
+    // Running(2026-10-05 深度 review F-P2-1)。取消没赶上、任务其实是失败的:如实显示失败原因。
+    if (ctx) {
+      if (d.status === "failed") ctx.finish(false, "✗ Failed", d.error || "");
+      else ctx.finish(false, "✕ Cancelled");
+    }
   }
   return d;
 }
@@ -1231,55 +1446,72 @@ async function settleCancel(jobId, d, ctx, wfName) {
 // 云端对取消回了 not_found。云端自己已经重读过几秒(见 modal_app.cancel_endpoint),这里再从
 // 前端复核一遍 —— 误判的代价在这条路上比轮询高一个量级:删掉恢复记录 = 没人再去取结果,
 // 告诉用户「不会继续计费」可能是假话。**钱的事上宁可说「没确认」,不能说「已停」。**
-async function onCancelNotFound(jobId, ctx, wfName, retried) {
+// aliveStatus:之前那一轮复核亲眼看到的非终态状态(只有重发取消那一轮才有)。
+async function onCancelNotFound(jobId, ctx, wfName, aliveStatus, opts = {}) {
   // 卡片此刻停在乐观的 "✕ Cancelled" 上,复核要好几秒 —— 如实显示「确认中」,
   // 别让用户看到 Cancelled 就关卡片走人,然后被几十秒后的弹窗吓一跳。
   if (ctx) ctx.finish(false, t("cancel.confirming"));
   const v = await confirmJobGone(jobId);
 
-  if (v.verdict === "gone") {
+  // ⚠ 只有**从没**看到它活着时,连续 not_found 才能解读成「已经没了」。之前一轮复核已经看到它
+  //   在 running、两次取消又都回「查无此任务」—— 两次取消都没被执行,它此刻多半还在跑;这时
+  //   复核全 not_found 只说明读不到它,不说明它停了。以前在这里宣布「不会继续计费」并删掉恢复
+  //   记录(2026-10-05 深度 review F-P1-2)。现在按矛盾处理:弹窗、保留记录。
+  if (v.verdict === "gone" && !aliveStatus) {
     removeActiveJob(jobId);
     reportJobEvent(jobId, "cancel_job_gone", "取消时云端查无此任务,已连续确认");
     if (ctx) ctx.finish(false, t("cancel.gone"));
     notify(t("cancel.gone_msg", { id: jobId.slice(0, 8) }), "warn");
     return false;
   }
-  if (v.verdict === "alive" && !retried) {
+  if (v.verdict === "alive" && !aliveStatus) {
     // 复查看到它还在 → 刚才那次 cancel 是陈旧读,根本没生效。直接对这个现在可见的任务
     // 再取消一次,这才是止损;只弹框让用户去控制台,等于把能做的事推给用户。只重发一次。
     reportJobEvent(jobId, "cancel_retry_after_stale_not_found", `复查状态=${v.data.status}`);
     if (ctx) ctx.finish(false, "✕ Cancelled");
-    return await requestCancel(jobId, ctx, wfName, true);
+    return await requestCancel(jobId, ctx, wfName, v.data.status || "running", opts);
   }
   if (v.verdict === "terminal") {
     // 复查时它已经结束了:completed 按「取消没赶上」取回(产物已付费),failed/cancelled 如实收尾。
     // 这里对已结束的任务报「可能仍在计费」就是假警报。
     reportJobEvent(jobId, "cancel_found_terminal", `复查状态=${v.data.status}`);
     const st = v.data.status;
-    if (st !== "completed" && ctx) ctx.finish(false, st === "cancelled" ? "✕ Cancelled" : "✗ Failed");
     return await settleCancel(jobId, st === "completed" ? { ...v.data, cancel_noop: true } : v.data,
                               ctx, wfName);
   }
-  // unknown(复查没看清),或重发的取消又回 not_found 而复查说它活着(自相矛盾)。
+  // unknown(复查没看清),或重发的取消又回 not_found 而复查说它活着 / 读不到它(自相矛盾)。
   // ⚠ 两种情况文案必须分开:网络问题时任务从没被看到过,不能说「它又出现了」,
   //   否则用户和排障的人都会被引向「任务确实在跑」的错误结论。
   // 恢复记录保留,但**真正的保障是这个弹窗**:超时路径上调用时 recoveryDeadline 已过,
   // 下次加载会丢掉这条记录 —— 所以必须让用户知道要自己去控制台看。
   const why = v.verdict === "unknown"
     ? t("cancel.state_unknown")
-    : t("cancel.state_inconsistent", { status: v.data.status });
+    : t("cancel.state_inconsistent", { status: aliveStatus || v.data?.status || "?" });
   err("cancel not_found unresolved", jobId, v.verdict);
   reportJobEvent(jobId, "cancel_unconfirmed", why);
   if (ctx) ctx.finish(false, t("cancel.failed"));
-  alert(t("cancel.failed_msg", { msg: why }));
+  // 卡片继续跟踪:没看清(unknown)或看到它还活着(alive)时,接着轮询才知道它的结局,用户也能再取消。
+  // 「看到过活着、随后又读不到」不接着轮询:轮询的 not_found 判死会把记录删掉,正是 F-P1-2 要避免的。
+  const keepTracking = typeof opts.onUnconfirmed === "function" && v.verdict !== "gone";
+  if (keepTracking) opts.onUnconfirmed(v.verdict);
+  alert(t("cancel.failed_msg", { msg: why }) + (keepTracking ? t("cancel.retry_hint") : ""));
   return false;
 }
 
 // 请求取消云端任务并**校验结果**。主流程和刷新恢复共用一份 —— 两处行为必须一致,
 // 否则会出现"恢复的卡片点了取消其实没取消"这种只在某条路径上成立的谎报。
 // 取消失败 = 云端还在跑还在计费,必须弹到用户面前。
-// retried:onCancelNotFound 复查看到任务还活着时重发取消用,防止无限重试。
-async function requestCancel(jobId, ctx, wfName = null, retried = false) {
+// aliveStatus:onCancelNotFound 复查看到任务还活着时重发取消用(带上看到的状态),防止无限重试。
+// opts.onUnconfirmed(kind):取消没能确认、云端可能还在跑时回调 —— 卡片据此恢复成可取消、继续轮询。
+async function requestCancel(jobId, ctx, wfName = null, aliveStatus = null, opts = {}) {
+  const keepTracking = typeof opts.onUnconfirmed === "function";
+  const failed = (msg) => {
+    err("cancel failed", msg);
+    if (ctx) ctx.finish(false, t("cancel.failed"));
+    if (keepTracking) opts.onUnconfirmed("failed");
+    alert(t("cancel.failed_msg", { msg }) + (keepTracking ? t("cancel.retry_hint") : ""));
+    return false;
+  };
   let d;
   try {
     const r = await bridgeFetch("/modal_bridge/cancel", {
@@ -1293,25 +1525,66 @@ async function requestCancel(jobId, ctx, wfName = null, retried = false) {
     //   「取消失败」里,弹出「云端可能仍在运行并继续计费,请到 Modal 控制台确认」。
     //   任务根本不存在,却让用户去控制台找一个不存在的容器:假警报比不报更糟。
     //   (这是把「缺字段」改成「显式 error」的副作用 —— 契约修好了,旧调用方反而更难发现。)
-    if (d.status === "not_found") return await onCancelNotFound(jobId, ctx, wfName, retried);
+    if (d.status === "not_found") return await onCancelNotFound(jobId, ctx, wfName, aliveStatus, opts);
     // 取消没赶上:任务已经自己结束了(完成 / 失败 / worker 早已死)。这时响应里带的 error 是
     // **任务的**失败原因,不是取消失败 —— 不能掉进下面「取消失败,云端可能仍在运行并计费」的分支,
     // 那句对一个已经结束的任务正好说反(2026-09-24 review #12)。
     if (d.cancel_noop) return await settleCancel(jobId, d, ctx, wfName);
-    if (!r.ok || d.ok === false || d.error) {
-      const msg = d.error || `HTTP ${r.status}`;
-      err("cancel failed", msg);
-      if (ctx) ctx.finish(false, t("cancel.failed"));
-      alert(t("cancel.failed_msg", { msg }));
-      return false;
-    }
+    // C2:本机 /cancel 的 ok = not still_billing,still_billing 只在「取消失败、云端可能还在跑」时为 true。
+    //   旧后端没有 still_billing,沿用 ok / error 判(兼容)。
+    const stillBilling = d.still_billing === true
+      || (d.still_billing === undefined && (d.ok === false || !!d.error));
+    if (!r.ok || d.ok === false || stillBilling) return failed(d.error || `HTTP ${r.status}`);
   } catch (e) {
-    err("cancel failed", e);
-    if (ctx) ctx.finish(false, t("cancel.failed"));
-    alert(t("cancel.failed_msg", { msg: String(e) }));
-    return false;
+    return failed(String(e));
   }
   return await settleCancel(jobId, d, ctx, wfName);
+}
+
+// 卡片上的取消按钮。主轮询与刷新恢复共用一份(两处以前各写一份,行为一起错)。
+// ⚠ 以前点取消就置 cancelled=true,轮询循环随即退出;取消失败(云端还在跑、还在计费)后既不复位、
+//   也不再轮询,✕ 还变成了「关闭」—— 前端彻底丢下一个正在计费的任务,用户也没法再取消
+//   (2026-10-05 深度 review F-P2-2)。现在:取消在途时轮询**等它出结果**而不是直接退出;
+//   确认停了才退出,没确认就恢复卡片、继续跟踪、允许再点一次。
+// 返回 gate:轮询每次 await 回来都调 `await gate.settled()`,true = 已确认停了,循环该退出。
+function attachCancel(ctx, jobId, wfName, beforeCancel = null) {
+  const gate = { task: null, stopped: false };
+  const run = async () => {
+    let unconfirmed = null;
+    try {
+      if (beforeCancel) beforeCancel();
+      // 立即结束卡片(不依赖后续 poll 拿到 cancelled —— 那可能慢或因竞态拿不到)。UI 先乐观
+      // 置为已取消(响应快),但**必须校验结果** —— 取消失败意味着云端还在跑、还在计费。
+      ctx.finish(false, "✕ Cancelled");
+      await requestCancel(jobId, ctx, wfName, null, { onUnconfirmed: (kind) => { unconfirmed = kind; } });
+    } catch (e) {
+      err("cancel flow failed", e);
+      unconfirmed = "failed";
+    }
+    if (unconfirmed) {
+      ctx.reopen(t("cancel.failed_retry"));
+      ctx.stage(ctx.lastStage || "running", null, true);
+    } else {
+      gate.stopped = true;
+    }
+  };
+  ctx.setCancel(jobId, async () => {
+    if (gate.task || gate.stopped) return;
+    if (!confirm(`Cancel Modal job ${jobId.slice(0, 8)}?`)) return;
+    const p = run();
+    gate.task = p;
+    await p;
+    if (gate.task === p) gate.task = null;
+  });
+  gate.settled = async () => {
+    while (gate.task) {
+      const p = gate.task;
+      await p;
+      if (gate.task === p) gate.task = null;
+    }
+    return gate.stopped;
+  };
+  return gate;
 }
 
 async function runOnceOnModal(workflowPrompt, outputNodeIds, ctx, submitGuard, batchInfo = null) {
@@ -1330,43 +1603,41 @@ async function runOnceOnModal(workflowPrompt, outputNodeIds, ctx, submitGuard, b
       local_nodes: ctx._localDigests || undefined,
     }),
   });
-  const sub = await subRes.json();
-  if (!subRes.ok || !sub.ok) {
+  const sub = await subRes.json().catch(() => ({}));
+  // C3:提交结果未知(重试全失败,但 /run 可能已经落地)。不能当成提交失败:那单可能已经在云端跑、
+  //   在计费,用户再点一次就是双跑。按这个 job_id 进正常轮询,not_found 照常按连续 N 次判定。
+  const submitUnknown = !!(sub && sub.outcome === "unknown" && typeof sub.job_id === "string" && sub.job_id);
+  if (!submitUnknown && (!subRes.ok || !sub.ok)) {
     throw new Error(sub.error || `HTTP ${subRes.status}`);
   }
 
   const jobId = sub.job_id;
-  const gpu = sub.gpu;
-  let cancelled = false;  // 点取消后置位:poll 循环据此立即退出,卡片不等后续 poll
-  // workerTimeoutSec 一起存:刷新页面后 recoverPendingJob 靠它判断"这个 job 还值不值得恢复",
-  // 否则它只能用硬编码值(历史上是 1200),用户把 worker 调到 3600 后,恢复逻辑会把还在
-  // 正常跑的任务当过期丢掉 —— 和 poll deadline 那次踩的是同一个坑(两个旋钮手动同步)。
-  addActiveJob({ jobId, gpu, wfName: ctx.wfName, startedAt: Date.now(),
-                 workerTimeoutSec: sub.worker_timeout_sec || null });
+  const gpu = sub.gpu || "?";
+  // 恢复记录。workerTimeoutSec 一起存:刷新页面后 recoverPendingJob 靠它判断"这个 job 还值不值得
+  // 恢复";runSeenAt / runTimeoutSec 第一次看到 running 时补上(见 noteRunning、jobDeadline)。
+  const rec = { jobId, gpu, wfName: ctx.wfName, startedAt: Date.now(),
+                workerTimeoutSec: sub.worker_timeout_sec || null,
+                runSeenAt: null, runStartedAt: null, runTimeoutSec: null };
+  addActiveJob(rec);
   // 这张卡的取消只取消这个 job(各 job 互不影响)
-  ctx.setCancel(jobId, async () => {
-    if (!confirm(`Cancel Modal job ${jobId.slice(0, 8)}?`)) return;
-    cancelled = true;
-    reportJobEvent(jobId, "user_cancelled", "用户点取消");
-    // 立即结束卡片(不依赖后续 poll 拿到 cancelled —— 那可能慢或因竞态拿不到)
-    ctx.finish(false, "✕ Cancelled");
-    // 告诉 Modal 取消。UI 先乐观置为已取消(响应快),但**必须校验结果** ——
-    // 取消失败意味着云端还在跑、还在计费,不能让 "✕ Cancelled" 骗过用户。
-    await requestCancel(jobId, ctx, ctx.wfName);
-  });
-  log("submitted", jobId, "gpu=" + gpu);
+  const gate = attachCancel(ctx, jobId, ctx.wfName,
+    () => reportJobEvent(jobId, "user_cancelled", "用户点取消"));
+  log("submitted", jobId, "gpu=" + gpu, submitUnknown ? "(outcome unknown)" : "");
 
-  ctx.stage("queued", `${batchSuffix}job=${jobId.slice(0, 8)} gpu=${gpu}`, true);
+  if (submitUnknown) {
+    notify(t("run.submit_unknown", { id: jobId.slice(0, 8) }), "warn");
+    reportJobEvent(jobId, "submit_outcome_unknown", sub.error || "");
+    ctx.stage("queued", t("run.submit_unknown_stage", { prefix: batchSuffix, id: jobId.slice(0, 8) }), true);
+  } else {
+    ctx.stage("queued", `${batchSuffix}job=${jobId.slice(0, 8)} gpu=${gpu}`, true);
+  }
 
   const interval = getSetting("ModalBridge.pollIntervalSec", 1.2) * 1000;
-  // 等待窗取「前端设置」与「云端 worker 超时 + 3 分钟尾巴」的较大者 —— 两个旋钮手动同步
-  // 是 bug 温床:历史上 900 vs 1800 踩过一次;2026-08-06 用户把 worker 调到 3600 后前端
-  // 仍按 1200 到点取消,把一单已跑完采样、正在 VAE decode 的任务杀在终点线前。尾巴罩住
-  // decode/编码/取回,与投影式预警的 TAIL_MS 同源。
-  const settingMs = getSetting("ModalBridge.timeoutSec", 1200) * 1000;  // 兜底值须与上面注册的 defaultValue 一致(见 ModalBridge.timeoutSec)
-  const workerMs = sub.worker_timeout_sec ? sub.worker_timeout_sec * 1000 + 180000 : 0;  // 老后端无此字段 → 0,退化为纯设置值
-  const timeoutMs = Math.max(settingMs, workerMs);
-  const deadline = Date.now() + timeoutMs;
+  // 截止线见 jobDeadline(C8):排队阶段不截止;第一次看到 running 起,按 worker 上限 + 尾巴算,
+  // 前端设置只当从提交起算的保底。worker 上限优先用云端 running 记录里的 timeout_s,
+  // 其次是提交响应的 worker_timeout_sec,老后端两者都没有时退化为前端设置。
+  const settingSec = getSetting("ModalBridge.timeoutSec", 1200);  // 兜底值须与上面注册的 defaultValue 一致(见 ModalBridge.timeoutSec)
+  const workerLimitSec = () => rec.runTimeoutSec || rec.workerTimeoutSec || settingSec;
   // 运行时慢速预警。显存不够时 ComfyUI 不报错,而是把权重甩去 CPU 降速硬撑 —— 实测同一
   // 工作流显存够是 37 s/it、不够是 219 s/it,最后撞 worker 超时、烧满预算却零产出,且全程
   // 没有任何提示。
@@ -1376,8 +1647,10 @@ async function runOnceOnModal(workflowPrompt, outputNodeIds, ctx, submitGuard, b
   // 900s 线必然误报,实际误导过用户把只差 3 分钟完工的任务取消。下面的比例线只剩一个
   // 用途:对没部署进度上报的老 worker 兜底。
   // 0.9 只作为「没有进度数据」时的兜底线(老 worker);有进度时走投影式预警,见 poll 循环。
+  // ⚠ 两条预警都按 runSeenAt + worker 上限算(C8)。以前拿前端等待窗当 worker 上限:前端设置
+  //   大于 worker 时注定被强杀的任务一次都不报,文案里的「worker 上限」分钟数也是等待窗的
+  //   (2026-10-05 深度 review F-P2-3)。
   const SLOW_WARN_RATIO = 0.9;
-  const slowWarnAt = Date.now() + timeoutMs * SLOW_WARN_RATIO;
   let slowWarned = false;
   let etaWarned = false;    // 投影式预警只弹一次
   let sawProgress = false;  // 收到过 progress → 永不走老的按耗时兜底
@@ -1385,20 +1658,34 @@ async function runOnceOnModal(workflowPrompt, outputNodeIds, ctx, submitGuard, b
   let final = null;
   let lastStatus = "queued";
   let gone = 0;                 // 连续看到 not_found 的次数(见下面的判据)
+  let sawStatus = false;        // 看到过 not_found 以外的状态(提交结果未知时据此区分「没落地」)
   try {
-    while (Date.now() < deadline) {
-      if (cancelled) return { jobId, gpu, cancelled: true };  // 用户已取消,卡片已结束,静默退出
+    while (Date.now() < jobDeadline(rec, settingSec)) {
+      // ⚠ 每次 await 回来都要重查取消(2026-10-05 深度 review F-P2-1):点取消时恰好有一个 /poll
+      //   在途,它回来后会把卡片改回 Running、甚至拿着 completed 去取回 —— 而取消那边拿到
+      //   cancel_noop 也在取回,同一个 job 被 /fetch_result 两次,后到的那次 409、报「失败」。
+      //   取消在途时这里等它出结果:确认停了就退出,没确认就接着轮询。
+      if (await gate.settled()) return { jobId, gpu, cancelled: true };
       await sleep(interval);
-      if (cancelled) return { jobId, gpu, cancelled: true };
-      // 「这一拍没看清」(网络错 / 502 {error} / 缺 status)一律当瞬态重试,判据只在 probeJobStatus
-      // 一处。job 执行失败的响应带 error 但也有 status:"failed",probe 会如实返回终态、不当瞬态吞掉
-      // (否则一直 poll 到超时,真正的失败原因回不到前端)。瞬态既不计入也不打断 not_found 连续计数。
+      if (await gate.settled()) return { jobId, gpu, cancelled: true };
+      // 「这一拍没看清」(网络错 / 502 {error} / 缺 status / unknown)一律当瞬态重试,判据只在
+      // probeJobStatus 一处。job 执行失败的响应带 error 但也有 status:"failed",probe 会如实返回终态、
+      // 不当瞬态吞掉(否则一直 poll 到超时,真正的失败原因回不到前端)。瞬态既不计入也不打断 not_found 连续计数。
       const probe = await probeJobStatus(jobId);
+      if (await gate.settled()) return { jobId, gpu, cancelled: true };
       if (probe.transient) {
         log("poll transient (will retry):", probe.data || probe.error);
         continue;
       }
       const pData = probe.data;
+      // C4:云端 401 —— key 不对,再轮询也看不到。终态失败,但保留恢复记录:
+      //   修好 key 之后刷新页面还能接着取回(任务本身可能正常跑完了)。
+      if (pData.status === "auth_failed") {
+        final = { status: "auth_failed", error: pData.error || "" };
+        break;
+      }
+      if (pData.status !== "not_found") sawStatus = true;
+      if (pData.status === "running" || pData.status === "delivering") noteRunning(rec, pData);
       if (pData.status !== lastStatus) {
         lastStatus = pData.status;
         log("status →", pData.status);
@@ -1419,14 +1706,16 @@ async function runOnceOnModal(workflowPrompt, outputNodeIds, ctx, submitGuard, b
         sawProgress = true;
         let overrun = false;
         // n_samples>=3:窗口里至少 3 个步间隔,热身样本已被中位数压制,投影才可信
-        if (prog.s_it && (prog.n_samples || 0) >= 3) {
+        if (prog.s_it && (prog.n_samples || 0) >= 3 && rec.runSeenAt != null) {
           // TAIL_MS:采样之后的固定尾巴(VAE decode+视频编码+写回,实测 45~124s)留 150s 余量
           const TAIL_MS = 150000;
           const remainMs = (prog.total - prog.step) * prog.s_it * 1000;
-          if (Date.now() + remainMs + TAIL_MS > deadline) {
+          const limitSec = workerLimitSec();
+          // worker 被强杀的时刻 ≈ 开始运行 + 上限(runSeenAt 比真实起跑晚不到一个轮询间隔)
+          if (Date.now() + remainMs + TAIL_MS > rec.runSeenAt + limitSec * 1000) {
             overrun = true;
             const eta = Math.ceil(remainMs / 60000);
-            const limit = Math.round(timeoutMs / 60000);
+            const limit = Math.round(limitSec / 60);
             if (!etaWarned) {  // 只用于日志去重,不再冻结显示
               etaWarned = true;
               log("eta overrun", jobId, `s/it=${prog.s_it} step=${prog.step}/${prog.total} eta=${eta}min`);
@@ -1444,9 +1733,10 @@ async function runOnceOnModal(workflowPrompt, outputNodeIds, ctx, submitGuard, b
       }
       // 兜底:老 worker(没部署进度上报)拿不到 progress —— 保留按耗时预警,但阈值提到 0.9
       // 减少误报(0.75 线被证明打在健康任务身上)。
-      if (!sawProgress && !slowWarned && lastStatus === "running" && Date.now() > slowWarnAt) {
+      if (!sawProgress && !slowWarned && lastStatus === "running" && rec.runSeenAt != null
+          && Date.now() > rec.runSeenAt + workerLimitSec() * 1000 * SLOW_WARN_RATIO) {
         slowWarned = true;
-        const min = Math.round((timeoutMs * SLOW_WARN_RATIO) / 60000);
+        const min = Math.round((workerLimitSec() * SLOW_WARN_RATIO) / 60);
         log("slow job", jobId, `still running after ${min}min — possible VRAM starvation`);
         ctx.stage("running", t("run.slow", { min, gpu }), true);
       }
@@ -1457,7 +1747,9 @@ async function runOnceOnModal(workflowPrompt, outputNodeIds, ctx, submitGuard, b
       if (pData.status === "not_found") {
         if (++gone >= NOT_FOUND_STREAK) {
           final = { ...pData, status: "failed",
-                    error: t("run.job_gone", { id: jobId }) };
+                    error: submitUnknown && !sawStatus
+                      ? t("run.submit_not_landed", { id: jobId })
+                      : t("run.job_gone", { id: jobId }) };
           break;
         }
         continue;
@@ -1469,9 +1761,10 @@ async function runOnceOnModal(workflowPrompt, outputNodeIds, ctx, submitGuard, b
       }
     }
   } finally {
-    // completed 仍须取回；取消失败也要保留恢复记录。
+    // completed 仍须取回；取消失败、auth_failed 也要保留恢复记录。
     if (final && (final.status === "failed" || final.status === "cancelled")) removeActiveJob(jobId);
   }
+  if (await gate.settled()) return { jobId, gpu, cancelled: true };
   if (!final) {
     reportJobEvent(jobId, "polling_timed_out", `前端等待超时,已请求取消云端任务`);
     // 主动放弃轮询时请求取消止损；确认失败则保留恢复记录。
@@ -1480,6 +1773,10 @@ async function runOnceOnModal(workflowPrompt, outputNodeIds, ctx, submitGuard, b
     // 仍然 throw —— 这条路径上工作流回填已经不可能了,如实报超时,产物在 output/ 里。
     await requestCancel(jobId, null, ctx.wfName);
     throw new Error(`[job ${jobId}] Polling timed out(前端等待超时,已请求取消云端任务)`);
+  }
+  if (final.status === "auth_failed") {
+    reportJobEvent(jobId, "poll_auth_failed", final.error || "");
+    throw new Error(`[job ${jobId}] ${t("run.auth_failed")}`);
   }
   if (final.status === "cancelled") {
     reportJobEvent(jobId, "cancelled", "");
@@ -1490,7 +1787,14 @@ async function runOnceOnModal(workflowPrompt, outputNodeIds, ctx, submitGuard, b
     throw new Error(`[job ${jobId}] ${final.error || "Modal worker failed"}`);
   }
 
-  const fetched = await fetchJobResult(jobId, final, ctx, batchSuffix);
+  let fetched;
+  try {
+    fetched = await fetchJobResult(jobId, final, ctx, batchSuffix);
+  } catch (e) {
+    // 取回失败时恢复记录还在(fetchJobResult 成功后才删),刷新页面会接着取 —— 告诉用户。
+    // 取消路径(cancel_noop)早就有这句,主流程漏了(2026-10-05 深度 review F-P3-10)。
+    throw new Error(t("run.fetch_failed") + (e.message || String(e)));
+  }
   // 已确认文件落盘后才回填；切到后台的工作流延后渲染。
   const sf = fetched.outputs?.[0]?.subfolder || "modal_results";
   const has3d = (fetched.outputs || []).some((o) => MODEL3D_EXT_RE.test(o.filename || ""));
@@ -1507,8 +1811,23 @@ async function runOnceOnModal(workflowPrompt, outputNodeIds, ctx, submitGuard, b
   return { jobId, gpu, outputs: fetched.outputs };
 }
 
-// 主流程、刷新恢复、取消没赶上共用：失败保留任务，成功后才删除恢复记录。
+// 同一个 job 同一时刻只取回一次(2026-10-05 深度 review F-P2-1):取消没赶上(cancel_noop)和主轮询
+// 可能同时拿着各自的终态去取回,两份 modal_state 不同,后端按签名判成「参数不同」回 409,
+// 用户看到「失败」toast,而文件其实已经落盘。后到的调用直接复用在途那一次的结果。
+const _fetchInflight = new Map();   // jobId -> Promise<fetched>
 async function fetchJobResult(jobId, final, ctx, batchSuffix = "") {
+  if (_fetchInflight.has(jobId)) return _fetchInflight.get(jobId);
+  const p = fetchJobResultOnce(jobId, final, ctx, batchSuffix);
+  _fetchInflight.set(jobId, p);
+  try {
+    return await p;
+  } finally {
+    if (_fetchInflight.get(jobId) === p) _fetchInflight.delete(jobId);
+  }
+}
+
+// 主流程、刷新恢复、取消没赶上共用：失败保留任务，成功后才删除恢复记录。
+async function fetchJobResultOnce(jobId, final, ctx, batchSuffix = "") {
   markJobFetching(jobId);
   ctx = ctx || { stage() {} };
   // ⚠ 这句文案以前**无条件**写死「Decoding base64...」,而大产物走的是 Volume 直连下载,
@@ -1530,7 +1849,8 @@ async function fetchJobResult(jobId, final, ctx, batchSuffix = "") {
   if (_volN) {
     _progTimer = setInterval(async () => {
       try {
-        const r = await bridgeFetch(`/modal_bridge/fetch_progress?job_id=${encodeURIComponent(jobId)}`);
+        const r = await bridgeFetch(`/modal_bridge/fetch_progress?job_id=${encodeURIComponent(jobId)}`,
+                                    { background: true });
         if (!r.ok) return;
         const j = await r.json();
         if (!j.ok) return;
@@ -1630,18 +1950,32 @@ async function ensureModelsAvailable(prompt, ctx) {
   ctx.bar(STATUS_PROGRESS.uploading[0]);
   const [a, b] = STATUS_PROGRESS.uploading;
   let tick = 0;
+  // F-P3-9:后端对被拒 / 失败的项逐行输出 ✗,最后一行 `== … ==` 汇总已同步 / 已存在跳过 / 被拒的数量,
+  //   rc 也反映被拒。以前不看这些,rc=0 就一律报「N 个模型已同步 ✓」—— 被拒的模型云端根本没有,
+  //   任务随后失败,用户却以为模型齐了(2026-10-05 深度 review)。
+  const failedLines = [];
+  let summary = "";
   const rc = await streamPost(
     "/modal_bridge/sync_models",
     { items: missing_local.map((m) => ({ type: m.type, filename: m.filename, local_path: m.local_path, size_mb: m.size_mb })) },
     (line) => {
       log("upload:", line);
+      const s = line.trim();
+      if (s.includes("✗")) failedLines.push(failLine(s));
+      else if (/^==.*==$/.test(s)) summary = failLine(s);
       tick++;
       ctx.bar(a + Math.min(b - a - 1, tick * 0.6));
       ctx.stage("uploading", line.length > 72 ? line.slice(0, 72) + "…" : line);
     },
   );
-  if (rc !== 0) throw new Error(t("mdl.upload_fail"));
-  ctx.stage("uploading", t("mdl.synced", { n: missing_local.length }), false);
+  // 只列最后 8 条(最后一条常是总的失败原因),前面省略的给个数
+  const failedList = (failedLines.length > 8 ? `… +${failedLines.length - 8}\n` : "")
+    + failedLines.slice(-8).join("\n");
+  if (rc !== 0) {
+    throw new Error(failedLines.length ? t("mdl.upload_fail_detail", { list: failedList }) : t("mdl.upload_fail"));
+  }
+  if (failedLines.length) notify(t("mdl.rejected", { list: failedList }), "warn");
+  ctx.stage("uploading", summary || t("mdl.synced", { n: missing_local.length }), false);
 }
 
 // =====================================================================
@@ -1722,12 +2056,14 @@ function confirmDialog(title, body, okText, cancelText, opts = {}) {
     Object.assign(box.style, { background: "#1e1e1e", color: "#eee", width: "440px", maxWidth: "92vw",
       borderRadius: "10px", padding: "20px", font: "13px/1.6 system-ui,sans-serif",
       boxShadow: "0 10px 40px rgba(0,0,0,0.5)" });
+    // 全是纯文本(换行靠 pre-line),一律转义:body 里有来自工作流的 class_type、来自 config 的卡名,
+    // 一个 `<img onerror=…>` 节点名就是自家弹窗上的 XSS(2026-10-05 深度 review,同 F-P3-2)。
     box.innerHTML = `
-      <div style="font-size:15px;font-weight:600;margin-bottom:8px;color:#fbbf24;">${title}</div>
-      <div style="color:#ddd;margin-bottom:16px;white-space:pre-line;">${body}</div>
+      <div style="font-size:15px;font-weight:600;margin-bottom:8px;color:#fbbf24;">${escHtml(title)}</div>
+      <div style="color:#ddd;margin-bottom:16px;white-space:pre-line;">${escHtml(body)}</div>
       <div style="text-align:right;">
-        <button id="mb-vram-cancel" style="padding:7px 14px;margin-right:8px;background:${cancelBg};color:${cancelFg};border:none;border-radius:6px;cursor:pointer;">${cancelText}</button>
-        <button id="mb-vram-ok" style="padding:7px 16px;background:#2563eb;color:#fff;border:none;border-radius:6px;cursor:pointer;font-weight:600;">${okText}</button>
+        <button id="mb-vram-cancel" style="padding:7px 14px;margin-right:8px;background:${cancelBg};color:${cancelFg};border:none;border-radius:6px;cursor:pointer;">${escHtml(cancelText)}</button>
+        <button id="mb-vram-ok" style="padding:7px 16px;background:#2563eb;color:#fff;border:none;border-radius:6px;cursor:pointer;font-weight:600;">${escHtml(okText)}</button>
       </div>`;
     ov.appendChild(box); document.body.appendChild(ov);
     const done = (v) => { ov.remove(); resolve(v); };
@@ -1879,20 +2215,25 @@ async function refreshRunReady() {
 }
 
 async function recoverPendingJob() {
-  let pending = loadLS(LS_KEYS.activeJob);
-  pending = Array.isArray(pending) ? pending : (pending ? [pending] : []);
-  // 丢弃过期的,其余各自恢复(并行,每个一张卡)。过期线跟提交时那条一致:
-  // max(前端设置, 云端 worker 上限 + 3 分钟尾巴),老条目没存 workerTimeoutSec 则退化为纯设置值。
-  // 已开始取回的额外保留到首次取回后 1 小时；仍受云端状态保留期限制。
+  // 丢弃过期的,其余各自恢复(并行,每个一张卡)。过期线与主轮询同一口径(jobDeadline,C8):
+  // 没见过 running 的不过期(排队交给云端判死),见过的按 runSeenAt + worker 上限 + 尾巴;
+  // 已开始取回的保留到首次取回后 1 小时；仍受云端状态保留期限制。
+  // 别的标签页正在跟踪(心跳没过期)的记录原样保留、不接手 —— 否则两边各一张卡、各取回一遍。
   const settingSec = getSetting("ModalBridge.timeoutSec", 1200);
-  const fresh = [];
-  for (const j of pending) {
+  const now = Date.now();
+  const keep = [];
+  const mine = [];
+  for (const j of loadActiveJobs()) {
     if (!j?.jobId) continue;
-    const maxAgeSec = Math.max(settingSec, j.workerTimeoutSec ? j.workerTimeoutSec + 180 : 0);
-    if (Date.now() <= recoveryDeadline(j, maxAgeSec)) fresh.push([j, maxAgeSec]);
+    const ownedElsewhere = j.tabId && j.tabId !== TAB_ID && now - (j.hb || 0) < ACTIVE_JOB_HB_STALE_MS;
+    if (ownedElsewhere) { keep.push(j); continue; }
+    if (now > recoveryDeadline(j, settingSec)) continue;
+    const adopted = { ...j, tabId: TAB_ID, hb: now };
+    keep.push(adopted);
+    mine.push(adopted);
   }
-  saveLS(LS_KEYS.activeJob, fresh.map(([j]) => j));
-  for (const [j, maxAgeSec] of fresh) recoverOne(j, maxAgeSec);
+  saveLS(LS_KEYS.activeJob, keep);
+  for (const j of mine) recoverOne(j, settingSec);
 }
 
 // 刷新页面后接管一个还没终结的 job:**一直轮询到它真的终结**。
@@ -1900,38 +2241,41 @@ async function recoverPendingJob() {
 // removeActiveJob —— 任务继续在云端跑到底、继续计费,而前端把它从恢复名单里删了,
 // 再没有任何人会来取结果。产物就这么烂在 Volume 上直到 TTL 被 GC。
 // 网络抖动那条路更糟:catch 完同样删记录,一次瞬时失败 = 永久失联。
-async function recoverOne(pending, maxAgeSec) {
+async function recoverOne(pending, settingSec) {
   const jobId = pending.jobId;
   const short = jobId.slice(0, 8);
   log("recovering pending job:", jobId);
   const ctx = newProgress("queued", pending.wfName || null);
   ctx.stage("queued", `recover job=${short}`, true);
 
-  let cancelled = false;
-  ctx.setCancel(jobId, async () => {
-    if (!confirm(`Cancel Modal job ${short}?`)) return;
-    cancelled = true;
-    ctx.finish(false, "✕ Cancelled");
-    await requestCancel(jobId, ctx, pending.wfName);
-  });
+  // 取消与主轮询共用一份(attachCancel):取消没确认就恢复卡片、接着轮询、允许重试。
+  const gate = attachCancel(ctx, jobId, pending.wfName);
 
-  // 与恢复列表用同一截止线：原始提交窗口或首次取回窗口，刷新不重新起算。
-  const deadline = recoveryDeadline(pending, maxAgeSec);
+  // 与恢复列表用同一截止线(jobDeadline / recoveryDeadline):刷新不重新起算;
+  // 恢复期间第一次看到 running 会补记 runSeenAt,截止线随之确定。
+  const rec = { ...pending };
   const interval = getSetting("ModalBridge.pollIntervalSec", 1.2) * 1000;
 
   let final = null;
   let gone = 0;                 // 连续 not_found 计数,同主轮询
-  while (Date.now() < deadline) {
-    if (cancelled) return;
+  while (Date.now() < recoveryDeadline(rec, settingSec)) {
+    if (await gate.settled()) return;
     // 临时错误只能重试,绝不能借机结束这张卡(见函数头注释)。判据与主轮询同一份:
     // 以前这里只防 throw,502 {error} 会一路落到下面、把 not_found 连续计数清零。
     const probe = await probeJobStatus(jobId);
+    if (await gate.settled()) return;   // 取消时在途的 poll 回来:别再改卡片(F-P2-1)
     if (probe.transient) {
       log("recover poll transient (will retry)", probe.data || probe.error);
       await sleep(interval);
       continue;
     }
     const pData = probe.data;
+    if (pData.status === "auth_failed") {
+      // C4:key 不对,再轮询也看不到。结束这张卡,但保留记录 —— 修好 key 再刷新还能接着取。
+      ctx.finish(false, "✗ auth failed", t("run.auth_failed") + (pData.error ? `\n\n${pData.error}` : ""));
+      notify(t("toast.fail", { wf: pending.wfName ? "「" + pending.wfName + "」" : "", msg: t("run.auth_failed") }), "error");
+      return;
+    }
     if (pData.status === "not_found") {
       // 同主轮询:恢复记录里的 job 可能早被 GC 清了,连续确认后如实结束,别一直转。
       if (++gone >= NOT_FOUND_STREAK) {
@@ -1947,6 +2291,7 @@ async function recoverOne(pending, maxAgeSec) {
       final = pData;
       break;
     }
+    if (pData.status === "running" || pData.status === "delivering") noteRunning(rec, pData);
     if (pData.status === "running" || pData.status === "queued") {
       const p = pData.progress;
       ctx.stage(pData.status,
@@ -1958,7 +2303,7 @@ async function recoverOne(pending, maxAgeSec) {
     // 没有 status 的响应(纯接口错误)按临时错误处理,与主 poll 循环一致:落到这里重试。
     await sleep(interval);
   }
-  if (cancelled) return;
+  if (await gate.settled()) return;
 
   if (!final) {
     // 到截止线仍未终结:和主流程一样主动取消止损 —— 这之后再没有人会 poll 它,
@@ -2001,7 +2346,7 @@ async function syncSnapshotToConfig(value) {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ enable_snapshot: !!value }),
     });
-    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    if (!r.ok) throw await httpError(r, "config");
     log("enable_snapshot →", !!value, "(写回 config;重新部署后生效)");
     notify(value ? t("set.snapshot.on") : t("set.snapshot.off"), "info");
   } catch (e) {
@@ -2018,14 +2363,25 @@ let _advReady = false;
 //   - 注册成 ComfyUI Setting 的值一定会明文落进 comfy.settings.json(0644),
 //     而且**任何第三方 custom node 的 JS 都能读到**。
 // 密钥改回部署面板的专用密码框 → /deploy,只写 0600 的 config.json。
-async function syncAigcFieldToConfig(field, value) {
-  if (!_advReady) return;
+// C10:文本设置项每敲一个键 onChange 就触发一次 —— 以前每键一次 POST /config,半截 URL 也逐个
+// 写进 config、每次还弹一条「已保存」(2026-10-05 深度 review F-P2-5)。停止输入 800ms 后才写,只写最后的值。
+const TEXT_SETTING_DEBOUNCE_MS = 800;
+const _textSettingTimers = {};
+function syncAigcFieldToConfig(field, value) {
+  if (!_advReady) return;   // 启动期回填触发的 onChange 不回写(判断放在这里:回填那一刻就该挡掉)
+  clearTimeout(_textSettingTimers[field]);
+  _textSettingTimers[field] = setTimeout(() => {
+    delete _textSettingTimers[field];
+    writeAigcFieldToConfig(field, value);
+  }, TEXT_SETTING_DEBOUNCE_MS);
+}
+async function writeAigcFieldToConfig(field, value) {
   try {
     const r = await bridgeFetch("/modal_bridge/config", {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ [field]: String(value ?? "") }),
     });
-    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    if (!r.ok) throw await httpError(r, "config");
     log(`${field} → ${field.endsWith("secret") ? "(已更新)" : String(value ?? "")}`);
     notify(t("set.aigc.saved"), "info");
   } catch (e) {
@@ -2041,7 +2397,7 @@ async function syncSageToConfig(value) {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ use_sage_attention: !!value }),
     });
-    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    if (!r.ok) throw await httpError(r, "config");
     log("use_sage_attention →", !!value, "(写回 config;重新部署后生效)");
     notify(value ? t("set.sage.on") : t("set.sage.off"), "info");
   } catch (e) {
@@ -2057,7 +2413,7 @@ async function syncCpuGuessToConfig(value) {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ cpu_tier_when_no_model: !!value }),
     });
-    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    if (!r.ok) throw await httpError(r, "config");
   } catch (e) {
     err("sync cpu routing policy failed", e);
     notify(t("set.save_failed", { msg: String(e) }), "error");
@@ -2095,10 +2451,11 @@ const SETTINGS = [
     name: "Timeout (sec)",
     category: ["Modal Bridge", "General", "Timeout (sec)"],
     type: "number",
-    // 实际等待窗 = max(此值, 云端 worker 超时 + 3 分钟)(见 poll deadline 处):后端在提交
-    // 响应里带回 worker_timeout_sec,前端自动跟上,不再要求手动同步两处 —— 历史上 900 vs
-    // 1800、1200 vs 3600 两次都是「前端先放弃取消,worker 还在跑/已跑完」的白烧钱事故。
-    // 此设置现在只用于「想比 worker 上限等得更久」的罕见场景,一般不用动。
+    // 实际截止线 = max(提交时刻 + 此值, 第一次看到 running 的时刻 + worker 上限 + 3 分钟),
+    // 排队阶段不截止(见 jobDeadline,C8)。worker 上限取云端 running 记录的 timeout_s,
+    // 前端自动跟上,不再要求手动同步两处 —— 历史上 900 vs 1800、1200 vs 3600 两次都是「前端先
+    // 放弃取消,worker 还在跑/已跑完」的白烧钱事故;2026-10-05 又发现从提交起算会把排队时间
+    // 吃进 worker 的配额里。此设置现在只是保底,用于「想比 worker 上限等得更久」的罕见场景。
     defaultValue: 1200,
     attrs: { min: 60, max: 21600, step: 60 },
     tooltip: t("set.timeout"),
@@ -2155,7 +2512,8 @@ const SETTINGS = [
   // 配置可见、可直接改;密钥是凭据,只能走部署面板 → config.json(0600),而且 /config
   // 端点显式抹掉它不回吐、PUBLIC_CONFIG_WRITE_FIELDS 也不收它(挡"改配置再取密钥"的
   // 两步绕过)。password 输入类型只遮显示(挡截图/录屏),不改存储 —— 别拿它当保护。
-  // ⚠ 清空这个 URL = 停用集成,后端会**连带清掉已存的密钥**(那是密钥唯一的删除入口)。
+  // 清空这个 URL = 停用集成。C10 起保存配置时**不再**连带清掉已存的旁路密钥(以前逐键保存时
+  // 删光再重输就会把密钥清掉);下次部署时 URL 仍为空,部署那一步才清(2026-10-05 深度 review)。
   {
     id: "ModalBridge.aigcStudioUrl",
     name: "AIGC Studio URL",
@@ -2226,23 +2584,33 @@ async function checkVersionOrBlock() {
       log("version check skipped: 本地队列忙,event loop 被阻塞");
       return true;   // 放行
     }
-    // ② 只有状态页(权威)说故障才叫平台故障。以前把 timeout/unreachable 也算进来,
-    //    于是本地一忙就误报成 Modal 挂了,还引导用户去看状态页 —— 归因完全是反的。
-    const outage = await isModalOutage();  // 查 status.modal.com 的 aggregate_state
-    if (outage) {
-      notify(t("ver.platform_toast"), "warn");
-      if (confirm(t("ver.platform_msg"))) {
-        try { window.open("https://status.modal.com", "_blank"); } catch (e) {}
+    // ② C7:只有「确定提交不了」的两种才拦 —— app 不存在(404)、bridge key 与云端不一致(401)。
+    //    401 以前混在 http_error 里、被说成「app 不存在」,引导用户去查一个其实好好的部署
+    //    (2026-10-05 深度 review F-P3-5)。
+    if (v.err_kind === "not_deployed") {
+      notify(t("ver.notdeployed_toast"), "warn");
+      if (confirm(t("ver.notdeployed_msg"))) {
+        try { openDeployDialog(); } catch (e) {}
       }
       return false;
     }
-    // ③ 状态页正常却连不上:本机网络慢 / 云端 app 被删 / key 不对。引导重新部署,
-    //    但文案不再甩锅给 Modal。
-    const netLike = v.err_kind === "timeout" || v.err_kind === "unreachable";
-    notify(netLike ? t("ver.unreach_toast") : t("ver.notdeployed_toast"), "warn");
-    if (confirm(netLike ? t("ver.unreach_msg") : t("ver.notdeployed_msg"))) {
-      try { openDeployDialog(); } catch (e) {}
+    if (v.err_kind === "unauthorized") {
+      notify(t("ver.unauthorized_toast"), "warn");
+      if (confirm(t("ver.unauthorized_msg"))) {
+        try { openDeployDialog(); } catch (e) {}
+      }
+      return false;
     }
+    // ③ 其余(timeout / unreachable / http_error)只是「这一次没问到」:6 秒挂钟超时、本机网络
+    //    抖一下……以前一律拦下并弹窗引导重新部署,网络慢一点就提交不了(2026-10-05 深度 review
+    //    F-P2-6)。现在放行,只给非阻断提示;真有问题 /submit 自己会报出原因。
+    //    只有状态页(权威)说故障才叫平台故障 —— 以前把 timeout/unreachable 也算进来,本地一忙
+    //    就误报成 Modal 挂了。状态页在后台查(最长 8 秒),不拖慢这次提交。
+    (async () => {
+      const outage = await isModalOutage();  // 查 status.modal.com 的 aggregate_state
+      notify(outage ? t("ver.platform_toast") : t("ver.unreach_toast", { kind: v.err_kind || "?" }), "warn");
+    })();
+    return true;
   } else {
     // 版本不一致(连得上,但本地↔云端版本不同)→ 引导重新部署
     notify(t("ver.mismatch_toast", { local: v.local, deployed: v.deployed }), "warn");
@@ -2264,11 +2632,17 @@ async function refreshVerBanner(panel) {
   try { v = await (await bridgeFetch("/modal_bridge/version")).json(); } catch (e) { return; }
   setRunReady(v);  // Setup 里刷新版本时,顺带更新 RunModal 按钮颜色
   const dep = v.reachable ? (v.deployed || "unknown") : t("dlg.ver.notconn");
-  const color = v.match ? "#34d399" : (v.reachable ? "#fbbf24" : "#9aa");
+  const color = v.match ? "#34d399"
+    : (v.reachable || v.err_kind === "unauthorized" ? "#fbbf24" : "#9aa");
   const hint = v.match ? t("dlg.ver.aligned")
-    : (v.reachable ? t("dlg.ver.mismatch") : t("dlg.ver.unreach"));
-  el.innerHTML = `${t("dlg.ver.local")}<b style="color:#eee;">${v.local}</b>　·` +
-    ` ${t("dlg.ver.deployed")}<b style="color:${color};">${dep}</b> <span style="color:${color};">${hint}</span>`;
+    : v.reachable ? t("dlg.ver.mismatch")
+    : v.err_kind === "unauthorized" ? t("dlg.ver.unauthorized")
+    : v.err_kind === "not_deployed" ? t("dlg.ver.notdeployed")
+    : t("dlg.ver.unreach");
+  // deployed_version 来自云端 /health、local 来自本机 —— 都不是我们写死的,进 innerHTML 前转义
+  // (2026-10-05 深度 review F-P3-2)。
+  el.innerHTML = `${t("dlg.ver.local")}<b style="color:#eee;">${escHtml(v.local)}</b>　·` +
+    ` ${t("dlg.ver.deployed")}<b style="color:${color};">${escHtml(dep)}</b> <span style="color:${color};">${escHtml(hint)}</span>`;
 }
 
 async function openDeployDialog() {
@@ -2276,18 +2650,23 @@ async function openDeployDialog() {
   if (deployDialogEl && _dialogLang === _locale()) {
     deployDialogEl.style.display = "flex";
     refreshVerBanner(deployDialogEl.querySelector("div"));  // 重开时刷新版本徽标
+    // 重开时也重新拉 /config:对话框缓存着第一次打开时的 cfg,部署过一次之后 has_token_secret、
+    // AIGC 字段都还是旧值(2026-10-05 深度 review F-P3-4)。不重建 DOM —— 部署可能正在跑、日志在里面。
+    const dlg = deployDialogEl;
+    fetchConfig().then((c) => { if (dlg._applyCfg) dlg._applyCfg(c); });
     return;
   }
   if (deployDialogEl) { deployDialogEl.remove(); deployDialogEl = null; }  // 语言变了,弃旧重建
   _dialogLang = _locale();
-  const cfg = await fetchConfig();   // 本地 /config,快
+  let cfg = await fetchConfig();   // 本地 /config,快;重开 / 部署后由 applyCfg 刷新
   // 版本徽标改成异步填(见对话框末尾 refreshVerBanner):不再在这里 await /version,
   // 否则首次打开要先等云端 /health(冷启动/超时最长 6s),对话框迟迟不出 → 像卡死。
   const ver = { local: "?", deployed: null, match: false, reachable: false };
   // 生效中的 GPU 档位。判定须与后端 routes.resolve_gpu_tier 一致:
   // 新配置用 gpu_tier;为空则回落到旧的 auto_downgrade 语义(关 = 固定 primary)。
-  const curTier = (cfg.gpu_tier || "").trim().toLowerCase()
-    || (cfg.auto_downgrade === false ? "primary" : "auto");
+  const tierOf = (c) => (c.gpu_tier || "").trim().toLowerCase()
+    || (c.auto_downgrade === false ? "primary" : "auto");
+  const curTier = tierOf(cfg);
 
   const overlay = document.createElement("div");
   deployDialogEl = overlay;
@@ -2347,10 +2726,10 @@ async function openDeployDialog() {
     <div style="${groupCss}">
       <div style="${groupHeadCss}"><span style="${groupBarCss}"></span>${t("dlg.grp.conn")}</div>
       <label style="${labelCss}">Workspace <span style="${hintCss}">${t("dlg.ws.hint")}</span></label>
-      <input id="mb-dep-ws" type="text" style="${inputCss}" value="${cfg.modal_workspace || ""}" placeholder="your-workspace">
+      <input id="mb-dep-ws" type="text" style="${inputCss}" value="${escHtml(cfg.modal_workspace || "")}" placeholder="your-workspace">
       <label style="${labelCss}">Token ID <span style="${hintCss}">(ak-...)</span></label>
-      <input id="mb-dep-id" type="text" style="${inputCss}" value="${cfg.modal_token_id || ""}" placeholder="ak-xxxxxxxx">
-      <label style="${labelCss}">Token Secret <span style="${hintCss}">(as-...${cfg.has_token_secret ? t("dlg.secret.saved") : ""})</span></label>
+      <input id="mb-dep-id" type="text" style="${inputCss}" value="${escHtml(cfg.modal_token_id || "")}" placeholder="ak-xxxxxxxx">
+      <label style="${labelCss}">Token Secret <span id="mb-dep-secret-hint" style="${hintCss}">(as-...${cfg.has_token_secret ? t("dlg.secret.saved") : ""})</span></label>
       <input id="mb-dep-secret" type="password" style="${inputCss}" value="" placeholder="${cfg.has_token_secret ? t("dlg.secret.ph_saved") : "as-xxxxxxxx"}">
       <div style="${noteCss}">${t("dlg.intro")}
         <a href="https://modal.com/settings/tokens" target="_blank" style="color:#6cf;">modal.com/settings/tokens</a>
@@ -2362,9 +2741,9 @@ async function openDeployDialog() {
       <label style="${labelCss}">GPU <span style="${hintCss}">${t("dlg.gpu.label")}</span></label>
       <select id="mb-dep-gputier" style="${inputCss}">
         <option value="auto"${curTier==="auto"?" selected":""}>${t("dlg.gpu.opt_auto")}</option>
-        <option value="cheap"${curTier==="cheap"?" selected":""}>${t("dlg.gpu.opt_cheap", { gpu: cfg.cheap_gpu || "L40S" })}</option>
-        <option value="primary"${curTier==="primary"?" selected":""}>${t("dlg.gpu.opt_primary", { gpu: cfg.default_gpu || "H100" })}</option>
-        <option value="top"${curTier==="top"?" selected":""}>${t("dlg.gpu.opt_top", { gpu: cfg.top_gpu || "B200" })}</option>
+        <option value="cheap"${curTier==="cheap"?" selected":""}>${escHtml(t("dlg.gpu.opt_cheap", { gpu: cfg.cheap_gpu || "L40S" }))}</option>
+        <option value="primary"${curTier==="primary"?" selected":""}>${escHtml(t("dlg.gpu.opt_primary", { gpu: cfg.default_gpu || "H100" }))}</option>
+        <option value="top"${curTier==="top"?" selected":""}>${escHtml(t("dlg.gpu.opt_top", { gpu: cfg.top_gpu || "B200" }))}</option>
       </select>
       <div id="mb-dep-tiermsg" style="margin:0 0 6px;color:#10b981;font-size:12px;"></div>
       <div style="${noteCss}margin-top:0;cursor:help;" title="${t("dlg.gpu.note_full")}">${t("dlg.gpu.note")}</div>
@@ -2375,10 +2754,11 @@ async function openDeployDialog() {
       <label style="${labelCss}">comfy.org API Key <span style="${hintCss}">${t("dlg.comfy.hint")}</span></label>
       <input id="mb-dep-comfy" type="password" style="${inputCss}" value="" placeholder="${cfg.has_comfy_api_key ? t("dlg.comfy.ph_saved") : t("dlg.comfy.ph")}">
       <div style="${noteCss}">${t("dlg.comfy.note")}</div>
-      ${(cfg.aigc_studio_base_url || "") ? `
+      <div id="mb-dep-aigc-wrap" style="display:${cfg.aigc_studio_base_url ? "block" : "none"};">
       <label style="${labelCss}">AIGC Bypass Secret <span style="${hintCss}">${t("dlg.aigc.bypass_hint")}</span></label>
       <input id="mb-dep-aigc-bypass" type="password" style="${inputCss}" value="" placeholder="${cfg.has_aigc_bypass_secret ? t("dlg.comfy.ph_saved") : t("dlg.aigc.bypass_ph")}">
-      <div style="${noteCss}">${t("dlg.aigc.bypass_note")}</div>` : ``}
+      <div style="${noteCss}">${t("dlg.aigc.bypass_note")}</div>
+      </div>
     </div>
 
     <div style="display:flex;align-items:center;flex-wrap:wrap;gap:8px;margin:20px 0 0;">
@@ -2418,6 +2798,35 @@ async function openDeployDialog() {
   const testBtn = panel.querySelector("#mb-dep-test");
   const statusEl = panel.querySelector("#mb-dep-status");
   const logEl = panel.querySelector("#mb-dep-log");
+  const aigcWrap = panel.querySelector("#mb-dep-aigc-wrap");
+  // 三个凭据输入框:留空 = 沿用已存的。部署成功后清空,别让明文停留在面板里(F-P3-4)。
+  const SECRET_INPUTS = ["#mb-dep-secret", "#mb-dep-comfy", "#mb-dep-aigc-bypass"];
+
+  // 用最新的 /config 刷新面板上依赖 cfg 的部分(重开面板、部署结束后调)。
+  // 用户正在编辑的文本框不覆盖:只有值仍等于旧 cfg 时才跟着换。
+  const applyCfg = (c) => {
+    if (!c || typeof c !== "object") return;
+    const prev = cfg;
+    cfg = c;
+    const ws = panel.querySelector("#mb-dep-ws");
+    const id = panel.querySelector("#mb-dep-id");
+    if (ws.value === (prev.modal_workspace || "")) ws.value = cfg.modal_workspace || "";
+    if (id.value === (prev.modal_token_id || "")) id.value = cfg.modal_token_id || "";
+    panel.querySelector("#mb-dep-secret-hint").textContent =
+      `(as-...${cfg.has_token_secret ? t("dlg.secret.saved") : ""})`;
+    panel.querySelector("#mb-dep-secret").placeholder =
+      cfg.has_token_secret ? t("dlg.secret.ph_saved") : "as-xxxxxxxx";
+    panel.querySelector("#mb-dep-comfy").placeholder =
+      cfg.has_comfy_api_key ? t("dlg.comfy.ph_saved") : t("dlg.comfy.ph");
+    // AIGC URL 在设置页改,改完再开面板就该出现 / 消失旁路密钥框
+    aigcWrap.style.display = cfg.aigc_studio_base_url ? "block" : "none";
+    panel.querySelector("#mb-dep-aigc-bypass").placeholder =
+      cfg.has_aigc_bypass_secret ? t("dlg.comfy.ph_saved") : t("dlg.aigc.bypass_ph");
+    const tierNow = tierOf(cfg);
+    const sel = panel.querySelector("#mb-dep-gputier");
+    if ([...sel.options].some((o) => o.value === tierNow)) sel.value = tierNow;
+  };
+  overlay._applyCfg = applyCfg;
 
   // AIGC Studio 交付配置默认折叠(大多数人用不到);已配置过则自动展开。
   // 输入框折叠时仍在 DOM 里,提交 payload 照常读取。
@@ -2443,8 +2852,12 @@ async function openDeployDialog() {
         statusEl.style.color = "#34d399";
         refreshVerBanner(panel);  // 顺带刷新顶部版本徽标
       } else {
-        const why = data.error || t("test.unreach");
-        statusEl.textContent = t("test.fail", { why: String(why).slice(0, 80) });
+        const why = String(data.error || t("test.unreach"));
+        // 401 = bridge key 与云端不一致,不是「app 没部署 / 被删」(2026-10-05 深度 review F-P3-5)。
+        // /health 的错误串由 health_client.interpret 生成,401 时带「/health 401」。
+        statusEl.textContent = /\b401\b/.test(why)
+          ? t("test.unauthorized", { why: why.slice(0, 80) })
+          : t("test.fail", { why: why.slice(0, 80) });
         statusEl.style.color = "#f87171";
       }
     } catch (e) {
@@ -2469,14 +2882,20 @@ async function openDeployDialog() {
     nodesStatusEl.style.color = "#9aa";
     try {
       const r = await bridgeFetch("/modal_bridge/list_nodes");
-      const d = await r.json();
+      const d = await r.json().catch(() => ({}));
+      // 出错的响应以前被当成「镜像里没有 custom_node」显示 —— 把错误说出来(F-P2-4 顺带)
+      if (!r.ok || d.ok === false) throw new Error(d.error || `list_nodes HTTP ${r.status}`);
       // 镜像里 clone 的节点(/health 枚举)+ Volume 上的本地包 —— 后者不在镜像文件系统里,
       // 只列 /health 会让自写节点在这个面板上「不存在」,既看不到也删不掉。
+      // C13:Volume 读不到时后端回 {ok:false, error},不能当成「没有私有包」静默显示空。
       let localPkgs = [];
+      let localErr = "";
       try {
         const lr = await bridgeFetch("/modal_bridge/list_local_nodes");
-        localPkgs = (await lr.json()).nodes || [];
-      } catch (e) { log("list_local_nodes failed:", e); }
+        const lj = await lr.json().catch(() => ({}));
+        if (!lr.ok || lj.ok === false) localErr = lj.error || `HTTP ${lr.status}`;
+        localPkgs = Array.isArray(lj.nodes) ? lj.nodes : [];
+      } catch (e) { log("list_local_nodes failed:", e); localErr = e.message || String(e); }
       loadedNodes = [
         ...(d.nodes || []).map((n) => ({ ...n, kind: "baked" })),
         ...localPkgs.map((name) => ({ name, kind: "local" })),
@@ -2495,8 +2914,9 @@ async function openDeployDialog() {
            </label>`).join("");
         nodesPruneBtn.style.display = "inline-block";
       }
-      nodesStatusEl.textContent = t("mn.installed", { n: loadedNodes.length, src: d.source });
-      nodesStatusEl.style.color = "#9aa";
+      nodesStatusEl.textContent = t("mn.installed", { n: loadedNodes.length, src: d.source })
+        + (localErr ? " · " + t("mn.local_list_fail", { e: localErr }) : "");
+      nodesStatusEl.style.color = localErr ? "#fbbf24" : "#9aa";
     } catch (e) {
       nodesStatusEl.textContent = t("mn.load_fail", { e: e.message || e });
       nodesStatusEl.style.color = "#f87171";
@@ -2542,22 +2962,47 @@ async function openDeployDialog() {
         }
       }
       // 只勾了本地包 → 无需重部署,直接收工
-      const rc = bakedChecked.length === 0 ? 0 : await streamPost("/modal_bridge/sync_nodes", {
-        new_baked: keepBaked.map((n) => ({ name: n.name, url: n.url, commit: n.commit })),
-        summary: { add: 0, update: 0, prune: bakedChecked.length },
-      }, (line) => { nodesLogEl.textContent += line + "\n"; nodesLogEl.scrollTop = nodesLogEl.scrollHeight; });
+      let rc = 0;
+      let syncErr = "";
+      let lastFail = "";
+      if (bakedChecked.length) {
+        try {
+          rc = await streamPost("/modal_bridge/sync_nodes", {
+            new_baked: keepBaked.map((n) => ({ name: n.name, url: n.url, commit: n.commit })),
+            // C6:删除必须显式。服务端只删 prune 里列出的;清单里没列、云端却有的节点会被并回,
+            //   不会因为本机清单过期或别的机器刚加了节点而被顺手删掉。
+            prune: bakedChecked.map((n) => n.name),
+            summary: { add: 0, update: 0, prune: bakedChecked.length },
+          }, (line) => {
+            if (line.includes("✗")) lastFail = failLine(line);
+            nodesLogEl.textContent += line + "\n"; nodesLogEl.scrollTop = nodesLogEl.scrollHeight;
+          });
+        } catch (e) {
+          // 流开始前的拒绝(409 读不到云端 / 补不出来源等):后端的说明原样给用户(F-P2-4)
+          rc = null;
+          syncErr = e.message || String(e);
+          nodesLogEl.textContent += "✗ " + syncErr + "\n";
+        }
+      }
       const keep = keepBaked;
-      if (rc === 0 && !localFailed.length) {
+      // 本地包删除与重部署可能同时失败 —— 两个都要报。以前只报本地那一半,重部署失败被吞掉
+      // (2026-10-05 深度 review F-P3-6)。
+      const problems = [];
+      if (localFailed.length) problems.push(t("mn.local_rm_fail", { list: localFailed.join(", ") }));
+      if (bakedChecked.length && rc !== 0) {
+        problems.push(syncErr ? "✗ " + syncErr
+          : isProtectiveAbort(lastFail) ? t("dep.aborted") : t("mn.redeploy_fail", { rc }));
+      }
+      if (!problems.length) {
         nodesStatusEl.textContent = t("mn.removed", { n: checked.length, keep: keep.length });
         nodesStatusEl.style.color = "#34d399";
         notify(t("mn.removed_toast", { n: checked.length }), "success");
         nodesLoadBtn.onclick();  // 刷新列表
-      } else if (localFailed.length) {
-        nodesStatusEl.textContent = t("mn.local_rm_fail", { list: localFailed.join(", ") });
-        nodesStatusEl.style.color = "#f87171";
-        nodesLoadBtn.onclick();  // 部分成功也刷新,让面板反映真实状态
       } else {
-        nodesStatusEl.textContent = t("mn.redeploy_fail", { rc });
+        // 部分成功也刷新,让面板反映真实状态。先刷新再写失败说明 —— 刷新会改写状态行,
+        // 以前失败说明一闪就被「镜像实装 N 个」盖掉了。
+        if (localFailed.length) await nodesLoadBtn.onclick();
+        nodesStatusEl.textContent = problems.join(" · ");
         nodesStatusEl.style.color = "#f87171";
       }
     } catch (e) {
@@ -2580,7 +3025,7 @@ async function openDeployDialog() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ gpu_tier: tier }),
       });
-      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      if (!r.ok) throw await httpError(r, "config");
       const label = tierSel.options[tierSel.selectedIndex].textContent.trim();
       tierMsg.style.color = "#10b981";
       tierMsg.textContent = t("dlg.gpu.tier_saved", { tier: label });
@@ -2610,7 +3055,8 @@ async function openDeployDialog() {
       // 而**旁路密钥是凭据**,只从下面这个专用密码框走:留空 = 沿用 config 里已存的,
       // 规则与 comfy.org API Key 一致。密钥不进 ComfyUI Settings —— 那里会明文落盘且
       // 任何第三方 custom node 都读得到。
-      ...(panel.querySelector("#mb-dep-aigc-bypass")
+      // 框只在配置了 AIGC URL 时显示(见 applyCfg);隐藏时不带这个键,后端保留已存值。
+      ...(aigcWrap.style.display !== "none"
           ? { aigc_bypass_secret: panel.querySelector("#mb-dep-aigc-bypass").value.trim() }
           : {}),
     };
@@ -2627,7 +3073,9 @@ async function openDeployDialog() {
     logEl.style.display = "block";
     logEl.textContent = "";
     try {
+      let lastFail = "";
       const rc = await streamPost("/modal_bridge/deploy", payload, (line) => {
+        if (line.includes("✗")) lastFail = failLine(line);
         logEl.textContent += line + "\n";
         logEl.scrollTop = logEl.scrollHeight;
       });
@@ -2635,8 +3083,16 @@ async function openDeployDialog() {
         statusEl.textContent = t("dep.ok");
         statusEl.style.color = "#34d399";
         notify(t("dep.ok.toast"), "success");
+        // 凭据已写进 config / Secret:清空输入框,别让明文停在面板里,下次打开也不会误以为没存
+        for (const sel of SECRET_INPUTS) { const el = panel.querySelector(sel); if (el) el.value = ""; }
         doHealthCheck();
         refreshVerBanner(panel);  // 部署成功 → 版本徽标翻绿(本地↔云端对齐)
+      } else if (isProtectiveAbort(lastFail)) {
+        // C5:保护性中止不是构建失败,别落到「常见是依赖装不上」那句(F-P3-1)
+        statusEl.textContent = t("dep.aborted");
+        statusEl.style.color = "#f87171";
+        notify(t("dep.aborted.toast"), "warn");
+        refreshVerBanner(panel);
       } else {
         statusEl.textContent = t("dep.fail", { rc });
         statusEl.style.color = "#f87171";
@@ -2651,6 +3107,8 @@ async function openDeployDialog() {
       statusEl.style.color = "#f87171";
     } finally {
       goBtn.disabled = false;
+      // 不论成败都重读 /config:has_token_secret 等标志可能已变(失败时凭据也可能已经存下)
+      fetchConfig().then(applyCfg);
     }
   };
 }
@@ -2658,183 +3116,10 @@ async function openDeployDialog() {
 // =====================================================================
 // actionBarButtons 注册
 // =====================================================================
-// 浏览器内触发文本文件下载(无需后端)
-function downloadText(filename, text) {
-  const blob = new Blob([text], { type: "text/x-python;charset=utf-8" });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement("a");
-  a.href = url; a.download = filename;
-  document.body.appendChild(a); a.click();
-  a.remove(); URL.revokeObjectURL(url);
-}
-
-// 把当前画布工作流导成「自包含单文件 Modal API 客户端」——别人 python xxx.py 就能云端出资产,
-// 不需要 ComfyUI / 本机 GPU / 作者机器开机(直连已部署的 -run / -status)。纯前端,不碰后端。
-async function exportModalApi() {
-  const cfg = await fetchConfig();
-  if (!isConfigured(cfg)) {
-    notify(t("toast.not_deployed"), "warn");
-    try { openDeployDialog(); } catch (e) {}
-    return;
-  }
-  let p;
-  try { p = await app.graphToPrompt(); }
-  catch (e) { notify(t("export.fail"), "error"); return; }
-  const wf = p.output;
-  const base = cfg.modal_endpoint_base;
-  const tier = getVramTier(wf);
-  const wfname = (activeWorkflowName() || "workflow").replace(/[^\w.-]+/g, "_");
-
-  // 探测可覆盖的提示词/种子节点 + 列出依赖模型(供接收方/作者核对已同步)
-  const promptNodes = [], seedNodes = [], prereq = new Set();
-  for (const [nid, node] of Object.entries(wf)) {
-    const ct = (node && node.class_type) || "";
-    const ins = (node && node.inputs) || {};
-    if (/TextEncode/i.test(ct) && typeof ins.text === "string") promptNodes.push(nid);
-    if (typeof ins.seed === "number" || typeof ins.noise_seed === "number") seedNodes.push(nid);
-    for (const v of Object.values(ins)) {
-      if (typeof v === "string" && /\.(safetensors|ckpt|pt|pth|gguf|bin|sft|onnx)$/i.test(v))
-        prereq.add(`#       - ${ct}: ${v}`);
-    }
-  }
-  const prereqText = prereq.size ? [...prereq].join("\n") : "#       (未检测到模型加载节点)";
-  const wfB64 = btoa(unescape(encodeURIComponent(JSON.stringify(wf))));
-
-  // KEY:默认占位符(安全);用户确认「嵌入」才写真 key——从本机路由取(/config 不回吐 key)
-  let keyValue = "在此填入作者给的 bridge_api_key(bk-...)";
-  let keyNote =
-`    3) 把作者给的 API KEY 填到下面 KEY(bk-...)。
-       注意:KEY = 作者的 Modal 账单,别公开、别提交到仓库。`;
-  // 右(主蓝)= 用占位符(推荐/安全);左(红)= 嵌入 KEY(危险)。返回 true=占位符,false=嵌入
-  const safe = await confirmDialog(
-    t("export.key.title"), t("export.key.body"),
-    t("export.key.placeholder"), t("export.key.embed"),
-    { dangerCancel: true },
-  );
-  if (!safe) {
-    try {
-      const kd = await (await bridgeFetch("/modal_bridge/bridge_key")).json();
-      if (kd && kd.key) {
-        keyValue = kd.key;
-        keyNote =
-`    3) ⚠ 本文件已内嵌作者的 API KEY = 作者的 Modal 账单。
-       别公开、别传仓库、别群发;一旦泄露,只能让作者轮换 key 止损。`;
-      } else { notify(t("export.key.fail"), "warn"); }
-    } catch (e) { notify(t("export.key.fail"), "warn"); }
-  }
-
-  const py = `#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-${wfname} — Modal API 单文件客户端(comfyui_modal_bridge 导出)
-
-把这套 ComfyUI 工作流在云端 Modal GPU 上跑、出资产存本地。
-不需要 ComfyUI、不需要本机 GPU、不用作者的机器开机。
-
-用法:
-    pip install requests
-    python ${wfname}_modal.py
-    python ${wfname}_modal.py --prompt "a cat" --seed 123 --out out.png
-
-前提(作者保证,只需一次):
-    1) app 已部署到 Modal:${base}
-    2) 以下模型已同步到云端 Volume(否则 worker 找不到),以及工作流用到的自定义节点已在云端镜像:
-${prereqText}
-${keyNote}
-"""
-import argparse, base64, json, sys, time
-try:
-    import requests
-except ImportError:
-    sys.exit("缺 requests:  pip install requests")
-
-BASE = "${base}"
-KEY  = "${keyValue}"
-TIER = "${tier}"
-
-_WF_B64 = "${wfB64}"
-WORKFLOW = json.loads(base64.b64decode(_WF_B64).decode("utf-8"))
-
-PROMPT_NODES = ${JSON.stringify(promptNodes)}   # --prompt 覆盖这些节点的 text
-SEED_NODES   = ${JSON.stringify(seedNodes)}     # --seed 覆盖这些节点的 seed/noise_seed
-
-
-def _apply(wf, prompt, seed):
-    if prompt is not None:
-        for nid in PROMPT_NODES:
-            wf.get(nid, {}).get("inputs", {})["text"] = prompt
-    if seed is not None:
-        for nid in SEED_NODES:
-            ins = wf.get(nid, {}).get("inputs", {})
-            for k in ("seed", "noise_seed"):
-                if k in ins:
-                    ins[k] = seed
-    return wf
-
-
-def run(wf, timeout=900):
-    if not KEY.startswith("bk-"):
-        sys.exit("请先在脚本顶部 KEY 填入作者给的 bridge_api_key(bk-...)")
-    # 提交(带重试,容忍偶发网络/冷启动抖动)
-    jid = None
-    for _ in range(5):
-        try:
-            # allow_redirects=False:KEY 是作者的计费 key,requests 跟随跨域重定向会把它带过去
-            jid = requests.post(BASE + "-run.modal.run", allow_redirects=False,
-                json={"workflow": wf, "tier": TIER, "auth_key": KEY}, timeout=60).json().get("id")
-            if jid:
-                break
-        except Exception as e:
-            print("提交重试:", e)
-        time.sleep(3)
-    if not jid:
-        sys.exit("提交失败(网络或鉴权问题)")
-    print("job:", jid, "(首次冷启动约 3-5 分钟,别急)")
-    # 轮询(单次网络抖动不致命,下一轮自动重试)
-    t0 = time.time()
-    while time.time() - t0 < timeout:
-        try:
-            s = requests.get(BASE + "-status.modal.run", allow_redirects=False,
-                             params={"job_id": jid},
-                             headers={"X-Bridge-Key": KEY}, timeout=30).json()
-        except Exception as e:
-            print("轮询抖动,重试:", e)
-            time.sleep(3)
-            continue
-        st = s.get("status")
-        if st == "completed":
-            return [base64.b64decode(im["data_base64"]) for im in s.get("images", [])]
-        if st == "failed":
-            sys.exit("失败: " + str(s.get("error")))
-        time.sleep(2)
-    sys.exit("超时(>" + str(timeout) + "s)")
-
-
-if __name__ == "__main__":
-    ap = argparse.ArgumentParser(description="${wfname} on Modal")
-    ap.add_argument("--prompt", help="覆盖正向提示词")
-    ap.add_argument("--seed", type=int, help="覆盖随机种子")
-    ap.add_argument("--out", default="${wfname}_out.png", help="输出文件名")
-    a = ap.parse_args()
-    wf = _apply(json.loads(json.dumps(WORKFLOW)), a.prompt, a.seed)
-    imgs = run(wf)
-    if not imgs:
-        sys.exit("没拿到图")
-    for i, b in enumerate(imgs):
-        fn = a.out if i == 0 else a.out.rsplit(".", 1)[0] + "_" + str(i) + ".png"
-        with open(fn, "wb") as f:
-            f.write(b)
-        print("saved:", fn)
-`;
-  downloadText(`${wfname}_modal.py`, py);
-  notify(t("export.done", { name: wfname }), "success");
-}
-
 // 注:这两个 tooltip 同时用作 DOM 选择器(下方 querySelector button[title=...]),
 // 不做 i18n(否则切语言后选择器对不上已注册的按钮)。保持稳定英文。
 const BUTTON_TOOLTIP = "Queue on Modal (H100, see Settings)";
 const SETUP_TOOLTIP = "Modal Bridge: deploy / settings (start here)";
-const EXPORT_TOOLTIP = "Export current workflow as a standalone Modal API client (.py)";
 
 app.registerExtension({
   name: "ModalBridge.QueueButton",
@@ -2848,13 +3133,6 @@ app.registerExtension({
       label: "RunModal",
       onClick: queueOnModal,
     },
-    // Export API 按钮先从 UI 摘掉(暂不暴露);exportModalApi / EXPORT_TOOLTIP 代码保留,以后可一键恢复。
-    // {
-    //   icon: "pi pi-file-export",
-    //   tooltip: EXPORT_TOOLTIP,
-    //   label: "Export API",
-    //   onClick: exportModalApi,
-    // },
     {
       icon: "pi pi-cog",
       tooltip: SETUP_TOOLTIP,
@@ -2904,5 +3182,9 @@ app.registerExtension({
 
     // history 持久化:启动时检查未完成 job
     recoverPendingJob();
+    // 恢复记录的归属心跳(见 TAB_ID):本标签页在跟踪的 job 定期续约;页面关闭 / 刷新时清零,
+    // 刷新后的页面立刻接手,其它标签页在心跳过期前不会重复接手。
+    setInterval(() => heartbeatActiveJobs(), ACTIVE_JOB_HB_MS);
+    try { window.addEventListener("pagehide", () => heartbeatActiveJobs(true)); } catch (e) {}
   },
 });
