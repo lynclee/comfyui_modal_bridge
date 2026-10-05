@@ -11,7 +11,6 @@ _local_nodes_boot.py — worker 启动时把 Volume 上的「本地自写节点�
 一个 ../../ 就能写到 /comfyui 之外。这里逐条校验规范化后的目标路径仍在目标目录内。
 """
 import os
-import re
 import shutil
 import zipfile
 import tempfile
@@ -32,22 +31,24 @@ BAKED_SENTINEL = "__modal_bridge_baked__"
 # 是具体指纹就触发重装 —— 两条路都能自愈。
 UNKNOWN_DIGEST = "__modal_bridge_unknown__"
 
-# 节点目录名白名单。名字会拼成 DEST_DIR / name 再拿去 rmtree / copytree,以前只挡 "/"、"\\"、".."
-# 三种子串 —— "." 本身就漏过去了:restore_baked(["."]) 的 target 就是 custom_nodes 整个目录,
-# 备份目录存在时会被 rmtree 掉、再拿备份根整个盖回来(2026-10-05 深度 review)。
-# 首字符必须是字母数字下划线(\w 含 CJK,本地 safe_folder 允许的中文目录名照样能用),排除 "." / ".." /
-# 隐藏目录 / 以 "-" 开头;其余只放行常见的目录名标点。本地那侧(local_nodes.safe_folder)更宽,
-# 极少数带奇怪字符的目录在这里会被跳过、任务按「版本对不上」明确失败,而不是静默跑错。
-_FOLDER_RE = re.compile(r"^\w[\w .+()\[\]@,-]{0,127}$")
+# 节点目录名校验。名字会拼成 DEST_DIR / name 再拿去 rmtree / copytree。
+# 历史:最早只挡 "/"、"\\"、".." 三种子串 —— "." 本身漏过去了:restore_baked(["."]) 的 target 就是
+# custom_nodes 整个目录,备份目录存在时会被 rmtree 掉、再拿备份根整个盖回来(2026-10-05 深度 review)。
+# 随后改成的字符白名单又比本机 local_nodes.safe_folder 严:Bob's Nodes、🎨nodes、(old) nodes、[dev] tools
+# 这类本机能打包上传的名字,云端一律拒,声明了它的任务必然失败(2026-10-05 深度 review 复核 r2)。
+# 现在与本机对齐:去掉首尾空白后为空 / "." / ".." 拒;含 "/" "\\" 拒;另外拒 NUL(本机那侧由 resolve 的
+# "embedded null byte" 挡住)。其余字符一律放行 —— 越界防护不靠字符集,靠下面「规范化后的父目录必须
+# 恰好是 base」那道闸:单段、非 "." / ".." 的名字规范化后不可能离开 base。
+_FOLDER_FORBIDDEN = ("/", "\\", "\0")
 
 
 def node_target(folder, base: Path | None = None) -> Path:
     """校验节点目录名并返回 base(默认 DEST_DIR)下的目标路径;不合法抛 ValueError。
 
-    两道闸:白名单正则 + 规范化后的父目录必须恰好是 base(防正则以后被放宽时漏掉某种写法)。"""
+    两道闸:与本机 local_nodes.safe_folder 同一套名字规则 + 规范化后的父目录必须恰好是 base。"""
     base = DEST_DIR if base is None else base
-    # fullmatch 而不是 match:`$` 会放过结尾的换行("foo\n")
-    if not isinstance(folder, str) or not _FOLDER_RE.fullmatch(folder) or ".." in folder:
+    if (not isinstance(folder, str) or folder.strip() in ("", ".", "..")
+            or any(c in folder for c in _FOLDER_FORBIDDEN)):
         raise ValueError(f"非法节点名: {folder!r}")
     root = Path(os.path.normpath(str(base)))
     target = Path(os.path.normpath(str(root / folder)))

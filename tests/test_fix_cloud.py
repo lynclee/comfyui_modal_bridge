@@ -265,14 +265,14 @@ def test_k1_partial_2xx_is_withdrawn_and_retried_like_400(monkeypatch):
     assert [c[0] for c in calls] == ["/prompt", "/queue", "/interrupt", "/prompt"]
 
 
-def test_k1_partial_2xx_other_errors_fail_without_retry(monkeypatch):
-    calls, reloads = _patch_comfy_http(monkeypatch, [_Resp(200, _partial("p-1", "required_input_missing"))])
-    with pytest.raises(cw.ValidationError) as ei:
-        cw.queue_workflow({"9": {}}, "cid")
-    assert isinstance(ei.value, ValueError), "老的捕获点按 ValueError 接,不能变"
-    assert "部分输出分支" in str(ei.value) and "Node 31" in str(ei.value)
+def test_k1_partial_2xx_other_errors_run_the_rest_without_retry(monkeypatch):
+    """2026-10-05 复核 r2 改了行为:非缺模型类的部分校验错误(悬空的输出节点等)不撤回、不失败,
+    其余分支照常跑,被剔除的输出走契约 D1 的 warnings(详见 test_fix_r2_cloud.py)。"""
+    resp = _partial("p-1", "required_input_missing")
+    calls, reloads = _patch_comfy_http(monkeypatch, [_Resp(200, resp)])
+    assert cw.queue_workflow({"9": {}}, "cid") == resp
     assert reloads == [], "非模型缺失类错误不重试"
-    assert ("/queue", {"delete": ["p-1"]}) in calls, "失败前也要撤回已入队的残缺 prompt"
+    assert [c[0] for c in calls] == ["/prompt"], "不能撤回合法分支"
 
 
 def test_k1_partial_2xx_retries_exhausted_raises(monkeypatch):
@@ -678,7 +678,9 @@ def test_k5_failed_verify_still_restarts_so_memory_matches_disk(ma, monkeypatch,
 # ============================================================================
 # K10 — 节点目录名白名单
 # ============================================================================
-@pytest.mark.parametrize("bad", [".", "..", "", ".hidden", "a/b", "a\\b", "foo\n", "-x", "a..b", None, 3])
+# 2026-10-05 复核 r2:与本机 local_nodes.safe_folder 对齐后,".hidden" / "-x" / "a..b" / "foo\n" 改为放行
+# (本机都能打包上传),见 test_fix_r2_cloud.py 的对照测试
+@pytest.mark.parametrize("bad", [".", "..", "", " ", " .. ", "a/b", "a\\b", "a\0b", None, 3])
 def test_k10_node_target_rejects(nodes_fs, bad):
     with pytest.raises(ValueError):
         lnb.node_target(bad)
@@ -857,7 +859,8 @@ def _ent(path, mtime, typ=2):
 
 def test_k17_orphan_outputs_are_collected_conservatively(ma):
     now = time.time()
-    old, young = now - 3 * ma.JOB_TTL_S, now - 600
+    # 期限 = max(2×TTL, 8 天)(2026-10-05 复核 r2:多 app 共用 Volume 时 2 小时会删掉别人的产物)
+    old, young = now - ma._ORPHAN_MIN_AGE_S - 3600, now - 600
     vol = ma._t.vol
     vol.entries["_outputs"] = [
         _ent("_outputs/orphan", old),                 # 删
@@ -880,7 +883,7 @@ def test_k17_orphan_outputs_are_collected_conservatively(ma):
 
 def test_k17_orphan_sweep_has_a_budget(ma):
     now = time.time()
-    ma._t.vol.entries["_outputs"] = [_ent(f"_outputs/o{i}", now - 99999) for i in range(25)]
+    ma._t.vol.entries["_outputs"] = [_ent(f"_outputs/o{i}", now - 9 * 86400) for i in range(25)]
     ma._sweep_orphan_outputs({}, now)
     assert len(ma._t.vol.removed) == ma._VOL_GC_PER_SWEEP
 
@@ -888,7 +891,7 @@ def test_k17_orphan_sweep_has_a_budget(ma):
 def test_k17_runs_from_the_regular_sweep_with_its_snapshot(ma):
     now = time.time()
     ma._t.js["live"] = {"status": "running", "started_at": now, "timeout_s": 1200}
-    ma._t.vol.entries["_outputs"] = [_ent("_outputs/live", now - 99999), _ent("_outputs/lost", now - 99999)]
+    ma._t.vol.entries["_outputs"] = [_ent("_outputs/live", now - 9 * 86400), _ent("_outputs/lost", now - 9 * 86400)]
     ma._sweep_job_state()
     assert ma._t.vol.removed == ["_outputs/lost"]
 

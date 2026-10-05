@@ -321,6 +321,9 @@ def _parse_validation_error(err: dict):
     """从 ComfyUI 400 响应提取 (details文案, 是否为'模型不在列表'类错误)。"""
     details, is_missing_value = [], False
     node_errors = err.get("node_errors") or {}
+    if not isinstance(node_errors, dict):
+        # 形态不认识(不是 {node_id: {...}}):照实带出文案,不当成「模型不在列表」去重试
+        return [str(node_errors)[:500]], False
     for nid, nerr in node_errors.items():
         if isinstance(nerr, dict):
             for sub in nerr.get("errors", []) or []:
@@ -338,6 +341,79 @@ def _parse_validation_error(err: dict):
 
 class ValidationError(ValueError):
     """ComfyUI 拒收(400)或只收了一部分(2xx + node_errors)的工作流。继承 ValueError,老的捕获点不受影响。"""
+
+
+# 这几类校验错误的 details 只含输入名 / 类型名 / 节点路径,可以原样带进 warnings。其余类型
+# (invalid_input_type、custom_validation_failed、exception_during_*)的 details 会带上输入的原值或
+# 节点自己抛的异常文本 —— 工作流里可能有 API key 之类的字符串,而 warnings 会进 job_state、/status,
+# AIGC Studio 也读得到(契约 D1:不含凭据)。那些只写类型 + 输入名,原文在容器日志里
+# (ComfyUI 校验失败时自己会把 message/details 打进 stdout)。
+_WARN_SAFE_DETAIL_TYPES = {"required_input_missing", "bad_linked_input", "return_type_mismatch",
+                           "dependency_cycle"}
+_WARN_MAX_LEN = 300
+
+
+def _one_line(text: str) -> str:
+    s = " ".join(str(text).split())
+    return s if len(s) <= _WARN_MAX_LEN else s[:_WARN_MAX_LEN - 1] + "…"
+
+
+def _nid_key(nid: str):
+    """节点 id 排序键:数字 id 按数值排("9" 在 "10" 前),其余按字符串。"""
+    s = str(nid)
+    return (0, int(s), s) if s.isdigit() else (1, 0, s)
+
+
+def _warn_reason(e: dict) -> str:
+    t = e.get("type") or "?"
+    extra = e.get("extra_info") if isinstance(e.get("extra_info"), dict) else {}
+    inp = extra.get("input_name")
+    if t in _WARN_SAFE_DETAIL_TYPES:
+        return f"{t}: {e.get('details') or inp or ''}".rstrip(": ")
+    if t in ("value_smaller_than_min", "value_bigger_than_max"):
+        # message 里只有数值和上下限("Value 0 smaller than min of 1")
+        return f"{t}: {inp or '?'} ({e.get('message') or ''})"
+    return f"{t}: {inp or e.get('message') or ''}(细节见 Modal 容器日志)"
+
+
+def partial_validation_warnings(node_errors, workflow: dict | None = None) -> list[str]:
+    """/prompt 回 2xx 但带 node_errors(ComfyUI 剔除了部分输出分支、其余照常入队)→ 契约 D1 的 warnings。
+
+    每个被剔除的输出节点一条:输出节点 id + class_type + 让它被剔除的节点 / 错误类型。单行、限长、
+    不带输入原值(见 _WARN_SAFE_DETAIL_TYPES)。纯函数。
+    v0.37.2 的形态(execution.py validate_prompt):node_errors 以**出错的节点**为键,
+    {errors: [...], dependent_outputs: [输出节点 id...], class_type};被剔除的输出在 dependent_outputs 里。"""
+    if not node_errors:
+        return []
+    if not isinstance(node_errors, dict):
+        return [_one_line(f"ComfyUI 校验时剔除了部分输出分支(没有执行、没有产物): {node_errors}")]
+    wf = workflow if isinstance(workflow, dict) else {}
+
+    def cls_of(nid) -> str:
+        node = wf.get(str(nid))
+        if isinstance(node, dict) and node.get("class_type"):
+            return str(node["class_type"])
+        ne = node_errors.get(str(nid))
+        return str(ne.get("class_type") or "?") if isinstance(ne, dict) else "?"
+
+    by_output: dict[str, list[str]] = {}
+    loose: list[str] = []
+    for nid, ne in node_errors.items():
+        if not isinstance(ne, dict):
+            loose.append(f"节点 {nid}: {ne}")
+            continue
+        reasons = [_warn_reason(e) for e in (ne.get("errors") or []) if isinstance(e, dict)]
+        what = f"节点 {nid} ({ne.get('class_type') or cls_of(nid)}) " + ("; ".join(reasons) or "校验未通过")
+        outs = ne.get("dependent_outputs") if isinstance(ne.get("dependent_outputs"), list) else []
+        if not outs:
+            loose.append(what)
+        for oid in outs:
+            by_output.setdefault(str(oid), []).append(what)
+    out = [_one_line(f"输出节点 {oid} ({cls_of(oid)}) 没有执行、没有产物 —— ComfyUI 校验时剔除了这个分支: "
+                     + " | ".join(by_output[oid]))
+           for oid in sorted(by_output, key=_nid_key)]
+    out += [_one_line(f"ComfyUI 校验时剔除了依赖它的输出分支(没有执行、没有产物): {w}") for w in loose]
+    return out
 
 
 def _withdraw_prompt(prompt_id: str) -> None:
@@ -360,11 +436,15 @@ def queue_workflow(workflow: dict, client_id: str) -> dict:
     覆盖"模型刚上传、worker 容器还没看到"的最终一致/全新目录场景,直到 ComfyUI 看到模型或重试用尽。
     其它验证错误(真缺节点/参数错)立即抛,不重试。
 
-    ⚠ 「部分通过」也是验证失败:v0.37.2 只要还有一个输出分支合法,/prompt 就回 200、只把合法分支入队,
-      被剔除的分支写在响应的 node_errors 里(server.py post_prompt / execution.py validate_prompt)。
-      以前只看状态码:缺一个输出分支照样报 completed、照样计费,专为「模型刚上传、暖容器还没看到」
-      写的 value_not_in_list 重试也被绕过 —— 而那恰好是最常见的部分失败(新传的 LoRA 只挂在一条分支上)
-      (2026-10-05 深度 review)。所以 2xx 带 node_errors 时先撤回已入队的残缺 prompt,再和 400 走同一条路。"""
+    「部分通过」:v0.37.2 只要还有一个输出分支合法,/prompt 就回 200、只把合法分支入队,
+      被剔除的分支写在响应的 node_errors 里(server.py post_prompt / execution.py validate_prompt)。按错误类型分两路:
+      · 含 value_not_in_list(模型 / 参数在云端找不到):撤回已入队的残缺 prompt,和 400 走同一条
+        reload + 重试路径,重试用尽仍找不到就失败。专为「模型刚上传、暖容器还没看到」写的重试不能被
+        2xx 绕过 —— 那恰好是最常见的部分失败(新传的 LoRA 只挂在一条分支上),缺模型的分支绝不能静默少产物
+        (2026-10-05 深度 review K1)。
+      · 其它(悬空的 PreviewImage / SaveImage、上游被 bypass 等):**不撤回**,合法分支照常跑完,
+        被剔除的输出由 run_workflow 按契约 D1 写进 warnings。这和本机 ComfyUI 的行为一致;前端对这种节点
+        会弹「仍要提交」,以前云端先撤回再整单失败,点了就必然失败(2026-10-05 深度 review 复核 r2)。"""
     # API 节点(comfy_api_nodes)鉴权:把 comfy.org API key 通过 /prompt 的 extra_data 传进去
     # (ComfyUI 从 extra_data.api_key_comfy_org 取,见 execution.py)。没配 key 就不带,普通工作流不受影响。
     body = {"prompt": workflow, "client_id": client_id}
@@ -387,7 +467,12 @@ def queue_workflow(workflow: dict, client_id: str) -> dict:
             node_errors = resp.get("node_errors") if isinstance(resp, dict) else None
             if not node_errors:
                 return resp
-            # 2xx 但有分支被剔除:残缺的那个 prompt 已经入队(甚至已开跑),先撤回,别让它白烧 GPU
+            if not _parse_validation_error(resp)[1]:
+                # 剔除原因里没有「模型 / 参数找不到」:不撤回,其余分支照常跑(warnings 由 run_workflow 生成)
+                print(f"[bridge] /prompt 剔除了部分输出分支(非缺模型类错误),其余分支照常执行: "
+                      f"{sorted(node_errors) if isinstance(node_errors, dict) else node_errors}")
+                return resp
+            # 2xx 但缺模型的分支被剔除:残缺的那个 prompt 已经入队(甚至已开跑),先撤回,别让它白烧 GPU
             partial = True
             pid = resp.get("prompt_id")
             if pid:
@@ -411,8 +496,8 @@ def queue_workflow(workflow: dict, client_id: str) -> dict:
             _reload_volume_in_worker()
             time.sleep(wait)
             continue
-        head = ("Workflow validation(部分输出分支没通过校验,ComfyUI 只会执行其余分支 —— "
-                "已撤回,不当成功): " if partial else "Workflow validation: ")
+        head = ("Workflow validation(部分输出分支引用的模型 / 参数在云端找不到,重试后仍然没有;"
+                "ComfyUI 只会执行其余分支 —— 已撤回,不当成功): " if partial else "Workflow validation: ")
         if details:
             raise ValidationError(head + "; ".join(details))
         if partial:
@@ -535,7 +620,8 @@ def run_workflow(workflow: dict, job_id: str, input_images: list[dict] | None = 
     """
     跑一个 workflow,返回所有产出图 base64。
     Returns: {images: [{filename, data_base64}], filename, data_base64, errors,
-              output_refs: [发现步骤的产物引用(含 asset_type),aigc-r2 交付用]}
+              output_refs: [发现步骤的产物引用(含 asset_type),aigc-r2 交付用],
+              warnings: [被 ComfyUI 剔除的输出分支,单行文案(契约 D1)]}
       - images: 所有非 temp 输出图(支持多 SaveImage / batch 出多图)
       - filename/data_base64: 第一张(向后兼容老回流路径)
       - materialize=False(aigc-r2):只「发现」不「读取」,images 留空 —— 产物不进
@@ -563,6 +649,11 @@ def run_workflow(workflow: dict, job_id: str, input_images: list[dict] | None = 
         if not prompt_id:
             raise ValueError(f"Missing prompt_id: {queued}")
         print(f"[bridge] queued workflow {prompt_id}")
+        # 被 ComfyUI 剔除、但不属于「模型 / 参数找不到」的输出分支(queue_workflow 已放行):
+        # 任务照常跑完,在结果里如实带上(契约 D1),别让少掉的产物无声无息
+        warnings = partial_validation_warnings(queued.get("node_errors"), workflow)
+        for w in warnings:
+            print(f"[bridge] ⚠ {w}")
 
         execution_done = False
         last_msg_at = time.time()   # 最近一次收到 WS 消息的时刻(静默探测用)
@@ -658,9 +749,12 @@ def run_workflow(workflow: dict, job_id: str, input_images: list[dict] | None = 
         # desktop = materialize(base64/Volume);aigc-r2 由 caller 拿 output_refs 走流式直传 R2。
         refs = discover_outputs(history[prompt_id].get("outputs", {}))
         if not refs:
-            raise ValueError(f"No usable output (image/video/3d) in result. errors={errors}")
+            # 唯一的产物分支恰好被剔除时,真因在 warnings 里,别只报一句「没有产物」
+            raise ValueError(f"No usable output (image/video/3d) in result. errors={errors}"
+                             + (f"; 被剔除的输出分支: {' / '.join(warnings)}" if warnings else ""))
         if not materialize:
-            return {"image_url": None, "images": [], "errors": errors, "output_refs": refs}
+            return {"image_url": None, "images": [], "errors": errors, "output_refs": refs,
+                    "warnings": warnings}
         images, mat_errors = materialize_desktop_outputs(refs, job_id)
         errors.extend(mat_errors)
         if not images:
@@ -684,6 +778,7 @@ def run_workflow(workflow: dict, job_id: str, input_images: list[dict] | None = 
             "data_base64": images[0].get("data_base64"),  # 向后兼容(Volume 项无 base64 → None)
             "errors": errors,
             "output_refs": refs,
+            "warnings": warnings,    # 契约 D1:被剔除的输出分支(见 partial_validation_warnings)
         }
     finally:
         if ws and ws.connected:

@@ -341,6 +341,15 @@ def _sweep_job_state():
 # _VOL_GC_PER_SWEEP 个 Volume RPC。模块级节流,理由同 _last_sweep。
 _ORPHAN_SWEEP_EVERY_S = 3600
 _last_orphan_sweep = [0.0]
+# 孤儿目录的最短「未改动」时长下限。期限取 max(2 × JOB_TTL_S, 这个值)。
+# ⚠ 不能只用 2 × JOB_TTL_S(默认 2 小时):app 名(MODAL_BRIDGE_APP_NAME → <app>-jobs Dict)和 Volume 名
+#   (MODAL_BRIDGE_VOLUME)是分开配的,多个 app 共用默认 Volume 时,A 只看得到自己的 Dict ——
+#   B 还有记录、用户还没回来取的 _outputs/<jid>,在 A 眼里就是「没有索引」,2 小时后被 A 删掉
+#   (2026-10-05 深度 review 复核 r2 复现)。
+#   8 天的来由:这个扫描本来要兜的是「索引因 Modal Dict 条目 7 天不读写而过期」,过期之后 B 自己的 GC
+#   也认领不了它,真成了孤儿;7 天 + 1 天余量之内,目录的主人(不管哪个 app)都还可能来取。
+#   代价:真正的孤儿要多占 ~8 天 Volume 存储才回收 —— 漏删只花存储钱,错删丢的是付过 GPU 钱的产物。
+_ORPHAN_MIN_AGE_S = 8 * 86400
 
 
 def _dir_entry_is_dir(ent) -> bool:
@@ -358,8 +367,9 @@ def _sweep_orphan_outputs(records: dict, now: float) -> None:
     判据(全部满足才删):
       · Volume 上的目录名是合法 job_id(脏名字一律不碰,remove_file 是递归删);
       · 本轮 Dict 快照里 `jid` / `jid:call` / `jid:progress` 都不存在;
-      · 最后修改时间早于 2 × JOB_TTL_S。正常任务写完产物、commit 时索引早已存在,哪怕跨容器最终一致
-        有延迟也是秒级;目录 2 小时没动过还查不到索引,只能是索引过期 / 被删后留下的。
+      · 最后修改时间早于 max(2 × JOB_TTL_S, _ORPHAN_MIN_AGE_S = 8 天)。正常任务写完产物、commit 时索引早已
+        存在,哪怕跨容器最终一致有延迟也是秒级;但共用同一个 Volume 的**别的 app** 的记录在本 app 的 Dict
+        里永远查不到,所以期限必须盖过 Dict 条目 7 天的过期期(见 _ORPHAN_MIN_AGE_S 的注释)。
     mtime 取目录项自己的(FileEntry.mtime,秒);目录项报 0 时退一步列它里面的文件取最大 mtime,
     仍拿不到就不删 —— 宁可漏删,不可错删。"""
     if now - _last_orphan_sweep[0] < _ORPHAN_SWEEP_EVERY_S:
@@ -372,7 +382,7 @@ def _sweep_orphan_outputs(records: dict, now: float) -> None:
             print(f"[bridge] ⚠ 孤儿产物扫描:列 _outputs 失败: {type(e).__name__}: {e}")
         return
     budget = _VOL_GC_PER_SWEEP
-    horizon = 2 * JOB_TTL_S
+    horizon = max(2 * JOB_TTL_S, _ORPHAN_MIN_AGE_S)
     for ent in entries:
         if budget <= 0:
             break
@@ -597,8 +607,33 @@ def _worker_shutdown(self, wait_s: float = 20.0):
 # 全部白白失败。所以:每单开跑前探活,不健康就原地重启;遇到不可达或 CUDA 黏性错误,当前单结束后
 # 让容器不再接单(Modal 换一个新容器来跑后面的)。
 # 黏性错误的典型文本:"CUDA error: an illegal memory access was encountered"(之后同进程的 CUDA 调用都失败)。
-# 普通的显存不足("CUDA out of memory")不黏,不在此列。
-_STICKY_CUDA = re.compile(r"CUDA error|illegal memory access", re.IGNORECASE)
+# ⚠ 只认真正把 CUDA 上下文弄坏的错误,不能用 "CUDA error" 一把抓(2026-10-05 深度 review 复核 r2):
+#   PyTorch 的 "CUDA error: out of memory"、"CUDA error: invalid argument"、"no kernel image is available"
+#   都带这个前缀,却不黏 —— 为它们退役容器,就把显存里的模型白白丢掉、下一单重付冷启动。
+# 名单 = CUDA 头文件 driver_types.h 里注明「leaves the process in an inconsistent state … the process must
+#   be terminated and relaunched」的错误(外加 ECC 不可纠正:硬件出错,同样不该再用这张卡),文本逐条对过
+#   libcudart 12.9.79 的 cudaGetErrorString 字符串;PyTorch 报 "CUDA error: <该字符串>",Triton 报
+#   "Triton Error [CUDA]: <同一字符串>"。另认枚举名(cudaErrorXxx / CUDA_ERROR_XXX),有些库只报名字。
+_STICKY_CUDA = re.compile(
+    r"an illegal memory access was encountered"                  # 700 cudaErrorIllegalAddress
+    r"|the launch timed out and was terminated"                  # 702 cudaErrorLaunchTimeout
+    r"|device-side assert triggered"                             # 710 cudaErrorAssert
+    r"|hardware stack error"                                     # 714 cudaErrorHardwareStackError
+    r"|an illegal instruction was encountered"                   # 715 cudaErrorIllegalInstruction
+    r"|misaligned address"                                       # 716 cudaErrorMisalignedAddress
+    r"|operation not supported on global/shared address space"   # 717 cudaErrorInvalidAddressSpace
+    r"|invalid program counter"                                  # 718 cudaErrorInvalidPc
+    r"|unspecified launch failure"                               # 719 cudaErrorLaunchFailure
+    r"|tensor memory not completely freed"                       # 721 cudaErrorTensorMemoryLeak
+    r"|uncorrectable ECC error encountered"                      # 214 cudaErrorECCUncorrectable
+    r"|Invalid access of peer GPU memory over nvlink or a hardware error"   # 226 cudaErrorContained
+    r"|cudaError(?:IllegalAddress|LaunchTimeout|Assert|HardwareStackError|IllegalInstruction"
+    r"|MisalignedAddress|InvalidAddressSpace|InvalidPc|LaunchFailure|TensorMemoryLeak|ECCUncorrectable"
+    r"|Contained)\b"
+    r"|CUDA_ERROR_(?:ILLEGAL_ADDRESS|LAUNCH_TIMEOUT|ASSERT|HARDWARE_STACK_ERROR|ILLEGAL_INSTRUCTION"
+    r"|MISALIGNED_ADDRESS|INVALID_ADDRESS_SPACE|INVALID_PC|LAUNCH_FAILED|TENSOR_MEMORY_LEAK"
+    r"|ECC_UNCORRECTABLE|CONTAINED)\b",
+    re.IGNORECASE)
 
 
 def _comfy_unhealthy_reason(self) -> str:
@@ -757,7 +792,9 @@ def _refresh_local_nodes_if_stale(self, expected: dict | None) -> bool:
     if not expected:
         return False
     from _local_nodes_boot import BAKED_SENTINEL, extract_all, needs_refresh, node_target, restore_baked
-    # 名字先校验再动任何东西:非法名(如 ".")直接让这一单失败,别为一个坏请求白白重启 ComfyUI
+    # 名字先校验再动任何东西:非法名(空 / "." / ".." / 含 / \ NUL)直接让这一单失败,别为一个坏请求白白重启
+    # ComfyUI。规则与本机 local_nodes.safe_folder 对齐(见 _local_nodes_boot.node_target):本机能打包上传的
+    # 名字(Bob's Nodes、🎨nodes、[dev] tools …)这里必须放行,否则声明了它的任务一律失败(2026-10-05 深度 review 复核 r2)。
     for folder in expected:
         node_target(folder)
     # ⚠ 比的是 ComfyUI **启动时加载的**版本,不是磁盘 marker:纠偏失败后磁盘已是新版、内存里还是旧代码,
@@ -822,6 +859,16 @@ def _claim_pending_call_id(job_id: str) -> bool:
     except Exception as e:
         print(f"[bridge] ⚠ job {job_id}: 补写 call_id 失败(忽略): {e}")
         return False
+
+
+def _result_warnings(result: dict) -> list:
+    """completed 记录里的 warnings(契约 D1,/status 原样透传,前端在 completed 时给 warn 提示)。
+
+    两个来源:run_workflow 的 warnings(被 ComfyUI 校验剔除、但不属于「模型 / 参数找不到」的输出分支 ——
+    这类不撤回,其余分支照常跑完,见 _comfy_ws.queue_workflow)和历史上的 errors(非致命信息)。
+    每条单行、不含凭据(_comfy_ws.partial_validation_warnings 保证);最多 20 条,别让 Dict 记录无限长。"""
+    out = [str(w) for w in (result.get("warnings") or []) + (result.get("errors") or []) if w]
+    return out[:20]
 
 
 def _worker_run(workflow: dict, job_id: str, input_images: list | None = None,
@@ -927,9 +974,12 @@ def _worker_run(workflow: dict, job_id: str, input_images: list | None = None,
                 job_id=job_id, output_refs=result.get("output_refs") or [], delivery=delivery,
                 provider_job_id=_call_id(job_id))
             # manifest 只有 r2_key/etag/size 等元数据(无 base64、无 token),job_state 不膨胀。
+            # warnings(契约 D1)和 desktop 分支同一个来源,见 _result_warnings
+            _w = _result_warnings(result)
             job_state[job_id] = {**job_state.get(job_id, {}), "status": "completed",
                                  "delivery": {"mode": "aigc-r2", **dres},
-                                 "completed_at": time.time()}
+                                 "completed_at": time.time(),
+                                 **({"warnings": _w} if _w else {})}
             return {"delivered": dres["status"], "assets": len(dres["assets"])}
     except Exception as e:
         interrupt_comfy()   # 失败时 prompt 可能还在 ComfyUI 里跑,别让它接着烧 GPU
@@ -986,9 +1036,10 @@ def _worker_run(workflow: dict, job_id: str, input_images: list | None = None,
             "image_url": result.get("image_url"), "completed_at": time.time()}
     # 非致命告警也要留痕:走到这里说明产物齐了(数量对不上会在 _comfy_ws 里抛),
     # 但过程中可能有过重试/跳过之类的信息。以前 result["errors"] 直接丢掉,
-    # 出了问题事后完全无从追溯。
-    if result.get("errors"):
-        done["warnings"] = result["errors"][:20]
+    # 出了问题事后完全无从追溯。被 ComfyUI 剔除的输出分支也在这里(契约 D1,见 _result_warnings)。
+    _w = _result_warnings(result)
+    if _w:
+        done["warnings"] = _w
     if result.get("images"):
         done["images"] = result["images"]
     else:
@@ -1233,8 +1284,9 @@ def run_endpoint(payload: dict):
         or payload.get("job_id") or str(uuid.uuid4())
     # 先消毒再用:下面所有分支(job_state key / spawn 参数 / Volume 路径)都吃这个值。
     if not _safe_job_id(job_id):
+        # 文案与 _SAFE_JOB_ID / _safe_job_id 的规则逐条对应(契约 C1),改规则记得改这里
         return {"error": f"invalid job_id: {str(job_id)[:64]!r} "
-                         f"(只允许 [A-Za-z0-9_.-],最长 64)"}
+                         f"(只允许 [A-Za-z0-9_.-],首字符必须是字母或数字,不能含 ..,最长 64)"}
     workflow = payload.get("workflow")
     if not workflow:
         return {"error": "Missing 'workflow' in payload"}

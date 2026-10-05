@@ -151,10 +151,48 @@ def _redact_query(text: str) -> str:
     return _URL_QUERY.sub("?<redacted>", str(text))
 
 
-def _redirect_refused(r) -> str:
-    """3xx 一律当失败:跟随跳转会把请求头(含 bypass 密钥)和 body(含 job token)转发给跳转目标。"""
+def _redirect_refused(r, why: str = "") -> str:
+    """拒绝跟随时的说明(Location 的 query 打码)。"""
     loc = _redact_query(r.headers.get("Location", "") if getattr(r, "headers", None) else "")
-    return f"redirect refused (HTTP {r.status_code} → {loc or '?'})"
+    return f"redirect refused (HTTP {r.status_code} → {loc or '?'}" + (f";{why})" if why else ")")
+
+
+# 自己跟随跳转时只认这两个:它们按定义保持方法与 body。301/302 在 POST 上历来被客户端改成 GET、303 明确要求
+# 改 GET —— 对端期待的不是「把同一个 body 再 POST 一遍」,跟了就是猜。
+_FOLLOWABLE_REDIRECTS = (307, 308)
+_DEFAULT_PORTS = {"http": 80, "https": 443}
+
+
+def _same_site_redirect(url: str, r) -> tuple[str, str]:
+    """一次 3xx 能不能跟随:返回 (新地址, "") 或 ("", 拒绝原因)。纯函数。
+
+    只放行一种情况(2026-10-05 深度 review 复核 r2):同一主机的 http→https 升级(目标端口 443),
+    或同一 origin(协议 + 主机 + 端口都相同)内的跳转;并且必须是 307/308。跨主机一律拒绝 ——
+    请求头里有 bypass 密钥、body 里有 job token、PUT 的地址本身就是预签名凭据,换了主机就是交给别人。"""
+    from urllib.parse import urljoin, urlsplit
+    if r.status_code not in _FOLLOWABLE_REDIRECTS:
+        return "", f"HTTP {r.status_code} 不保证保留方法与 body,只跟随 307/308"
+    loc = (r.headers.get("Location") if getattr(r, "headers", None) else "") or ""
+    if not loc:
+        return "", "没有 Location"
+    # 反斜杠 / 控制字符:不同解析器对它们的理解不一致("/\\evil.com" 在浏览器里是跨主机),一律不跟
+    if "\\" in loc or any(ord(c) < 0x20 or ord(c) == 0x7f for c in loc):
+        return "", "Location 含反斜杠或控制字符"
+    try:
+        src, dst = urlsplit(url), urlsplit(urljoin(url, loc))
+        sport = src.port or _DEFAULT_PORTS.get(src.scheme)
+        dport = dst.port or _DEFAULT_PORTS.get(dst.scheme)
+    except ValueError:
+        return "", "Location 解析不了"
+    if dst.username or dst.password:
+        return "", "Location 带 userinfo"
+    if src.scheme not in _DEFAULT_PORTS or not src.hostname or dst.hostname != src.hostname:
+        return "", "跨主机,不跟随"
+    if dst.scheme == src.scheme and dport == sport:
+        return dst.geturl(), ""
+    if src.scheme == "http" and dst.scheme == "https" and dport == 443:
+        return dst.geturl(), ""
+    return "", "同一主机但换了协议或端口(只放行 http→https:443 升级)"
 
 
 def _default_poster(url: str, body: dict, headers: dict, timeout: int):
@@ -162,14 +200,28 @@ def _default_poster(url: str, body: dict, headers: dict, timeout: int):
 
     ⚠ allow_redirects=False:requests 对 POST 默认跟随跳转,307/308 会**原样带着 body 和自定义头**
       跳过去 —— 它只在跨域时剥 Authorization,不认识 x-vercel-protection-bypass。一个跨源 307
-      就能把 bypass 密钥和带 job token 的 body 交给第三方(2026-10-05 深度 review)。"""
+      就能把 bypass 密钥和带 job token 的 body 交给第三方(2026-10-05 深度 review)。
+    但一刀切不跟随又误伤了同站跳转:AIGC 地址配成 http:// 或少了尾斜杠时,对端的 308 升级 / 规范化
+      也会让交付整单失败(2026-10-05 深度 review 复核 r2)。所以改成自己跟:只按 _same_site_redirect
+      的规则、最多一次,方法与 body 原样。apex→www 属于跨主机,照旧拒绝,文案里提示改配置。"""
     import requests
-    try:
-        r = requests.post(url, json=body, headers=headers, timeout=timeout, allow_redirects=False)
-    except Exception as e:
-        return None, _redact_query(f"{type(e).__name__}: {e}")
-    if 300 <= r.status_code < 400:
-        return r.status_code, _redirect_refused(r)
+    target = url
+    for hop in range(2):
+        try:
+            r = requests.post(target, json=body, headers=headers, timeout=timeout, allow_redirects=False)
+        except Exception as e:
+            return None, _redact_query(f"{type(e).__name__}: {e}")
+        if not (300 <= r.status_code < 400):
+            break
+        nxt, why = _same_site_redirect(target, r) if hop == 0 else ("", "只跟随一次跳转")
+        if not nxt:
+            return r.status_code, (_redirect_refused(r, why)
+                                   + " —— 把 AIGC Studio 地址直接配成跳转后的最终地址(https://…)再部署")
+        note = ("。⚠ 地址配的是 http://,第一跳(含 bypass 头和 job token)已经明文发出,请改成 https://"
+                if target.startswith("http://") else "")
+        print(f"[bridge] AIGC 地址同站跳转 {_redact_query(target)} → {_redact_query(nxt)},"
+              f"已跟随一次(建议直接配成后者){note}")
+        target = nxt
     try:
         return r.status_code, r.json()
     except ValueError:
@@ -179,13 +231,22 @@ def _default_poster(url: str, body: dict, headers: dict, timeout: int):
 def _default_putter(put_url: str, file_path: str, headers: dict, timeout: int):
     """流式 PUT 文件到预签名地址 → (status_code, 响应头 dict)。网络异常 → (None, {})。
     只带 required_headers(Content-Type),不自加签名头;Content-Length 由 requests 按文件算。
-    不跟随跳转(同 _default_poster):预签名地址本身就是凭据,产物也不该被转去别处;3xx 由调用方按失败重试。"""
+    跳转规则同 _default_poster(_same_site_redirect,最多一次;每次重新打开文件,整份重传):
+    预签名地址本身就是凭据,产物也不该被转去别的主机;拒绝的 3xx 由调用方按失败重试。"""
     import requests
     try:
-        with open(file_path, "rb") as src:
-            r = requests.put(put_url, data=src, headers=headers, timeout=timeout, allow_redirects=False)
-        if 300 <= r.status_code < 400:
-            print(f"[bridge] R2 PUT {_redirect_refused(r)}")
+        target = put_url
+        for hop in range(2):
+            with open(file_path, "rb") as src:
+                r = requests.put(target, data=src, headers=headers, timeout=timeout, allow_redirects=False)
+            if not (300 <= r.status_code < 400):
+                break
+            nxt, why = _same_site_redirect(target, r) if hop == 0 else ("", "只跟随一次跳转")
+            if not nxt:
+                print(f"[bridge] R2 PUT {_redirect_refused(r, why)}")
+                break
+            print(f"[bridge] R2 PUT 同站跳转 → {_redact_query(nxt)},已跟随一次")
+            target = nxt
         return r.status_code, dict(r.headers)
     except Exception as e:
         print(f"[bridge] R2 PUT failed: {_redact_query(f'{type(e).__name__}: {e}')}")
