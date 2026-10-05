@@ -108,6 +108,12 @@ def main():
         cfg = dict(cfg_mod.load_config())
     except Exception as e:      # 新版 config 对损坏文件抛 ConfigCorrupt:同样停下,不吞
         sys.exit(f"✗ 读插件 config 失败({type(e).__name__}: {e}),已中止")
+    # AIGC 地址会原样写进 Secret,worker 往它发带旁路密钥 / job token 的回调:只收 https://
+    # (2026-10-05 深度 review 第二轮,规则见 contract.aigc_url_problem)。在任何写入之前挡。
+    import contract
+    _aigc_err = contract.aigc_url_problem(cfg.get("aigc_studio_base_url") or "")
+    if _aigc_err:
+        sys.exit(f"✗ 插件设置里的 {_aigc_err}。改好(或清空 = 停用)后再部署")
     ws = args.workspace
     # ⚠ 以前写死 comfyui-bridge:用了自定义 app 名的用户跑一次就多出第二个 app,插件 config 也被
     #   改指向它(2026-10-05 深度 review)。
@@ -187,6 +193,11 @@ def main():
     if rc != 0:
         print("✗ secret 写入失败(token 可能无效)")
         sys.exit(rc)
+    # 记下这台机器往 Secret 里写了哪些 AIGC 键:GUI 部署据此判断 config 里的空值是「用户清掉了」
+    # 还是「这台机器从没配过」(见 routes 的 _clear,2026-10-05 深度 review 第二轮)。
+    _persist(cfg_mod, {contract.AIGC_PUSHED_FIELD: [
+        f for f, k in (("aigc_base_url", "aigc_studio_base_url"), ("aigc_bypass_secret", "aigc_bypass_secret"))
+        if cfg.get(k)]})
 
     print("\n== 部署(首次拉镜像约 3-5 分钟)==")
     rc = run(node_sync.deploy_command(), cwd=str(MODAL_APP_DIR), env=env)

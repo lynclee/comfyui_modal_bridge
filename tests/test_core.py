@@ -4308,7 +4308,7 @@ def test_legacy_local_node_without_manifest_forces_migration(tmp_path, monkeypat
     files, _ = ln.scan_node_dir(node)
     digest = ln.compute_digest(files)
     monkeypatch.setattr(ln, "volume_digests", lambda cfg, folders: {"private_node": digest})
-    monkeypatch.setattr(ln, "volume_local_node_requirements", lambda cfg, folders: {})
+    monkeypatch.setattr(ln, "volume_local_node_requirements", lambda cfg, folders, **kw: {})
     plan = ln.plan_local_uploads({}, ["private_node"], tmp_path)
     assert [x["folder"] for x in plan["upload"]] == ["private_node"]
     assert not plan["uptodate"]

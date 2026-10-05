@@ -17,10 +17,13 @@ POST 走 body 的 auth_key;云端仍兼容旧的 ?key=,但本客户端不再往 
 localhost 直连策略相反,勿混用。
 """
 import base64
+import errno
 import json
 import mimetypes
 import os
 import re
+import socket
+import ssl
 import time
 import urllib.error
 import urllib.parse
@@ -31,6 +34,16 @@ from pathlib import Path
 
 class BridgeError(RuntimeError):
     pass
+
+
+# 报错文本里的 URL userinfo(user:pass@)一律打码:urllib 的网络错有时会带出代理地址,而本机代理 env
+# 常是 http://USER:PASS@host:port。comfyagent 的 vendor 副本先加了这一条(同名、同规则),2026-10-05
+# 深度 review 第二轮收回上游,免得两边 vendor 时互相覆盖。
+_CREDS_IN_URL = re.compile(r"([a-zA-Z][\w+.-]*://)[^/@\s]*:[^/@\s]*@")
+
+
+def _scrub_credentials(text) -> str:
+    return _CREDS_IN_URL.sub(r"\1***:***@", str(text))
 
 
 class BridgeHTTPError(BridgeError):
@@ -53,7 +66,8 @@ class SubmitUnknown(BridgeError):
     .job_id 是这次提交用的幂等键。调用方必须拿它去 status / cancel 核实,**绝不能换新 id 重新提交**
     (那是双跑双计费)。以前重试用尽只抛一个不带 id 的 BridgeError,调用方手里没有任何能查的东西,
     云端那个任务就成了谁也看不见的孤儿(2026-10-05 深度 review,契约 C3)。
-    「确定没提交」(401、其它 4xx、HTTP 200 + {"error"})不抛它,照旧抛普通 BridgeError。"""
+    「确定没提交」(401、其它 4xx、HTTP 200 + {"error"}、每次都失败在连接阶段)不抛它,照旧抛普通
+    BridgeError —— 但前面有过结果不确定的尝试时,之后的拒收也抛它(分类规则见 BridgeClient.submit)。"""
 
     def __init__(self, msg: str, job_id: str):
         super().__init__(msg)
@@ -94,6 +108,31 @@ def cancel_still_billing(resp) -> bool:
     if resp.get("status") == "not_found" or resp.get("cancel_noop"):
         return False
     return bool(resp.get("error"))
+
+
+_NO_ROUTE_ERRNOS = frozenset(x for x in (getattr(errno, "ENETUNREACH", None), getattr(errno, "EHOSTUNREACH", None),
+                                          getattr(errno, "EADDRNOTAVAIL", None)) if x is not None)
+
+
+def never_sent(exc) -> bool:
+    """urllib 的异常 → 这次请求是否**确定没有到达服务端**(失败在连接阶段,一个字节的请求都没发出去)。
+
+    只认 URLError 包着的这几种 reason:DNS 解析失败(socket.gaierror)、连接被拒(ConnectionRefusedError)、
+    网络 / 主机不可达、TLS 握手失败(ssl.SSLError,含证书校验)、代理 CONNECT 失败(http.client 抛的
+    OSError「Tunnel connection failed: …」)。为什么 URLError 可信:urllib 只把 h.request() 里(建连、
+    TLS 握手、代理隧道、发请求)抛出的 OSError 包成 URLError;读响应阶段的超时 / 断连
+    (TimeoutError、RemoteDisconnected、ConnectionResetError)原样抛出,不会走到这里。
+    **超时一律不算**:URLError(TimeoutError) 分不清是连接超时还是请求发到一半超时,按结果未知处理
+    (方向安全:多一次 status 核实,而不是双跑双计费)。HTTPError 也是 URLError 的子类,先排除。
+    给 submit 分类用,也给 mcp_server 判断本机 ComfyUI 那一跳(2026-10-05 深度 review 第二轮)。"""
+    if isinstance(exc, urllib.error.HTTPError) or not isinstance(exc, urllib.error.URLError):
+        return False
+    r = exc.reason
+    if isinstance(r, (socket.gaierror, ConnectionRefusedError, ssl.SSLError)):
+        return True
+    if isinstance(r, OSError) and getattr(r, "errno", None) in _NO_ROUTE_ERRNOS:
+        return True
+    return isinstance(r, OSError) and str(r).startswith("Tunnel connection failed")
 
 
 def _err_body(e: urllib.error.HTTPError):
@@ -190,7 +229,7 @@ class BridgeClient:
                 last = e
                 if attempt < retries:
                     time.sleep(1.5)
-        raise BridgeError(f"request failed: {last}") from last
+        raise BridgeError(f"request failed: {_scrub_credentials(last)}") from last
 
     # ── 协议 ──
     # /run 的重试间隔(秒),条数 = 重试次数(共 1 + len 次尝试)。指数退避:网关 504 多半是
@@ -204,9 +243,21 @@ class BridgeClient:
         gpu_class ∈ primary/cheap/top(部署时绑的卡型);needs_gpu=False → CPU worker(纯 API 工作流)。
 
         失败分两种,调用方必须分开处理:
-        - BridgeError:**确定没提交**(401 / 其它 4xx / 云端回 {"error"} 拒收),改好再提交即可;
-        - SubmitUnknown(BridgeError 的子类,带 .job_id):网络错 / 超时 / 5xx / 非 JSON 重试用尽,
-          任务**可能已在云端跑**。拿 .job_id 去 status / cancel 核实,别重新提交。"""
+        - BridgeError:**确定没提交**,改好再提交即可。消息一律以 `401` 或 `/run:` 开头(comfyagent 的
+          `_definitely_rejected` 按这两个前缀认,别改):401(key 不对)、其它 4xx(`/run: HTTP 422 …`)、
+          云端回 {"error"} 拒收(`/run: …`)、每次尝试都失败在连接阶段(`/run: 连不上云端…`);
+        - SubmitUnknown(BridgeError 的子类,带 .job_id):任务**可能已在云端跑**。拿 .job_id 去
+          status / cancel 核实,别重新提交。
+
+        每次尝试的结局分三类,决定重不重试、最后抛哪一种(2026-10-05 深度 review 第二轮):
+          · 没发出去:连接阶段就失败(DNS / 连接被拒 / 不可达 / TLS 握手 / 代理 CONNECT,判据见 never_sent)。
+            请求没到云端,重试是安全的;**全部**尝试都是这一类 → 确定没提交。
+          · 结果不确定:超时、读响应时断连、5xx / 408 / 429、非 JSON、缺 id、拒绝跟随的重定向 —— 请求可能
+            已经到了云端、spawn 了。重试(同一个 job_id,云端会回 duplicate,不会双跑)。
+          · 确定拒收:401 / 其它 4xx / HTTP 200 + {"error"}。不重试。
+        只要**之前**有过一次结果不确定的尝试,之后的确定拒收也抛 SubmitUnknown(附拒收原文):前一次
+        可能已经 spawn 了,后一次的 401 / 404 说明不了前一次的结局。以前直接抛「确定没提交」,
+        job_id 跟着丢了,调用方会换新 id 重交(2026-10-05 深度 review 第二轮)。"""
         payload = {"workflow": workflow, "tier": tier, "needs_gpu": bool(needs_gpu),
                    "gpu_class": gpu_class, "delivery": {"mode": "desktop"},
                    "user_id": "bridge-client"}
@@ -218,6 +269,7 @@ class BridgeClient:
         job_id = payload["job_id"] = job_id or str(uuid.uuid4())
         delays = tuple(self._SUBMIT_RETRY_DELAYS)
         last: Exception | None = None
+        uncertain = 0            # 结果不确定的尝试次数(可能已经到了云端)
         for attempt in range(len(delays) + 1):
             if attempt:
                 time.sleep(delays[attempt - 1])
@@ -226,21 +278,44 @@ class BridgeClient:
             except BridgeHTTPError as e:
                 # 4xx = 请求被拒、没有进到 spawn(408 / 429 除外:超时与限流不说明请求被处理了没有)
                 if 400 <= e.status < 500 and e.status not in (408, 429):
-                    raise
+                    # ⚠ 前缀 `/run:`:comfyagent 按它认「确定拒收」。以前是 "HTTP 422 https://…",
+                    #   422 / 413 / 404 在那边全被当成结果未知(2026-10-05 深度 review 第二轮)。401 原样
+                    #   (消息以 "401" 开头,那边本来就认)。
+                    rejected = e if e.status == 401 else BridgeHTTPError(f"/run: {e}", e.status, e.body)
+                    self._raise_rejected(rejected, job_id, uncertain)
+                uncertain += 1
                 last = e
                 continue
             except BridgeError as e:      # 网络错 / 超时 / 非 JSON / 拒绝跟随的重定向
+                if not never_sent(e.__cause__):
+                    uncertain += 1
                 last = e
                 continue
             if isinstance(d, dict) and "error" in d:
-                raise BridgeError(f"/run: {d['error']}")   # 云端校验没过(job_id / workflow / delivery),确定没提交
+                # 云端校验没过(job_id / workflow / delivery),确定没提交
+                self._raise_rejected(BridgeError(f"/run: {d['error']}"), job_id, uncertain)
             if isinstance(d, dict) and d.get("id"):
                 return d
+            uncertain += 1
             last = BridgeError(f"/run 响应缺 id: {str(d)[:200]}")
+        if not uncertain:
+            raise BridgeError(
+                f"/run: 连不上云端,请求没有发出去({len(delays) + 1} 次尝试都失败在连接阶段;最后一次:{last})。"
+                f"任务没有提交,网络恢复后直接重新提交即可") from last
         raise SubmitUnknown(
             f"提交结果未知 job_id={job_id}:{len(delays) + 1} 次尝试都没拿到确定答复(最后一次:{last})。"
             f"任务可能已在云端排队 / 运行 —— 先用 status/cancel 核实这个 job_id,别重新提交(会双跑双计费)",
             job_id)
+
+    @staticmethod
+    def _raise_rejected(err: BridgeError, job_id: str, uncertain: int):
+        """确定拒收:之前没有结果不确定的尝试 → 原样抛(确定没提交);有过 → 抛 SubmitUnknown,附拒收原文。"""
+        if not uncertain:
+            raise err
+        raise SubmitUnknown(
+            f"提交结果未知 job_id={job_id}:前面 {uncertain} 次尝试结果不确定(请求可能已到云端并开跑),"
+            f"之后这次被拒收({err})—— 拒收说明不了前一次的结局。先用 status/cancel 核实这个 job_id,"
+            f"别重新提交(会双跑双计费)", job_id) from err
 
     def status(self, job_id: str) -> dict:
         """status ∈ queued/running/delivering/completed/failed/cancelled/not_found;

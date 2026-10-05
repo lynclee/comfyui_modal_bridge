@@ -731,7 +731,8 @@ def test_health_full_only_for_loopback_or_capability(_isolate):
     local, anon_st, anon, anon_calls, remote = harness._run(go)
     assert local["ok"] and "custom_nodes_manifest" in local["modal"], "本机直连行为不变"
     assert anon_st == 200 and anon_calls == 0, "匿名非本机请求不能唤醒云端"
-    assert set(anon) <= {"ok", "healthy", "limited", "detail"} and anon["healthy"] is True, anon
+    # 2026-10-05 第二轮:受限视图多回一个 checked_at(结论的时刻,过期 / 换 endpoint 时为 null)
+    assert set(anon) <= {"ok", "healthy", "checked_at", "limited", "detail"} and anon["healthy"] is True, anon
     assert "custom_nodes_manifest" in remote["modal"], "带有效 capability 的应拿完整内容"
 
 

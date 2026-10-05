@@ -331,6 +331,50 @@ def _read_cnr_info(path: Path) -> tuple[str, str] | None:
     return None
 
 
+# 判 Registry 节点改没改时的时间容差(秒):有的文件系统 mtime 只精确到 1~2 秒(FAT / SMB / 部分虚拟化共享),
+# 解包与写 .tracking 落在同一刻时别把它们误判成「解包之后又改过」。
+_CNR_MTIME_SLACK_S = 2.0
+
+
+def cnr_dirty(path: Path) -> bool:
+    """Registry(CNR)装的节点,本机有没有改过。ComfyUI-Manager 解包后把包里的文件逐行写进 .tracking
+    (zip 的 namelist,先解包、后写 .tracking),之后不再碰它 —— 所以:
+      · .tracking 里列的文件,mtime 比 .tracking 本身新(超过容差)→ 解包之后被改过;
+      · 出现 .tracking 里没有的 .py → 本机加了代码。
+    只看 .py 新增、不看别的新文件:节点运行时常往自己目录写配置 / 缓存 / 下载的模型(json、txt、权重),
+    那些不改变代码,算进去会把大量公开节点永久判成 dirty(同 worktree_dirty 的取舍)。
+    跳过隐藏目录与已知垃圾目录(__pycache__、.venv 之类),免得把节点自带的虚拟环境整个算成「新增代码」。
+    读不了 .tracking 时按干净处理:这条只是补「改了没察觉」,不该让读不到元数据的节点全走私有通道。"""
+    tracking = path / ".tracking"
+    try:
+        lines = tracking.read_text(encoding="utf-8", errors="replace").splitlines()
+        t0 = tracking.stat().st_mtime
+    except OSError:
+        return False
+    listed = set()
+    for ln in lines:
+        rel = ln.strip().replace("\\", "/")
+        rel = rel[2:] if rel.startswith("./") else rel
+        if rel and not rel.endswith("/"):
+            listed.add(rel)
+    for rel in listed:
+        try:
+            if (path / rel).stat().st_mtime > t0 + _CNR_MTIME_SLACK_S:
+                return True
+        except OSError:
+            if rel.endswith(".py"):
+                return True     # 列了的代码文件被删了:云端从 Registry 装的那份还有它
+    for root, dirs, files in os.walk(path):
+        dirs[:] = [d for d in dirs if not d.startswith(".") and d not in _JUNK_DIRS
+                   and d not in ("venv", "env", "site-packages")]
+        for fn in files:
+            if fn.endswith(".py"):
+                rel = Path(root, fn).relative_to(path).as_posix()
+                if rel not in listed:
+                    return True
+    return False
+
+
 def _baked_entry(name: str, src: dict) -> dict:
     """任一来源(云端 manifest / 本机清单 / folder_git_info)→ 规整的清单条目。
     CNR 的统一成 {url: 版本 API 地址, commit: "", cnr_id, version};其它只留 name/url/commit。"""
@@ -619,8 +663,8 @@ def reconcile_baked_with_cloud(cfg: dict) -> Reconciled:
         entries, back_drift = complete_baked_entries_ex(missing, {}, manifest)
         back = [e for e in entries if (e.get("url") or "").strip()]
         lost = [e["name"] for e in entries if not (e.get("url") or "").strip()]
-        if lost:
-            raise DeployBlocked(unresolved_nodes_message(lost))   # 中止时什么都不写
+        if lost:   # 中止时什么都不写
+            raise DeployBlocked(unresolved_nodes_message(lost, explain_unresolved(lost, {}, manifest)))
         drift += back_drift
     if back or corrected:
         write_baked_nodes(local + back)
@@ -663,11 +707,58 @@ def auto_deploy_blocker(rec: Reconciled) -> str:
             f"在面板点「推送到云端」确认部署后再提交(明细见 ComfyUI 控制台)")
 
 
-def unresolved_nodes_message(unresolved: list[str]) -> str:
-    return (f"云端镜像装着 {', '.join(unresolved)},但本机清单里没有,也拿不到它们的来源"
-            f"(云端版本太旧报不出来源 / 来源带凭据被脱敏 / 本机也没装)。"
-            f"继续部署会把它们从镜像里删掉,已中止。\n"
-            f"处理:在本机装上这些节点后再部署;若确实不要它们,到「管理云端节点」里移除。")
+def explain_unresolved(names: list[str], local_by_name: dict | None = None,
+                       manifest: list[dict] | None = None, *, cloud_read: bool = True) -> dict[str, str]:
+    """补不出来源的节点 → {名字: 一句原因}(给 409 / DeployBlocked 的说明用)。说明里不打印 url(私有仓库常带凭据)。
+
+    ⚠ 以前一律说「本机清单里没有」:云端那条是带凭据的私有仓库(/health 脱敏了凭据)、本机清单里其实有
+      同一个仓库、只是地址不带凭据(ssh / 凭据助手克隆的)时,这句话是错的,用户照着去查清单只会更糊涂
+      (2026-10-05 深度 review 第二轮)。
+    cloud_read=False:手里没有云端 manifest(/sync_nodes 读云端之前的检查)。这时按补全规则反推 ——
+      本机清单 / 本机装的明明有地址却还是补不出来,只可能是云端那条被脱敏了(见 complete_baked_entries_ex)。
+    只对传进来的名字跑 git(_local_git_entry),调用方只传这次真补不出来的那几个。"""
+    by_name = {n["name"]: n for n in (manifest or []) if isinstance(n, dict) and n.get("name")}
+    out = {}
+    for name in names:
+        c = by_name.get(name)
+        srcs = []
+        listed = (local_by_name or {}).get(name)
+        if isinstance(listed, dict) and (listed.get("url") or "").strip():
+            srcs.append(("清单里", listed["url"].strip()))
+        g = _local_git_entry(name)
+        if g and (g.get("url") or "").strip():
+            srcs.append(("实际装的", g["url"].strip()))
+        redacted = bool(c and c.get("url_redacted")) or (not cloud_read and bool(srcs))
+        if redacted:
+            same = [(w, u) for w, u in srcs if c is None or _same_repo(u, c.get("url"))]
+            plain = [(w, u) for w, u in same if not _has_url_creds(u)]
+            if plain:
+                repo = "是同一个仓库、但地址" if c is not None else "地址"
+                out[name] = (f"{name}:云端那条是带凭据的私有仓库(/health 报出来时凭据已脱敏),本机{plain[0][0]}的"
+                             f"{repo}不带凭据(ssh / 凭据助手克隆的),云端构建拿它克隆不下来")
+            elif srcs:
+                out[name] = (f"{name}:云端那条是带凭据的私有仓库(凭据已脱敏),本机{srcs[0][0]}的地址指向另一个仓库,"
+                             f"不能拿来顶替")
+            else:
+                out[name] = f"{name}:云端那条是带凭据的私有仓库(凭据已脱敏),本机清单里没有它、本机也没装"
+        elif cloud_read and (manifest is None or (c is not None and not (c.get("url") or "").strip())):
+            out[name] = (f"{name}:云端没报它的来源(云端早于 0.8.48,或那条本来就没有地址),本机清单里没有,"
+                         f"本机也没装(或装的没有 git 来源)")
+        else:
+            out[name] = f"{name}:本机清单里没有它的来源地址,本机也没装(或装的没有 git 来源)"
+    return out
+
+
+def unresolved_nodes_message(unresolved: list[str], reasons: dict | None = None) -> str:
+    """补不出来源 → 中止说明。reasons 来自 explain_unresolved;没给的名字用笼统的说法。"""
+    reasons = reasons or {}
+    lines = "".join(
+        f"\n  · {reasons.get(n) or f'{n}:本机清单里没有,也拿不到它的来源(云端版本太旧报不出来源 / 来源带凭据被脱敏 / 本机也没装)'}"
+        for n in unresolved)
+    return (f"云端镜像装着 {', '.join(unresolved)},这次补不出可克隆的来源,继续部署会把它们从镜像里删掉"
+            f"(或让镜像构建克隆失败),已中止:{lines}\n"
+            f"处理:在本机装上这些节点(带凭据的私有仓库要用带凭据的地址克隆,或到有凭据的那台机器上同步);"
+            f"若确实不要它们,到「管理云端节点」里移除。")
 
 
 def ensure_baked_file() -> None:
@@ -967,9 +1058,11 @@ def folder_git_info(folder: str) -> dict:
             return info
     cnr = _read_cnr_info(path)
     if cnr:
-        # Manager 不跟踪 Registry 包里的文件改动,这里也没有可比的依据 → dirty 按 False(同 pyproject 兜底)
+        # dirty 按 .tracking 判(见 cnr_dirty)。以前写死 False:本机改了 Registry 节点,云端照样从 Registry
+        # 下载原版,改动被静默丢掉 —— 而以前这类节点走 Volume 时是带着本机文件的(2026-10-05 深度 review 第二轮)。
+        # dirty 的节点在 plan_node_sync 里走私有节点通道(local_pack),把本机这份传上去。
         return {"folder": folder, "has_git": True, "url": cnr_url(*cnr), "commit": "",
-                "cnr_id": cnr[0], "version": cnr[1], "pushed": True, "dirty": False}
+                "cnr_id": cnr[0], "version": cnr[1], "pushed": True, "dirty": cnr_dirty(path)}
     repo = _pyproject_repo_url(path)
     if repo:
         return {"folder": folder, "has_git": True,
@@ -1153,8 +1246,10 @@ def plan_node_sync(prompt: dict, baked: list[dict] | None = None,
             # 自写节点(无 git remote)、或有 remote 但本轮改动没推 —— 走本地打包通道:
             # 打包传 Volume,worker 启动时解压。不需要重 build 镜像(见 local_nodes.py)。
             # remote 是云端克隆不了的地址(自建 ssh / 本地路径)也走这里,而不是进镜像清单让构建失败。
+            # dirty 单列(2026-10-05 第二轮):Registry 节点现在也会判 dirty,它们从来没有「没推送」这回事
             item = {"folder": folder, "class_types": sorted(class_types),
                     "reason": ("unclonable" if git.get("url_problem")
+                               else "dirty" if git.get("dirty")
                                else "unpushed" if git["has_git"] else "no_git")}
             if git.get("url_problem"):
                 item["detail"] = git["url_problem"]
@@ -1383,8 +1478,8 @@ def secret_upsert_cmd(cfg: dict, hf_token: str = "", civitai_token: str = "",
     公开 API 删不了键(proto 支持,但只能走私有 stub),所以「清空」是写成空串 —— worker 读这些键
     都按真假判断(空串 = 没配),效果等同删除。SDK 太旧时脚本退回旧的整份重建并明说。
 
-    跑的是 `python node_sync.py secret-upsert …`(见文件末尾):值仍以 KEY=VALUE 出现在 argv 里,
-    redact_cmd 的打码规则原样适用。"""
+    跑的是 `python -c <引导> <插件目录> secret-upsert <名> KEY=VALUE…`(见 _SECRET_UPSERT_BOOT):值仍以
+    KEY=VALUE 单独出现在 argv 里,redact_cmd 的打码规则原样适用。"""
     values = {"bridge_key": bridge_key, "hf_token": hf_token, "civitai_token": civitai_token,
               "comfy_api_key": comfy_api_key, "aigc_base_url": aigc_base_url,
               "aigc_bypass_secret": aigc_bypass_secret}
@@ -1395,12 +1490,22 @@ def secret_upsert_cmd(cfg: dict, hf_token: str = "", civitai_token: str = "",
     app_name = cfg.get("modal_app_name", "comfyui-bridge")
     pairs = [f"{k}={v}" for f, v in values.items() if v for k in _SECRET_KEYS[f]]
     clears = [f"--clear={k}" for f in sorted(clear) if not values.get(f) for k in _SECRET_KEYS[f]]
-    return [sys.executable, str(Path(__file__).resolve()), "secret-upsert",
+    return [sys.executable, "-c", _SECRET_UPSERT_BOOT, str(_HERE), "secret-upsert",
             f"{app_name}-secrets", *pairs, *clears]
 
 
+# secret_upsert_cmd 的子进程入口。⚠ 不能是 `python node_sync.py …`(2026-10-05 深度 review 第二轮):
+#   Windows 便携版 ComfyUI 的 python_embeded/python3XX._pth 让解释器进入隔离模式(等同 -P / -I),
+#   脚本所在目录不进 sys.path,node_sync 顶部的 `import health_client` 直接 ModuleNotFoundError ——
+#   所有 GUI 部署卡在写 Secret 这一步。改用 -c,自己把插件目录(argv[1])插到 sys.path 最前面,
+#   不依赖解释器的路径规则;argv[2] 固定是 "secret-upsert"(给日志 / 测试认),之后才是真正的参数。
+#   代码里不出现 KEY=VALUE 形态的串,redact_cmd 不会误判它。
+_SECRET_UPSERT_BOOT = ("import sys;sys.path.insert(0,sys.argv[1]);import node_sync;"
+                       "sys.exit(node_sync._secret_upsert_main(sys.argv[3:]))")
+
+
 def _secret_upsert_main(argv: list[str], modal_mod=None) -> int:
-    """secret_upsert_cmd 的执行体:`python node_sync.py secret-upsert <名> KEY=VALUE… [--clear=KEY…]`。"""
+    """secret_upsert_cmd 的执行体:argv = [<secret 名>, KEY=VALUE…, --clear=KEY…]。"""
     if not argv:
         print("用法: python node_sync.py secret-upsert <secret 名> KEY=VALUE... [--clear=KEY ...]")
         return 2
@@ -1474,7 +1579,7 @@ def deploy_env(cfg: dict) -> dict:
 
 
 if __name__ == "__main__":
-    # 只给 secret_upsert_cmd 用:部署流程以子进程跑它,与 `modal secret create` 同样的 argv 形态。
+    # 手动排查用(部署流程走 _SECRET_UPSERT_BOOT,不走这里:隔离模式的 Python 下脚本形态 import 不到同目录模块)。
     if len(sys.argv) >= 2 and sys.argv[1] == "secret-upsert":
         sys.exit(_secret_upsert_main(sys.argv[2:]))
     sys.exit("用法: python node_sync.py secret-upsert <secret 名> KEY=VALUE... [--clear=KEY ...]")

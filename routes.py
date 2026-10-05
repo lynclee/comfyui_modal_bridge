@@ -12,6 +12,7 @@ import mimetypes
 import re
 import secrets
 import subprocess
+import time
 import traceback
 from pathlib import Path
 
@@ -754,8 +755,33 @@ def _admin_denial(request: web.Request) -> web.Response | None:
     )
 
 
-# /health 匿名(受限)视图用:最近一次完整检查的结论。只是个布尔,不含 manifest。
-_LAST_HEALTH: dict = {"healthy": None}
+# /health、/version 匿名(受限)视图用:最近一次真实检查的结论。只是个布尔,不含 manifest。
+# ⚠ 带上检查时刻和 endpoint(2026-10-05 深度 review 第二轮):以前只存一个布尔,云端停了 / 换了
+#   workspace 之后匿名视图还一直报 healthy:true。endpoint 对不上、或超过 _LAST_HEALTH_MAX_AGE_S
+#   就回 null(不知道),不拿旧结论冒充。写入方:完整 /health、/version、部署收尾的 _deploy_verify。
+_LAST_HEALTH: dict = {"healthy": None, "checked_at": None, "endpoint": None}
+_LAST_HEALTH_MAX_AGE_S = 600
+
+
+def _record_health(endpoint, healthy: bool) -> None:
+    _LAST_HEALTH.update(healthy=bool(healthy), checked_at=time.time(), endpoint=endpoint or "")
+
+
+def _cached_health(endpoint) -> dict:
+    """受限视图里的 {healthy, checked_at}:换了 endpoint / 太旧 / 从没查过 → 两者都是 None。"""
+    h = dict(_LAST_HEALTH)
+    at = h.get("checked_at")
+    fresh = (isinstance(at, (int, float)) and h.get("endpoint") == (endpoint or "")
+             and 0 <= time.time() - at <= _LAST_HEALTH_MAX_AGE_S)
+    return {"healthy": h.get("healthy") if fresh else None, "checked_at": at if fresh else None}
+
+
+def _limited_endpoint() -> str:
+    """受限视图比对缓存用的当前 endpoint。config 读不了就当不知道(匿名请求不回 config 的错误详情)。"""
+    try:
+        return str(cfg_mod.load_config().get("modal_endpoint_base") or "")
+    except Exception:
+        return "\0unknown"
 
 
 def _health_full_view(request: web.Request) -> bool:
@@ -865,26 +891,14 @@ def _compute_local_node_reqs(cfg: dict) -> list[str]:
     与 _refresh_local_node_reqs 拆开,是因为 /local_nodes_diff 这种只读预检也要算这个
     指纹(判断"依赖镜像是否还欠一次重建"),而它不该写文件、也不该去抢 _DEPLOY_LOCK。
     """
-    # 读不到 Volume 时 list_volume_local_nodes 抛 local_nodes.VolumeUnavailable(契约 C13),
-    # 这里**不接**,让调用方中止。以前读失败与「真的没有」都是 [],于是退回本机那份被 gitignore 的
-    # 清单 —— 新机器 / 插件重装后它是空的,一次部署就把所有私有节点的依赖从镜像里删了(深度 review)。
-    folders = local_nodes.list_volume_local_nodes(cfg, max_age=0)
-    if not folders:
-        return []   # 确认 Volume 上没有私有节点(C13 起 [] 只表示这个)
-    manifests = local_nodes.volume_local_node_requirements(cfg, folders)
-    reqs: list[str] = []
-    seen: set[str] = set()
-    for folder in sorted(manifests):
-        for req in manifests[folder]:
-            if req not in seen:
-                seen.add(req)
-                reqs.append(req)
-    if set(folders) - set(manifests):
-        for req in node_sync.read_local_node_reqs():
-            if req not in seen:
-                seen.add(req)
-                reqs.append(req)
-    return reqs
+    # 读不到 Volume 时抛 local_nodes.VolumeUnavailable(契约 C13),这里**不接**,让调用方中止。
+    # 以前读失败与「真的没有」都是 [],于是退回本机那份被 gitignore 的清单 —— 新机器 / 插件重装后
+    # 它是空的,一次部署就把所有私有节点的依赖从镜像里删了(深度 review)。
+    # ⚠ 读 manifest 也必须是 strict(2026-10-05 深度 review 第二轮):以前这里自己拼,调的是非 strict 的
+    #   volume_local_node_requirements,读某个 manifest 时一次网络抖动被当成「这个包没有 manifest」,
+    #   新机器上扁平清单又是空的 → 那个节点的依赖从镜像里消失,自动部署照样 rc=0,还把不完整的结果
+    #   记进 meta。直接用部署期那份(deploy.py / bridge_cli 共用),规则只有一份。
+    return local_nodes.volume_node_requirements(cfg, node_sync.read_local_node_reqs())
 
 
 def _refresh_local_node_reqs(cfg: dict) -> list[str]:
@@ -1266,8 +1280,17 @@ async def _deploy_locked(resp: web.StreamResponse, body: dict, token_id: str,
     # 合并语义(契约 C16):空值 = 这次没提供,Secret 里原有的保持不动 —— 别的机器 / deploy.py 写进去的
     # 凭据不会被这台机器的 config 抹掉。AIGC 集成是例外:用户在面板清空了地址 / 密钥,就要显式清掉,
     # 否则旧地址和旧密钥会一直留在云端,worker 继续往一个用户以为已经停用的站点回调。
+    # ⚠ 但「空」不等于「用户清空了」(2026-10-05 深度 review 第二轮):前端 /deploy 不发
+    #   aigc_studio_base_url,从没配过 AIGC 的机器 config 里本来就是空的,以前照样带 --clear=AIGC_*,
+    #   把别的机器写进 Secret 的 AIGC 配置清掉。只清**这台机器知道有过**的:部署前 config 里有值
+    #   (这次变空 = 用户清了),或这台机器上次部署往 Secret 里写过它(contract.AIGC_PUSHED_FIELD)—— 后者兜住
+    #   「在设置页清空 URL 再部署」:那时 config 里的 URL 在部署前就已经空了。
+    _pushed = _base_cfg.get(contract.AIGC_PUSHED_FIELD)
+    _aigc_known = {f for f, k in (("aigc_base_url", "aigc_studio_base_url"),
+                                  ("aigc_bypass_secret", "aigc_bypass_secret"))
+                   if _base_cfg.get(k) or (isinstance(_pushed, list) and f in _pushed)}
     _clear = tuple(f for f, v in (("aigc_base_url", aigc_base_url), ("aigc_bypass_secret", aigc_bypass))
-                   if not v)
+                   if not v and f in _aigc_known)
     rc = await _run_streamed(
         resp, node_sync.secret_upsert_cmd(cfg, hf_token, civitai_token, bridge_key,
                                           comfy_api_key, aigc_base_url, aigc_bypass, clear=_clear),
@@ -1276,6 +1299,13 @@ async def _deploy_locked(resp: web.StreamResponse, body: dict, token_id: str,
     if rc != 0:
         await _emit(resp, "== ✗ secret 创建失败(token 可能无效)==\n")
         return rc, ()
+    # Secret 已写:马上记下这台机器往里写了哪些 AIGC 键(不等部署收尾 —— modal deploy 失败时 Secret
+    # 也已经是新的,下次部署要按它判断该不该清)。
+    _pushed_now = [f for f, v in (("aigc_base_url", aigc_base_url), ("aigc_bypass_secret", aigc_bypass)) if v]
+    _cur = cfg_mod.load_config()
+    _cur[contract.AIGC_PUSHED_FIELD] = _pushed_now
+    cfg_mod.save_config(_cur)
+    _deploy_updates[contract.AIGC_PUSHED_FIELD] = cfg[contract.AIGC_PUSHED_FIELD] = _pushed_now
 
     # 3.2) modal deploy
     await _emit(resp, "\n== modal deploy(首次拉镜像约 3-5 分钟,别关窗口)==\n")
@@ -1305,10 +1335,12 @@ async def _deploy_verify(resp: web.StreamResponse, cfg: dict, endpoint_base: str
         try:
             async with aiohttp.ClientSession() as s:
                 h = await modal_client.health(s, cfg)
+            _record_health(endpoint_base, isinstance(h, dict) and h.get("healthy"))
             await _emit(resp, f"== ✓ /health: {h} ==\n")
             _not_found = None
             break
         except Exception as e:
+            _record_health(endpoint_base, False)
             if getattr(e, "kind", None) == "not_deployed":
                 _not_found = e
                 if _attempt + 1 < _HEALTH_404_TRIES:
@@ -1374,6 +1406,13 @@ def _setup_routes():
         prompt = body.get("prompt")
         if not isinstance(prompt, dict):
             return web.json_response({"error": "prompt (object) required"}, status=400)
+        # 契约 D2(2026-10-05 深度 review 第二轮):调用方可以自带 job_id(幂等键)。MCP 本地模式靠它在
+        # 自己这一跳超时 / 断线时也能交还一个可查的 id —— 以前 id 只在 submit_job 里生成,MCP 等不到
+        # 响应就什么都拿不到,agent 只能重交,云端多一个孤儿任务。按 C1 校验(会拼进本地落盘路径)。
+        caller_job_id = body.get("job_id")
+        if caller_job_id is not None and not contract.is_safe_job_id(caller_job_id):
+            return web.json_response({"error": f"job_id 不合法(规则同云端:字母数字开头,只含字母数字 _ . -,"
+                                               f"≤64 位,不含 ..):{str(caller_job_id)[:80]!r}"}, status=400)
 
         cfg = cfg_mod.load_config()
         tier = (_opt_str(body, "tier") or "40g").lower()
@@ -1451,6 +1490,7 @@ def _setup_routes():
                     session, cfg, workflow=prompt,
                     input_images=input_images or None, tier=tier, needs_gpu=needs_gpu,
                     gpu_class=gpu_class, local_nodes=local_digests or None,
+                    job_id=caller_job_id,
                 )
         except Exception as e:
             # 契约 C3:重试全部失败时 submit_job 抛 SubmitUnknown(带 .job_id)—— 任务**可能已经在
@@ -2126,9 +2166,17 @@ def _setup_routes():
         # ⚠ 空 url 的条目以前会在 write_baked_nodes 出口被静默丢掉,随后的部署就把它从镜像里删了。
         #   这里的 new_baked 来自 /check_nodes 的补全,补不出 url(云端太老 / 来源被脱敏 / 本机没装)
         #   的节点必须拒绝,不能当成「用户要删它」(2026-09-24 review)。
+        # 这次明确要删的不算(2026-10-05 深度 review 第二轮:只在这次同步真要保留它时才拦)—— 用户要移除的
+        # 节点补不出来源无所谓,不能反过来挡住移除它的那次同步。
+        _pruned = set(prune)
+        clean = [e for e in clean if e["name"] not in _pruned]
         _lost = [e["name"] for e in clean if not (e.get("url") or "").strip()]
         if _lost:
-            return web.json_response({"error": node_sync.unresolved_nodes_message(_lost)}, status=409)
+            # 说明要准:云端那条是带凭据的私有仓库、本机清单里其实有同一个仓库(只是地址不带凭据)时,
+            # 以前也说成「本机清单里没有」。这里还没读云端(不碰网络),按补全规则反推;要跑 git,放线程里。
+            _local = {n["name"]: n for n in node_sync.read_baked_nodes() if n.get("name")}
+            _why = await asyncio.to_thread(node_sync.explain_unresolved, _lost, _local, None, cloud_read=False)
+            return web.json_response({"error": node_sync.unresolved_nodes_message(_lost, _why)}, status=409)
 
         # 读云端 + 写清单 + deploy 整段独占:并发请求会互相覆盖 _custom_nodes_data.py、两个 deploy 也冲突。
         # ⚠ 锁要在 prepare 之前拿:锁内对账出的 409 必须是 JSON(契约 C6),流一开就回不了状态码了。
@@ -2149,6 +2197,15 @@ def _setup_routes():
                 if getattr(e, "kind", None) != "not_deployed":   # 未部署 = 全新部署,没有可保护的
                     unchecked = str(e) or type(e).__name__
                     local_names = {n.get("name") for n in node_sync.read_baked_nodes() if n.get("name")}
+                    if not local_names:
+                        # 与 reconcile_baked_with_cloud 同一条规则(2026-10-05 深度 review 第二轮):读不到云端、
+                        # 本机清单又是空的 —— 多半是插件重装丢了清单。这时下面「会消失的节点」永远是空集,
+                        # 以前照常部署,镜像清单就只剩这次计划里的几个,云端其余节点全被删掉。
+                        return web.json_response({
+                            "error": (f"读不到云端装了哪些节点({_one_line(unchecked)}),而本机节点清单是空的 —— "
+                                      f"多半是插件重装丢了清单,照这次的计划部署可能清空云端其余的自定义节点,"
+                                      f"已拒绝。检查网络 / bridge key 后重试。"),
+                            "cloud_unchecked": unchecked}, status=409)
                     vanish = sorted(local_names - wanted - dropped)
                     if vanish:
                         return web.json_response({
@@ -2165,8 +2222,9 @@ def _setup_routes():
                         node_sync.complete_baked_entries, missing, local_by_name, manifest)
                     lost = [x["name"] for x in entries if not (x.get("url") or "").strip()]
                     if lost:
+                        _why = await asyncio.to_thread(node_sync.explain_unresolved, lost, local_by_name, manifest)
                         return web.json_response(
-                            {"error": node_sync.unresolved_nodes_message(lost)}, status=409)
+                            {"error": node_sync.unresolved_nodes_message(lost, _why)}, status=409)
                     clean.extend(entries)
                     added_back = [x["name"] for x in entries]
 
@@ -2251,6 +2309,13 @@ def _setup_routes():
         else:
             errs += _deploy_name_errors(
                 workspace, (body.get("app_name") or _stored.get("modal_app_name") or "comfyui-bridge").strip())
+        # AIGC 地址只收 https://(2026-10-05 深度 review 第二轮,见 contract.aigc_url_problem)。查的是这次
+        # 实际会写进 Secret 的那个:body 带了就看 body,没带看 config(以前的设置页收过 http://)。
+        _aigc = (body.get("aigc_studio_base_url") if "aigc_studio_base_url" in body
+                 else _stored.get("aigc_studio_base_url"))
+        _aigc_err = contract.aigc_url_problem(_aigc or "")
+        if _aigc_err:
+            errs.append(_aigc_err + ("" if "aigc_studio_base_url" in body else "(当前设置里存的地址)"))
 
         async def run(resp: web.StreamResponse) -> int:
             if errs:
@@ -2321,15 +2386,16 @@ def _setup_routes():
             return _config_corrupt_response(e)
         if not full:
             return web.json_response({
-                "ok": True, "healthy": _LAST_HEALTH["healthy"], "limited": True,
-                "detail": "非本机访问未带有效 capability:只给最近一次检查的结论,不查询云端"})
+                "ok": True, **_cached_health(_limited_endpoint()), "limited": True,
+                "detail": "非本机访问未带有效 capability:只给最近一次检查的结论(10 分钟内、同一 endpoint),"
+                          "不查询云端"})
         async with aiohttp.ClientSession() as s:
             try:
                 h = await modal_client.health(s, cfg)
-                _LAST_HEALTH["healthy"] = bool(isinstance(h, dict) and h.get("healthy"))
+                _record_health(cfg.get("modal_endpoint_base"), isinstance(h, dict) and h.get("healthy"))
                 return web.json_response({"ok": True, "modal": h})  # 不回传 config(含 token)
             except Exception as e:
-                _LAST_HEALTH["healthy"] = False
+                _record_health(cfg.get("modal_endpoint_base"), False)
                 return web.json_response({"ok": False, "error": str(e)}, status=502)
 
     @routes.get("/modal_bridge/platform_status")
@@ -2356,9 +2422,17 @@ def _setup_routes():
         """
         local = node_sync.plugin_version()
         try:
-            cfg = cfg_mod.load_config()
+            full = _health_full_view(request)
+            cfg = cfg_mod.load_config() if full else None
         except cfg_mod.ConfigCorrupt as e:
             return _config_corrupt_response(e)
+        if not full:
+            # 同 /health 的受限视图(2026-10-05 深度 review 第二轮):/version 也是匿名端点,以前对任何来访
+            # 都真的去请求云端 —— 局域网 / 反代后的匿名访客每调一次就唤醒一次云端容器。这里只给本地版本
+            # 和最近一次检查的结论,不碰云端。本机前端与带 capability 的 MCP 走下面的完整路径,行为不变。
+            return web.json_response({
+                "ok": True, "limited": True, "local": local, **_cached_health(_limited_endpoint()),
+                "detail": "非本机访问未带有效 capability:只给本地版本和最近一次检查的结论,不查询云端"})
         local_gpu = (cfg.get("default_gpu") or "H100")
         local_comfyui = node_sync.detect_local_comfyui_version()   # 当前本机 ComfyUI 版本
         deploy_comfyui = cfg.get("comfyui_version") or None         # 上次部署时检测到的版本
@@ -2375,6 +2449,7 @@ def _setup_routes():
                             deployed = h.get("deployed_version")
                             deployed_gpu = h.get("deployed_gpu")
                             reachable = True
+                            _record_health(cfg.get("modal_endpoint_base"), h.get("healthy"))
                     elif r.status == 404:
                         err_kind = "not_deployed"  # endpoint 不存在 = app 没部署
                     elif r.status == 401:
@@ -2398,6 +2473,9 @@ def _setup_routes():
         except Exception as e:
             err_kind = "unreachable"
             print(f"[modal_bridge] version check: health 不可达 ({e})")
+        if not reachable and err_kind != "local_busy":
+            # local_busy 是本机事件循环被占住,云端状态未知 —— 不记,别把「没问到」记成「不健康」
+            _record_health(cfg.get("modal_endpoint_base"), False)
         # 契约计算抽到 contract.compute_contract(纯函数,有单测)。
         c = contract.compute_contract(local, deployed, reachable, local_gpu, deployed_gpu,
                                       local_comfyui=local_comfyui, deploy_comfyui=deploy_comfyui)

@@ -44,10 +44,26 @@ CLI_CFG = Path.home() / ".modal_bridge" / "cli.json"
 
 
 def _load_cli_cfg() -> dict:
+    """读 ~/.modal_bridge/cli.json。不存在 → {};存在但读不了 / 不是 JSON 对象 → **中止**。
+
+    ⚠ 以前任何异常都当成空配置(2026-10-05 深度 review 第二轮):手改多打一个逗号,`deploy` 就以为
+      从没部署过 —— 换一把新 bridge key 写进 Secret(旧 key 的调用方全部 401)、按全新部署对账;
+      `configure` 则拿空配置整份覆盖,按 app 存的 keys 一起丢了。坏了就停,让用户修好或删掉。"""
     try:
-        return json.loads(CLI_CFG.read_text())
-    except Exception:
+        text = CLI_CFG.read_text(encoding="utf-8")
+    except FileNotFoundError:
         return {}
+    except (OSError, ValueError) as e:
+        sys.exit(f"✗ 读不了 {CLI_CFG}({type(e).__name__}: {e}),已中止。修好权限 / 编码后重试,"
+                 f"或确认不要后删掉它(删掉 = 忘掉记下的 endpoint 和 bridge key)")
+    try:
+        data = json.loads(text)
+    except ValueError as e:
+        sys.exit(f"✗ {CLI_CFG} 不是合法 JSON({e}),已中止 —— 照常继续会把它当成空配置:deploy 会换一把新 "
+                 f"bridge key、configure 会覆盖掉里面按 app 记的 key。修好或确认不要后删掉再重试")
+    if not isinstance(data, dict):
+        sys.exit(f"✗ {CLI_CFG} 顶层不是 JSON 对象(是 {type(data).__name__}),已中止。修好或删掉再重试")
+    return data
 
 
 def _save_cli_cfg(d: dict) -> None:
@@ -56,11 +72,13 @@ def _save_cli_cfg(d: dict) -> None:
 
 
 def _client(args) -> BridgeClient:
-    saved = _load_cli_cfg()
-    endpoint = (getattr(args, "endpoint", None) or os.environ.get("MODAL_BRIDGE_ENDPOINT")
-                or saved.get("endpoint") or "")
-    key = (getattr(args, "key", None) or os.environ.get("MODAL_BRIDGE_KEY")
-           or saved.get("key") or "")
+    endpoint = getattr(args, "endpoint", None) or os.environ.get("MODAL_BRIDGE_ENDPOINT") or ""
+    key = getattr(args, "key", None) or os.environ.get("MODAL_BRIDGE_KEY") or ""
+    if not (endpoint and key):
+        # flag / env 已经给全了就不读 cli.json —— 它坏了也不该挡住不用它的调用
+        saved = _load_cli_cfg()
+        endpoint = endpoint or saved.get("endpoint") or ""
+        key = key or saved.get("key") or ""
     if not endpoint:
         sys.exit("缺 endpoint:flag --endpoint / env MODAL_BRIDGE_ENDPOINT / `configure` 三选一")
     return BridgeClient(endpoint, key)
@@ -245,6 +263,43 @@ def _known_endpoint(u) -> str:
     return "" if not u or _PLACEHOLDER_ENDPOINT in u else u
 
 
+# modal_app.py 里 /health 那个 web 函数的名字(label = <app>-health)。endpoint 未知时拿它问 Modal API。
+_HEALTH_FUNCTION = "health_endpoint"
+
+
+class EndpointLookupFailed(RuntimeError):
+    """问不了 Modal「这个 app 部署过没有」(没装 modal / 没登录 / 网络 / 地址形态认不出)。"""
+
+
+def _lookup_deployed_endpoint(app_name: str, modal_mod=None) -> str:
+    """本机没记下 endpoint 时,问 Modal API 这个 app 部署过没有。
+    部署过 → endpoint base(https://<ws>--<app>,多环境时带环境后缀,以 Modal 给的为准);确认没部署 → "";
+    问不了 → 抛 EndpointLookupFailed(调用方中止,不能按全新部署处理)。
+
+    走 Modal 控制面:Function.from_name(...).get_web_url() 是一次 FunctionGet RPC(SDK 1.4.3 / 1.5.4 的
+    _functions.py 核对过:查无此 app / 函数抛 modal.exception.NotFoundError,web 函数的地址来自
+    handle_metadata.web_url),**不访问 *.modal.run、不唤醒容器**。
+
+    ⚠ 为什么要问(2026-10-05 深度 review 第二轮):以前 endpoint 未知就直接按全新部署 —— 第二台机器
+      (没装插件、没有 cli.json)对一个已部署的 app 跑 deploy,云端节点一个都不核对,镜像按本机那份
+      空清单重建,云端装的节点全被删掉。"""
+    if modal_mod is None:
+        try:
+            import modal as modal_mod
+        except ImportError as e:
+            raise EndpointLookupFailed(f"没装 modal SDK({e})") from e
+    try:
+        url = modal_mod.Function.from_name(app_name, _HEALTH_FUNCTION).get_web_url()
+    except modal_mod.exception.NotFoundError:
+        return ""
+    except Exception as e:      # 鉴权 / 网络 / 服务端错:不知道,就不能当成「没部署」
+        raise EndpointLookupFailed(f"{type(e).__name__}: {e}") from e
+    m = re.match(r"^(https://[^/\s]+?)-health\.modal\.run/?$", (url or "").strip())
+    if not m:
+        raise EndpointLookupFailed(f"app {app_name} 的 {_HEALTH_FUNCTION} 地址认不出来:{url!r}")
+    return m.group(1)
+
+
 def cmd_deploy(args):
     """无 ComfyUI 的部署:复用插件的 deploy_env / secret 链路,避开「裸 modal deploy」陷阱
     (裸跑会丢 MODAL_BRIDGE_* env → 云端 ComfyUI 落到老兜底 tag、GPU/超时全回默认)。"""
@@ -269,6 +324,12 @@ def cmd_deploy(args):
     same_app = (plugin.get("modal_app_name") or "comfyui-bridge") == args.app_name
     if not same_app:
         plugin = {}   # 部署的是另一个 app,插件那套凭据不属于它,别串
+    # AIGC 地址(取自插件 config)会原样写进 Secret:只收 https://(规则见 contract.aigc_url_problem,
+    # 2026-10-05 深度 review 第二轮)。在生成 key、对账、写 Secret 之前挡。
+    import contract
+    _aigc_err = contract.aigc_url_problem(plugin.get("aigc_studio_base_url") or "")
+    if _aigc_err:
+        sys.exit(f"✗ 插件设置里的 {_aigc_err}。改好(或清空 = 停用)后再部署")
     # ⚠ 同一个 app 时**插件的 key 优先**,cli.json 的只在插件没有 key 时用。反过来的话,一把过时的
     #   cli.json key 会覆盖 Secret,插件照样全部 401(2026-09-24 review:第一版顺序写反了,
     #   和上面注释自相矛盾)。
@@ -311,6 +372,17 @@ def cmd_deploy(args):
     #   (2026-10-05 深度 review)。占位符 / 空 = 不知道 endpoint = 按没部署过处理。
     endpoint = (_known_endpoint(saved.get("endpoint")) if saved_same else "") \
         or _known_endpoint(plugin.get("modal_endpoint_base"))
+    if not endpoint:
+        # 本机没记录 ≠ 云端没部署:问一下 Modal(见 _lookup_deployed_endpoint)。查到就照常对账,
+        # 确认没有才按全新部署;问不了就停 —— 宁可让用户重试,也别把一个已部署的 app 当空的覆盖。
+        try:
+            endpoint = _lookup_deployed_endpoint(args.app_name)
+        except EndpointLookupFailed as e:
+            sys.exit(f"✗ 本机没记下 app {args.app_name} 的 endpoint,也没法向 Modal 确认它是否已部署({e}),"
+                     f"已中止 —— 按全新部署处理的话云端已装的节点一个都不会核对,可能被这次部署删掉。\n"
+                     f"  检查 `modal token` / 网络后重试,或用 `configure --endpoint https://<ws>--{args.app_name}` 指定")
+        if endpoint:
+            print(f"      本机没有记录,但 Modal 上 app {args.app_name} 已部署过:{endpoint} —— 按已部署处理,核对云端节点")
     cfg = {**DEFAULT_CONFIG,
            **{k: plugin[k] for k in ("comfy_api_key", "hf_token", "civitai_token",
                                      "aigc_studio_base_url", "aigc_bypass_secret",

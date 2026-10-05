@@ -690,9 +690,11 @@ def test_secret_upsert_cmd_only_touches_given_keys():
     cmd = node_sync.secret_upsert_cmd({"modal_app_name": "my-app"}, "hf_SECRETVALUE123", "",
                                       "bk-0123456789abcdef", "", "", "",
                                       clear=("aigc_base_url", "aigc_bypass_secret"))
-    assert cmd[1].endswith("node_sync.py") and cmd[2:4] == ["secret-upsert", "my-app-secrets"]
+    # 2026-10-05 第二轮:改成 `python -c <引导> <插件目录> secret-upsert …`(隔离模式的 Python 下脚本形态
+    # import 不到同目录模块,见 node_sync._SECRET_UPSERT_BOOT)
+    assert cmd[1] == "-c" and cmd[4:6] == ["secret-upsert", "my-app-secrets"]
     assert "--force" not in cmd
-    assert sorted(a.split("=")[0] for a in cmd[4:] if not a.startswith("--")) == \
+    assert sorted(a.split("=")[0] for a in cmd[6:] if not a.startswith("--")) == \
         ["BRIDGE_API_KEY", "HF_TOKEN", "HUGGING_FACE_HUB_TOKEN"]
     assert "--clear=AIGC_STUDIO_BASE_URL" in cmd and "--clear=AIGC_STUDIO_BYPASS_SECRET" in cmd
     assert not any("CIVITAI" in a or "COMFY_API" in a for a in cmd), "没给的键不能出现(出现就会被覆盖)"
@@ -877,7 +879,7 @@ def test_deploy_py_respects_app_name_and_pin_and_refuses_unknown_tag(deploy_env)
     assert final["modal_app_name"] == "my-bridge", "自定义 app 名被改回 comfyui-bridge(会部署出第二个 app)"
     assert final["modal_endpoint_base"] == "https://ws--my-bridge"
     assert final["comfyui_tag"] == "v0.37.2", "没认 comfyui_tag_pin"
-    assert ev["cmds"][0][1][3] == "my-bridge-secrets"
+    assert ev["cmds"][0][1][5] == "my-bridge-secrets"   # argv:python -c <引导> <插件目录> secret-upsert <名>
     assert final["bridge_api_key"] == "bk-old"
 
     # 什么版本线索都没有:拒绝,而不是落到 v0.22.0
@@ -904,6 +906,11 @@ def cli_env(baked, tmp_path, monkeypatch):
     monkeypatch.setattr(health_client, "fetch", fetch)
     monkeypatch.setattr(local_nodes, "volume_node_requirements", lambda cfg, legacy=None: list(ev["reqs"]))
     monkeypatch.setattr(modal_volume, "record_deployed_reqs", lambda cfg, r: ev["recorded"].append(list(r)))
+    # endpoint 未知时 cmd_deploy 会问 Modal API 这个 app 部署过没有(2026-10-05 第二轮)。测试里绝不能真问:
+    # 默认答「没部署」,要模拟「已部署」的用例改 ev["deployed_endpoint"]。
+    ev["lookups"], ev["deployed_endpoint"] = [], ""
+    monkeypatch.setattr(bridge_cli, "_lookup_deployed_endpoint",
+                        lambda app: ev["lookups"].append(app) or ev["deployed_endpoint"])
 
     def run(cmd, **kw):
         cli = json.loads((tmp_path / "cli.json").read_text()) if (tmp_path / "cli.json").exists() else {}

@@ -49,10 +49,11 @@ import sys
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from pathlib import Path
 
 from bridge_client import (BridgeClient, BridgeError, SubmitUnknown, _open_http, _safe_job_id,
-                           cancel_still_billing)
+                           cancel_still_billing, never_sent)
 
 try:                                        # mcp >= 2.0
     from mcp.server import MCPServer as _Server
@@ -86,13 +87,36 @@ if not _LOCAL_CAPABILITY and _LOCAL_CONFIG:
     _LOCAL_CAPABILITY = read_local_capability_file(_LOCAL_CONFIG)
 
 
-def _call(path: str, body: dict | None = None, timeout: int = 120) -> dict:
-    url = f"{BASE}{path}"
+def _request(path: str, body: dict | None):
     data = json.dumps(body).encode() if body is not None else None
     headers = {"Content-Type": "application/json"} if data else {}
     if _LOCAL_CAPABILITY:
         headers["X-Modal-Bridge-Capability"] = _LOCAL_CAPABILITY
-    req = urllib.request.Request(url, data=data, headers=headers)
+    return urllib.request.Request(f"{BASE}{path}", data=data, headers=headers)
+
+
+def _http_error_body(e: urllib.error.HTTPError, path: str) -> tuple[dict, bool]:
+    """本机 HTTP 错误 → (给 agent 的 dict, 正文是不是插件自己回的 JSON 对象)。"""
+    try:
+        body = json.loads(e.read().decode())
+    except Exception:
+        body = None
+    ours = isinstance(body, dict)
+    if not ours:
+        body = {"error": f"HTTP {e.code} {path}"}
+    if e.code == 403 and e.headers.get("X-Modal-Bridge-Auth") == "capability-required":
+        # 0.8.36 起 localhost 也要 capability。agent 看到裸 403 不知道该配什么,这里把
+        # 两种给法都说清楚;值本身不进日志、不进聊天。
+        body = dict(body)
+        body["hint"] = ("缺少或错误的 X-Modal-Bridge-Capability。给 MCP 进程设 "
+                        "MODAL_BRIDGE_LOCAL_CONFIG=<ComfyUI 的插件 config.json 路径>"
+                        "(推荐,值不出文件),或 MODAL_BRIDGE_LOCAL_CAPABILITY=<值>。"
+                        f"当前:{'已从文件读到值' if _LOCAL_CAPABILITY else '两者都未设置'}。")
+    return body, ours
+
+
+def _call(path: str, body: dict | None = None, timeout: int = 120) -> dict:
+    req = _request(path, body)
     try:
         # 与独立客户端共用逐跳同源校验；不能将本地管理 capability 带给重定向目标。
         with _open_http(req, timeout=timeout) as r:
@@ -100,23 +124,51 @@ def _call(path: str, body: dict | None = None, timeout: int = 120) -> dict:
         # 调用方一律按 dict 读(.get);别让一个 JSON 数组变成 AttributeError
         return out if isinstance(out, dict) else {"error": f"{path} 返回的不是 JSON 对象"}
     except urllib.error.HTTPError as e:
-        try:
-            body = json.loads(e.read().decode())
-        except Exception:
-            body = None
-        if not isinstance(body, dict):
-            body = {"error": f"HTTP {e.code} {path}"}
-        if e.code == 403 and e.headers.get("X-Modal-Bridge-Auth") == "capability-required":
-            # 0.8.36 起 localhost 也要 capability。agent 看到裸 403 不知道该配什么,这里把
-            # 两种给法都说清楚;值本身不进日志、不进聊天。
-            body = dict(body)
-            body["hint"] = ("缺少或错误的 X-Modal-Bridge-Capability。给 MCP 进程设 "
-                            "MODAL_BRIDGE_LOCAL_CONFIG=<ComfyUI 的插件 config.json 路径>"
-                            "(推荐,值不出文件),或 MODAL_BRIDGE_LOCAL_CAPABILITY=<值>。"
-                            f"当前:{'已从文件读到值' if _LOCAL_CAPABILITY else '两者都未设置'}。")
-        return body
+        return _http_error_body(e, path)[0]
     except Exception as e:
         return {"error": f"{type(e).__name__}: {e} (ComfyUI 在跑吗? BASE={BASE})"}
+
+
+# 本机 /submit 的超时(契约 D2,2026-10-05 深度 review 第二轮)。/submit 里 modal_client.submit_job 最坏
+# 4 次 × 60s + 退避 1.5+3+6s = 250.5s,前面还有模型扫描、每个节点目录跑 git、读输入图转 base64。以前用
+# _call 的默认 120s:本机还在重试,MCP 先超时,手里没有 job_id,agent 只能重交 —— 云端多一个孤儿任务。
+_SUBMIT_TIMEOUT_S = 330
+
+
+def _submit_local(prompt: dict) -> dict:
+    """local 模式的提交。job_id 由这里先定、随请求带给本机 /submit(契约 D2),这一跳出任何岔子都能交还它。
+
+    结局分三种:
+      · 本机 /submit 给了答复(成功,或它自己的 {error[, job_id, outcome]}):原样返回;
+      · 请求确定没发出去(连接被拒 = ComfyUI 没开、DNS、TLS,判据同 bridge_client.never_sent):
+        普通错误,**没有提交**,ComfyUI 起来后重交即可;
+      · 其余(超时、读响应时断连、网关 5xx、回了看不懂的东西):本机可能已经把任务交上云端 ——
+        {ok:false, outcome:"unknown", job_id, error},agent 拿 job_id 去 job_status 核实,别重交。"""
+    job_id = str(uuid.uuid4())
+    path = "/modal_bridge/submit"
+    unknown = {"ok": False, "outcome": "unknown", "job_id": job_id}
+    try:
+        with _open_http(_request(path, {"prompt": prompt, "job_id": job_id}), timeout=_SUBMIT_TIMEOUT_S) as r:
+            raw = r.read()
+    except urllib.error.HTTPError as e:
+        body, ours = _http_error_body(e, path)
+        if ours or (e.code < 500 and e.code not in (408, 429)):
+            return body           # 插件自己的答复(含它判出的 outcome:unknown),或代理 / 网关的确定拒绝
+        return {**unknown, "error": f"本机 /submit 回了 HTTP {e.code}(不是插件的答复),提交结果未知 —— "
+                                    f"按 job_id 用 job_status 核实,别重新提交"}
+    except Exception as e:
+        if never_sent(e):
+            return {"ok": False, "error": f"连不上本机 ComfyUI({type(e).__name__}: {e};BASE={BASE}),"
+                                          f"请求没有发出去,任务没有提交。ComfyUI 起来后重新提交即可"}
+        return {**unknown, "error": f"等本机 /submit 答复时出错({type(e).__name__}: {e}),提交结果未知 —— "
+                                    f"任务可能已经交上云端:按 job_id 用 job_status 核实,别重新提交(会双跑双计费)"}
+    try:
+        out = json.loads(raw.decode())
+    except ValueError:
+        out = None
+    if not isinstance(out, dict):
+        return {**unknown, "error": "本机 /submit 回了看不懂的内容,提交结果未知 —— 按 job_id 用 job_status 核实"}
+    return out
 
 
 def _parse_prompt(workflow_json: str) -> dict | None:
@@ -230,6 +282,7 @@ def submit_workflow(workflow_json: str, gpu_class: str = "") -> dict:
     返回含 job_id;随后 job_status 轮询,完成后 fetch_result 取产物。
     ⚠ 返回 outcome:"unknown"(带 job_id)= 提交结果不确定,任务**可能已在云端跑、在计费**:
     按这个 job_id 照常 job_status 轮询核实(not_found 连续出现才作数),**不要重新提交**(会双跑双计费)。
+    local 模式等本机答复最多约 330s;本机 ComfyUI 没开(连接被拒)时是普通错误,没有提交,可直接重交。
     轮询 deadline:local 模式用返回的 worker_timeout_sec+180s;cloud 模式问部署者(默认按 3600s)。"""
     prompt = _parse_prompt(workflow_json)
     if prompt is None:
@@ -245,7 +298,7 @@ def submit_workflow(workflow_json: str, gpu_class: str = "") -> dict:
             d = _client.submit(prompt, input_images=imgs or None, gpu_class=gc)
             return {"ok": True, "job_id": d["id"], "gpu": d.get("gpu"), "mode": "cloud"}
         return _cloud(_do)
-    return _call("/modal_bridge/submit", {"prompt": prompt})
+    return _submit_local(prompt)
 
 
 def _poll_path(job_id: str) -> str:
