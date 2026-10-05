@@ -9,7 +9,9 @@ clone + 装依赖这两层。
 模型不进镜像 — Volume 挂到 /comfy-volume/models/
 """
 import os as _os
+import re as _re
 from shlex import quote as _q
+from urllib.parse import unquote as _unquote
 
 import modal
 from pathlib import Path
@@ -54,12 +56,60 @@ if not _EXTRA_MODEL_PATHS_YAML.exists():
     _EXTRA_MODEL_PATHS_YAML.write_text("\n".join(_yaml) + "\n", encoding="utf-8")
 
 
-def _clone_one(n: dict) -> str:
-    """生成单个 custom_node 的 clone(+ 可选 checkout)命令。
+# ── Comfy Registry(CNR)节点 ──
+# 与 node_sync.cnr_ref 同一套判据(本模块在容器运行时也会被 import,而容器里没有 node_sync,只能内联):
+# url 是 https://api.comfy.org/nodes/<id>/versions/<version> 就按它,否则看 cnr_id / version 字段。
+_CNR_ID_RE = _re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+_CNR_VER_RE = _re.compile(r"^[0-9][0-9A-Za-z.+_-]{0,63}$")
+_CNR_URL_RE = _re.compile(r"^https://api\.comfy\.org/nodes/([^/?#\s]+)/versions/([^/?#\s]+)/?$", _re.I)
+
+
+def _cnr_ref(n: dict):
+    m = _CNR_URL_RE.match((n.get("url") or "").strip())
+    cid, ver = (m.group(1), m.group(2)) if m else (str(n.get("cnr_id") or "").strip(),
+                                                   str(n.get("version") or "").strip())
+    return (cid.lower(), ver) if _CNR_ID_RE.match(cid) and _CNR_VER_RE.match(ver) else None
+
+
+# 构建期按 (id, version) 问 Registry 要这一版的 zip 地址,下载、解压到节点目录。
+# 2026-10-05 联网核实:/nodes/<id>/versions/<version> 回 {"downloadUrl": "https://cdn.comfy.org/…/node.zip"},
+# 文件直接在 zip 根。全程 Python 标准库:镜像里不保证有 unzip;extractall 会去掉 zip 里的绝对路径和 ..。
+# ⚠ 必须是单行(Modal 把每条 run_commands 原样变成一行 RUN,见下方 basicsr shim 的说明);
+#   代码里只用双引号,shlex.quote 包成一对单引号就够,不出现 '"'"' 这种转义。
+_CNR_FETCH_PY = (
+    'import json,os,sys,tempfile,urllib.parse as p,urllib.request as r,zipfile as z;'
+    'i,v,d=sys.argv[1:4];'
+    'a="https://api.comfy.org/nodes/%s/versions/%s"%(p.quote(i,safe=""),p.quote(v,safe=""));'
+    'print("[bridge] Comfy Registry",i,v,a,flush=True);'
+    'u=json.load(r.urlopen(a,timeout=120)).get("downloadUrl") or sys.exit("[bridge] Registry has no zip for "+a);'
+    'f=tempfile.mkstemp(suffix=".zip")[1];'
+    'r.urlretrieve(u,f);'
+    'z.ZipFile(f).extractall(d);'
+    'os.remove(f);'
+    'print("[bridge] CNR",i,v,"->",d)'
+)
+
+
+def _split_creds(url: str):
+    """https://user:token@host/path → ("https://host/path", (user, token));不带凭据 → (url, None)。
+    按 authority 里**最后一个** @ 切(同 node_sync._norm_repo / 云端 _redact_url);值按 git 的规则做百分号解码。"""
+    scheme, sep, rest = url.partition("://")
+    if not sep or scheme.lower() not in ("http", "https"):
+        return url, None
+    auth, slash, path = rest.partition("/")
+    if "@" not in auth:
+        return url, None
+    userinfo, _, hostport = auth.rpartition("@")
+    user, _, pw = userinfo.partition(":")
+    return f"{scheme}://{hostport}{slash}{path}", (_unquote(user), _unquote(pw))
+
+
+def _clone_one(n: dict, slot: int = 0) -> tuple[str, dict]:
+    """生成单个 custom_node 的 clone(+ 可选 checkout)命令 → (命令, 这条需要的构建期凭据 env)。
     ⚠ url / name / commit 都插值进 shell,必须 quote:节点文件夹名含空格(Windows 用户常见)
     或 url 带 shell 元字符会让整个镜像 build 崩,报错还很难和"哪个节点"对上号。"""
-    url = (n.get("url") or "").strip()
-    name = (n.get("name") or "").strip()
+    url = (n.get("url") or "").strip() if isinstance(n, dict) else ""
+    name = (n.get("name") or "").strip() if isinstance(n, dict) else ""
     if not url or not name:
         # 第二道闸(第一道在 node_sync.write_baked_nodes):空 url 会生成
         # `git clone '' /comfyui/custom_nodes/…`,让整个镜像 build 崩在一个
@@ -67,32 +117,73 @@ def _clone_one(n: dict) -> str:
         # 本模块在**容器运行时**也会被 import,抛了会让 worker 直接起不来,
         # 把一个"少装一个节点"的问题升级成"整个 worker 挂掉"。
         print(f"[bridge] ⚠ 跳过无效 custom_node 条目(url/name 为空): {n!r}")
-        return ""
+        return "", {}
     path = _q(f"/comfyui/custom_nodes/{name}")
-    base = f"git clone {_q(url)} {path}"
+    ref = _cnr_ref(n)
+    if ref:
+        # Registry 节点:钉在本机装的那一版,而不是 GitHub 默认分支 HEAD(2026-10-05 深度 review)
+        return f"python -c {_q(_CNR_FETCH_PY)} {_q(ref[0])} {_q(ref[1])} {path}", {}
+    clean, cred = _split_creds(url)
+    env = {}
+    if cred is None:
+        base = f"git clone {_q(url)} {path}"
+    else:
+        # ⚠ 带凭据的地址以前原样写进 RUN 行,会出现在 Modal 的构建日志里(镜像层定义也是明文);
+        #   克隆下来的 .git/config 里也留着它(2026-10-05 深度 review,推断)。
+        #   现在 RUN 行只放不带凭据的地址,凭据经构建期 secret 以 env 注入,由只在这条 git 命令上生效的
+        #   credential helper 交给 git(-c 不落盘;先用空值清掉镜像里可能配置的其它 helper)。
+        #   helper 里只用 printf "%s" + echo,不出现反斜杠,也不让 echo 解释值里的转义。
+        u, p = f"MB_GIT_USER_{slot}", f"MB_GIT_PASS_{slot}"
+        env = {u: cred[0], p: cred[1]}
+        helper = (f'!f() {{ test "$1" = get || return 0; printf "%s" "username=${u}"; echo; '
+                  f'printf "%s" "password=${p}"; echo; }}; f')
+        base = (f"GIT_TERMINAL_PROMPT=0 git -c credential.helper= -c {_q('credential.helper=' + helper)} "
+                f"clone {_q(clean)} {path}")
     commit = (n.get("commit") or "").strip()
     if commit:
-        return f"{base} && cd {path} && git checkout {_q(commit)}"
-    return base
+        return f"{base} && cd {path} && git checkout {_q(commit)}", env
+    return base, env
 
 
-_CLONE_CMD = " && ".join([
-    "mkdir -p /comfyui/custom_nodes",
-    *[c for c in (_clone_one(n) for n in CUSTOM_NODES) if c],
-])
+_BUILD_NODES, _CLONE_PARTS, _CLONE_ENV = [], [], {}
+for _i, _n in enumerate(CUSTOM_NODES):
+    _c, _e = _clone_one(_n, _i)
+    if _c:
+        _BUILD_NODES.append(_n)
+        _CLONE_PARTS.append(_c)
+        _CLONE_ENV.update(_e)
+_CLONE_CMD = " && ".join(["mkdir -p /comfyui/custom_nodes", *_CLONE_PARTS])
+# 只有清单里真有带凭据的地址才挂 secret:secret 会进镜像层定义,没必要时不挂,
+# 免得公共节点用户的这一层(及之后所有层)的缓存因此失效。
+_CLONE_SECRETS = [modal.Secret.from_dict(_CLONE_ENV)] if _CLONE_ENV else []
+
+# 节点 requirements 里钉了别的 torch 时,pip 会把镜像里的 torch 2.13 / cu130 换掉,
+# 连带 sage wheel(按这个 torch 的 ABI 编译)失效。装节点依赖前先把镜像里实际装的
+# torch / torchvision / torchaudio 版本写成约束文件(2026-10-05 深度 review,推断):
+# 节点要的版本与之冲突时 pip 直接报冲突、构建失败,而不是悄悄换掉 torch。
+# 文件留在镜像里,后面私有节点依赖那层也用它。
+_TORCH_CONSTRAINTS = "/opt/bridge/torch-constraints.txt"
+_TORCH_PIN_CMD = (
+    f"mkdir -p /opt/bridge && python -c \"import importlib.metadata as m;"
+    f"print(chr(10).join(p+'=='+m.version(p) for p in ('torch','torchvision','torchaudio')))\" "
+    f"> {_TORCH_CONSTRAINTS} && cat {_TORCH_CONSTRAINTS} && export PIP_CONSTRAINT={_TORCH_CONSTRAINTS}"
+)
 
 
 def _install_reqs_one(n: dict) -> str:
-    req = _q(f"/comfyui/custom_nodes/{n['name']}/requirements.txt")
+    # ⚠ 以前直接 n['name']:清单里缺 name 的条目让本模块 import 就抛 KeyError,而它在容器运行时
+    #   也会被 import —— 一条坏条目让 worker 起不来(2026-10-05 深度 review)。缺 name 的 clone 那边已跳过。
+    name = (n.get("name") or "").strip() if isinstance(n, dict) else ""
+    if not name:
+        return ""
+    req = _q(f"/comfyui/custom_nodes/{name}/requirements.txt")
     return (f"if [ -f {req} ]; then pip install -r {req}; "
-            f"else echo {_q('no requirements for ' + n['name'])}; fi")
+            f"else echo {_q('no requirements for ' + name)}; fi")
 
 
-# ⚠ 空清单(全新安装 / 没同步过节点)时 join 出空串 → .run_commands("") 会生成空 RUN,
-# Modal 直接拒绝("the 'RUN' Dockerfile command is not supported")。所以空时兜底成一个 no-op。
-_INSTALL_REQS_CMD = " && ".join(
-    _install_reqs_one(n) for n in CUSTOM_NODES
-) or "echo 'no custom_nodes — skip requirements'"
+# 约束文件那步总在:即便清单为空也不会 join 出空串(.run_commands("") 会生成空 RUN,Modal 直接拒绝)。
+_INSTALL_REQS_CMD = " && ".join([_TORCH_PIN_CMD,
+                                 *[c for c in (_install_reqs_one(n) for n in _BUILD_NODES) if c]])
 
 # basicsr 兼容性 shim(2026-09-02)。**与 PEP 667 那条无关的第二个坑**:
 # basicsr/data/degradations.py 从 torchvision.transforms.functional_tensor 取
@@ -223,7 +314,7 @@ cuda_image = (
         "sage-2.2.0-d1a57a5-multiarch/sageattention-2.2.0-cp312-cp312-linux_x86_64.whl"
     )
     .run_commands("cd /comfyui && pip install -r requirements.txt")
-    .run_commands(_CLONE_CMD)
+    .run_commands(_CLONE_CMD, secrets=_CLONE_SECRETS)
     .run_commands(_INSTALL_REQS_CMD)
     # worker 自身需要的小包。模型不在容器里下载(本地 SDK 传 Volume),所以不再装
     # huggingface_hub / hf_xet。这层经常改,放最后让 cache 命中率最高。
@@ -248,7 +339,9 @@ cuda_image = (
     # 本地自写节点(Volume 通道)的依赖。清单空时 pip_install() 不生成任何层,
     # 所以没有自写节点的用户完全不受影响。
     # 代码仍走 Volume(改一行免重 build);只有依赖变了才会动这一层。
-    .pip_install(*LOCAL_NODE_REQS)
+    # -c:同上面节点依赖那层,不许私有节点的依赖换掉镜像里的 torch(约束文件在那层生成)。
+    # 用 extra_options 而不是 env=:env 会被 SDK 包成一个临时 Secret,可能让这一层的缓存每次都失效。
+    .pip_install(*LOCAL_NODE_REQS, extra_options=f"-c {_TORCH_CONSTRAINTS}")
     # SageAttention 两个上游缺陷的 build 期补丁(2026-08-28)—— 上游 main 至今都未修。
     #
     # ① int32 指针溢出(**已致 H3 尾几帧塌坏**):triton/quant_per_thread.py 的量化 kernel

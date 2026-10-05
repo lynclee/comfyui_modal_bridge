@@ -120,31 +120,39 @@ def deployed_reqs(cfg: dict) -> list | None:
     return v if isinstance(v, list) else None
 
 
-def _listdir_names(vol, type_) -> set:
-    """models/<type>/ 下所有**文件**的相对路径(含子目录,如 "SDXL/x.safetensors")。
+def _listdir_sizes(vol, type_) -> dict:
+    """models/<type>/ 下所有**文件**的相对路径(含子目录,如 "SDXL/x.safetensors")→ 字节数。
 
     ⚠ 以前是非递归 listdir + 取 basename:子目录里的模型在存在性检查里根本看不见,而检查又按
       basename 比对 —— 工作流引用 "SDXL/sd_xl_base.safetensors",上传却落到
       models/checkpoints/sd_xl_base.safetensors,云端 ComfyUI 列表里只有不带目录的名字 →
       value not in list,先烧约 43s GPU(5 轮 free+reload)才失败;下次预检又按 basename
       判「已齐」,**这个工作流永远跑不通**(2026-09-23 review)。
-    实查过真实 Volume:recursive 返回完整卷路径 "models/<type>/..." 且目录也会作为条目出现。"""
+    实查过真实 Volume:recursive 返回完整卷路径 "models/<type>/..." 且目录也会作为条目出现。
+    带上大小:存在性检查只比路径时,传错的文件(大小不对)永远不会被纠正(2026-10-05 深度 review)。"""
     prefix = f"models/{type_}/"
     try:
         entries = vol.listdir(f"models/{type_}", recursive=True)
     except Exception:
-        return set()  # 该 type 目录在 Volume 还不存在
-    out = set()
+        return {}  # 该 type 目录在 Volume 还不存在
+    out = {}
     for e in entries:
         if getattr(e.type, "name", str(e.type)) != "FILE":
             continue
-        out.add(e.path[len(prefix):] if e.path.startswith(prefix) else Path(e.path).name)
+        rel = e.path[len(prefix):] if e.path.startswith(prefix) else Path(e.path).name
+        out[rel] = int(getattr(e, "size", 0) or 0)
     return out
 
 
+def _listdir_names(vol, type_) -> set:
+    """同 _listdir_sizes,只要路径。"""
+    return set(_listdir_sizes(vol, type_))
+
+
 def volume_files_by_type(cfg, types) -> dict:
-    """返回 {type: set(filename)}。查询前 reload() 刷新元数据:否则刚 batch_upload 提交的文件
-    在最终一致性窗口内可能 listdir 看不到 → 误判"缺失"→ 又触发上传(用户遇到的"传过了还触发")。
+    """返回 {type: {相对路径: 字节数}}(按路径判断存在时和 set 一样用 `in`)。查询前 reload() 刷新元数据:
+    否则刚 batch_upload 提交的文件在最终一致性窗口内可能 listdir 看不到 → 误判"缺失"→ 又触发上传
+    (用户遇到的"传过了还触发")。
     每个 type 连同其别名目录(unet↔diffusion_models 等)一并查,避免传在别名目录的模型被误判缺失。"""
     vol = get_volume(cfg)
     try:
@@ -153,11 +161,21 @@ def volume_files_by_type(cfg, types) -> dict:
         pass
     out = {}
     for t in sorted(set(types)):
-        names = _listdir_names(vol, t)
+        names = _listdir_sizes(vol, t)
         for alias in _VOL_TYPE_ALIASES.get(t, []):
-            names |= _listdir_names(vol, alias)  # 并入别名目录的文件
+            for rel, size in _listdir_sizes(vol, alias).items():  # 并入别名目录的文件
+                names.setdefault(rel, size)
         out[t] = names
     return out
+
+
+def remote_size_mismatch(have_for_type, rel: str, local_size: int | None) -> bool:
+    """Volume 上已有 rel,但大小与本地文件不同 → True(应当覆盖重传)。
+    拿不到任一边的大小(老调用方传的是纯 set、本地文件读不到)时返回 False —— 只按路径判断,同以前。"""
+    if local_size is None or not isinstance(have_for_type, dict) or rel not in have_for_type:
+        return False
+    remote = have_for_type.get(rel)
+    return isinstance(remote, int) and remote > 0 and remote != local_size
 
 
 # ============================================================================
@@ -186,10 +204,16 @@ def find_local_model(type_: str, filename: str, roots) -> Path | None:
       - `../` 同理;
       - resolve() 之后再比,顺带挡住经符号链接绕出去的情况。
     找到的路径会被上传进 Volume,所以逃逸 = 任意本地文件外泄。
+
+    ⚠ 请求带子目录("flux/x.gguf")时只认那个确切位置,不按文件名兜底:兜底会把**另一个子目录里的
+      同名文件**当成它、传到请求的路径上,云端从此用错模型;而存在性检查以前只比路径,错的文件
+      永远不会被纠正(2026-10-05 深度 review)。不带子目录的名字照旧平铺 + 递归兜底。
     """
     base = Path(filename).name  # 容错:workflow 里偶有 "subdir/x.safetensors"
     if not base:
         return None
+    rel = model_relpath(filename)
+    has_subdir = rel is not None and "/" in rel
     for root in roots:
         r = Path(root)
         if not r.exists():
@@ -199,6 +223,11 @@ def find_local_model(type_: str, filename: str, roots) -> Path | None:
         direct = r / filename
         if direct.is_file() and is_path_within_roots(direct, [r]):
             return direct
+        if has_subdir:
+            exact = r / rel             # 反斜杠写法("flux\\x.gguf")在 posix 上也要能命中
+            if exact.is_file() and is_path_within_roots(exact, [r]):
+                return exact
+            continue
         flat = r / base
         if flat.is_file() and is_path_within_roots(flat, [r]):
             return flat
@@ -242,21 +271,35 @@ def check_models(cfg: dict, required: list, resolver) -> dict:
             missing_no_source.append({"type": t, "filename": fn})
             continue
         # 按带子目录的相对路径**精确**比对。按 basename 比会把「别的子目录里的同名文件」
-        # 误判成已存在,于是永远不上传到工作流真正引用的位置(见 _listdir_names)。
-        if rel in have.get(t, set()):
-            present.append({"type": t, "filename": fn})
-            continue
-        local = resolver(t, fn)
+        # 误判成已存在,于是永远不上传到工作流真正引用的位置(见 _listdir_sizes)。
+        remote = have.get(t, set())
+        local = None
+        if rel in remote:
+            # 路径对上还要比大小:以前只比路径,传错的文件(按文件名兜底拿错的同名文件 / 截断的上传)
+            # 之后永远不会被纠正(2026-10-05 深度 review)。本地找不到或拿不到大小就只按路径判断,同以前。
+            local = resolver(t, fn)
+            try:
+                local_size = local.stat().st_size if local is not None else None
+            except OSError:
+                local_size = None
+            if not remote_size_mismatch(remote, rel, local_size):
+                present.append({"type": t, "filename": fn})
+                continue
+        else:
+            local = resolver(t, fn)
         if local is None:
             missing_no_source.append({"type": t, "filename": fn})
         elif file_in_progress(local):
             downloading.append({"type": t, "filename": rel})
         else:
-            missing_local.append({
+            item = {
                 "type": t, "filename": rel,
                 "local_path": str(local),
                 "size_mb": local.stat().st_size // 1024 // 1024,
-            })
+            }
+            if rel in remote:
+                item["replace"] = True      # Volume 上同路径是另一个大小的文件 → 覆盖
+            missing_local.append(item)
     return {
         "required": required,
         "present": present,
@@ -319,10 +362,14 @@ def upload_models(cfg: dict, items: list, on_progress=None) -> dict:
         if file_in_progress(local, settle_check=False):
             skipped.append({**it, "reason": "still downloading"})
             continue
-        if it["filename"] in have.get(it["type"], set()):
+        remote = have.get(it["type"], set())
+        # 同路径已存在但大小不同 = 上次传错了(按文件名兜底拿错同名文件 / 截断),覆盖它;
+        # 以前只比路径,错的文件永远不会被纠正(2026-10-05 深度 review)
+        replace = remote_size_mismatch(remote, it["filename"], local.stat().st_size)
+        if it["filename"] in remote and not replace:
             skipped.append({**it, "reason": "already in volume"})
             continue
-        pending.append((it, local))
+        pending.append(({**it, "replace": True} if replace else it, local))
 
     if pending:
         sizes = [max(1, Path(p[1]).stat().st_size // 1024 // 1024) for p in pending]
@@ -333,11 +380,17 @@ def upload_models(cfg: dict, items: list, on_progress=None) -> dict:
                                    for (it, _), sz in zip(pending, sizes)]})
         vol = get_volume(cfg)
         t0 = time.time()
-        with vol.batch_upload(force=False) as batch:  # 真正上传在此 with 退出时一次性发生
-            for (it, local), sz in zip(pending, sizes):
-                batch.put_file(str(local), f"models/{it['type']}/{it['filename']}")
-                total_mb += sz
-                uploaded.append({**it, "size_mb": sz})
+        # 新文件 force=False:并发的另一个请求刚传完同一路径时报错,而不是两个 batch 互相覆盖;
+        # 只有确认要纠正的(大小不对)才 force=True 覆盖。真正上传在 with 退出时一次性发生。
+        for force in (False, True):
+            group = [(p, sz) for p, sz in zip(pending, sizes) if bool(p[0].get("replace")) == force]
+            if not group:
+                continue
+            with vol.batch_upload(force=force) as batch:
+                for (it, local), sz in group:
+                    batch.put_file(str(local), f"models/{it['type']}/{it['filename']}")
+                    total_mb += sz
+                    uploaded.append({**it, "size_mb": sz})
         secs = time.time() - t0
         if on_progress:
             on_progress({"phase": "end", "count": len(pending), "total_mb": grand_total,
@@ -365,14 +418,34 @@ def volume_file_size(cfg: dict, vol_path: str) -> int:
     return 0
 
 
-def download_volume_file(cfg: dict, vol_path: str, local_path: str) -> int:
+class DownloadIncomplete(OSError):
+    """Volume 下载下来的字节数与期望不符(断流 / 截断)。.part 已删,正式文件没动。"""
+
+
+def download_volume_file(cfg: dict, vol_path: str, local_path: str,
+                         expected_size: int | None = None) -> int:
     """从 Volume 把 vol_path 直连下载到本地 local_path(同步阻塞)。返回字节数。
-    大产物(视频/3D)走这条,避开 base64+modal.Dict 上限 + 省一道浏览器中转。"""
+    大产物(视频/3D)走这条,避开 base64+modal.Dict 上限 + 省一道浏览器中转。
+
+    在 .part 上校验大小,**通过后**才 rename 成正式文件;不通过删掉 .part 并抛 DownloadIncomplete:
+      · expected_size 给了(云端 images[] 的 size_bytes)→ 必须相等;
+      · 没给 → 实际落盘的字节数要等于 SDK 报的读取字节数,也要等于 Volume 列出的文件大小(列得到时)。
+    ⚠ 以前不校验:SDK 少读一段也照样 rename,调用方事后再比又晚了一步 —— 正式名已经是个截断文件,
+      回执也可能已经记下(2026-10-05 深度 review,C14)。"""
     vol = get_volume(cfg)
     try:
         vol.reload()  # 最终一致:worker 刚 commit,本地读前刷新一下视图
     except Exception:
         pass
+    listed = 0
+    if expected_size is None:
+        try:
+            for e in vol.listdir(vol_path):
+                listed = int(getattr(e, "size", 0) or 0)
+                if listed:
+                    break
+        except Exception:
+            listed = 0            # 列不到就只比 SDK 读到的字节数
     # 先写 .part、成功后原子 rename:直接写正式名的话,下载中断会在 ComfyUI 的 output
     # 里留下一个**看起来完整**的截断视频/3D 文件 —— 用户点开才发现坏了,而且下次同名
     # 去重逻辑还会把它当成已存在的产物。routes._atomic_write 走的也是这个模式。
@@ -382,8 +455,15 @@ def download_volume_file(cfg: dict, vol_path: str, local_path: str) -> int:
     try:
         with open(part, "wb") as f:
             n = vol.read_file_into_fileobj(vol_path, f)
+        actual = part.stat().st_size
+        if expected_size is not None:
+            if actual != int(expected_size):
+                raise DownloadIncomplete(f"{vol_path} 下载不完整: {actual}/{int(expected_size)} bytes")
+        elif (isinstance(n, int) and n != actual) or (listed and actual != listed):
+            raise DownloadIncomplete(f"{vol_path} 下载不完整: 落盘 {actual} bytes,"
+                                     f"SDK 报 {n},Volume 列出 {listed or '未知'}")
         os.replace(part, dst)
-        return n
+        return actual
     except Exception:
         try:
             part.unlink()

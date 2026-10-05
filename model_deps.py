@@ -8,8 +8,8 @@ model_deps.py — 从工作流 prompt 解析需要的模型文件(纯逻辑,无�
      (web/modal_bridge.js 的 /\.(safetensors|ckpt|pt|pth|gguf|bin|sft|onnx)$/i)和
      modal_volume.MODEL_EXTS 三处保持一致,避免漂移导致"某处列了模型、另一处不上传"。
 
-通用兜底拿到的只是文件名(不知道 type)。type 需要按本地命中位置反推,涉及文件系统,
-放在 routes.py(用 folder_paths);这里只做纯解析。
+通用兜底拿到的是工作流里写的那个名字(保留子目录,如 "flux/x.gguf"),不知道 type。type 需要按本地
+命中位置反推,涉及文件系统,放在 routes.py(用 folder_paths.get_full_path(t, 相对路径));这里只做纯解析。
 """
 from pathlib import Path
 
@@ -63,8 +63,13 @@ def extract_loader_models(prompt: dict) -> list[dict]:
 
 
 def extract_generic_filenames(prompt: dict) -> set:
-    """通用兜底:扫所有节点所有 string input,命中模型扩展名的文件名(取 basename,去重)。
-    覆盖 LOADER_MAP 之外的 loader。返回 set[str]。"""
+    """通用兜底:扫所有节点所有 string input,命中模型扩展名的文件名(**保留相对路径**,去重)。
+    覆盖 LOADER_MAP 之外的 loader。返回 set[str]。
+
+    ⚠ 以前只取 basename:ComfyUI 下拉框里的值本来就带子目录("flux/x.gguf"),剥掉之后
+      get_full_path(t, "x.gguf") 找不到 → 推不出 type → 这个模型从需求里消失,既不报缺也不上传;
+      只有它一个模型的工作流(例如只用 UnetLoaderGGUF)甚至因「扫不到模型」被路由到 CPU
+      (2026-10-05 深度 review,契约 C15)。与 LOADER_MAP 那条一致,原样保留工作流里的写法。"""
     found: set = set()
     for node in (prompt or {}).values():
         if not isinstance(node, dict):
@@ -73,6 +78,6 @@ def extract_generic_filenames(prompt: dict) -> set:
         if not isinstance(ins, dict):
             continue
         for v in ins.values():
-            if isinstance(v, str) and Path(v).suffix.lower() in MODEL_EXTS:
-                found.add(Path(v).name)
+            if isinstance(v, str) and v.strip() and Path(v).suffix.lower() in MODEL_EXTS:
+                found.add(v)
     return found
