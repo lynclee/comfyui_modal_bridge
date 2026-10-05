@@ -911,4 +911,3 @@ test("R3-4 带矛盾标记的记录:30 分钟内反复刷新只弹一次 error",
   await c.sb.recoverOne({ ...store.get(JOBS)[0] }, 1200);
   assert.equal(c.observed.notifies.filter((n) => n.sev === "error").length, 1, "过了 30 分钟再提示一次");
 });
-
