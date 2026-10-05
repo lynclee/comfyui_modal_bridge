@@ -189,6 +189,12 @@ async def cancel(session, cfg, job_id) -> dict:
 async def list_nodes(session, cfg) -> dict:
     """镜像已装的 custom_nodes。模型相关全部走本地 SDK(modal_volume.py),这里只剩节点。"""
     h = await health(session, cfg)
-    nodes = h.get("custom_nodes", []) if isinstance(h, dict) else []
-    manifest = h.get("custom_nodes_manifest") if isinstance(h, dict) else None
-    return {"custom_nodes": nodes, "custom_nodes_manifest": manifest or []}
+    nodes = h.get("custom_nodes") if isinstance(h, dict) else None
+    if not isinstance(nodes, list):
+        # 以前缺字段时回 [],调用方当成「云端一个节点都没有」(source=modal):对账、并回、cloud_unchecked
+        # 全被跳过,正是 /sync_nodes 误删云端节点的那条路(2026-10-05 深度 review)。拿不到就抛,
+        # 调用方按「读不到云端」处理。
+        why = h.get("custom_nodes_error", "字段缺失") if isinstance(h, dict) else "响应不是对象"
+        raise RuntimeError(f"/health 没有报节点清单: {why}")
+    manifest = h.get("custom_nodes_manifest")
+    return {"custom_nodes": nodes, "custom_nodes_manifest": manifest if isinstance(manifest, list) else []}

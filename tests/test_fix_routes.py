@@ -68,7 +68,8 @@ def _isolate(monkeypatch, tmp_path):
     monkeypatch.setattr(modal_client, "list_nodes", fake_list_nodes)
 
     async def fake_run(resp, cmd, cwd, env):
-        kind = "secret" if "secret" in cmd else "deploy" if "deploy" in cmd else \
+        # Secret 现在走合并语义的 `node_sync.py secret-upsert`(C16),老的是 `modal secret create`
+        kind = "secret" if ("secret" in cmd or "secret-upsert" in cmd) else "deploy" if "deploy" in cmd else \
             "compat" if "node_compat_check.py" in cmd else "?"
         rec.cmds.append((kind, env.get("MODAL_BRIDGE_APP_NAME")))
         if kind == "secret":

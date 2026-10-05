@@ -128,6 +128,8 @@ const I18N = {
   "node.scan":        { zh: "扫描工作流 custom nodes...", en: "Scanning workflow custom nodes..." },
   "node.nogit":       { zh: "这些 custom_node 在本地找不到目录,无法自动补(单文件节点?):\n{list}",
                         en: "No local directory for these custom_nodes, cannot auto-add (single-file node?):\n{list}" },
+  "node.unclonable":  { zh: "这些节点的仓库地址云端克隆不了,改走私有节点通道(打包上传):{list}",
+                        en: "The cloud cannot clone these nodes' repository URLs, so they go through the private-node upload path: {list}" },
   "node.local_pack":  { zh: "打包 {n} 个本地节点上传(依赖变化时自动部署)...",
                         en: "Packing {n} local node(s) (auto-deploys only if dependencies changed)..." },
   "node.local_fail_detail":{ zh: "私有节点同步失败,已停止提交(避免云端静默跑旧代码):\n\n{msg}\n\n完整日志见 ComfyUI 控制台(失败时会打印命令输出尾部)。常见原因是某个节点的 requirements 在云端装不上。",
@@ -851,6 +853,11 @@ async function removeLocalOverrides(folders, ctx) {
 }
 
 // submit 前调:custom_node 与本地双向同步(加/改/删)。返回 true=可继续 / false=用户取消
+// 节点版本的显示:Registry 装的节点没有 commit,按版本号显示(2026-10-05 深度 review B4)
+function nodeRevNew(m) { return m.version ? `v${m.version}` : (m.commit || "HEAD").slice(0, 8); }
+function nodeRevOld(m) { return m.old_version ? `v${m.old_version}` : (m.old_commit || "—").slice(0, 8); }
+function nodeRev(m) { return (m.version || m.commit) ? ` @ ${nodeRevNew(m)}` : ""; }
+
 async function ensureNodesAvailable(prompt, ctx) {
   ctx.stage("nodes", t("node.scan"));
   let plan;
@@ -884,6 +891,11 @@ async function ensureNodesAvailable(prompt, ctx) {
   // C13:读不到 Volume 上的私有节点包时 local_remove 为空 —— 只是这次清理不了旧覆盖包,
   //   正确性由下面随任务下发的 baked sentinel 保证,不拦提交,提示一句即可。
   if (plan.volume_unchecked) notify(t("node.volume_unchecked", { why: plan.volume_unchecked }), "warn");
+  // 走 Volume 的原因是「云端克隆不了这个地址」(自建 ssh、本地路径等)时说清楚 —— 否则用户以为是自写节点
+  const _unclonable = local_pack.filter((p) => p.reason === "unclonable");
+  if (_unclonable.length) {
+    notify(t("node.unclonable", { list: _unclonable.map((p) => `${p.folder}${p.detail ? `(${p.detail})` : ""}`).join(", ") }), "warn");
+  }
 
   // 本地自写节点(无 git remote / commit 未推送)→ 打包传 Volume,worker 启动时解压。
   // 放在部署之前:即使同一批还要重部署,本地节点也已经在 Volume 上,一次提交全齐。
@@ -954,12 +966,12 @@ async function ensureNodesAvailable(prompt, ctx) {
     const parts = [];
     if (add.length) {
       parts.push(t("node.add_head") + "\n" + add.map((m) =>
-        `   • ${m.folder} (${t("node.nodes_n", { n: m.class_types.length })})` + (m.commit ? ` @ ${m.commit.slice(0, 8)}` : "")
+        `   • ${m.folder} (${t("node.nodes_n", { n: m.class_types.length })})` + nodeRev(m)
       ).join("\n"));
     }
     if (update.length) {
       parts.push(t("node.upd_head") + "\n" + update.map((m) =>
-        `   • ${m.folder}  ${(m.old_commit || "—").slice(0, 8)} → ${m.commit.slice(0, 8)}`
+        `   • ${m.folder}  ${nodeRevOld(m)} → ${nodeRevNew(m)}`
       ).join("\n"));
     }
     const msg = t("node.sync_title", { src: source, parts: parts.join("\n\n") });

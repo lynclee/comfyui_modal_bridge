@@ -1262,10 +1262,15 @@ async def _deploy_locked(resp: web.StreamResponse, body: dict, token_id: str,
             _cur["bridge_api_key"] = bridge_key
             cfg_mod.save_config(_cur)
         _deploy_updates["bridge_api_key"] = cfg["bridge_api_key"] = bridge_key
-    await _emit(resp, "\n== 创建 Modal Secret ==\n")
+    await _emit(resp, "\n== 更新 Modal Secret ==\n")
+    # 合并语义(契约 C16):空值 = 这次没提供,Secret 里原有的保持不动 —— 别的机器 / deploy.py 写进去的
+    # 凭据不会被这台机器的 config 抹掉。AIGC 集成是例外:用户在面板清空了地址 / 密钥,就要显式清掉,
+    # 否则旧地址和旧密钥会一直留在云端,worker 继续往一个用户以为已经停用的站点回调。
+    _clear = tuple(f for f, v in (("aigc_base_url", aigc_base_url), ("aigc_bypass_secret", aigc_bypass))
+                   if not v)
     rc = await _run_streamed(
-        resp, node_sync.secret_create_cmd(cfg, hf_token, civitai_token, bridge_key,
-                                          comfy_api_key, aigc_base_url, aigc_bypass),
+        resp, node_sync.secret_upsert_cmd(cfg, hf_token, civitai_token, bridge_key,
+                                          comfy_api_key, aigc_base_url, aigc_bypass, clear=_clear),
         cwd=cwd, env=env,
     )
     if rc != 0:
