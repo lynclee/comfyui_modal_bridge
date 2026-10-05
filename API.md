@@ -50,8 +50,11 @@ estimate_vram(可选) → submit → poll(循环) → fetch_result
 curl -X POST http://127.0.0.1:8000/modal_bridge/submit \
   -H "X-Modal-Bridge-Capability: ${MODAL_BRIDGE_LOCAL_CAPABILITY}" \
   -H 'Content-Type: application/json' \
-  -d '{"prompt": { ...API prompt... }}'
+  -d '{"prompt": { ...API prompt... }, "job_id": "可选,自带的幂等 id"}'
 ```
+
+`job_id` 可选(规则见下文「job_id 规则」):自带 id 的调用方在自己超时、连接断开时,仍然知道该去 poll 哪个任务。
+MCP 本地模式就是这么做的。
 
 返回:
 ```json
@@ -131,7 +134,7 @@ curl -X POST http://127.0.0.1:8000/modal_bridge/submit \
 | 端点 | 方法 | 说明 |
 |---|---|---|
 | `/modal_bridge/sync_models` | POST | 本地模型 → Modal Volume(SDK batch_upload,CAS 去重)。同路径大小不同会覆盖;最后一行汇总已同步 / 已存在跳过 / 被拒,有被拒的项 rc≠0 |
-| `/modal_bridge/sync_nodes` | POST | `{new_baked, summary?, prune?}` → custom_node 清单同步 + 重新部署。**删除必须显式**:只有 `prune` 里点名的节点会从镜像移除;云端有、`new_baked` 里没写、也不在 `prune` 里的节点会被自动并回。补不出来源、或读不到云端且这次会少掉节点时,返回 409 `{error, cloud_unchecked?, vanish?}` |
+| `/modal_bridge/sync_nodes` | POST | `{new_baked, summary?, prune?}` → custom_node 清单同步 + 重新部署。**删除必须显式**:只有 `prune` 里点名的节点会从镜像移除;云端有、`new_baked` 里没写、也不在 `prune` 里的节点会被自动并回。补不出来源、读不到云端且这次会少掉节点、或读不到云端而本机清单为空时,返回 409 `{error, cloud_unchecked?, vanish?}` |
 | `/modal_bridge/sync_local_nodes` | POST | `{folders:[...]}` → 自写节点打包传 Volume；代码变化只重传,`requirements.txt` 变化会自动重建依赖层。每个包携带 manifest,支持多机恢复 |
 | `/modal_bridge/list_local_nodes` | GET | Volume 上现存的本地节点包名单;读不到 Volume 时 `{ok:false, error}`,不会冒充「没有」 |
 | `/modal_bridge/remove_local_node` | POST | `{folder}` → 从 Volume 删掉某个本地节点包 |
@@ -142,10 +145,10 @@ curl -X POST http://127.0.0.1:8000/modal_bridge/submit \
 
 | 端点 | 方法 | 说明 |
 |---|---|---|
-| `/modal_bridge/health` | GET | 云端 app 健康(`{ok, modal:{...}}`)。非本机、又没带有效 capability 的请求只回 `{ok, healthy, limited:true, detail}`:`healthy` 是最近一次完整检查的结论,不会为此唤醒云端容器,也不回节点清单 |
-| `/modal_bridge/version` | GET | 版本契约:`{local, deployed, match, reachable, err_kind}`。`err_kind` ∈ `not_deployed / unauthorized / http_error / timeout / unreachable / local_busy`;只有 `not_deployed` 和 `unauthorized` 应拦截提交 |
+| `/modal_bridge/health` | GET | 云端 app 健康(`{ok, modal:{...}}`)。非本机、又没带有效 capability 的请求只回 `{ok, healthy, checked_at, limited:true, detail}`:`healthy` 是最近一次完整检查的结论,超过 10 分钟或 endpoint 变了就回 `null`;不会为此唤醒云端容器,也不回节点清单 |
+| `/modal_bridge/version` | GET | 版本契约:`{local, deployed, match, reachable, err_kind}`。`err_kind` ∈ `not_deployed / unauthorized / http_error / timeout / unreachable / local_busy`;只有 `not_deployed` 和 `unauthorized` 应拦截提交。非本机匿名请求同样只回受限视图(`local` 加缓存的 `healthy / checked_at`,`limited:true`),不请求云端 |
 | `/modal_bridge/platform_status` | GET | Modal 官方状态页聚合态(`operational/degraded/...`),区分平台故障 vs 未部署 |
-| `/modal_bridge/config` | GET/POST | GET 返回脱敏配置;POST 只接受 GPU/高级设置 allowlist,不能改凭据或管理鉴权字段。config.json 损坏(解析失败)时各路由返回 500 `{error, code:"config_corrupt"}`,并**拒绝写入** —— 修好或删除该文件后再用,插件不会用默认值覆盖它 |
+| `/modal_bridge/config` | GET/POST | GET 返回脱敏配置;POST 只接受 GPU/高级设置 allowlist,不能改凭据或管理鉴权字段。`aigc_studio_base_url` 只收 `https://`(填跳转后的最终地址;云端只跟随同主机内的 307/308),否则 400。config.json 损坏(解析失败)时各路由返回 500 `{error, code:"config_corrupt"}`,并**拒绝写入** —— 修好或删除该文件后再用,插件不会用默认值覆盖它 |
 | `/modal_bridge/job_event` | POST | 前端/调用方上报客户端侧结局(`{job_id, event, detail}`)进后端日志留痕 |
 
 ## 无 ComfyUI 直连云端(standalone)
@@ -170,6 +173,10 @@ GET 的 `?key=` 仍兼容,但会进反代 / CDN 日志,新客户端请用请求�
 
 **产物**:`images[]` 每项带 `filename / node_id / key / size_bytes`,小文件带 `data_base64`,大文件带 `volume_path`
 (走 `-fetch`)。客户端用 `size_bytes` 校验下载完整性;核对不了时不要 ack,交给云端按保留期回收。
+
+**bridge_client 的错误分类**(`submit`):`SubmitUnknown`(带 `.job_id`)= 结果未知,可能已在跑,去 poll,别换 id 重交;
+`BridgeError("/run: HTTP {status} …")` 或 `/run: …` 开头 = 确定没提交;每次尝试都失败在连接阶段(请求没发出去)也按确定没提交报。
+一旦有过一次结果不确定的尝试,之后的拒收也报 `SubmitUnknown`。`cli.json` 损坏时 `bridge_cli` 中止,不会静默当成空配置。
 
 **三种消费方式**(都基于 `bridge_client.py`,纯 stdlib 零依赖):
 
