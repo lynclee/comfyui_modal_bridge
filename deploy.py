@@ -195,9 +195,12 @@ def main():
         sys.exit(rc)
     # 记下这台机器往 Secret 里写了哪些 AIGC 键:GUI 部署据此判断 config 里的空值是「用户清掉了」
     # 还是「这台机器从没配过」(见 routes 的 _clear,2026-10-05 深度 review 第二轮)。
-    _persist(cfg_mod, {contract.AIGC_PUSHED_FIELD: [
-        f for f, k in (("aigc_base_url", "aigc_studio_base_url"), ("aigc_bypass_secret", "aigc_bypass_secret"))
-        if cfg.get(k)]})
+    # ⚠ 取并集,不覆盖:deploy.py 不清 Secret 里的 AIGC 键,覆盖成「这次有值的」会把 GUI 部署要清的那一项
+    #   从记录里抹掉,旧 URL 从此留在 Secret 里(2026-10-05 第二轮复核)。
+    _old = [f for f in (cfg.get(contract.AIGC_PUSHED_FIELD) or []) if isinstance(f, str)]
+    _now = [f for f, k in (("aigc_base_url", "aigc_studio_base_url"), ("aigc_bypass_secret", "aigc_bypass_secret"))
+            if cfg.get(k)]
+    _persist(cfg_mod, {contract.AIGC_PUSHED_FIELD: sorted(set(_old) | set(_now))})
 
     print("\n== 部署(首次拉镜像约 3-5 分钟)==")
     rc = run(node_sync.deploy_command(), cwd=str(MODAL_APP_DIR), env=env)

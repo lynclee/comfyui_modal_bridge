@@ -283,6 +283,7 @@ def submit_workflow(workflow_json: str, gpu_class: str = "") -> dict:
     ⚠ 返回 outcome:"unknown"(带 job_id)= 提交结果不确定,任务**可能已在云端跑、在计费**:
     按这个 job_id 照常 job_status 轮询核实(not_found 连续出现才作数),**不要重新提交**(会双跑双计费)。
     local 模式等本机答复最多约 330s;本机 ComfyUI 没开(连接被拒)时是普通错误,没有提交,可直接重交。
+    ⚠ MCP 客户端自己的工具调用超时要 ≥ 330s:客户端先掐断的话,上面那个带 job_id 的 unknown 结果到不了你手里。
     轮询 deadline:local 模式用返回的 worker_timeout_sec+180s;cloud 模式问部署者(默认按 3600s)。"""
     prompt = _parse_prompt(workflow_json)
     if prompt is None:

@@ -970,12 +970,12 @@ def _worker_run(workflow: dict, job_id: str, input_images: list | None = None,
             # callback_failed + 保留 manifest,AIGC Studio 轮询 /status 兜底落库(计划 §7)。
             job_state[job_id] = {**job_state.get(job_id, {}), "status": "delivering"}
             from aigc_delivery import deliver_outputs
+            # warnings(契约 D1)和 desktop 分支同一个来源,见 _result_warnings;回调里也带上
+            _w = _result_warnings(result)
             dres = deliver_outputs(
                 job_id=job_id, output_refs=result.get("output_refs") or [], delivery=delivery,
-                provider_job_id=_call_id(job_id))
+                provider_job_id=_call_id(job_id), warnings=_w)
             # manifest 只有 r2_key/etag/size 等元数据(无 base64、无 token),job_state 不膨胀。
-            # warnings(契约 D1)和 desktop 分支同一个来源,见 _result_warnings
-            _w = _result_warnings(result)
             job_state[job_id] = {**job_state.get(job_id, {}), "status": "completed",
                                  "delivery": {"mode": "aigc-r2", **dres},
                                  "completed_at": time.time(),

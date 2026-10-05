@@ -419,7 +419,8 @@ test("#3 pagehide 释放:删掉本页心跳键,刷新后的页面立即接手;�
 
 test("#3 setup 接线:定时器只在有跟踪中的 job 时写心跳;pagehide 同时释放心跳并 flush 防抖设置", () => {
   const setup = between("  async setup() {", "\n});");
-  assert(/setInterval\(\(\) => \{ if \(_trackedJobs\.size\) writeTabHeartbeat\(\); \}, ACTIVE_JOB_HB_MS\)/.test(setup), setup);
+  assert(/if \(_trackedJobs\.size\) writeTabHeartbeat\(\);/.test(setup), setup);
+  assert(/adoptOrphanJobs\(\)/.test(setup) && /ACTIVE_JOB_HB_MS\)/.test(setup), "定时器里要定期接手无主记录(第三轮)");
   const ph = /addEventListener\("pagehide", \(\) => \{([\s\S]*?)\}\);/.exec(setup);
   assert(ph && ph[1].includes("releaseTabHeartbeat()") && ph[1].includes("flushTextSettings()"), ph && ph[1]);
   assert(!source.includes("heartbeatActiveJobs"), "旧的读改写心跳还在");
@@ -808,3 +809,106 @@ test("notify 的 life 参数透传给 toast;不给时按严重程度取默认", 
   sb.notify("c", "error");
   assert.deepEqual(added.map((o) => o.life), [12000, 4000, 8000]);
 });
+
+
+// =============================================================================
+// 第三轮(第二轮复核报出)
+// =============================================================================
+test("R3-1 结果未知后 2 分钟内刷新:恢复流程同样用分钟级窗口,任务 60 秒后落地照常取回", async () => {
+  const t0 = 1_000_000_000;
+  const job = { jobId: "job-u", wfName: "wf", startedAt: t0, submitUnknown: true };
+  const tab = makeTab({ store: makeStore({ [JOBS]: [job] }), clock: { t: t0 + 5_000 }, fetch: (url, o, obs, clock) => {
+    if (url.includes("/poll?")) {
+      obs.polls++;
+      const el = clock.t - t0;
+      if (el < 60_000) return json(200, { status: "not_found" });
+      return el < 70_000 ? json(200, { status: "queued" }) : json(200, done());
+    }
+    if (url.endsWith("/fetch_result")) { obs.fetches++; return fetchOk(); }
+    return json(200, { ok: true });
+  } });
+  await tab.sb.recoverOne({ ...job }, 1200);
+  assert.equal(tab.observed.fetches, 1, "落地后要照常取回");
+  assert(tab.observed.polls > NOT_FOUND_STREAK * 5, "60 秒的 not_found 远超 5 次也不能判没落地");
+});
+
+test("R3-1 结果未知、一直 not_found:满 2 分钟才判『多半没落地』,文案用 submit_not_landed", async () => {
+  const t0 = 1_000_000_000;
+  const job = { jobId: "job-u", wfName: "wf", startedAt: t0, submitUnknown: true };
+  const tab = makeTab({ store: makeStore({ [JOBS]: [job] }), clock: { t: t0 + 5_000 }, fetch: (url, o, obs) => {
+    if (url.includes("/poll?")) { obs.polls++; return json(200, { status: "not_found" }); }
+    return json(200, { ok: true });
+  } });
+  await tab.sb.recoverOne({ ...job }, 1200);
+  assert(tab.clock.t - t0 >= 120_000, "不到 2 分钟就判了");
+  assert.equal(tab.jobs().length, 0);
+  assert(tab.observed.notifies.some((n) => n.m.startsWith("run.submit_not_landed")));
+});
+
+test("R3-1 主流程:第一次看到状态就把记录里的 submitUnknown 清掉(之后刷新按普通口径)", async () => {
+  const tab = makeTab({ fetch: (url, o, obs, clock) => {
+    if (url.endsWith("/submit")) return json(502, { error: "未知", job_id: "job-u", outcome: "unknown" });
+    if (url.includes("/poll?")) { obs.polls++; return obs.polls < 3 ? json(200, { status: "queued" }) : json(200, { status: "running", started_at: 1, timeout_s: 1200 }); }
+    return json(200, { ok: true });
+  } });
+  const p = tab.sb.runOnceOnModal({}, ["9"], tab.sb.newProgress("submitting", "wf"), null).catch(() => {});
+  for (let i = 0; i < 40 && tab.observed.polls < 2; i++) await tick();
+  const rec = tab.jobs().find((j) => j.jobId === "job-u");
+  assert(rec && rec.submitUnknown === false, JSON.stringify(rec));
+  p.then(() => {});
+});
+
+test("R3-2 主人标签页崩溃(没 pagehide)、心跳还新鲜:心跳过期后由定期检查接手,本页自己保留的记录不碰", async () => {
+  const now = 1_000_000_000;
+  const store = makeStore({
+    [JOBS]: [{ jobId: "job-c", startedAt: now, tabId: "crashed-tab" }, { jobId: "job-mine", startedAt: now, tabId: "SELF" }],
+    [HB + "crashed-tab"]: { t: now, jobs: ["job-c"] },
+  });
+  const clock = { t: now + 10_000 };
+  const B = makeTab({ store, clock, fetch: () => json(200, {}) });
+  // 「本页自己保留」的那条:tabId 改成 B 自己的
+  store.set(JOBS, store.get(JOBS).map((j) => (j.tabId === "SELF" ? { ...j, tabId: B.tabId } : j)));
+  const adopted = [];
+  B.sb.recoverOne = (j) => adopted.push(j.jobId);
+  B.sb.adoptOrphanJobs();
+  assert.deepEqual(adopted, [], "主人心跳还新鲜时不接");
+  clock.t = now + 200_000;   // 超过 120 秒阈值
+  B.sb.adoptOrphanJobs();
+  assert.deepEqual(adopted, ["job-c"], "心跳过期后要接手;本页自己保留的那条不碰");
+  assert.equal(B.jobs().find((j) => j.jobId === "job-c").tabId, B.tabId);
+  B.sb.adoptOrphanJobs();
+  assert.deepEqual(adopted, ["job-c"], "接手过的不会重复接");
+});
+
+test("R3-3 取消失败的警告不会被『连续查不到状态』盖掉、也不会被它的恢复撤掉", () => {
+  const tab = makeTab({ fetch: () => json(200, {}) });
+  const ctx = tab.sb.newProgress("queued", "wf");
+  ctx.setWarn("取消失败,可能仍在计费", "cancel");
+  const w = tab.sb.transientWatch("job-1", ctx);
+  w.transient({ error: "x" });
+  tab.clock.t += 10 * 60 * 1000;
+  w.transient({ error: "x" });
+  assert.equal(ctx.warnKind, "cancel");
+  assert.match(ctx.els.warn.textContent, /取消失败/);
+  w.seen();
+  assert.match(ctx.els.warn.textContent, /取消失败/, "状态恢复时不能把取消失败那条撤掉");
+});
+
+test("R3-4 带矛盾标记的记录:30 分钟内反复刷新只弹一次 error", async () => {
+  const job = { jobId: "job-1", wfName: "wf", startedAt: 1_000_000_000, cancelContradicted: "queued" };
+  const store = makeStore({ [JOBS]: [job] });
+  const clock = { t: 1_000_000_000 + 60_000 };
+  const mk = () => makeTab({ store, clock, fetch: (url) => (url.includes("/poll?") ? json(200, { status: "not_found" }) : json(200, { ok: true })) });
+  const a = mk();
+  await a.sb.recoverOne({ ...store.get(JOBS)[0] }, 1200);
+  clock.t += 5 * 60 * 1000;
+  const b = mk();
+  await b.sb.recoverOne({ ...store.get(JOBS)[0] }, 1200);
+  const errs = [...a.observed.notifies, ...b.observed.notifies].filter((n) => n.sev === "error");
+  assert.equal(errs.length, 1, JSON.stringify(errs));
+  clock.t += 40 * 60 * 1000;
+  const c = mk();
+  await c.sb.recoverOne({ ...store.get(JOBS)[0] }, 1200);
+  assert.equal(c.observed.notifies.filter((n) => n.sev === "error").length, 1, "过了 30 分钟再提示一次");
+});
+

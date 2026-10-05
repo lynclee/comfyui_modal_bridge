@@ -333,22 +333,23 @@ def _read_cnr_info(path: Path) -> tuple[str, str] | None:
 
 # 判 Registry 节点改没改时的时间容差(秒):有的文件系统 mtime 只精确到 1~2 秒(FAT / SMB / 部分虚拟化共享),
 # 解包与写 .tracking 落在同一刻时别把它们误判成「解包之后又改过」。
-_CNR_MTIME_SLACK_S = 2.0
+_CNR_MTIME_SLACK_S = 600.0
 
 
 def cnr_dirty(path: Path) -> bool:
-    """Registry(CNR)装的节点,本机有没有改过。ComfyUI-Manager 解包后把包里的文件逐行写进 .tracking
-    (zip 的 namelist,先解包、后写 .tracking),之后不再碰它 —— 所以:
-      · .tracking 里列的文件,mtime 比 .tracking 本身新(超过容差)→ 解包之后被改过;
+    """Registry(CNR)装的节点,本机有没有改过代码。ComfyUI-Manager 解包后把包里的文件逐行写进 .tracking
+    (zip 的 namelist),之后不再碰它。判为改过(dirty)的三种情况:
+      · .tracking 列的某个 .py 的 mtime 比列出的 .py 的 mtime **中位数**晚 10 分钟以上 → 解包之后被改过;
+      · 列了的 .py 被删了(云端从 Registry 装的那份还有它);
       · 出现 .tracking 里没有的 .py → 本机加了代码。
-    只看 .py 新增、不看别的新文件:节点运行时常往自己目录写配置 / 缓存 / 下载的模型(json、txt、权重),
-    那些不改变代码,算进去会把大量公开节点永久判成 dirty(同 worktree_dirty 的取舍)。
-    跳过隐藏目录与已知垃圾目录(__pycache__、.venv 之类),免得把节点自带的虚拟环境整个算成「新增代码」。
-    读不了 .tracking 时按干净处理:这条只是补「改了没察觉」,不该让读不到元数据的节点全走私有通道。"""
+    ⚠ 基准用列出文件自己的 mtime 中位数,不用 .tracking 本身的时间:不保留时间戳的拷贝 / 同步工具迁移安装目录时,
+      .tracking 可能先落盘,所有文件都比它新 → 全部 Registry 节点被误判成改过、改走私有通道(包超 200MB 就打包失败)。
+      10 分钟容差罩住慢盘上拷贝本身的时间差;用户真改代码几乎都在装完很久之后(2026-10-05 第二轮复核)。
+    只看 .py:节点运行时常往自己目录写配置 / 缓存 / 下载的模型,改的是数据不是代码(同 worktree_dirty 的取舍)。
+    跳过隐藏目录与已知垃圾目录(__pycache__、.venv 之类)。读不了 .tracking 时按干净处理。"""
     tracking = path / ".tracking"
     try:
         lines = tracking.read_text(encoding="utf-8", errors="replace").splitlines()
-        t0 = tracking.stat().st_mtime
     except OSError:
         return False
     listed = set()
@@ -357,13 +358,17 @@ def cnr_dirty(path: Path) -> bool:
         rel = rel[2:] if rel.startswith("./") else rel
         if rel and not rel.endswith("/"):
             listed.add(rel)
-    for rel in listed:
+    mtimes = []
+    for rel in sorted(r for r in listed if r.endswith(".py")):
         try:
-            if (path / rel).stat().st_mtime > t0 + _CNR_MTIME_SLACK_S:
-                return True
+            mtimes.append((rel, (path / rel).stat().st_mtime))
         except OSError:
-            if rel.endswith(".py"):
-                return True     # 列了的代码文件被删了:云端从 Registry 装的那份还有它
+            return True     # 列了的代码文件被删了
+    if mtimes:
+        ts = sorted(t for _, t in mtimes)
+        median = ts[len(ts) // 2]
+        if any(t > median + _CNR_MTIME_SLACK_S for _, t in mtimes):
+            return True
     for root, dirs, files in os.walk(path):
         dirs[:] = [d for d in dirs if not d.startswith(".") and d not in _JUNK_DIRS
                    and d not in ("venv", "env", "site-packages")]

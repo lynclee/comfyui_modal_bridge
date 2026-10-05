@@ -1478,7 +1478,9 @@ function transientWatch(jobId, ctx) {
       const why = String((d && (d.error || (d.http_status && `HTTP ${d.http_status}`)))
                          || (probe && probe.error && (probe.error.message || probe.error)) || "?").slice(0, 120);
       const msg = t("run.poll_unreachable", { min: Math.round(POLL_TRANSIENT_WARN_MS / 60000), why });
-      if (ctx && ctx.setWarn) ctx.setWarn(msg, "transient");
+      // ⚠ 别盖掉「取消失败、可能仍在计费」那条:盖掉后状态一恢复 clearWarn("transient") 会把整行撤掉,
+      //   取消失败的提示就丢了(2026-10-05 第二轮复核)。那条更要紧,只发 toast。
+      if (ctx && ctx.setWarn && ctx.warnKind !== "cancel") ctx.setWarn(msg, "transient");
       notify(msg, "warn");
       reportJobEvent(jobId, "poll_unreachable", why);
     },
@@ -1787,7 +1789,9 @@ async function runOnceTracked(workflowPrompt, outputNodeIds, ctx, submitGuard, b
   // 恢复";runSeenAt / runTimeoutSec 第一次看到 running 时补上(见 noteRunning、jobDeadline)。
   const rec = { jobId, gpu, wfName: ctx.wfName, startedAt: Date.now(),
                 workerTimeoutSec: sub.worker_timeout_sec || null,
-                runSeenAt: null, runStartedAt: null, runTimeoutSec: null };
+                runSeenAt: null, runStartedAt: null, runTimeoutSec: null,
+                // 提交结果未知:刷新后的恢复流程也要用分钟级的「没落地」窗口(见 recoverOneTracked)
+                ...(submitUnknown ? { submitUnknown: true } : {}) };
   // 先登记「本页在跟踪」再写记录:别的标签页恰好在这一刻启动时,不会把这条当成无主记录接走
   track.jobId = jobId;
   trackJob(jobId);
@@ -1861,7 +1865,10 @@ async function runOnceTracked(workflowPrompt, outputNodeIds, ctx, submitGuard, b
         final = { status: "auth_failed", error: pData.error || "" };
         break;
       }
-      if (pData.status !== "not_found") sawStatus = true;
+      if (pData.status !== "not_found") {
+        if (!sawStatus && rec.submitUnknown) { rec.submitUnknown = false; updateActiveJob(jobId, { submitUnknown: false }); }
+        sawStatus = true;
+      }
       if (pData.status === "running" || pData.status === "delivering") noteRunning(rec, pData);
       if (pData.status !== lastStatus) {
         lastStatus = pData.status;
@@ -2437,7 +2444,28 @@ async function recoverPendingJob() {
   }
   saveLS(LS_KEYS.activeJob, keep);
   sweepTabHeartbeats(now);
+  const others = keep.length - mine.length;
+  if (others > 0) log(`另有 ${others} 个任务正由别的标签页跟踪,本页不接手(主人停止心跳后会自动接手)`);
   for (const j of mine) recoverOne(j, settingSec);
+}
+
+// 定期接手无主记录:主人标签页崩溃 / 被杀 / 强退时来不及 pagehide,它的心跳键会新鲜地留到过期为止;
+// 启动时那一次检查看到的还是「有人在跟踪」,之后就再也没人管 —— 任务跑完没人取回,过保留期被回收
+// (2026-10-05 第二轮复核)。只接别的标签页的、心跳已过期的记录;本页自己保留的(比如取回失败后留着
+// 等刷新的)不碰,免得自动重试取回;本页正在跟踪的也不碰。
+function adoptOrphanJobs() {
+  const settingSec = getSetting("ModalBridge.timeoutSec", 1200);
+  const now = Date.now();
+  const all = loadActiveJobs();
+  const orphans = all.filter((j) => j?.jobId && j.tabId && j.tabId !== TAB_ID
+                                    && !_trackedJobs.has(j.jobId) && !trackedByLiveTab(j, now)
+                                    && now <= recoveryDeadline(j, settingSec));
+  if (!orphans.length) return;
+  const ids = new Set(orphans.map((j) => j.jobId));
+  const adopted = orphans.map((j) => { const a = { ...j, tabId: TAB_ID }; delete a.hb; return a; });
+  saveLS(LS_KEYS.activeJob, all.map((j) => (ids.has(j?.jobId) ? adopted.find((a) => a.jobId === j.jobId) : j)));
+  log("接手无主任务:", [...ids].join(","));
+  for (const j of adopted) recoverOne(j, settingSec);
 }
 
 // 刷新页面后接管一个还没终结的 job:**一直轮询到它真的终结**。
@@ -2495,17 +2523,34 @@ async function recoverOneTracked(pending, settingSec) {
     }
     if (pData.status === "not_found") {
       // 同主轮询:恢复记录里的 job 可能早被 GC 清了,连续确认后如实结束,别一直转。
-      if (++gone >= NOT_FOUND_STREAK) {
+      // ⚠ 提交结果未知、还从没看到过它:窗口要分钟级,从提交时刻起算(同主轮询的 unlanded)。
+      //   以前刷新后这里只数 5 次(约 6 秒)就删记录,run_endpoint 冷启动完一分钟后才落地的任务没人跟踪、
+      //   没人取回,用户还可能重交成双跑(2026-10-05 第二轮复核)。
+      const unlanded = !!rec.submitUnknown;
+      if (++gone >= NOT_FOUND_STREAK
+          && (!unlanded || Date.now() - (Number(rec.startedAt) || 0) >= SUBMIT_UNKNOWN_NOT_FOUND_MS)) {
         // 记录上带矛盾标记(看到过它在跑、取消都回「查无此任务」):只报矛盾、保留记录,同主轮询
         if (cancelContradiction(jobId)) {
           const msg = t("run.gone_contradicted", { id: jobId });
           reportJobEvent(jobId, "recover_gone_contradicted", "看到过 running、取消都回 not_found,恢复轮询又连续 not_found");
           ctx.finish(false, t("recover.contradicted"), msg);
-          notify(msg, "error");
+          // 记录最长要留到兜底截止线(可能 6 小时),每次刷新都弹一次 error 太吵:同一个 job 30 分钟内只弹一次,
+          // 卡片上照样显示矛盾(2026-10-05 第二轮复核)。
+          const shownAt = Number(rec.contradictionShownAt) || 0;
+          if (Date.now() - shownAt > 30 * 60 * 1000) {
+            notify(msg, "error");
+            updateActiveJob(jobId, { contradictionShownAt: Date.now() });
+          }
           return;
         }
         removeActiveJob(jobId);
-        ctx.finish(false, t("recover.gone"));
+        if (unlanded) {
+          const msg = t("run.submit_not_landed", { id: jobId, min: Math.round(SUBMIT_UNKNOWN_NOT_FOUND_MS / 60000) });
+          ctx.finish(false, "✗ not landed", msg);
+          notify(msg, "warn");
+        } else {
+          ctx.finish(false, t("recover.gone"));
+        }
         return;
       }
       await sleep(interval);
@@ -3433,7 +3478,11 @@ app.registerExtension({
     recoverPendingJob();
     // 恢复记录的归属心跳(见 TAB_ID / _trackedJobs):本页正在轮询或取回的 job 定期续约,写在本页自己的
     // 键里;页面关闭 / 刷新时删掉,刷新后的页面立刻接手,其它标签页在心跳过期前不会重复接手。
-    setInterval(() => { if (_trackedJobs.size) writeTabHeartbeat(); }, ACTIVE_JOB_HB_MS);
+    let _hbTicks = 0;
+    setInterval(() => {
+      if (_trackedJobs.size) writeTabHeartbeat();
+      if (++_hbTicks % 6 === 0) { try { adoptOrphanJobs(); } catch (e) { log("adopt orphans:", e); } }   // 约 30 秒一次
+    }, ACTIVE_JOB_HB_MS);
     try {
       window.addEventListener("pagehide", () => {
         releaseTabHeartbeat();

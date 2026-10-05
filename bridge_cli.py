@@ -300,6 +300,16 @@ def _lookup_deployed_endpoint(app_name: str, modal_mod=None) -> str:
     return m.group(1)
 
 
+def _saved_is_same_app(saved: dict, app_name: str) -> bool:
+    """cli.json 记的是不是这个 app。老文件 / configure 写的没有 app_name:按默认 app 算;endpoint 以
+    `--<app>` 结尾的也算 —— 否则自定义 app 名的用户照中止提示 `configure --endpoint` 之后,下次 deploy
+    仍会中止(2026-10-05 第二轮复核)。"""
+    if saved.get("app_name"):
+        return saved["app_name"] == app_name
+    ep = (saved.get("endpoint") or "").rstrip("/")
+    return app_name == "comfyui-bridge" or ep.endswith(f"--{app_name}")
+
+
 def cmd_deploy(args):
     """无 ComfyUI 的部署:复用插件的 deploy_env / secret 链路,避开「裸 modal deploy」陷阱
     (裸跑会丢 MODAL_BRIDGE_* env → 云端 ComfyUI 落到老兜底 tag、GPU/超时全回默认)。"""
@@ -310,7 +320,7 @@ def cmd_deploy(args):
 
     saved = _load_cli_cfg()
     # cli.json 记的是哪个 app:老文件 / configure 写的没有 app_name,按默认 app 算
-    saved_same = (saved.get("app_name") or "comfyui-bridge") == args.app_name
+    saved_same = _saved_is_same_app(saved, args.app_name)
     # 同一台机器上若装着插件,它的 config.json 才是这个 app 的权威凭据来源。
     # ⚠ 以前只看 ~/.modal_bridge/cli.json:用 GUI 部署过、从没跑过 CLI 的机器上 cli.json 不存在,
     #   于是新生成一把 BRIDGE_API_KEY 并 --force 覆盖 Secret —— 插件 config 里那把随即失效,

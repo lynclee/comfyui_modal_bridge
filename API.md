@@ -53,7 +53,7 @@ curl -X POST http://127.0.0.1:8000/modal_bridge/submit \
   -d '{"prompt": { ...API prompt... }, "job_id": "可选,自带的幂等 id"}'
 ```
 
-`job_id` 可选(规则见下文「job_id 规则」):自带 id 的调用方在自己超时、连接断开时,仍然知道该去 poll 哪个任务。
+`job_id` 可选(规则见下文「job_id 规则」,不合法返回 400):自带 id 的调用方在自己超时、连接断开时,仍然知道该去 poll 哪个任务。
 MCP 本地模式就是这么做的。
 
 返回:
@@ -84,6 +84,9 @@ MCP 本地模式就是这么做的。
 | `unknown` | 本机路由附加:云端回了其它 HTTP 错误,带 `http_status`。按瞬态处理,继续 poll |
 
 `completed` 的完整对象作为下一步的 `modal_state` 原样传回。
+`completed` 可能带 `warnings: [str]`:工作流里有输出分支被 ComfyUI 校验剔除(比如没接线的 PreviewImage),
+合法分支照常跑完、少了那一份产物,每条写明节点与原因。**模型 / 参数在云端找不到**的分支不会这样放行:
+会先撤回、等 Volume 同步后重试,仍找不到就整单 `failed`。aigc-r2 交付时,job-complete 回调里也带同样的 `warnings`。
 `gpu` 是部署时的**候选卡型链**(如 `H100→A100-80GB`),实际跑在哪张卡看 `gpu_actual`(如 `NVIDIA H100 80GB HBM3`)。
 `progress.s_it` 是滑窗中位数(≥3 个采样点才可信),可用于投影是否会撞 `worker_timeout_sec`。
 终态记录在云端只保留 1 小时(超过 200 条时更早裁剪),之后 poll 会得到 `not_found`。
@@ -138,7 +141,7 @@ MCP 本地模式就是这么做的。
 | `/modal_bridge/sync_local_nodes` | POST | `{folders:[...]}` → 自写节点打包传 Volume；代码变化只重传,`requirements.txt` 变化会自动重建依赖层。每个包携带 manifest,支持多机恢复 |
 | `/modal_bridge/list_local_nodes` | GET | Volume 上现存的本地节点包名单;读不到 Volume 时 `{ok:false, error}`,不会冒充「没有」 |
 | `/modal_bridge/remove_local_node` | POST | `{folder}` → 从 Volume 删掉某个本地节点包 |
-| `/modal_bridge/deploy` | POST | 重新部署云端 app(drain 语义:在跑的任务在旧版本上跑完)。workspace / app 名不合规返回 rc=2;部署后 `/health` 仍 404 判失败 |
+| `/modal_bridge/deploy` | POST | 重新部署云端 app(drain 语义:在跑的任务在旧版本上跑完)。workspace / app 名不合规、或 AIGC 地址不是 `https://` 时返回 rc=2;部署后 `/health` 仍 404 判失败 |
 | `/modal_bridge/list_nodes` | GET | 云端镜像当前的 custom_node 清单 |
 
 ## 状态与配置
@@ -175,7 +178,7 @@ GET 的 `?key=` 仍兼容,但会进反代 / CDN 日志,新客户端请用请求�
 (走 `-fetch`)。客户端用 `size_bytes` 校验下载完整性;核对不了时不要 ack,交给云端按保留期回收。
 
 **bridge_client 的错误分类**(`submit`):`SubmitUnknown`(带 `.job_id`)= 结果未知,可能已在跑,去 poll,别换 id 重交;
-`BridgeError("/run: HTTP {status} …")` 或 `/run: …` 开头 = 确定没提交;每次尝试都失败在连接阶段(请求没发出去)也按确定没提交报。
+以 `401` 开头(bridge key 不对)或 `/run:` 开头(如 `/run: HTTP {status} …`)的 `BridgeError` = 确定没提交;每次尝试都失败在连接阶段(请求没发出去)也按确定没提交报。
 一旦有过一次结果不确定的尝试,之后的拒收也报 `SubmitUnknown`。`cli.json` 损坏时 `bridge_cli` 中止,不会静默当成空配置。
 
 **三种消费方式**(都基于 `bridge_client.py`,纯 stdlib 零依赖):

@@ -366,7 +366,7 @@ def deliver_one(job_id: str, token: str, position: int, ref: dict,
 
 
 def deliver_outputs(job_id: str, output_refs: list[dict], delivery: dict,
-                    provider_job_id: str = "",
+                    provider_job_id: str = "", warnings: list | None = None,
                     poster=None, putter=None, streamer=None) -> dict:
     """aigc-r2 交付入口:逐个产物直传 R2,全部成功后 POST job-complete。
     返回 {"status": "completed" | "callback_failed", "assets": [...manifest...]}。
@@ -391,7 +391,10 @@ def deliver_outputs(job_id: str, output_refs: list[dict], delivery: dict,
         post_json_with_retry(
             f"{_studio_base_url()}/api/internal/job-complete",
             {"job_id": job_id, "token": token, "provider_job_id": provider_job_id,
-             "assets": assets},
+             "assets": assets,
+             # 契约 D1:被 ComfyUI 剔除的输出分支(任务照常完成、少了那一份产物)。AIGC Studio 走的是这个回调,
+             # 只写在 /status 里它看不到(2026-10-05 第二轮复核)。已脱敏、单行;对端按字段逐个读,多一个字段不影响。
+             **({"warnings": list(warnings)} if warnings else {})},
             website_headers(), COMPLETE_TRIES, poster=poster)
     except DeliveryError as e:
         # 文件已在 R2,只是没通知到 —— 保留 manifest 让 /status 兜底,不丢结果。

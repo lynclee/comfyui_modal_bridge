@@ -12,3 +12,24 @@ os.environ.setdefault("MODAL_SERVER_URL", "http://127.0.0.1:9")
 os.environ.setdefault("MODAL_TOKEN_ID", "ak-test-no-network")
 os.environ.setdefault("MODAL_TOKEN_SECRET", "as-test-no-network")
 os.environ.setdefault("MODAL_CONFIG_PATH", os.devnull)
+
+
+import pytest  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _no_real_modal_control_plane(monkeypatch):
+    """漏桩的 Modal 控制面调用**立即**失败,而且失败得出声。
+
+    光靠上面的假地址不够:SDK 自带重试,漏桩的调用要 ~56s 才抛 ConnectionError;代码里又常把异常
+    转成自己的错误(比如 bridge_cli 的 EndpointLookupFailed),「期望中止」的测试会在一分钟后照样通过,
+    谁也不会发现(2026-10-05 第二轮复核)。这里在建客户端的那一步直接 pytest.fail:它是 BaseException,
+    `except Exception` 吞不掉。需要真 SDK 行为的测试自己 monkeypatch 覆盖即可。"""
+    try:
+        import modal.client as _mc
+    except Exception:
+        return
+
+    async def _refuse(*a, **k):
+        pytest.fail("测试里出现了未桩的 Modal 控制面调用(会用真实凭据出网)—— 请 monkeypatch 掉它")
+    monkeypatch.setattr(_mc._Client, "from_env", classmethod(_refuse), raising=False)

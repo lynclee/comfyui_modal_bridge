@@ -205,6 +205,14 @@ def merge_public_config(current: dict, body: dict) -> dict:
         body = {**body, "aigc_studio_base_url": v.rstrip("/")}
     out = dict(current)
     out.update({k: body[k] for k in PUBLIC_CONFIG_WRITE_FIELDS if k in body})
+    # 用户把 URL 从有值清空:记进「这台机器写过的 AIGC 键」,部署时据此把 Secret 里的旧 URL 清掉。
+    # ⚠ 只看部署前 config 有没有值会漏掉这种情况 —— 清空发生在设置页,部署时 config 已经是空的;
+    #   升级上来的用户又没有 pushed 记录,旧 URL 就永远留在 Secret 里(2026-10-05 第二轮复核)。
+    #   只在「有值 → 空」时记,从没配过的机器不会去清别的机器写的配置。
+    if (body.get("aigc_studio_base_url") == "" and (current.get("aigc_studio_base_url") or "").strip()):
+        pushed = [f for f in (current.get(AIGC_PUSHED_FIELD) or []) if isinstance(f, str)]
+        if "aigc_base_url" not in pushed:
+            out[AIGC_PUSHED_FIELD] = pushed + ["aigc_base_url"]
     # ⚠ URL 置空**不再**连带清掉旁路密钥(2026-10-05 深度 review)。设置页的文本框是边输边存的:
     #   用户把 URL 删空准备重填、或者全选粘贴新地址,中间那一次保存就把密钥无声抹掉了,而密钥
     #   不回显、页面上只看得到「已保存」消失。停用集成后密钥的清理交给部署:/deploy 在 URL 为空时
