@@ -7,7 +7,12 @@ import hashlib
 import json
 import os
 import tempfile
+import time
 from pathlib import Path
+
+# 回执只在「成功响应丢失 / 进程重启后再次取回」时有用,云端 _outputs 的 GC 远短于此。
+# 不清的话 download_receipts/ 只增不删,每个取回过的产物留一个文件(2026-10-05 深度 review)。
+RECEIPT_MAX_AGE_S = 30 * 24 * 3600
 
 
 class ResultReceipts:
@@ -45,3 +50,25 @@ class ResultReceipts:
             os.replace(name, target)
         finally:
             Path(name).unlink(missing_ok=True)
+
+    def prune(self, max_age_s: float = RECEIPT_MAX_AGE_S) -> int:
+        """按 mtime 删掉超过 max_age_s 的回执(连同崩溃残留的 receipt-*.tmp),返回删了几个。
+
+        与 scope 无关:回执目录是全插件共用的。尽力而为,任何一个文件删不掉都跳过。"""
+        cutoff = time.time() - max_age_s
+        removed = 0
+        try:
+            entries = list(self.root.iterdir())
+        except OSError:
+            return 0
+        for p in entries:
+            if not (p.suffix == ".json" or (p.name.startswith("receipt-") and p.suffix == ".tmp")):
+                continue
+            try:
+                if p.is_symlink() or not p.is_file() or p.stat().st_mtime >= cutoff:
+                    continue
+                p.unlink()
+                removed += 1
+            except OSError:
+                continue
+        return removed

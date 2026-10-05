@@ -21,7 +21,28 @@ def atomic_write_json(path: Path, data: dict) -> None:
             raise
         with stream:
             stream.write(payload)
+            # replace 之前先把内容落盘:不 fsync 的话,断电后可能出现「rename 已生效、内容还在
+            # 页缓存里」的空文件 / 半个 JSON —— 现在那会被 load_config 判成损坏、拒绝一切写入
+            # (2026-10-05 深度 review)。
+            stream.flush()
+            os.fsync(stream.fileno())
         # 同目录 rename：读者只能看到完整旧文件或完整新文件。并发保存各自有独立临时文件。
         os.replace(name, path)
+        _fsync_dir(path.parent)
     finally:
         Path(name).unlink(missing_ok=True)
+
+
+def _fsync_dir(directory: Path) -> None:
+    """把目录项(rename 本身)也落盘。Windows 打不开目录 fd,跳过即可 —— NTFS 的
+    MoveFileEx 由文件系统日志保证;尽力而为,失败不影响已经完成的替换。"""
+    try:
+        fd = os.open(directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)

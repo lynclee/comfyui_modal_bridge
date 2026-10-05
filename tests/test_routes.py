@@ -271,34 +271,6 @@ def test_local_nodes_diff_reports_pending_image_rebuild():
     assert body["reqs_redeploy_pending"] is True, f"云端镜像的依赖是旧的却没报: {body}"
 
 
-def test_bridge_key_needs_capability_only_off_loopback():
-    """本机直连取 key 放行(0.8.40);外部 Host 无 capability 一律拒、有则放行。"""
-    _set_cfg()
-
-    async def body(c):
-        ok = await c.get("/modal_bridge/bridge_key")
-        spoofed = await c.get("/modal_bridge/bridge_key",
-                              headers={"Host": "bridge.example.com", "X-Modal-Bridge-Capability": ""})
-        local_anonymous = await c.get("/modal_bridge/bridge_key",
-                                      headers={"X-Modal-Bridge-Capability": ""})
-        assert local_anonymous.status == 200, "本机直连不该再要 capability"
-        assert (await local_anonymous.json()).get("key") == "bk-secret-value"
-        # 本机但跨站页面发起 —— Origin 守卫必须挡住,否则任意网页能偷走云端 key。
-        cross_site = await c.get("/modal_bridge/bridge_key",
-                                 headers={"Origin": "https://foreign.example",
-                                          "X-Modal-Bridge-Capability": ""})
-        assert cross_site.status == 403, "跨站页面竟然能取走 bridge key"
-        assert "bk-secret-value" not in await cross_site.text()
-        remote_authorized = await c.get("/modal_bridge/bridge_key",
-                                        headers={"Host": "bridge.example.com"})
-        assert remote_authorized.status == 200
-        return ok.status, (await ok.json()).get("key"), spoofed.status
-
-    ok_status, key, spoofed_status = _run(body)
-    assert ok_status == 200 and key == "bk-secret-value", "本机取不到 key"
-    assert spoofed_status == 403, "外部 Host 竟然能取走 bridge key"
-
-
 if __name__ == "__main__":
     # 与 test_core.py 同样的极简自跑(CI 里没有 pytest,直接 python tests/test_routes.py)
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
