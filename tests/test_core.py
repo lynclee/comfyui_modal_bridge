@@ -1693,7 +1693,9 @@ def test_bridge_client_acks_only_after_every_output_is_on_disk(tmp_path):
             {"filename": "a.mp4", "volume_path": "_outputs/j/a.mp4"},
             {"filename": "b.wav", "volume_path": "_outputs/j/b.wav"}]}
         try:
-            return c.download_outputs(state, str(tmp_path / f"out{len(clens)}"), delete_remote=True)
+            # 每次用新目录:同一任务取回成功后再取同一目录,会按回执直接返回(2026-10-05 起),测不到下载
+            out = tmp_path / ("out_" + "_".join(map(str, clens)))
+            return c.download_outputs(state, str(out), delete_remote=True)
         finally:
             bc._open_http = orig
 

@@ -2,6 +2,7 @@
 modal_client.py — 调用 Modal endpoint(私有 endpoint,自建鉴权:GET 走 X-Bridge-Key 头,POST 走 body auth_key)
 """
 import asyncio
+import json
 import uuid
 from typing import Optional
 
@@ -11,6 +12,19 @@ try:                                   # 插件里是包内相对导入;CLI / �
     from . import health_client
 except ImportError:
     import health_client
+
+
+class SubmitUnknown(RuntimeError):
+    """/run 的重试全部失败,而**至少有一次请求可能已经到达云端** —— 任务也许已在排队 / 运行、在计费。
+
+    .job_id 是这次提交用的幂等键:调用方拿它去 status / cancel 核实,**绝不能换新 id 重新提交**
+    (双跑双计费)。以前重试用尽只抛 last_err,job_id 跟着丢了,云端那个任务没人看得见
+    (2026-10-05 深度 review,契约 C3)。本机 /submit 捕获它回 502 {error, job_id, outcome: "unknown"}。
+    「确定没提交」(401、其它 4xx、云端回 {"error"} 拒收)照旧抛普通 RuntimeError。"""
+
+    def __init__(self, msg: str, job_id: str):
+        super().__init__(msg)
+        self.job_id = job_id
 
 
 def _endpoint(base: str, label: str) -> str:
@@ -38,12 +52,15 @@ async def submit_job(
     needs_gpu: bool = True,
     gpu_class: str = "primary",
     local_nodes: Optional[dict] = None,
-    max_retries: int = 1,
+    max_retries: int = 3,
 ) -> dict:
-    """POST /run,带鉴权,自动重试 1 次。
+    """POST /run,带鉴权;结果未知的失败(网络错 / 超时 / 5xx / 408 / 429 / 非 JSON)按指数退避重试,
+    默认最多 3 次。重试全部失败抛 SubmitUnknown(带 .job_id);确定没提交的(401 / 其它 4xx /
+    云端回 {"error"})直接抛 RuntimeError、不重试。
     needs_gpu=False → 后端路由到 CPU worker(纯 API/无模型工作流,省钱)。
     gpu_class='cheap' → 显存放得下的工作流降到便宜卡(L40S);'primary' → 主卡(H100)。"""
     url = _endpoint(cfg["modal_endpoint_base"], "run")
+    job_id = str(uuid.uuid4())
     payload = {
         "workflow": workflow,
         "user_id": cfg.get("user_id", "local-dev"),
@@ -58,7 +75,7 @@ async def submit_job(
         # 不带的话服务端每次 uuid4 新建,而 502/504/超时的那一次 spawn 可能其实已经成功
         # (只是响应丢在网关)—— 重试就等于再开一个同样的 GPU 任务,双跑双计费,
         # 前端只拿得到第二个 id,第一个在后台烧到跑完谁也不知道。
-        "job_id": str(uuid.uuid4()),
+        "job_id": job_id,
     }
     if input_images:
         payload["images"] = input_images
@@ -69,36 +86,49 @@ async def submit_job(
 
     headers = {"Content-Type": "application/json"}
     last_err: Optional[Exception] = None
+    attempts = 0
     for attempt in range(max_retries + 1):
+        if attempt:
+            # 指数退避:网关 504 多半是 run_endpoint 冷启动慢,紧接着重试大概率撞同一个冷容器
+            await asyncio.sleep(1.5 * 2 ** (attempt - 1))
+        attempts += 1
         try:
             async with session.post(url, json=payload, headers=headers, allow_redirects=False,
                                     timeout=aiohttp.ClientTimeout(total=60)) as r:
-                text = await r.text()
+                raw = await r.read()
+                text = raw.decode("utf-8", "replace")
                 if 300 <= r.status < 400:
-                    raise RuntimeError(f"Modal /run 返回重定向 {r.status},没有跟随(会把 bridge key 带过去)")
+                    # 不跟随(会把 bridge key 带过去),也不重试(同一个地址还会回同一个跳转)。
+                    # 跳转不说明请求有没有被处理,按「结果未知」交还 job_id。
+                    last_err = RuntimeError(f"Modal /run 返回重定向 {r.status},没有跟随(会把 bridge key 带过去)")
+                    break
                 if r.status == 401:
                     raise RuntimeError("Modal /run 401 — bridge key 不对/缺失。点 [Modal Setup] 重新部署会刷新 key")
-                if r.status in (502, 503, 504):
+                # 4xx = 请求被拒、没有进到 spawn(408 / 429 除外:超时与限流不说明请求被处理了没有)
+                if 400 <= r.status < 500 and r.status not in (408, 429):
+                    raise RuntimeError(f"Modal /run failed {r.status}: {text[:500]}")
+                if r.status >= 400:
                     last_err = RuntimeError(f"Modal /run transient {r.status}: {text[:200]}")
                     print(f"[modal_bridge] /run attempt {attempt+1} got {r.status}, retrying...")
-                    await asyncio.sleep(1.5)
                     continue
-                if r.status >= 400:
-                    raise RuntimeError(f"Modal /run failed {r.status}: {text[:500]}")
                 try:
-                    data = await r.json(content_type=None)
-                except Exception:
-                    raise RuntimeError(f"Modal /run non-JSON: {text[:500]}")
-                if "error" in data:
-                    raise RuntimeError(f"Modal /run error: {data['error']}")
-                if "id" not in data:
-                    raise RuntimeError(f"Modal /run missing id: {data}")
-                return data
+                    data = json.loads(raw)
+                except ValueError:
+                    last_err = RuntimeError(f"Modal /run non-JSON: {text[:300]}")
+                    print(f"[modal_bridge] /run attempt {attempt+1} got non-JSON, retrying...")
+                    continue
+                if isinstance(data, dict) and "error" in data:
+                    raise RuntimeError(f"Modal /run error: {data['error']}")   # 云端校验没过,确定没提交
+                if isinstance(data, dict) and data.get("id"):
+                    return data
+                last_err = RuntimeError(f"Modal /run missing id: {str(data)[:300]}")
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
             last_err = e
             print(f"[modal_bridge] /run attempt {attempt+1} network err: {e}, retrying...")
-            await asyncio.sleep(1.5)
-    raise last_err or RuntimeError("submit_job failed after retries")
+    raise SubmitUnknown(
+        f"提交结果未知 job_id={job_id}:{attempts} 次尝试都没拿到确定答复(最后一次:{last_err})。"
+        f"任务可能已在云端排队 / 运行 —— 先用 status/cancel 核实这个 job_id,别重新提交(会双跑双计费)",
+        job_id)
 
 
 async def health(session, cfg) -> dict:
@@ -109,7 +139,8 @@ async def health(session, cfg) -> dict:
         try:
             async with session.get(health_client.url(cfg), headers=health_client.headers(cfg),
                                    allow_redirects=False, timeout=aiohttp.ClientTimeout(total=10)) as r:
-                return health_client.interpret(r.status, await r.text())
+                # errors="replace":正文不是 UTF-8 时别抛 UnicodeDecodeError 漏出去(它不在下面的 except 里)
+                return health_client.interpret(r.status, await r.text(errors="replace"))
         except health_client.HealthUnavailable as e:
             if e.kind in ("unauthorized", "not_deployed"):
                 raise
@@ -122,13 +153,33 @@ async def health(session, cfg) -> dict:
 
 
 async def cancel(session, cfg, job_id) -> dict:
+    """POST /cancel,返回云端响应 dict(读法见契约 C2 / bridge_client.cancel_still_billing:
+    带 error 且不是 cancel_noop、不是 not_found,才是「取消失败、可能仍在计费」)。
+
+    HTTP 非 2xx、重定向、响应不是 JSON 对象 → 抛 RuntimeError(取消结果未知,调用方按可能仍在计费报)。
+    ⚠ 以前原样返回正文:云端回 500 + {"detail": …}(没有 error 字段)时,本机 /cancel 报 ok:true ——
+      取消失败被说成成功(2026-10-05 深度 review,同 bridge_client 的 C8)。"""
     url = _endpoint(cfg["modal_endpoint_base"], "cancel")
     async with session.post(
         url, json={"job_id": job_id, "auth_key": _key(cfg)},
         headers={"Content-Type": "application/json"}, allow_redirects=False,
         timeout=aiohttp.ClientTimeout(total=15),
     ) as r:
-        return await r.json(content_type=None)
+        raw = await r.read()
+        text = " ".join(raw.decode("utf-8", "replace").split())
+        if 300 <= r.status < 400:
+            raise RuntimeError(f"Modal /cancel 返回重定向 {r.status},没有跟随(会把 bridge key 带过去)")
+        if r.status == 401:
+            raise RuntimeError("Modal /cancel 401 — bridge key 不对/缺失。点 [Modal Setup] 重新部署会刷新 key")
+        if r.status >= 400:
+            raise RuntimeError(f"Modal /cancel {r.status}: {text[:300] or '(无正文)'}")
+        try:
+            data = json.loads(raw)
+        except ValueError:
+            raise RuntimeError(f"Modal /cancel 返回的不是 JSON: {text[:200]}") from None
+        if not isinstance(data, dict):
+            raise RuntimeError(f"Modal /cancel 返回的不是 JSON 对象: {text[:200]}")
+        return data
 
 
 # ============================================================================
