@@ -787,8 +787,8 @@ def test_clearing_the_url_in_settings_keeps_the_bypass_secret():
     assert cfg["aigc_studio_base_url"] == "" and cfg["aigc_bypass_secret"] == "byp-1"
 
 
-def test_job_id_rule_rejects_trailing_newline():
-    for bad in ("abc\n", "a" * 65):
+def test_job_id_rule_rejects_trailing_newline_and_leading_symbol():
+    for bad in ("abc\n", "-x", ".x", "_x", "a" * 65):
         assert not contract.is_safe_job_id(bad), repr(bad)
     assert contract.is_safe_job_id("a" * 64) and contract.is_safe_job_id("0-a_b.c")
 

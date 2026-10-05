@@ -12,7 +12,10 @@ from urllib.parse import urlsplit
 
 # job_id 会拼进本地落盘路径(output/<subfolder>/<job_id>/)。云端产生的 id 是 uuid4
 # 或 AIGC Studio 的任务 UUID,都在这个字符集内;别的一律拒。
-_SAFE_JOB_ID = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
+# 首字符必须是字母或数字(契约 C1,2026-10-05 深度 review):"-x" 会被 CLI 当成选项,
+# "." 开头是隐藏目录。⚠ 与 modal_app/modal_app.py 的 _SAFE_JOB_ID 逐字一致,由
+# test_job_id_rule_identical_local_and_cloud 钉死。
+_SAFE_JOB_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 # 设置页可经通用 /config 写入的字段。**凭据一律不在此列** —— 这个 allowlist 存在的
 # 意义就是挡住"先改配置、再取 key"那类两步绕过,往里加密钥等于自己开口子。
 # aigc_studio_base_url 是站点地址、不是凭据,可以进;它的旁路密钥走部署面板的
