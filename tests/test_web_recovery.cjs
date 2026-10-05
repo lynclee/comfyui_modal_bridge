@@ -13,6 +13,7 @@ const NOT_FOUND_STREAK = Number(
 function setup({ fetchFails = false, status = "completed", cancelError = false,
                  cancelGone = false, pollSeq = null, cancelSeq = null } = {}) {
   let saved = [];
+  const other = {};
   const observed = { stages: [], timers: [], cleared: [], fetches: 0, polls: 0, alerts: 0,
                      cancels: 0, sleeps: [], notifies: [], finishes: [] };
   const context = () => ({
@@ -21,8 +22,13 @@ function setup({ fetchFails = false, status = "completed", cancelError = false,
   });
   const sandbox = {
     Date, Headers, LS_KEYS: { activeJob: "jobs" },
-    loadLS: () => JSON.parse(JSON.stringify(saved)),
-    saveLS: (_key, value) => { saved = JSON.parse(JSON.stringify(value)); },
+    // 只有恢复记录走 saved;标签页心跳(modal_bridge.tab_hb.*,2026-10-05 第二轮起)等其它键另存
+    loadLS: (key) => (key === "jobs" ? JSON.parse(JSON.stringify(saved)) : (other[key] ?? null)),
+    saveLS: (key, value) => {
+      if (key === "jobs") saved = JSON.parse(JSON.stringify(value));
+      else other[key] = JSON.parse(JSON.stringify(value));
+    },
+    clearLS: (key) => { if (key === "jobs") saved = []; else delete other[key]; },
     getSetting: (_key, value) => value, getVramTier: () => "80g",
     sleep: async (ms) => { observed.sleeps.push(ms); }, log: () => {}, err: () => {},
     notify: (m) => { observed.notifies.push(m); },
