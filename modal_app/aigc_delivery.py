@@ -139,13 +139,37 @@ def is_retryable_status(status: int | None) -> bool:
     return status is None or status >= 500
 
 
+# URL 里的 query(形如 ?X-Amz-Signature=...)。requests 的网络异常文本会带上完整请求地址 ——
+# 有时是整条 URL,有时是 "Max retries exceeded with url: /path?query" 这种只有路径的形态。
+# 预签名 PUT 地址的 query 就是凭据(几分钟内谁拿到谁能往那个 key 写),以前原样打进日志
+# (2026-10-05 深度 review)。只认「? 后紧跟 key=」,不误伤中文报错里的问号。
+_URL_QUERY = re.compile(r"\?[A-Za-z0-9_.~%-]+=[^\s'\")]*")
+
+
+def _redact_query(text: str) -> str:
+    """把文本里所有 URL 的 query 换成占位,其余原样保留(便于看出是哪个 host / path 出的错)。"""
+    return _URL_QUERY.sub("?<redacted>", str(text))
+
+
+def _redirect_refused(r) -> str:
+    """3xx 一律当失败:跟随跳转会把请求头(含 bypass 密钥)和 body(含 job token)转发给跳转目标。"""
+    loc = _redact_query(r.headers.get("Location", "") if getattr(r, "headers", None) else "")
+    return f"redirect refused (HTTP {r.status_code} → {loc or '?'})"
+
+
 def _default_poster(url: str, body: dict, headers: dict, timeout: int):
-    """POST JSON → (status_code, 解析后的 dict 或原始文本)。网络异常 → (None, 错误串)。"""
+    """POST JSON → (status_code, 解析后的 dict 或原始文本)。网络异常 → (None, 错误串)。
+
+    ⚠ allow_redirects=False:requests 对 POST 默认跟随跳转,307/308 会**原样带着 body 和自定义头**
+      跳过去 —— 它只在跨域时剥 Authorization,不认识 x-vercel-protection-bypass。一个跨源 307
+      就能把 bypass 密钥和带 job token 的 body 交给第三方(2026-10-05 深度 review)。"""
     import requests
     try:
-        r = requests.post(url, json=body, headers=headers, timeout=timeout)
+        r = requests.post(url, json=body, headers=headers, timeout=timeout, allow_redirects=False)
     except Exception as e:
-        return None, f"{type(e).__name__}: {e}"
+        return None, _redact_query(f"{type(e).__name__}: {e}")
+    if 300 <= r.status_code < 400:
+        return r.status_code, _redirect_refused(r)
     try:
         return r.status_code, r.json()
     except ValueError:
@@ -154,14 +178,17 @@ def _default_poster(url: str, body: dict, headers: dict, timeout: int):
 
 def _default_putter(put_url: str, file_path: str, headers: dict, timeout: int):
     """流式 PUT 文件到预签名地址 → (status_code, 响应头 dict)。网络异常 → (None, {})。
-    只带 required_headers(Content-Type),不自加签名头;Content-Length 由 requests 按文件算。"""
+    只带 required_headers(Content-Type),不自加签名头;Content-Length 由 requests 按文件算。
+    不跟随跳转(同 _default_poster):预签名地址本身就是凭据,产物也不该被转去别处;3xx 由调用方按失败重试。"""
     import requests
     try:
         with open(file_path, "rb") as src:
-            r = requests.put(put_url, data=src, headers=headers, timeout=timeout)
+            r = requests.put(put_url, data=src, headers=headers, timeout=timeout, allow_redirects=False)
+        if 300 <= r.status_code < 400:
+            print(f"[bridge] R2 PUT {_redirect_refused(r)}")
         return r.status_code, dict(r.headers)
     except Exception as e:
-        print(f"[bridge] R2 PUT failed: {type(e).__name__}: {e}")
+        print(f"[bridge] R2 PUT failed: {_redact_query(f'{type(e).__name__}: {e}')}")
         return None, {}
 
 
@@ -181,9 +208,12 @@ def stream_output_to_temp(ref: dict) -> tuple[str, int, str]:
     # 字面量 "/tmp" 会吃 Bandit B108(MEDIUM),见 _local_nodes_boot.py 同款注释。
     fd, temp_path = tempfile.mkstemp(prefix="aigc_")
     try:
-        with requests.get(f"http://{COMFY_HOST}/view?{params}", stream=True, timeout=60) as r:
-            r.raise_for_status()
-            with os.fdopen(fd, "wb") as out:
+        # ⚠ fdopen 必须在任何可能失败的调用之前接管 fd:以前它在 requests.get 之后,
+        #   /view 连不上或回 4xx/5xx 时 fd 从没被包进文件对象,也没人 close —— 每失败一次漏一个
+        #   (2026-10-05 深度 review)。现在 fd 一出生就归 with 管,任何异常都会关掉。
+        with os.fdopen(fd, "wb") as out:
+            with requests.get(f"http://{COMFY_HOST}/view?{params}", stream=True, timeout=60) as r:
+                r.raise_for_status()
                 for chunk in r.iter_content(1024 * 1024):
                     out.write(chunk)
                     sha.update(chunk)
@@ -209,7 +239,7 @@ def post_json_with_retry(url: str, body: dict, headers: dict, max_tries: int,
             # 2xx 一律算成功:job-complete 完全可能回 204/空 body,不能因为体不是
             # JSON 就误判成拒绝。需要具体字段的调用方(intake)自己校验缺字段。
             return resp if isinstance(resp, dict) else {}
-        last = f"HTTP {status}: {str(resp)[:300]}"
+        last = f"HTTP {status}: {_redact_query(str(resp))[:300]}"
         if not is_retryable_status(status):
             raise DeliveryError(f"{url.rsplit('/', 1)[-1]} rejected — {last}",
                                 status=status, retryable=False)
@@ -228,7 +258,7 @@ def _intake_one(base_url: str, job_id: str, token: str, asset_type: str, positio
          "filename": filename, "content_type": content_type, "size_bytes": size},
         website_headers(), INTAKE_TRIES, poster=poster)
     if not resp.get("put_url") or not resp.get("r2_key"):
-        raise DeliveryError(f"asset-intake malformed response: {str(resp)[:300]}")
+        raise DeliveryError(f"asset-intake malformed response: {_redact_query(str(resp))[:300]}")
     return resp
 
 

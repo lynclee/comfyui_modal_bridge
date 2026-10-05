@@ -1123,6 +1123,16 @@ def _load_endpoint(name, ns):
     装饰器不在 FunctionDef 的源码区间里,所以取到的就是裸函数本身。"""
     ns.setdefault("_Header", lambda default="": default)
     ns.setdefault("_effective", lambda s, now: s)     # 默认不判死;要测判死的用 _status_ns / 显式传
+    # 2026-10-05:cancel_endpoint 也要校验 job_id、cancel_noop 只回字段子集 —— 没显式传就给真函数
+    if "_safe_job_id" not in ns:
+        import ast as _ast
+        import re as _re
+        mod = ROOT / "modal_app" / "modal_app.py"
+        pat = next(n.value.args[0] for n in _ast.parse(mod.read_text(encoding="utf-8")).body
+                   if isinstance(n, _ast.Assign) and any(getattr(t, "id", "") == "_SAFE_JOB_ID" for t in n.targets))
+        ns["_safe_job_id"] = _extract_nested(mod, "_safe_job_id",
+                                             {"_SAFE_JOB_ID": _re.compile(_ast.literal_eval(pat))})
+    ns.setdefault("_cancel_noop_view", _extract_nested(ROOT / "modal_app" / "modal_app.py", "_cancel_noop_view", {}))
     return _extract_nested(ROOT / "modal_app" / "modal_app.py", name, ns)
 
 
@@ -3397,6 +3407,7 @@ def _load_sweep(job_state, remove_file, *, budget=10, ttl=3600, job_max=200):
         "_release_stale_call": lambda jid, s, call_id=None: "",
         "_CALL_PENDING": "pending",
         "_SWEEP_EVERY_S": 0, "_last_sweep": [0.0],      # 默认关节流,节流另有专门测试
+        "_sweep_orphan_outputs": lambda records, now: None,   # 孤儿目录扫描另有专门测试(test_fix_cloud)
         "_is_already_gone": _extract_nested(ROOT / "modal_app" / "modal_app.py",
                                             "_is_already_gone", {}),
     }
