@@ -73,13 +73,16 @@ def main():
             #   相对路径(ComfyUI 列表里看到的也是 "SDXL/x.safetensors")。按 basename 比会把已在子目录
             #   的模型判成缺失、再拍平重传一份,云端 ComfyUI 里出现两个同名条目(2026-09-24 review)。
             rel = f.relative_to(MODELS / type_).as_posix()
-            if rel in existing:
+            # 路径相同还要比大小:Volume 上那份大小不对(传错 / 截断)时要覆盖,
+            # 以前只比路径,错的文件永远留在云端(2026-10-05 深度 review)
+            replace = modal_volume.remote_size_mismatch(existing, rel, f.stat().st_size)
+            if rel in existing and not replace:
                 continue
             if modal_volume.file_in_progress(f):
                 in_progress.append(f"{type_}/{rel}")
                 continue
             items.append({"type": type_, "filename": rel, "local_path": str(f),
-                          "size_mb": f.stat().st_size // 1024 // 1024})
+                          "size_mb": f.stat().st_size // 1024 // 1024, "replace": replace})
 
     if in_progress:
         print(f"\n⏳ 跳过 {len(in_progress)} 个还在下载中的文件(等下完再跑本脚本):")
@@ -93,7 +96,8 @@ def main():
     total = sum(x["size_mb"] for x in items)
     print(f"\n待同步 {len(items)} 个文件,共 ~{total} MB:")
     for it in items:
-        print(f"  {it['type']}/{it['filename']}  ({it['size_mb']} MB)")
+        tag = "  ← Volume 上同名文件大小不同,将覆盖" if it.get("replace") else ""
+        print(f"  {it['type']}/{it['filename']}  ({it['size_mb']} MB){tag}")
 
     if dry:
         print("\n(--dry-run,未上传)")

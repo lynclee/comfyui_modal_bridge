@@ -225,8 +225,10 @@ _custom_nodes_data.py — Modal 镜像里要装的 custom_nodes 清单(纯数据
    - name:  custom_nodes 下的文件夹名(必须和 git clone 出来的目录名一致)
    - url:   git 仓库地址
    - commit: pin 的 commit sha(防止 master HEAD 漂移;留空字符串则跟随默认分支 HEAD)
+   Comfy Registry(CNR)装的节点另有两个字段 {"cnr_id","version"},url 是
+   https://api.comfy.org/nodes/<cnr_id>/versions/<version>,build 时按这个版本下载 Registry 的 zip。
 
-modal_image.py 在 build 时读这个列表生成 git clone 命令。
+modal_image.py 在 build 时读这个列表生成 git clone / Registry 下载命令。
 改这里 → 重新 `modal deploy` → 只重 build 节点那两层(clone + 装依赖),不影响其它层。
 """
 '''
@@ -257,6 +259,92 @@ def baked_node_names() -> set[str]:
     return {n.get("name", "") for n in read_baked_nodes() if n.get("name")}
 
 
+# ============================================================================
+# Comfy Registry(CNR)节点
+#
+# ComfyUI-Manager 从 Registry 装的节点**没有 .git**,只有 .tracking(装了哪些文件)和 pyproject 的
+# [project] name / version —— Manager 自己就是这么认 CNR 包的(glob/cnr_utils.read_cnr_info)。
+# 以前只能退回 pyproject 里的仓库地址:第一次部署云端克隆的是 GitHub 默认分支 HEAD,不是本机装的版本
+# (ComfyUI-GGUF 的 pyproject 自己写着「2.0.0 = GitHub main,1.X.X = Registry」);之后同一个节点
+# 又因为没有 commit 被判 no_git,走私有节点通道传 Volume,还触发依赖重建(2026-10-05 深度 review)。
+# 现在当公共节点处理,钉到本机的 Registry 版本:镜像构建时按 (id, version) 从 Registry 下载那一版的 zip。
+#
+# 2026-10-05 联网核实:GET https://api.comfy.org/nodes/<id>/versions/<version> 返回 downloadUrl
+# (如 https://cdn.comfy.org/city96/ComfyUI-GGUF/1.1.10/node.zip,文件直接在 zip 根),id 大小写不敏感,
+# 版本不存在回 404。下载下来的 1.1.10 与本机 .tracking 列的文件逐个一致。
+#
+# ⚠ 清单条目的 url 就写成这个版本 API 地址,(id, version) 以 url 为准、cnr_id / version 字段只是冗余:
+#   routes 的 /sync_nodes 只保留 name/url/commit,云端 /health 的 manifest 也只回这三个字段 ——
+#   把版本放在额外字段里,走一圈就丢了;放在 url 里,任何只认 url 的环节都原样带着它。
+# ============================================================================
+CNR_API = "https://api.comfy.org"
+_CNR_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+_CNR_VER_RE = re.compile(r"^[0-9][0-9A-Za-z.+_-]{0,63}$")
+_CNR_URL_RE = re.compile(r"^https://api\.comfy\.org/nodes/([^/?#\s]+)/versions/([^/?#\s]+)/?$", re.I)
+
+
+def cnr_url(cnr_id: str, version: str) -> str:
+    return f"{CNR_API}/nodes/{cnr_id}/versions/{version}"
+
+
+def cnr_ref(entry) -> tuple[str, str] | None:
+    """清单条目 / 云端 manifest / folder_git_info 的结果 → (cnr_id 小写, version);不是 CNR 返回 None。
+    url 优先(见上方说明),url 不是 Registry 地址时才看 cnr_id / version 字段。"""
+    if not isinstance(entry, dict):
+        return None
+    m = _CNR_URL_RE.match((entry.get("url") or "").strip())
+    if m:
+        cid, ver = m.group(1), m.group(2)
+    else:
+        cid, ver = str(entry.get("cnr_id") or "").strip(), str(entry.get("version") or "").strip()
+    if _CNR_ID_RE.match(cid) and _CNR_VER_RE.match(ver):
+        return cid.lower(), ver
+    return None
+
+
+def _read_cnr_info(path: Path) -> tuple[str, str] | None:
+    """本机节点目录是不是 Registry 装的:有 .tracking + pyproject 的 [project] name / version。
+    判据与 ComfyUI-Manager 的 read_cnr_info 一致(id 取 name 的小写;TOML 解析失败 = 不是)。"""
+    if not (path / ".tracking").is_file():
+        return None
+    try:
+        text = (path / "pyproject.toml").read_text(encoding="utf-8")
+    except Exception:
+        return None
+    try:
+        import tomllib
+    except ImportError:          # Python 3.10 及以下:只认最常见的写法
+        sect = re.search(r"(?ms)^\[project\]\s*$(.*?)(?=^\[|\Z)", text)
+        body = sect.group(1) if sect else ""
+        mn = re.search(r'(?m)^\s*name\s*=\s*["\']([^"\']+)["\']', body)
+        mv = re.search(r'(?m)^\s*version\s*=\s*["\']([^"\']+)["\']', body)
+        name, ver = (mn.group(1) if mn else ""), (mv.group(1) if mv else "")
+    else:
+        try:
+            proj = tomllib.loads(text).get("project") or {}
+        except Exception:
+            return None
+        name, ver = str(proj.get("name") or ""), str(proj.get("version") or "")
+    name, ver = name.strip(), ver.strip()
+    if _CNR_ID_RE.match(name) and _CNR_VER_RE.match(ver):
+        return name.lower(), ver
+    return None
+
+
+def _baked_entry(name: str, src: dict) -> dict:
+    """任一来源(云端 manifest / 本机清单 / folder_git_info)→ 规整的清单条目。
+    CNR 的统一成 {url: 版本 API 地址, commit: "", cnr_id, version};其它只留 name/url/commit。"""
+    ref = cnr_ref(src)
+    if ref:
+        return {"name": name, "url": cnr_url(*ref), "commit": "", "cnr_id": ref[0], "version": ref[1]}
+    return {"name": name, "url": (src.get("url") or ""), "commit": (src.get("commit") or "")}
+
+
+def _has_url_creds(url: str) -> bool:
+    """http(s) 地址里带不带 userinfo(https://tok@host/… / https://u:p@host/…)。"""
+    return bool(re.match(r"^https?://[^/@\s]+@[^/\s]", (url or "").strip(), re.I))
+
+
 def complete_baked_entries(names: list[str], local_by_name: dict,
                            manifest: list[dict] | None) -> list[dict]:
     """云端 /health 只保证给出节点**名字**,url/commit 从哪来:**云端 manifest 优先**,本机清单兜底。
@@ -265,19 +353,64 @@ def complete_baked_entries(names: list[str], local_by_name: dict,
       条目丢掉 —— 下一次部署就把它从镜像里删了。机器 A 加的节点被机器 B 一次同步删掉;
       插件被 Manager 重装、本机清单丢了,一次部署清空云端全部节点。设计本意是「多机取并集、
       永不互删」(见 plan_node_sync),实现却因为云端只报名字把自己的承诺打破了(2026-09-23 review)。
-    云端优先的理由:manifest 就是镜像实际装的那份,比本机「上次从这台机器部署的」更权威。"""
-    cloud = {n["name"]: n for n in (manifest or []) if isinstance(n, dict) and n.get("name")
-             and (n.get("url") or "").strip() and not n.get("url_redacted")}
-    out = []
+    云端优先的理由:manifest 就是镜像实际装的那份,比本机「上次从这台机器部署的」更权威。
+    补不出来源的条目 url 为空(调用方据此中止);url 带凭据被脱敏的规则见 complete_baked_entries_ex。"""
+    return complete_baked_entries_ex(names, local_by_name, manifest)[0]
+
+
+def complete_baked_entries_ex(names: list[str], local_by_name: dict,
+                              manifest: list[dict] | None) -> tuple[list[dict], list[str]]:
+    """同 complete_baked_entries,另回一组差异说明行(给 reconcile 的 drift)。
+
+    url 被 /health 脱敏(url_redacted)的云端条目:脱敏后的地址克隆不了私有仓库,只能借本机的地址。
+    ⚠ 以前直接退回本机清单 / 本机 git 的**整条**(地址 + commit):本机落后时云端被静默换成本机的旧
+      commit,既不算 drift、自动部署也不拦;本机地址指向别的仓库时连仓库都换了(2026-10-05 深度 review)。
+    现在只有「本机地址与云端是同一个仓库、且本机地址确实带凭据」才借用,而且只借地址、commit 用云端的;
+    本机 commit 与云端不同时出一条差异说明。其它情况一律当补不出来源(url 留空,调用方中止)。"""
+    by_name = {n["name"]: n for n in (manifest or []) if isinstance(n, dict) and n.get("name")}
+    out, drift = [], []
     for name in names:
-        e = cloud.get(name) or local_by_name.get(name) or _local_git_entry(name) \
-            or {"name": name, "url": "", "commit": ""}
-        out.append({"name": name, "url": e.get("url", ""), "commit": e.get("commit", "")})
-    return out
+        c = by_name.get(name)
+        if c and c.get("url_redacted"):
+            e, line = _complete_redacted(name, c, local_by_name.get(name))
+            out.append(e)
+            if line:
+                drift.append(line)
+            continue
+        if c and (c.get("url") or "").strip():
+            out.append(_baked_entry(name, c))
+            continue
+        e = local_by_name.get(name) or _local_git_entry(name) or {"url": "", "commit": ""}
+        out.append(_baked_entry(name, e))
+    return out, drift
+
+
+def _complete_redacted(name: str, cloud: dict, listed: dict | None) -> tuple[dict, str]:
+    """脱敏的云端条目 → (条目, 差异说明行)。见 complete_baked_entries_ex。"""
+    cc = (cloud.get("commit") or "").strip()
+
+    def candidates():
+        if listed:
+            yield "清单里", listed
+        g = _local_git_entry(name)     # 跑 git,用到才算
+        if g:
+            yield "实际装的", g
+
+    for where, src in candidates():
+        u = (src.get("url") or "").strip()
+        if not (_same_repo(u, cloud.get("url")) and _has_url_creds(u)):
+            continue
+        lc = (src.get("commit") or "").strip()
+        line = ""
+        if lc != cc:
+            line = (f"{name}: 云端独有的私有节点,按云端 {_show_commit(cc)} 并回;"
+                    f"本机{where}是 {_show_commit(lc)}(与云端不同,这次不会改动云端)")
+        return {"name": name, "url": u, "commit": cc}, line
+    return {"name": name, "url": "", "commit": ""}, ""
 
 
 def _local_git_entry(name: str) -> dict | None:
-    """本机 custom_nodes/<name> 装着的话,用它的 git 信息补。
+    """本机 custom_nodes/<name> 装着的话,用它的 git / Registry 信息补。
 
     ⚠ 这是云端报不出来源时的兜底:云端 < 0.8.48 没有 manifest(Registry 上的 latest 还是 0.7.9,
       所有从 Registry 升级的用户第一次部署都走这里),或 url 带凭据被 /health 脱敏了
@@ -287,7 +420,7 @@ def _local_git_entry(name: str) -> dict | None:
     except Exception:
         return None
     if g.get("has_git") and (g.get("url") or "").strip():
-        return {"name": name, "url": g["url"], "commit": g.get("commit", "")}
+        return _baked_entry(name, g)
     return None
 
 
@@ -329,6 +462,12 @@ def _show_commit(c: str) -> str:
     return c[:12] if c else "未钉 commit(构建时取最新)"
 
 
+def _show_src(e: dict) -> str:
+    """说明行里的版本:Registry 节点显示版本号,git 节点显示 commit。"""
+    ref = cnr_ref(e)
+    return f"Registry {ref[1]}" if ref else _show_commit((e.get("commit") or "").strip())
+
+
 def _same_repo(a: str, b: str) -> bool:
     """去掉凭据后比 scheme / host / path。任一边为空 = 来源未知,不算同一仓库。
 
@@ -340,15 +479,21 @@ def _same_repo(a: str, b: str) -> bool:
 
 
 def _same_source(entry: dict, cloud: dict) -> bool:
-    """同一仓库 + 同一 commit。"""
+    """同一仓库 + 同一 commit;Registry 节点比 (cnr_id, version)。一边 Registry 一边 git 不算相同。"""
+    a, b = cnr_ref(entry), cnr_ref(cloud)
+    if a or b:
+        return a == b
     return _same_repo(entry.get("url"), cloud.get("url")) and \
         (entry.get("commit") or "").strip() == (cloud.get("commit") or "").strip()
 
 
 def _drift_line(n: dict, c: dict) -> str:
-    lc, cc = (n.get("commit") or "").strip(), (c.get("commit") or "").strip()
-    line = f"{n.get('name')}: 云端 {_show_commit(cc)} → 本次部署 {_show_commit(lc)}"
-    if not (c.get("url") or "").strip():
+    line = f"{n.get('name')}: 云端 {_show_src(c)} → 本次部署 {_show_src(n)}"
+    if bool(cnr_ref(n)) != bool(cnr_ref(c)):
+        line += "(安装来源也不同:一边是 Registry 版本、一边是 git 仓库)"
+    elif cnr_ref(n):
+        pass
+    elif not (c.get("url") or "").strip():
         line += "(云端没报来源,确认不了是不是同一仓库)"
     elif not _same_repo(n.get("url"), c.get("url")):
         line += "(来源仓库也不同)"
@@ -388,23 +533,35 @@ def resolve_drift(local: list, manifest: list | None, names: list | None = None)
             g = folder_git_info(n.get("name"))
         except Exception:
             g = {}
-        inst = {"url": g.get("url") or "", "commit": (g.get("commit") or "").strip()}
+        inst = {"url": g.get("url") or "", "commit": (g.get("commit") or "").strip(),
+                "cnr_id": g.get("cnr_id"), "version": g.get("version")}
+        inst_cnr = cnr_ref(inst) if g.get("has_git") else None
         # 要连地址一起换(仓库搬过家),而云端那条是带凭据的私有仓库、本机地址却没带凭据(ssh / 凭据助手克隆):
         # 换过去的地址构建时克隆不下来,整个镜像构建失败(2026-09-28 review)。这种不自动更正,留作差异。
         moved_private = c.get("url_redacted") and not _same_repo(n.get("url"), c.get("url")) \
             and "@" not in inst["url"].split("://", 1)[-1].split("/", 1)[0]
-        if g.get("has_git") and inst["commit"] and _same_source(inst, c) and not moved_private:
-            old = (n.get("commit") or "").strip()
-            n["commit"] = inst["commit"]
-            if not _same_source(n, c):          # 仓库也变了(清单里是旧地址)→ 连地址一起更正
-                n["url"] = inst["url"]
-            corrected.append(f"{n.get('name')}: 清单里是 {_show_commit(old)},本机实际装的 "
-                             f"{_show_commit(inst['commit'])} = 云端")
+        if g.get("has_git") and (inst["commit"] or inst_cnr) and _same_source(inst, c) and not moved_private:
+            old = _show_src(n)
+            if inst_cnr:
+                # Registry 节点:(id, version) 就是全部来源,整条换成规整的 CNR 条目
+                n.update(_baked_entry(n.get("name"), inst))
+            else:
+                n.pop("cnr_id", None)           # 清单里原来若是 Registry 条目,字段会让 cnr_ref 仍判成 CNR
+                n.pop("version", None)
+                n["commit"] = inst["commit"]
+                if not _same_source(n, c):      # 仓库也变了(清单里是旧地址)→ 连地址一起更正
+                    n["url"] = inst["url"]
+            corrected.append(f"{n.get('name')}: 清单里是 {old},本机实际装的 "
+                             f"{_show_src(inst)} = 云端")
         else:
-            if g.get("has_git") and inst["commit"]:
+            if inst_cnr:
+                installed = f"Registry {inst_cnr[1]}"
+            elif g.get("has_git") and inst["commit"]:
                 installed = _show_commit(inst["commit"])
             elif g.get("has_git"):
                 installed = "已装,但没有 git 记录的 commit(Registry / 压缩包安装)"
+            elif g.get("url_problem"):
+                installed = f"已装,但来源地址云端克隆不了({g['url_problem']})"
             else:
                 installed = "没装,或读不到来源"
             if moved_private and g.get("has_git") and _same_source(inst, c):
@@ -448,15 +605,23 @@ def reconcile_baked_with_cloud(cfg: dict) -> Reconciled:
     if manifest is None and any(n.get("name") in names for n in local):
         unchecked = "云端没报节点版本(云端早于 0.8.48,或它读取清单失败),同名节点比对不了"
     drift, corrected = resolve_drift(local, manifest, names)   # 更正会就地改 local 的条目,下面一并写回
+    # 本机清单有、云端镜像里没有的:可能是别的机器在「管理云端节点」里有意删掉的,也可能是上次写了清单但
+    # 部署失败。这次部署会把它装回云端 —— 以前只比两边同名的节点,这种既不拦也不列(2026-10-05 深度 review)。
+    # 显式部署照推并列出;自动部署据此停下(auto_deploy_blocker)。
+    # not_deployed / 读不到云端的情况在上面已经返回,走不到这里,不会把全新部署误判成「云端缺节点」。
+    cloud_names = set(names)
+    drift += [f"{n.get('name')}: 本机清单有、云端镜像里没有(可能在别处被有意移除,或上次部署没成功),"
+              f"这次部署会把它装回云端" for n in local if n.get("name") and n.get("name") not in cloud_names]
     have = {n.get("name") for n in local}
     missing = [n for n in names if n not in have]
     back = []
     if missing:
-        entries = complete_baked_entries(missing, {}, manifest)
+        entries, back_drift = complete_baked_entries_ex(missing, {}, manifest)
         back = [e for e in entries if (e.get("url") or "").strip()]
         lost = [e["name"] for e in entries if not (e.get("url") or "").strip()]
         if lost:
             raise DeployBlocked(unresolved_nodes_message(lost))   # 中止时什么都不写
+        drift += back_drift
     if back or corrected:
         write_baked_nodes(local + back)
     return Reconciled([e["name"] for e in back], drift, corrected, unchecked)
@@ -472,7 +637,7 @@ def drift_message(rec: Reconciled) -> str:
         out += ("   ✓ 本机节点清单陈旧,已按本机实际装的版本更正(与云端一致,这次不会改动它们):\n"
                 + "".join(f"      {d}\n" for d in rec.corrected))
     if rec.drift:
-        out += ("   ⚠ 同名节点与云端版本不同,本次部署以本机清单为准(若清单是旧的,这就是一次降级):\n"
+        out += ("   ⚠ 以下节点与云端不一致,本次部署以本机清单为准(若清单是旧的,这就是一次降级):\n"
                 + "".join(f"      {d}\n" for d in rec.drift))
     return out
 
@@ -491,7 +656,9 @@ def auto_deploy_blocker(rec: Reconciled) -> str:
     else:
         names = [d.split(":", 1)[0] for d in rec.drift]
         shown = "、".join(names[:5]) + (f" 等 {len(names)} 个" if len(names) > 5 else "")
-        why = f"公共节点 {shown} 的版本与云端不同,这次部署会把它们换成本机清单里的版本"
+        # 差异不只「同名版本不同」,还有「本机清单有、云端没有」「云端独有的私有节点本机版本不同」,
+        # 措辞要盖得住这几种(2026-10-05 深度 review)
+        why = f"节点 {shown} 与云端不一致,确认不了这次部署该以哪边为准"
     return (f"自动部署已中止:{why}。它是为私有节点依赖触发的,不替你改公共节点。"
             f"在面板点「推送到云端」确认部署后再提交(明细见 ComfyUI 控制台)")
 
@@ -519,13 +686,25 @@ def write_baked_nodes(nodes: list[dict]) -> None:
         # url 非空时才判 has_git=True,正常流程产生不了空值 —— 但这个文件是
         # 机器可改的本地状态(可能被手工编辑、也可能是历史遗留),坏条目宁可丢掉
         # 也不能进镜像。丢弃要出声,静默跳过等于让节点"莫名其妙没装上"。
-        if not (n.get("url") or "").strip() or not (n.get("name") or "").strip():
+        name = (n.get("name") or "").strip()
+        if not (n.get("url") or "").strip() or not name:
             print(f"[modal_bridge] ⚠ 跳过无效 baked 条目(url/name 为空): {n!r}")
             continue
+        # CNR 条目规整成 {url: 版本 API 地址, cnr_id, version}:routes / 云端 manifest 只回传
+        # name/url/commit,字段在这里由 url 重新补齐(见 cnr_ref 上方说明)
+        e = _baked_entry(name, n)
+        if not cnr_ref(e):
+            # ssh 写法能换成 https 的就地换掉;换不了的(自建 ssh、本地路径、file://)云端构建克隆不到,
+            # 进镜像只会让**整个** RUN 失败、连带其它节点(2026-10-05 深度 review)。同上:丢弃并出声。
+            e["url"] = _normalize_git_url(e["url"])
+            problem = clone_url_problem(e["url"])
+            if problem:
+                print(f"[modal_bridge] ⚠ 跳过 baked 条目 {name}:{problem}")
+                continue
         lines.append("    {")
-        lines.append(f'        "name": {json.dumps(n.get("name", ""), ensure_ascii=False)},')
-        lines.append(f'        "url": {json.dumps(n.get("url", ""), ensure_ascii=False)},')
-        lines.append(f'        "commit": {json.dumps(n.get("commit", ""), ensure_ascii=False)},')
+        for k in ("name", "url", "commit", "cnr_id", "version"):
+            if k in e:
+                lines.append(f'        "{k}": {json.dumps(e[k], ensure_ascii=False)},')
         lines.append("    },")
     lines.append("]")
     DATA_FILE.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -603,15 +782,58 @@ def _git(args: list[str], cwd: Path) -> str | None:
     return None
 
 
-def _normalize_git_url(url: str) -> str:
-    """ssh 形式转 https,方便 Modal 容器里无凭据 clone。"""
-    url = (url or "").strip()
-    if url.startswith("git@github.com:"):
-        return "https://github.com/" + url[len("git@github.com:"):]
-    return url
-
-
 _GIT_HOSTS = ("github.com", "gitlab.com", "codeberg.org", "bitbucket.org", "gitee.com")
+
+# ssh / git 协议的几种写法:scp 风格 user@host:path、ssh://[user@]host[:port]/path、git://host[:port]/path
+_SCP_RE = re.compile(r"^[A-Za-z0-9._-]+@([A-Za-z0-9.-]+):(?!//)/?(.+)$")
+_SSH_RE = re.compile(r"^ssh://(?:[^@/]+@)?([^/:]+)(?::(\d+))?/(.+)$", re.I)
+_GITPROTO_RE = re.compile(r"^git://([^/:]+)(?::(\d+))?/(.+)$", re.I)
+
+
+def _normalize_git_url(url: str) -> str:
+    """ssh / git:// 写法转 https,方便 Modal 容器里无凭据 clone。
+
+    ⚠ 以前只认 `git@github.com:` 一种,`ssh://git@github.com/…`、`git@gitlab.com:…` 原样进镜像,
+      构建时克隆失败、整个 RUN 连带其它节点一起挂(2026-10-05 深度 review)。
+    只转已知公共托管站(_GIT_HOSTS)且是默认端口的:自建服务器的 ssh 地址换成 https 多半是另一个端口 /
+    根本不开 https,而且它通常是私有仓库 —— 云端没有 ssh 凭据,换了也克隆不到。转不了的原样返回,
+    由 clone_url_problem 在入口拒绝。"""
+    url = (url or "").strip()
+    host = path = port = None
+    m = _SCP_RE.match(url)
+    if m and "://" not in url:
+        host, path = m.group(1), m.group(2)
+    elif (m := _SSH_RE.match(url)):
+        host, port, path = m.group(1), m.group(2), m.group(3)
+        if port not in (None, "22"):
+            return url
+    elif (m := _GITPROTO_RE.match(url)):
+        host, port, path = m.group(1), m.group(2), m.group(3)
+        if port not in (None, "9418"):
+            return url
+    if host is None:
+        return url
+    host = host.lower()
+    if host.removeprefix("www.") not in _GIT_HOSTS:
+        return url
+    return f"https://{host}/{path.lstrip('/')}"
+
+
+def clone_url_problem(url: str) -> str:
+    """云端构建能不能克隆这个地址;能 → 空串,不能 → 一句原因(给用户看)。
+
+    云端构建容器里没有 ssh 密钥、没有本机文件系统,只认 http(s)。调用方应先过 _normalize_git_url。"""
+    u = (url or "").strip()
+    if not u:
+        return "没有仓库地址"
+    if re.match(r"^https?://[^/\s]+", u, re.I):
+        return ""
+    if _SCP_RE.match(u) or _SSH_RE.match(u):
+        return (f"来源是 ssh 地址({u.split('@')[-1].split(':')[0].split('/')[0]}),云端构建没有 ssh 凭据;"
+                f"只有 {' / '.join(_GIT_HOSTS)} 的 ssh 地址能自动换成 https")
+    if _GITPROTO_RE.match(u):
+        return "来源是 git:// 地址且不是已知公共托管站,云端构建克隆不到"
+    return "来源不是 http(s) 地址(本地路径 / file:// 等),云端构建克隆不到"
 
 
 def _sanitize_repo_url(url: str) -> str:
@@ -718,10 +940,13 @@ def _is_own_git_repo(path: Path) -> bool:
 
 def folder_git_info(folder: str) -> dict:
     """读本地 custom_nodes/<folder> 的可克隆地址 + commit。
-    主路径读 .git(remote.origin.url + HEAD commit);CNR / Registry / 压缩包装的节点
-    没有 .git,则兜底读 pyproject.toml 的仓库地址(commit 留空 = 跟随默认分支 HEAD)。
-    has_git 在此表示「解析得到可克隆 url」(未必真有本地 .git)。
-    额外回 pushed:False 表示本地 commit 没推到远端(云端 checkout 必失败)。"""
+    主路径读 .git(remote.origin.url + HEAD commit);Registry(CNR)装的节点回
+    {url: Registry 版本地址, commit: "", cnr_id, version}(见 cnr_ref 上方说明);
+    压缩包装的节点没有 .git,则兜底读 pyproject.toml 的仓库地址(commit 留空 = 跟随默认分支 HEAD)。
+    has_git 在此表示「解析得到云端构建拿得到的来源」(未必真有本地 .git)。
+    额外回 pushed:False 表示本地 commit 没推到远端(云端 checkout 必失败)。
+    remote 是云端克隆不了的地址(自建 ssh / 本地路径)时 has_git=False,url_problem 写明原因 ——
+    这种节点不能进镜像清单,走私有节点通道(Volume)。"""
     path = _comfyui_root() / "custom_nodes" / folder
     if not path.is_dir():
         # 注意用 is_dir:单文件节点(custom_nodes/foo.py)不是可 clone 的仓库,
@@ -731,10 +956,20 @@ def folder_git_info(folder: str) -> dict:
         url = _git(["config", "--get", "remote.origin.url"], path)
         commit = _git(["rev-parse", "HEAD"], path)
         if url and commit:
-            return {"folder": folder, "has_git": True,
-                    "url": _normalize_git_url(url), "commit": commit,
+            url = _normalize_git_url(url)
+            info = {"folder": folder, "has_git": True,
+                    "url": url, "commit": commit,
                     "pushed": commit_on_remote(path, commit),
                     "dirty": worktree_dirty(path)}
+            problem = clone_url_problem(url)
+            if problem:
+                info.update(has_git=False, url_problem=problem)
+            return info
+    cnr = _read_cnr_info(path)
+    if cnr:
+        # Manager 不跟踪 Registry 包里的文件改动,这里也没有可比的依据 → dirty 按 False(同 pyproject 兜底)
+        return {"folder": folder, "has_git": True, "url": cnr_url(*cnr), "commit": "",
+                "cnr_id": cnr[0], "version": cnr[1], "pushed": True, "dirty": False}
     repo = _pyproject_repo_url(path)
     if repo:
         return {"folder": folder, "has_git": True,
@@ -805,15 +1040,26 @@ def folder_exists_locally(folder: str) -> bool:
     return (_comfyui_root() / "custom_nodes" / folder).is_dir()
 
 
-def _cloud_stale_reason(git: dict, local_commit: str, baked_commit: str) -> str | None:
+def _cloud_stale_reason(git: dict, local_commit: str, baked_commit: str,
+                        baked: dict | None = None) -> str | None:
     """已烤进镜像的节点:云端那份跟本地比是不是旧的?返回原因,None = 一致无需动作。
       "dirty"    工作树有未提交改动 —— 云端按 commit clone,拿不到这些改动
       "unpushed" commit 变了但没推 —— 云端 clone 不到这个 commit
       "no_git"   拿不到 git 依据(.git 丢了/不是仓库)—— 无从判断,只能按「可能不一致」处理
       "commit"   干净且已推、commit 与镜像不同 —— 走 git 路线更新即可
-    纯函数,单测覆盖四条分支。"""
+      "cnr"      本机是 Registry 装的、版本与镜像那条不同 —— 按本机的 Registry 版本更新(同 commit 路线)
+      "unclonable" remote 是云端克隆不了的地址 —— 只能走私有节点通道
+    baked 是镜像清单里的那条(Registry 节点按 (cnr_id, version) 比,commit 两边都是空的)。
+    纯函数,单测覆盖各条分支。"""
     if git.get("dirty"):
         return "dirty"
+    lref = cnr_ref(git)
+    if lref:
+        # ⚠ 以前 Registry 节点没有 commit,一律落到 no_git、走 Volume 通道并触发依赖重建
+        #   (2026-10-05 深度 review)。现在有 (id, version) 可比。
+        return None if baked is not None and cnr_ref(baked) == lref else "cnr"
+    if git.get("url_problem"):
+        return "unclonable"
     if not git.get("has_git") or not local_commit:
         # 没有 git 可比:镜像里那份是历史某次同步进去的,现在无从校验 → 保守当作可能不一致。
         # (老实说这条大多命中"用户把 .git 删了"的自写节点,正是本地打包通道的目标场景。)
@@ -829,7 +1075,8 @@ def plan_node_sync(prompt: dict, baked: list[dict] | None = None,
     节点同步规划:让 Modal 镜像装上工作流需要的 custom_node。
       - add:   工作流用到、本地有 git(且已推送)、baked 还没有的 → 加进镜像
       - update: baked 有、但本地 commit 跟 baked 不一致的 → 按本地 commit 更新
-      - local_pack: 无 git remote(自写节点)或本地 commit 未推送 → 走 Volume 打包通道,
+      - local_pack: 无 git remote(自写节点)、本地 commit 未推送、或 remote 云端克隆不了
+                    (reason=unclonable,detail 写原因)→ 走 Volume 打包通道,
                     **不需要重新部署**(worker 启动时解压,见 local_nodes.py)
       - prune: baked 有、但本地 custom_nodes 没有的 → 候选移除
 
@@ -841,8 +1088,8 @@ def plan_node_sync(prompt: dict, baked: list[dict] | None = None,
     baked 不传则读本地 _custom_nodes_data.py。
     返回:
       {
-        "add": [{folder, class_types, url, commit}],
-        "update": [{folder, url, old_commit, commit}],
+        "add": [{folder, class_types, url, commit}],          # Registry 节点另带 cnr_id / version
+        "update": [{folder, url, old_commit, commit}],        # Registry 节点另带 cnr_id / version / old_version
         "expect_baked": [folder...],                  # 本次任务明确应运行镜像版
         "prune": [{name}],
         "missing_no_git": [{folder, class_types}],  # 工作流要、baked 没、本地也没 git → 补不了
@@ -866,38 +1113,52 @@ def plan_node_sync(prompt: dict, baked: list[dict] | None = None,
             ok_baked += 1
             local_commit = (git.get("commit") or "").strip()
             baked_commit = (baked_by_name[folder].get("commit") or "").strip()
-            reason = _cloud_stale_reason(git, local_commit, baked_commit)
+            reason = _cloud_stale_reason(git, local_commit, baked_commit, baked_by_name[folder])
             if reason is None:
                 # 这次应跑镜像版。若历史上曾上传过 dirty/local 覆盖包,它必须退场;
                 # expect_baked 还会随任务发给暖容器,让已解压/已 import 的旧覆盖恢复成 baked。
                 expect_baked.append(folder)
-            elif reason == "commit":
-                # 干净、已推、commit 变了 → 走 git 路线更新镜像
-                update.append({"folder": folder, "url": git["url"],
-                               "old_commit": baked_commit, "commit": local_commit})
-                baked_by_name[folder] = {"name": folder, "url": git["url"], "commit": local_commit}
+            elif reason in ("commit", "cnr"):
+                # 干净、已推、commit 变了 → 走 git 路线更新镜像;Registry 节点同理,按本机版本更新
+                entry = _baked_entry(folder, git)
+                upd = {"folder": folder, "url": entry["url"],
+                       "old_commit": baked_commit, "commit": entry["commit"]}
+                if reason == "cnr":
+                    old_ref = cnr_ref(baked_by_name[folder])
+                    upd.update(cnr_id=entry["cnr_id"], version=entry["version"],
+                               old_version=old_ref[1] if old_ref else "")
+                update.append(upd)
+                baked_by_name[folder] = entry
                 expect_baked.append(folder)
             elif folder_exists_locally(folder):
                 # dirty / 未推送 / 没有 git 可依据 —— 云端 clone 不到这一版,
                 # 走本地打包通道盖掉镜像里那份。
                 # ⚠ 绝不能默默跳过:那样云端**静默跑旧代码**,比部署报错难查得多
                 #   (用户改完节点点运行,结果和改之前一模一样,毫无线索)。
-                local_pack.append({"folder": folder, "class_types": sorted(class_types),
-                                   "reason": reason})
+                item = {"folder": folder, "class_types": sorted(class_types), "reason": reason}
+                if git.get("url_problem"):
+                    item["detail"] = git["url_problem"]
+                local_pack.append(item)
             continue
         if git["has_git"] and git.get("pushed", True) and not git.get("dirty"):
-            add.append({"folder": folder, "class_types": sorted(class_types),
-                        "url": git["url"], "commit": git.get("commit") or ""})
-            baked_by_name[folder] = {"name": folder, "url": git["url"],
-                                     "commit": git.get("commit") or ""}
+            entry = _baked_entry(folder, git)
+            item = {"folder": folder, "class_types": sorted(class_types),
+                    "url": entry["url"], "commit": entry["commit"]}
+            if "cnr_id" in entry:
+                item.update(cnr_id=entry["cnr_id"], version=entry["version"])
+            add.append(item)
+            baked_by_name[folder] = entry
             expect_baked.append(folder)
         elif folder_exists_locally(folder):
             # 自写节点(无 git remote)、或有 remote 但本轮改动没推 —— 走本地打包通道:
             # 打包传 Volume,worker 启动时解压。不需要重 build 镜像(见 local_nodes.py)。
-            local_pack.append({
-                "folder": folder, "class_types": sorted(class_types),
-                "reason": "unpushed" if git["has_git"] else "no_git",
-            })
+            # remote 是云端克隆不了的地址(自建 ssh / 本地路径)也走这里,而不是进镜像清单让构建失败。
+            item = {"folder": folder, "class_types": sorted(class_types),
+                    "reason": ("unclonable" if git.get("url_problem")
+                               else "unpushed" if git["has_git"] else "no_git")}
+            if git.get("url_problem"):
+                item["detail"] = git["url_problem"]
+            local_pack.append(item)
         else:
             # 目录都不在(单文件节点 custom_nodes/foo.py,或路径解析异常)→ 真的补不了
             missing_no_git.append({"folder": folder, "class_types": sorted(class_types),
@@ -1096,6 +1357,90 @@ def secret_create_cmd(cfg: dict, hf_token: str = "", civitai_token: str = "",
     return [sys.executable, "-m", "modal", "secret", "create", "--force", secret_name, *pairs]
 
 
+# 逻辑字段 → Secret 里的键(与 secret_create_cmd 一一对应)
+_SECRET_KEYS = {
+    "bridge_key": ("BRIDGE_API_KEY",),
+    "hf_token": ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN"),
+    "civitai_token": ("CIVITAI_TOKEN",),
+    "comfy_api_key": ("COMFY_API_KEY_COMFY_ORG",),
+    "aigc_base_url": ("AIGC_STUDIO_BASE_URL",),
+    "aigc_bypass_secret": ("AIGC_STUDIO_BYPASS_SECRET",),
+}
+
+
+def secret_upsert_cmd(cfg: dict, hf_token: str = "", civitai_token: str = "",
+                      bridge_key: str = "", comfy_api_key: str = "",
+                      aigc_base_url: str = "", aigc_bypass_secret: str = "",
+                      clear=()) -> list[str]:
+    """合并语义地写 Modal Secret 的命令(参数顺序与 secret_create_cmd 相同,可直接替换)。
+
+    非空的值写入(覆盖同名键);空值 = 这次没提供,Secret 里原有的键**保持不动**;
+    clear 里点名的逻辑字段(如 ("aigc_base_url", "aigc_bypass_secret"))才清空 —— 只用于用户明确清掉的项。
+
+    ⚠ 为什么不再 `secret create --force` 整份重建:Secret 只按这一台机器的 config 重建,别的机器 /
+      deploy.py --hf-token 写进去的 HF / comfy.org / AIGC 凭据就被抹掉(2026-10-05 深度 review)。
+    合并靠 modal.Secret.update(SDK ≥ 1.3.5;Mac 上实测 1.4.3 有,语义同 dict.update)。
+    公开 API 删不了键(proto 支持,但只能走私有 stub),所以「清空」是写成空串 —— worker 读这些键
+    都按真假判断(空串 = 没配),效果等同删除。SDK 太旧时脚本退回旧的整份重建并明说。
+
+    跑的是 `python node_sync.py secret-upsert …`(见文件末尾):值仍以 KEY=VALUE 出现在 argv 里,
+    redact_cmd 的打码规则原样适用。"""
+    values = {"bridge_key": bridge_key, "hf_token": hf_token, "civitai_token": civitai_token,
+              "comfy_api_key": comfy_api_key, "aigc_base_url": aigc_base_url,
+              "aigc_bypass_secret": aigc_bypass_secret}
+    clear = set(clear or ())
+    bad = clear - set(_SECRET_KEYS) | (clear & {"bridge_key"})
+    if bad:
+        raise ValueError(f"不能清空的字段: {sorted(bad)}")
+    app_name = cfg.get("modal_app_name", "comfyui-bridge")
+    pairs = [f"{k}={v}" for f, v in values.items() if v for k in _SECRET_KEYS[f]]
+    clears = [f"--clear={k}" for f in sorted(clear) if not values.get(f) for k in _SECRET_KEYS[f]]
+    return [sys.executable, str(Path(__file__).resolve()), "secret-upsert",
+            f"{app_name}-secrets", *pairs, *clears]
+
+
+def _secret_upsert_main(argv: list[str], modal_mod=None) -> int:
+    """secret_upsert_cmd 的执行体:`python node_sync.py secret-upsert <名> KEY=VALUE… [--clear=KEY…]`。"""
+    if not argv:
+        print("用法: python node_sync.py secret-upsert <secret 名> KEY=VALUE... [--clear=KEY ...]")
+        return 2
+    name, sets, clears = argv[0], {}, []
+    for a in argv[1:]:
+        if a.startswith("--clear="):
+            clears.append(a[len("--clear="):])
+            continue
+        k, sep, v = a.partition("=")
+        if not sep or not k:
+            print(f"✗ 参数不是 KEY=VALUE: {k[:40]}")
+            return 2
+        sets[k] = v
+    if modal_mod is None:
+        import modal as modal_mod
+    if not hasattr(modal_mod.Secret, "update"):
+        print("⚠ 本机 modal SDK 早于 1.3.5,没有 Secret.update —— 退回整份重建(--force):"
+              "这次没给的键会被清掉。升级 SDK(pip install -U modal)后恢复合并更新。", flush=True)
+        return subprocess.call([sys.executable, "-m", "modal", "secret", "create", "--force", name,
+                                *([f"{k}={v}" for k, v in sets.items()] or ["EMPTY=1"])])
+    upd = {**{k: "" for k in clears}, **sets}
+    if not upd:
+        print(f"[modal_bridge] Secret {name}:没有要改的键")
+        return 0
+    try:
+        try:
+            modal_mod.Secret.from_name(name).update(upd)
+            how = "合并更新"
+        except modal_mod.exception.NotFoundError:
+            modal_mod.Secret.objects.create(name, dict(sets) or {"EMPTY": "1"})
+            how = "新建"
+    except Exception as e:
+        # 只报类型和消息:Modal 的报错不含 Secret 的值,但别把 upd 打出来
+        print(f"✗ 写 Modal Secret {name} 失败:{type(e).__name__}: {e}")
+        return 1
+    print(f"✓ Secret {name} 已{how}:写入 {', '.join(sorted(sets)) or '无'}"
+          + (f";清空 {', '.join(sorted(clears))}" if clears else "") + "(其余键保持不变)")
+    return 0
+
+
 def deploy_env(cfg: dict) -> dict:
     """从 config 拼出 modal deploy / secret 需要的环境变量(MODAL_BRIDGE_* + 鉴权)。"""
     app_name = cfg.get("modal_app_name", "comfyui-bridge")
@@ -1126,3 +1471,10 @@ def deploy_env(cfg: dict) -> dict:
     if cfg.get("modal_token_secret"):
         env["MODAL_TOKEN_SECRET"] = cfg["modal_token_secret"]
     return env
+
+
+if __name__ == "__main__":
+    # 只给 secret_upsert_cmd 用:部署流程以子进程跑它,与 `modal secret create` 同样的 argv 形态。
+    if len(sys.argv) >= 2 and sys.argv[1] == "secret-upsert":
+        sys.exit(_secret_upsert_main(sys.argv[2:]))
+    sys.exit("用法: python node_sync.py secret-upsert <secret 名> KEY=VALUE... [--clear=KEY ...]")

@@ -30,6 +30,21 @@ VOLUME_PREFIX = "_local_nodes"
 BAKED_SENTINEL = "__modal_bridge_baked__"
 
 
+class VolumeUnavailable(RuntimeError):
+    """读不到 Volume 上的私有节点信息(Modal 不可用 / 网络 / 鉴权)。
+
+    ⚠ 以前读失败一律返回 [] —— 和「确认 Volume 上没有私有节点」长得一样,还被缓存 60 秒:
+      部署时据此生成空的依赖清单,私有节点的依赖从镜像里消失;检查节点时当成没有覆盖包可清。
+      (2026-10-05 深度 review)现在分开:真的没有才返回 [],读不到就抛它,调用方决定中止还是标「未检查」。"""
+
+
+def _is_not_found(e: Exception) -> bool:
+    """Modal SDK 的「不存在」:读文件转成 FileNotFoundError,列目录是 modal.exception.NotFoundError。
+    只认异常类型、不认消息文字:「…not found」也可能出现在鉴权 / workspace 的报错里,
+    误认成「确认没有」正是这里要防的方向。"""
+    return isinstance(e, FileNotFoundError) or type(e).__name__ == "NotFoundError"
+
+
 def _mv():
     """拿 modal_volume 模块。插件在 ComfyUI 里以包加载(相对导入),而 tests / sync_models.py
     走 sys.path 直接导入 —— 两种上下文都要能用,所以延迟到调用时解析。"""
@@ -242,12 +257,15 @@ def volume_digests(cfg: dict, folders: list[str]) -> dict:
     return out
 
 
-def volume_local_node_requirements(cfg: dict, folders: list[str] | None = None) -> dict[str, list[str]]:
+def volume_local_node_requirements(cfg: dict, folders: list[str] | None = None,
+                                   strict: bool = False) -> dict[str, list[str]]:
     """读取每个 Volume 本地节点随包上传的依赖 manifest。
 
     manifest 与 zip/digest 同批上传，使任意一台机器重部署时都能恢复多机节点依赖；
     不能只扫当前机器的 custom_nodes，否则另一台机器上传的私有节点会在重部署后掉包。
     旧包没有 manifest 时不出现在结果里，调用方会保留旧的 flat requirements 兼容迁移。
+    strict=True(部署期用):拿不到 Volume、或读 manifest 出了「不存在」以外的错,抛 VolumeUnavailable ——
+    否则一次网络抖动就让这个节点按「没有 manifest」处理,依赖从镜像里漏掉。
     """
     names = list(folders) if folders is not None else list_volume_local_nodes(cfg, max_age=0)
     out: dict[str, list[str]] = {}
@@ -257,18 +275,52 @@ def volume_local_node_requirements(cfg: dict, folders: list[str] | None = None) 
             vol.reload()
         except Exception:
             pass
-    except Exception:
+    except Exception as e:
+        if strict:
+            raise VolumeUnavailable(f"拿不到 Modal Volume:{e}") from e
         return out
     for folder in names:
         buf = io.BytesIO()
         try:
             vol.read_file_into_fileobj(f"{VOLUME_PREFIX}/{folder}.requirements.json", buf)
+        except Exception as e:
+            if strict and not _is_not_found(e):
+                raise VolumeUnavailable(f"读 {folder} 的依赖清单失败:{e}") from e
+            continue
+        try:
             value = json.loads(buf.getvalue().decode("utf-8"))
-            if isinstance(value, list) and all(isinstance(x, str) for x in value):
-                out[folder] = value
         except Exception:
-            pass
+            continue          # 内容坏了 = 当它没有 manifest,按旧扁平清单兼容
+        if isinstance(value, list) and all(isinstance(x, str) for x in value):
+            out[folder] = value
     return out
+
+
+def volume_node_requirements(cfg: dict, legacy: list[str] | None = None) -> list[str]:
+    """部署期:镜像要装的私有节点依赖 = Volume 上每个私有节点 manifest 的并集(纯读,不落盘)。
+
+    给 deploy.py / bridge_cli 用 —— 它们以前部署前不刷新依赖文件、部署后也不记录,插件的预检会把
+    「镜像缺依赖」误判成「不用重建」(2026-10-05 深度 review)。
+      · 读不到 Volume → 抛 VolumeUnavailable(调用方中止部署;沿用旧文件可能正好是错的那份);
+      · Volume 上确认没有私有节点 → [];
+      · 旧包没有 manifest → 并入 legacy(上次生成的扁平清单),等它下次重传时完成迁移。"""
+    folders = list_volume_local_nodes(cfg, max_age=0)
+    if not folders:
+        return []
+    manifests = volume_local_node_requirements(cfg, folders, strict=True)
+    reqs: list[str] = []
+    seen: set[str] = set()
+    for folder in sorted(manifests):
+        for req in manifests[folder]:
+            if req not in seen:
+                seen.add(req)
+                reqs.append(req)
+    if set(folders) - set(manifests):
+        for req in legacy or []:
+            if req not in seen:
+                seen.add(req)
+                reqs.append(req)
+    return reqs
 
 
 def plan_local_uploads(cfg: dict, folders: list[str], root: Path) -> dict:
@@ -345,27 +397,35 @@ def list_volume_local_nodes(cfg: dict, max_age: float = _LIST_TTL) -> list[str]:
     要 0.8~2.4s —— 那个端点的契约是「全本地解析、瞬时」,不能为它加一次网络往返
     (点 RunModal 后的静默等待会被用户读成卡死)。名单只在本机上传/删除时变,
     那两处会主动失效缓存;别的机器传的包最多晚 60s 才可见,而漏掉的后果仅是
-    少清一个残留包 —— 正确性由 worker 侧的 baked sentinel 兜底,不依赖这份名单。"""
+    少清一个残留包 —— 正确性由 worker 侧的 baked sentinel 兜底,不依赖这份名单。
+
+    读不到 Volume 时抛 VolumeUnavailable,**不缓存**(缓存的是失败就等于 60 秒内都报「没有」)。"""
     import time
     if max_age > 0 and (time.time() - _LIST_CACHE["t"]) < max_age:
         return list(_LIST_CACHE["v"])
-    v = _list_volume_local_nodes_uncached(cfg)
+    v = _list_volume_local_nodes_uncached(cfg)     # 抛异常时直接穿出去,缓存保持原样
     _LIST_CACHE.update(t=time.time(), v=list(v))
     return v
 
 
 def _list_volume_local_nodes_uncached(cfg: dict) -> list[str]:
-    """Volume 上现有的本地节点包名单(供「管理云端节点」展示 / 清理)。"""
+    """Volume 上现有的本地节点包名单(供「管理云端节点」展示 / 清理)。
+    _local_nodes 目录不存在 = 确认没有,返回 [];其它失败抛 VolumeUnavailable。"""
     try:
         vol = _mv().get_volume(cfg)
-        try:
-            vol.reload()
-        except Exception:
-            pass
-        return sorted(Path(e.path).name[:-4] for e in vol.listdir(VOLUME_PREFIX)
-                      if e.path.endswith(".zip"))
+    except Exception as e:
+        raise VolumeUnavailable(f"拿不到 Modal Volume:{e}") from e
+    try:
+        vol.reload()
     except Exception:
-        return []
+        pass
+    try:
+        entries = vol.listdir(VOLUME_PREFIX)
+    except Exception as e:
+        if _is_not_found(e):
+            return []
+        raise VolumeUnavailable(f"列 Volume 上的私有节点失败:{e}") from e
+    return sorted(Path(e.path).name[:-4] for e in entries if e.path.endswith(".zip"))
 
 
 def remove_volume_local_node(cfg: dict, folder: str) -> dict:

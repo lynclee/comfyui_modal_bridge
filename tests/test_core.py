@@ -399,10 +399,11 @@ def test_loader_models_flux2():
 
 
 def test_generic_catches_unknown_loader():
-    """不在 LOADER_MAP 的节点,但 input 指向模型文件 → 通用兜底捕获(取 basename)。"""
+    """不在 LOADER_MAP 的节点,但 input 指向模型文件 → 通用兜底捕获(保留相对路径)。
+    2026-10-05 起不再取 basename(契约 C15):剥掉子目录后 routes 反推不出 type,模型从需求里消失。"""
     prompt = {"9": {"class_type": "SomeFutureLoader",
-                    "inputs": {"weird_field": "models/sub/cool_model.gguf", "x": 7}}}
-    assert model_deps.extract_generic_filenames(prompt) == {"cool_model.gguf"}
+                    "inputs": {"weird_field": "sub/cool_model.gguf", "x": 7}}}
+    assert model_deps.extract_generic_filenames(prompt) == {"sub/cool_model.gguf"}
 
 
 def test_generic_ignores_images_and_nonmodel():
@@ -2079,7 +2080,9 @@ def test_bridge_cli_never_overrides_plugin_deploy_settings_with_its_own_defaults
     for flag in ("--comfyui-tag", "--gpu", "--cheap-gpu", "--top-gpu", "--timeout-s", "--sage"):
         i = body.index(f'p.add_argument("{flag}"')
         assert "default=None" in body[i:body.index(")", i)], f"{flag} 的默认值会覆盖插件配置"
-    assert 'pick(args.comfyui_tag, "comfyui_tag"' in body
+    # 2026-10-05:tag 不再走 pick(空串会落到 v0.22.0 兜底、也不认 pin),改为 --comfyui-tag >
+    # 插件的 comfyui_tag_pin > 插件的 comfyui_tag > CLI 上次部署的,都没有就拒绝。行为测试见 test_fix_build.py
+    assert '"comfyui_tag_pin"' in body and 'plugin.get("comfyui_tag")' in body
     assert '"modal_volume_name"' in body
 
 
@@ -4500,7 +4503,8 @@ def test_cli_deploy_keeps_secret_fields_and_atomic_config():
     """
     src = (ROOT / "deploy.py").read_text(encoding="utf-8")
 
-    i = src.index("secret_create_cmd(")
+    # 2026-10-05:改用合并语义的 secret_upsert_cmd(参数顺序与 secret_create_cmd 相同),字段要求不变
+    i = src.index("secret_upsert_cmd(")
     call = src[i:src.index(")", src.index("aigc_bypass_secret", i))]
     for field in ("comfy_api_key", "aigc_studio_base_url", "aigc_bypass_secret"):
         assert field in call, f"CLI 部署漏传 Secret 字段: {field}"
