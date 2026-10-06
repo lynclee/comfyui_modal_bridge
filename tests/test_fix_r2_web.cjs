@@ -29,7 +29,9 @@ function between(a, b) {
   return source.slice(i, j);
 }
 
-const json = (status, body) => ({ ok: status >= 200 && status < 300, status, json: async () => body });
+// 桩的是插件自己的路由:答复带插件的来源头(0.8.60 起前端只信带头的 /submit 错误答复,codex review 0.8.59 P1)
+const PLUGIN_HDRS = new Headers({ "X-Modal-Bridge-Origin": "plugin-submit" });
+const json = (status, body) => ({ ok: status >= 200 && status < 300, status, headers: PLUGIN_HDRS, json: async () => body });
 const tick = () => new Promise((r) => setImmediate(r));
 const ticks = async (n = 10) => { for (let i = 0; i < n; i++) await tick(); };
 function deferred() { let resolve; const p = new Promise((r) => { resolve = r; }); return { p, resolve }; }
@@ -910,4 +912,39 @@ test("R3-4 带矛盾标记的记录:30 分钟内反复刷新只弹一次 error",
   const c = mk();
   await c.sb.recoverOne({ ...store.get(JOBS)[0] }, 1200);
   assert.equal(c.observed.notifies.filter((n) => n.sev === "error").length, 1, "过了 30 分钟再提示一次");
+});
+
+
+// =============================================================================
+// 0.8.60 第五轮复核:不是插件判的「结果未知」(代理掐断)—— 插件可能还在重试,窗口 9 分钟
+// =============================================================================
+test("R5 恢复流程:记录带 submitUnknownMs 时按它算窗口(代理掐断后 5 分钟才落地的任务照常取回)", async () => {
+  const t0 = 1_000_000_000;
+  const job = { jobId: "job-u", wfName: "wf", startedAt: t0, submitUnknown: true, submitUnknownMs: 540_000 };
+  const tab = makeTab({ store: makeStore({ [JOBS]: [job] }), clock: { t: t0 + 61_000 }, fetch: (url, o, obs, clock) => {
+    if (url.includes("/poll?")) {
+      obs.polls++;
+      const el = clock.t - t0;
+      if (el < 300_000) return json(200, { status: "not_found" });
+      return el < 310_000 ? json(200, { status: "queued" }) : json(200, done());
+    }
+    if (url.endsWith("/fetch_result")) { obs.fetches++; return fetchOk(); }
+    return json(200, { ok: true });
+  } });
+  await tab.sb.recoverOne({ ...job }, 1200);
+  assert.equal(tab.observed.fetches, 1, "插件重试完才落地的任务要照常取回");
+});
+
+test("R5 恢复流程:submitUnknownMs 的窗口满了才判没落地,文案里的分钟数跟着窗口", async () => {
+  const t0 = 1_000_000_000;
+  const job = { jobId: "job-u", wfName: "wf", startedAt: t0, submitUnknown: true, submitUnknownMs: 540_000 };
+  const tab = makeTab({ store: makeStore({ [JOBS]: [job] }), clock: { t: t0 + 61_000 }, fetch: (url, o, obs) => {
+    if (url.includes("/poll?")) { obs.polls++; return json(200, { status: "not_found" }); }
+    return json(200, { ok: true });
+  } });
+  await tab.sb.recoverOne({ ...job }, 1200);
+  assert(tab.clock.t - t0 >= 540_000, `不到 9 分钟就判了:${tab.clock.t - t0}`);
+  assert.equal(tab.jobs().length, 0);
+  assert(tab.observed.notifies.some((n) => n.m.startsWith("run.submit_not_landed") && n.m.includes('"min":9')),
+         JSON.stringify(tab.observed.notifies));
 });

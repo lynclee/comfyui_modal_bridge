@@ -67,6 +67,13 @@ MCP 本地模式就是这么做的。
 **提交结果未知**:HTTP 502 且正文带 `"outcome": "unknown"` 和 `job_id` 时,任务**可能已经在云端跑了**
 (网关超时、响应丢失)。不要重新提交,用这个 `job_id` 去 poll:查到就照常跟进;连续 not_found **并且持续分钟级**(前端用 2 分钟,冷启动慢时任务可能晚落地)才说明多半没落地,重交前先到 Modal 控制台核实。
 
+**分清答复来自谁**:插件 `/submit` 的每个答复(成功和各种错误)都带响应头 `X-Modal-Bridge-Origin: plugin-submit`。
+调用方与 ComfyUI 之间隔着反向代理时,不带这个头的答复是代理 / 网关回的,不能按正文格式当成插件的结论:
+不带头的 5xx / 408 / 429 / 3xx 按「提交结果未知」处理(用自带的 `job_id` 去 poll);不带头的其它 4xx 说明请求没到插件,
+任务没有提交。带 `X-Modal-Bridge-Auth` 头的 403 也是插件的(没重启 ComfyUI 的旧版插件不带来源头,但配对 403 照样带它)。
+插件的前端与 MCP 本地模式都按这个分,而且都自带 `job_id`。
+不是插件判的「结果未知」(代理掐断、连接中断)时,插件多半还在 `/submit` 里重试(最长约 420s),「没落地」的确认窗口要拉到 9 分钟(前端就是这么做的),不能按 2 分钟算。
+
 ### GET /modal_bridge/poll?job_id=…
 
 轮询状态(建议间隔 1–2s)。透传云端 status 对象:
@@ -130,7 +137,7 @@ MCP 本地模式就是这么做的。
 | `/modal_bridge/estimate_vram` | POST | `{prompt}` | 返回 `{est_vram_gb, est_basis, category, total_mb, unknown[]}`。视频类在能从工作流抠出 分辨率×帧数 字面量时走激活公式(`est_basis:"activation"`,实测校准),否则回退权重×系数(`"legacy"`,偏保守) |
 | `/modal_bridge/check_required_inputs` | POST | `{prompt}` | 找出缺必填输入的节点(老工作流 × 新节点定义),`{missing:[{node_id, class_type, missing[]}]}` |
 | `/modal_bridge/check_models` | POST | `{prompt}` | 对比工作流所需模型 vs 云端 Volume,返回缺失清单 |
-| `/modal_bridge/check_nodes` | POST | `{prompt}` | 对比工作流 custom_node vs 云端镜像清单。分流:`add`/`update`(有 git 且已推送,或从 Comfy Registry 装的 → 进镜像,要重部署;Registry 节点带 `version` / `old_version`)、`local_pack`(自写节点、commit 未推送、或云端克隆不了的地址 → 代码走 Volume;仅依赖变化时自动重部署;`reason: "unclonable"` 时带 `detail`)、`missing_no_git`(本地连目录都没有 → 补不了)。读不到云端、退回本机清单时带 `cloud_unchecked`(此时不要据此同步);读不到 Volume 上的私有节点名单时带 `volume_unchecked` |
+| `/modal_bridge/check_nodes` | POST | `{prompt}` | 对比工作流 custom_node vs 云端镜像清单。分流:`add`/`update`(有 git 且已推送,或从 Comfy Registry 装的 → 进镜像,要重部署;Registry 节点带 `version` / `old_version`)、`local_pack`(自写节点、commit 未推送、本机改过代码的 Registry 节点(与该版本原包内容不同;取不到原包时按改过算)、或云端克隆不了的地址 → 代码走 Volume;仅依赖变化时自动重部署;`reason: "unclonable"` 时带 `detail`)、`missing_no_git`(本地连目录都没有 → 补不了)。读不到云端、退回本机清单时带 `cloud_unchecked`(此时不要据此同步);读不到 Volume 上的私有节点名单时带 `volume_unchecked` |
 
 ## 同步与部署(耗时操作,内部有互斥锁)
 

@@ -697,6 +697,12 @@ _LAST_POLL_MAX = 500
 
 _ADMIN_HEADER = "X-Modal-Bridge-Capability"
 _ADMIN_REQUIRED_HEADER = "X-Modal-Bridge-Auth"
+# /submit 的每个答复都带这个头(2026-10-05 codex review 0.8.59 P1)。MCP 本地模式据此分辨「插件自己的答复」
+# 与「中间的反向代理 / 网关回的错」:以前只看正文是不是 JSON 对象,网关的 504 {"error": …} 也被当成插件的确定答复
+# 原样返回,job_id 与 outcome:unknown 都丢了 —— 而那时任务可能已经交上云端,agent 一重交就是双跑双计费。
+# 值与 mcp_server.py 的 _SUBMIT_ORIGIN 一致(有测试对齐)。
+_SUBMIT_ORIGIN_HEADER = "X-Modal-Bridge-Origin"
+_SUBMIT_ORIGIN = "plugin-submit"
 
 
 def _loopback_host(request: web.Request) -> tuple[bool, str]:
@@ -821,6 +827,17 @@ def _admin_only(handler):
         except cfg_mod.ConfigCorrupt as e:
             return _config_corrupt_response(e)
     return guarded
+
+
+def _tag_submit_origin(handler):
+    """给 /submit 的每个答复(含 _admin_only 的 403 / 400 / 配置损坏)打上来源头,见 _SUBMIT_ORIGIN_HEADER。
+    处理函数自己抛出的未捕获异常由 aiohttp 回 500、不带头 —— MCP 按「结果未知」处理,正合适。"""
+    @functools.wraps(handler)
+    async def tagged(request: web.Request):
+        resp = await handler(request)
+        resp.headers[_SUBMIT_ORIGIN_HEADER] = _SUBMIT_ORIGIN
+        return resp
+    return tagged
 
 
 async def _json_object(request: web.Request) -> dict:
@@ -1400,6 +1417,7 @@ def _setup_routes():
 
     # -------- 异步提交(返回 job_id,不阻塞)--------
     @routes.post("/modal_bridge/submit")
+    @_tag_submit_origin
     @_admin_only
     async def _submit(request: web.Request):
         body = await _json_object(request)

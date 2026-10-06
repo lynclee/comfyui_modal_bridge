@@ -27,7 +27,9 @@ function between(a, b) {
   return source.slice(i, j);
 }
 
-const json = (status, body) => ({ ok: status >= 200 && status < 300, status, json: async () => body });
+// 桩的是插件自己的路由:答复带插件的来源头(0.8.60 起前端只信带头的 /submit 错误答复,codex review 0.8.59 P1)
+const PLUGIN_HDRS = new Headers({ "X-Modal-Bridge-Origin": "plugin-submit" });
+const json = (status, body) => ({ ok: status >= 200 && status < 300, status, headers: PLUGIN_HDRS, json: async () => body });
 const tick = () => new Promise((r) => setImmediate(r));
 const ticks = async (n = 10) => { for (let i = 0; i < n; i++) await tick(); };
 function deferred() { let resolve; const p = new Promise((r) => { resolve = r; }); return { p, resolve }; }
@@ -664,6 +666,106 @@ test("C3 普通的提交失败(没有 outcome=unknown)仍然直接报错,不轮�
   await assert.rejects(h.sb.runOnceOnModal({}, ["9"], h.sb.newProgress("submitting", "wf"), null), /401/);
   assert.equal(h.observed.polls, 0);
   assert.equal(h.saved().length, 0);
+});
+
+// ── codex review 0.8.59 P1 的同一根因(0.8.60):前端自己定 job_id,不带插件来源头的答复不按正文下结论 ──
+const gateway = (status, body) => ({ ok: false, status, headers: new Headers({ "Content-Type": "application/json" }),
+                                     json: async () => body });
+function submitThen(submitResp) {
+  const seen = { bodies: [], polled: [] };
+  const h = makeRunSandbox({ fetch: (url, o, obs) => {
+    if (url.endsWith("/submit")) { seen.bodies.push(JSON.parse(o.body)); return submitResp(); }
+    if (url.includes("/poll?")) {
+      obs.polls++; seen.polled.push(url);
+      return json(200, { status: "completed", images: [{ filename: "a.png", data_base64: "AA==" }] });
+    }
+    if (url.endsWith("/fetch_result")) { obs.fetches++; return json(200, { ok: true, outputs: [{ filename: "a.png" }] }); }
+    return json(200, { ok: true });
+  } });
+  return { h, seen };
+}
+
+test("P1 前端:/submit 带上自己定的 job_id(符合 C1)", async () => {
+  const { h, seen } = submitThen(() => json(200, { ok: true, job_id: "x", gpu: "H100", worker_timeout_sec: 60 }));
+  await h.sb.runOnceOnModal({}, ["9"], h.sb.newProgress("submitting", "wf"), null);
+  assert.match(seen.bodies[0].job_id, /^[0-9a-f]{32}$/);
+  const ids = new Set();
+  for (let i = 0; i < 50; i++) ids.add(h.sb.newJobId());
+  assert.equal(ids.size, 50);
+});
+
+for (const st of [504, 502, 524, 500, 408, 429]) {
+  test(`P1 前端:代理 / 网关回 ${st}(JSON 正文、不带来源头)→ 结果未知,按自己的 job_id 轮询取回,不报提交失败`, async () => {
+    const { h, seen } = submitThen(() => gateway(st, { error: "upstream timeout" }));
+    const r = await h.sb.runOnceOnModal({}, ["9"], h.sb.newProgress("submitting", "wf"), null);
+    const mine = seen.bodies[0].job_id;
+    assert.equal(r.jobId, mine);
+    assert(seen.polled.length && seen.polled.every((u) => u.includes("job_id=" + mine)), seen.polled.join());
+    assert(h.observed.notifies.some((m) => m.startsWith("run.submit_unknown")));
+    assert.equal(h.observed.fetches, 1);
+  });
+}
+
+test("P1 前端:等答复时连接断了(fetch 抛错)→ 结果未知,按自己的 job_id 轮询", async () => {
+  const { h, seen } = submitThen(() => { throw new TypeError("Failed to fetch"); });
+  const r = await h.sb.runOnceOnModal({}, ["9"], h.sb.newProgress("submitting", "wf"), null);
+  assert.equal(r.jobId, seen.bodies[0].job_id);
+  assert(h.observed.notifies.some((m) => m.startsWith("run.submit_unknown")));
+});
+
+test("P1 前端:代理 / 网关的 4xx(不带来源头)→ 确定没提交,直接报错、不轮询", async () => {
+  const { h } = submitThen(() => gateway(413, { error: "request entity too large" }));
+  await assert.rejects(h.sb.runOnceOnModal({}, ["9"], h.sb.newProgress("submitting", "wf"), null), /413.*没有提交/);
+  assert.equal(h.observed.polls, 0);
+  assert.equal(h.saved().length, 0);
+});
+
+test("R5 前端:代理掐断(不是插件判的未知)→ 插件可能还在重试,2 分钟后才落地的任务照常取回,记录里存 9 分钟窗口", async () => {
+  let recSeen = null;
+  const h = makeRunSandbox({ fetch: (url, o, obs, clock) => {
+    if (url.endsWith("/submit")) { obs.t0 = clock.t; return gateway(504, { error: "gateway timeout" }); }
+    if (url.includes("/poll?")) {
+      obs.polls++;
+      recSeen = recSeen || h.saved()[0];
+      const el = clock.t - obs.t0;
+      if (el < 250_000) return json(200, { status: "not_found" });
+      return json(200, { status: "completed", images: [{ filename: "a.png", data_base64: "AA==" }] });
+    }
+    if (url.endsWith("/fetch_result")) { obs.fetches++; return json(200, { ok: true, outputs: [{ filename: "a.png" }] }); }
+    return json(200, { ok: true });
+  } });
+  await h.sb.runOnceOnModal({}, ["9"], h.sb.newProgress("submitting", "wf"), null);
+  assert.equal(h.observed.fetches, 1, "250 秒后才落地(插件第 4 次尝试)的任务不能被判没落地");
+  assert.equal(recSeen.submitUnknownMs, 540_000, JSON.stringify(recSeen));
+});
+
+test("R5 前端:插件自己判的未知仍是 2 分钟窗口", async () => {
+  let recSeen = null;
+  const h = makeRunSandbox({ fetch: (url, o, obs) => {
+    if (url.endsWith("/submit")) return json(502, { error: "x", job_id: JSON.parse(o.body).job_id, outcome: "unknown" });
+    if (url.includes("/poll?")) { obs.polls++; recSeen = recSeen || h.saved()[0]; return json(200, { status: "not_found" }); }
+    return json(200, { ok: true });
+  } });
+  const t0 = h.clock.t;
+  await assert.rejects(h.sb.runOnceOnModal({}, ["9"], h.sb.newProgress("submitting", "wf"), null), /run\.submit_not_landed/);
+  assert.equal(recSeen.submitUnknownMs, 120_000);
+  assert(h.clock.t - t0 < 300_000, "插件判的未知不该等 9 分钟");
+});
+
+test("R5 前端:没重启的旧插件回 400(不带来源头)→ 确定没提交,原因原文带上,文案不只怪代理", async () => {
+  const { h } = submitThen(() => gateway(400, { error: "输入图找不到: a.png" }));
+  await assert.rejects(h.sb.runOnceOnModal({}, ["9"], h.sb.newProgress("submitting", "wf"), null),
+                       (e) => /输入图找不到: a\.png/.test(e.message) && /没重启/.test(e.message) && /没有提交/.test(e.message));
+  assert.equal(h.observed.polls, 0);
+});
+
+test("P1 前端:没重启的旧插件回 403 配对(只带 X-Modal-Bridge-Auth)仍按插件的答复处理", async () => {
+  const { h } = submitThen(() => ({ ok: false, status: 403,
+    headers: new Headers({ "X-Modal-Bridge-Auth": "capability-required" }),
+    json: async () => ({ error: "admin capability required" }) }));
+  await assert.rejects(h.sb.runOnceOnModal({}, ["9"], h.sb.newProgress("submitting", "wf"), null),
+                       /admin capability required/);
+  assert.equal(h.observed.polls, 0);
 });
 
 // =============================================================================

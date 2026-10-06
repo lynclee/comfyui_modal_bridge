@@ -63,10 +63,14 @@ def _cnr(tmp_path, files, tracking_age_s=0.0):
     return d, now
 
 
-def test_cnr_copy_without_timestamps_is_not_dirty(tmp_path):
-    """不保留时间戳的拷贝:.tracking 比所有文件都早(先落盘),以前全部 Registry 节点被误判改过。"""
+def test_cnr_copy_without_timestamps_is_not_dirty(tmp_path, monkeypatch):
+    """不保留时间戳的拷贝:.tracking 比所有文件都早(先落盘),以前全部 Registry 节点被误判改过。
+    0.8.60 起这种「时间分不清」的情况比 Registry 原包的内容(codex review 0.8.59 P2),内容一致就是干净的。"""
+    import hashlib
     d, _ = _cnr(tmp_path, ["a.py", "b.py", "sub/c.py", "conf.json"], tracking_age_s=3600)
-    assert not node_sync.cnr_dirty(d)
+    same = {rel: hashlib.sha256(b"x").hexdigest() for rel in ("a.py", "b.py", "sub/c.py")}
+    monkeypatch.setattr(node_sync, "_download_cnr_py_hashes", lambda cid, ver: same)
+    assert not node_sync.cnr_dirty(d, ("node", "1.0.0"))
 
 
 def test_cnr_edited_py_is_dirty_but_runtime_data_is_not(tmp_path):
@@ -114,7 +118,7 @@ def test_aigc_job_complete_callback_carries_the_warnings():
 
 
 # ── 测试护栏:漏桩的 Modal 控制面调用立即失败、且 except Exception 吞不掉 ──
-def test_unstubbed_modal_control_plane_call_fails_loudly():
+def test_unstubbed_modal_control_plane_call_fails_loudly(_no_real_modal_control_plane):
     modal = pytest.importorskip("modal")
     t = time.time()
     with pytest.raises(pytest.fail.Exception):
@@ -123,3 +127,6 @@ def test_unstubbed_modal_control_plane_call_fails_loudly():
         except Exception:
             pass   # 业务代码常这么吞 —— 护栏必须穿透它
     assert time.time() - t < 10, "应当立刻失败,不是等 SDK 重试到超时"
+    # 被吞成断连时(aiohttp 路由里)靠 teardown 判:这里确认记下了,然后清掉(这次是故意触发的)
+    assert _no_real_modal_control_plane == ["modal"]
+    _no_real_modal_control_plane.clear()

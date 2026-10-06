@@ -1465,6 +1465,12 @@ async function probeJobStatus(jobId) {
 const POLL_TRANSIENT_WARN_MS = 5 * 60 * 1000;
 // 提交结果未知(C3)、又从没看到过这个任务时,「没落地」的确认窗口(见 runOnceTracked;与 NOT_FOUND_STREAK 同时满足)
 const SUBMIT_UNKNOWN_NOT_FOUND_MS = 120000;
+// 「结果未知」不是插件判的(反代掐断 / 连接中断,0.8.60):那一刻插件多半还在 /submit 里重试 submit_job
+// (最坏约 250s,前面还有模型扫描、git、Registry 下载),2 分钟就判「没落地」会删掉恢复记录、让晚落地的任务
+// 没人跟踪(第五轮复核)。窗口 = 插件 /submit 的最长耗时(同 MCP 的 _SUBMIT_TIMEOUT_S = 420s)+ 上面的 2 分钟。
+const SUBMIT_UNKNOWN_GATEWAY_MS = 420000 + SUBMIT_UNKNOWN_NOT_FOUND_MS;
+// 恢复记录上存了窗口就用它(老记录没有,按插件判的算)
+const unlandedWindowMs = (rec) => Number(rec && rec.submitUnknownMs) || SUBMIT_UNKNOWN_NOT_FOUND_MS;
 function transientWatch(jobId, ctx) {
   let since = null;
   let warned = false;
@@ -1746,6 +1752,28 @@ function attachCancel(ctx, jobId, wfName, beforeCancel = null) {
   return gate;
 }
 
+// 前端自己定 job_id(契约 D2,2026-10-05 codex review 0.8.59 P1 的同一根因):隔着反向代理时,/submit 最坏要等
+// 几分钟(submit_job 重试),nginx 默认 60s、Cloudflare 约 100s 就回 504 / 524。以前前端把它当「提交失败」,
+// 而那时任务可能已经交上云端 —— 用户再点一次就是双跑,第一单的 job_id 前端从来不知道,结果也取不回来。
+// 自己定 id,任何结局都有一个能去 poll 的 id。32 位十六进制,符合 C1;getRandomValues 在非安全上下文
+// (局域网 http)也能用(randomUUID 不行)。
+function newJobId() {
+  const c = globalThis.crypto;
+  const b = new Uint8Array(16);
+  if (c && c.getRandomValues) c.getRandomValues(b);
+  else for (let i = 0; i < b.length; i++) b[i] = Math.floor(Math.random() * 256);
+  return Array.from(b, (x) => x.toString(16).padStart(2, "0")).join("");
+}
+
+// /submit 的答复是不是插件自己回的(routes 的 _SUBMIT_ORIGIN_HEADER)。X-Modal-Bridge-Auth 也只有插件会发
+// (没重启 ComfyUI 的旧插件不带来源头,但 403 配对照样带它)。
+const SUBMIT_ORIGIN = ["X-Modal-Bridge-Origin", "plugin-submit"];
+function fromPlugin(res) {
+  const h = res && res.headers;
+  if (!h || typeof h.get !== "function") return false;
+  return (h.get(SUBMIT_ORIGIN[0]) || "").trim() === SUBMIT_ORIGIN[1] || !!h.get("X-Modal-Bridge-Auth");
+}
+
 // 单次跑的外壳:只负责「本页在跟踪这个 job」的登记(见 _trackedJobs)。提交成功后登记,
 // 不论怎么结束(取回成功 / 失败保留记录 / 超时 / 取消 / 异常)都在这里撤销,保留下来的记录
 // 立刻可以被别的标签页接手(2026-10-05 深度 review 第二轮)。
@@ -1764,23 +1792,46 @@ async function runOnceTracked(workflowPrompt, outputNodeIds, ctx, submitGuard, b
 
   ctx.stage("submitting", batchSuffix + "POST /submit", false);
 
-  const subRes = await bridgeFetch("/modal_bridge/submit", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      prompt: workflowPrompt, tier: getVramTier(workflowPrompt),
-      // 本次同步实际放上 Volume 的自写节点版本(见 syncLocalNodes)。worker 据此校验,
-      // 对不上宁可让任务失败也不用旧代码跑 —— 静默出旧结果是最难查的失效。
-      local_nodes: ctx._localDigests || undefined,
-    }),
-  });
-  const sub = await subRes.json().catch(() => ({}));
+  const myJobId = newJobId();
+  let subRes = null, sub = {}, gatewayUnknown = false;
+  try {
+    subRes = await bridgeFetch("/modal_bridge/submit", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        prompt: workflowPrompt, tier: getVramTier(workflowPrompt), job_id: myJobId,
+        // 本次同步实际放上 Volume 的自写节点版本(见 syncLocalNodes)。worker 据此校验,
+        // 对不上宁可让任务失败也不用旧代码跑 —— 静默出旧结果是最难查的失效。
+        local_nodes: ctx._localDigests || undefined,
+      }),
+    });
+    sub = await subRes.json().catch(() => ({}));
+  } catch (e) {
+    // 请求发出去之后断了(反代掐断、网络抖动):分不清到没到插件,按结果未知
+    sub = { outcome: "unknown", job_id: myJobId, error: `等 /submit 答复时出错(${(e && e.message) || e})` };
+    gatewayUnknown = true;
+  }
+  if (!sub || typeof sub !== "object") sub = {};
+  if (subRes && !subRes.ok && !fromPlugin(subRes)) {
+    // 不是这版插件的答复:中间的代理 / 网关,或 ComfyUI 还没重启(旧插件不带来源头)。
+    // 5xx / 408 / 429:请求可能已到插件 → 结果未知;其它 4xx:没被受理,确定没提交。
+    // 不看正文长什么样(代理的 504 也可能是 JSON),但正文里的原因照样带上(旧插件的 400 就靠它说清楚)。
+    const st = subRes.status;
+    const where = "不是插件的答复:可能是中间的代理 / 网关,也可能是 ComfyUI 还没重启、跑的是旧版插件";
+    const detail = String((sub && (sub.error || sub.message)) || "").slice(0, 300);
+    if (st >= 500 || st === 408 || st === 429) {
+      sub = { outcome: "unknown", job_id: myJobId, error: `/submit 回了 HTTP ${st}(${where})${detail ? ":" + detail : ""}` };
+      gatewayUnknown = true;
+    } else {
+      sub = { ok: false, error: `/submit 回了 HTTP ${st}(${where}),任务没有提交${detail ? ":" + detail : ""}` };
+    }
+  }
   // C3:提交结果未知(重试全失败,但 /run 可能已经落地)。不能当成提交失败:那单可能已经在云端跑、
   //   在计费,用户再点一次就是双跑。按这个 job_id 进正常轮询;「没落地」的判定见轮询里的 not_found 分支
   //   (从没看到过它时窗口拉到分钟级,第二轮)。
   const submitUnknown = !!(sub && sub.outcome === "unknown" && typeof sub.job_id === "string" && sub.job_id);
-  if (!submitUnknown && (!subRes.ok || !sub.ok)) {
-    throw new Error(sub.error || `HTTP ${subRes.status}`);
+  if (!submitUnknown && (!subRes || !subRes.ok || !sub.ok)) {
+    throw new Error(sub.error || `HTTP ${subRes ? subRes.status : "?"}`);
   }
 
   const jobId = sub.job_id;
@@ -1791,7 +1842,9 @@ async function runOnceTracked(workflowPrompt, outputNodeIds, ctx, submitGuard, b
                 workerTimeoutSec: sub.worker_timeout_sec || null,
                 runSeenAt: null, runStartedAt: null, runTimeoutSec: null,
                 // 提交结果未知:刷新后的恢复流程也要用分钟级的「没落地」窗口(见 recoverOneTracked)
-                ...(submitUnknown ? { submitUnknown: true } : {}) };
+                ...(submitUnknown ? { submitUnknown: true,
+                                      submitUnknownMs: gatewayUnknown ? SUBMIT_UNKNOWN_GATEWAY_MS : SUBMIT_UNKNOWN_NOT_FOUND_MS }
+                                  : {}) };
   // 先登记「本页在跟踪」再写记录:别的标签页恰好在这一刻启动时,不会把这条当成无主记录接走
   track.jobId = jobId;
   trackJob(jobId);
@@ -1937,12 +1990,12 @@ async function runOnceTracked(workflowPrompt, outputNodeIds, ctx, submitGuard, b
         gone++;
         const unlanded = submitUnknown && !sawStatus;
         if (gone >= NOT_FOUND_STREAK
-            && (!unlanded || Date.now() - goneSince >= SUBMIT_UNKNOWN_NOT_FOUND_MS)) {
+            && (!unlanded || Date.now() - goneSince >= unlandedWindowMs(rec))) {
           final = cancelContradiction(jobId)
             ? { status: "contradicted", error: t("run.gone_contradicted", { id: jobId }) }
             : { ...pData, status: "failed",
                 error: unlanded
-                  ? t("run.submit_not_landed", { id: jobId, min: Math.round(SUBMIT_UNKNOWN_NOT_FOUND_MS / 60000) })
+                  ? t("run.submit_not_landed", { id: jobId, min: Math.round(unlandedWindowMs(rec) / 60000) })
                   : t("run.job_gone", { id: jobId }) };
           break;
         }
@@ -2528,7 +2581,7 @@ async function recoverOneTracked(pending, settingSec) {
       //   没人取回,用户还可能重交成双跑(2026-10-05 第二轮复核)。
       const unlanded = !!rec.submitUnknown;
       if (++gone >= NOT_FOUND_STREAK
-          && (!unlanded || Date.now() - (Number(rec.startedAt) || 0) >= SUBMIT_UNKNOWN_NOT_FOUND_MS)) {
+          && (!unlanded || Date.now() - (Number(rec.startedAt) || 0) >= unlandedWindowMs(rec))) {
         // 记录上带矛盾标记(看到过它在跑、取消都回「查无此任务」):只报矛盾、保留记录,同主轮询
         if (cancelContradiction(jobId)) {
           const msg = t("run.gone_contradicted", { id: jobId });
@@ -2545,7 +2598,7 @@ async function recoverOneTracked(pending, settingSec) {
         }
         removeActiveJob(jobId);
         if (unlanded) {
-          const msg = t("run.submit_not_landed", { id: jobId, min: Math.round(SUBMIT_UNKNOWN_NOT_FOUND_MS / 60000) });
+          const msg = t("run.submit_not_landed", { id: jobId, min: Math.round(unlandedWindowMs(rec) / 60000) });
           ctx.finish(false, "✗ not landed", msg);
           notify(msg, "warn");
         } else {

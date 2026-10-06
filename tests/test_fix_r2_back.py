@@ -335,12 +335,16 @@ def test_mcp_local_submit_dropped_connection_is_unknown(cloud, monkeypatch):
     assert r["outcome"] == "unknown" and r["job_id"] == seen[0]["job_id"], r
 
 
+_PLUGIN = {"X-Modal-Bridge-Origin": "plugin-submit"}    # 0.8.60 起插件 /submit 的答复都带(codex review P1)
+
+
 def test_mcp_local_submit_passes_server_answers_through(cloud, monkeypatch):
     m, seen = _mcp_with_submit(monkeypatch, cloud, lambda h, b: h.send_json(
-        502, {"error": "提交结果未知", "job_id": b["job_id"], "outcome": "unknown"}))
+        502, {"error": "提交结果未知", "job_id": b["job_id"], "outcome": "unknown"}, extra=_PLUGIN))
     r = m.submit_workflow(json.dumps(WF))
     assert r == {"error": "提交结果未知", "job_id": seen[0]["job_id"], "outcome": "unknown"}
-    m, _ = _mcp_with_submit(monkeypatch, cloud, lambda h, b: h.send_json(502, {"error": "Modal /run 401"}))
+    m, _ = _mcp_with_submit(monkeypatch, cloud, lambda h, b: h.send_json(502, {"error": "Modal /run 401"},
+                                                                         extra=_PLUGIN))
     r = m.submit_workflow(json.dumps(WF))
     assert r == {"error": "Modal /run 401"}, "插件判定的确定失败原样给出,不能被改成 unknown"
     m, seen = _mcp_with_submit(monkeypatch, cloud, lambda h, b: h.send_json(500, b"Internal Server Error",
@@ -897,7 +901,16 @@ def _registry_node(root: Path, folder="ComfyUI-GGUF") -> Path:
     return d
 
 
-def test_cnr_dirty_rules(tmp_path):
+def _cnr_offline(monkeypatch):
+    """Registry 原包拿不到(离线):分不清改没改的一律判改过。0.8.60 起有比 .tracking 晚的 .py 时会去比原包内容。"""
+    def offline(*a, **k):
+        raise OSError("offline (test)")
+    monkeypatch.setattr(ns_top, "_download_cnr_py_hashes", offline)
+    monkeypatch.setattr(ns_pkg, "_download_cnr_py_hashes", offline)
+
+
+def test_cnr_dirty_rules(tmp_path, monkeypatch):
+    _cnr_offline(monkeypatch)
     d = _registry_node(tmp_path)
     assert ns_top.cnr_dirty(d) is False
     # 运行时写的非代码文件、字节码、节点自带的虚拟环境:都不算
@@ -918,7 +931,8 @@ def test_cnr_dirty_rules(tmp_path):
 
 
 @pytest.mark.parametrize("change", ["new_py", "deleted_py", "edited_nested"])
-def test_cnr_dirty_detects_code_changes(tmp_path, change):
+def test_cnr_dirty_detects_code_changes(tmp_path, monkeypatch, change):
+    _cnr_offline(monkeypatch)
     d = _registry_node(tmp_path)
     if change == "new_py":
         (d / "my_patch.py").write_text("P = 1\n", encoding="utf-8")
@@ -930,6 +944,7 @@ def test_cnr_dirty_detects_code_changes(tmp_path, change):
 
 
 def test_cnr_dirty_routes_to_private_channel(tmp_path, monkeypatch):
+    _cnr_offline(monkeypatch)
     d = _registry_node(tmp_path)
     monkeypatch.setattr(ns_top, "_comfyui_root", lambda: tmp_path)
     monkeypatch.setattr(ns_top, "_is_own_git_repo", lambda p: False)

@@ -95,14 +95,13 @@ def _request(path: str, body: dict | None):
     return urllib.request.Request(f"{BASE}{path}", data=data, headers=headers)
 
 
-def _http_error_body(e: urllib.error.HTTPError, path: str) -> tuple[dict, bool]:
-    """本机 HTTP 错误 → (给 agent 的 dict, 正文是不是插件自己回的 JSON 对象)。"""
+def _http_error_body(e: urllib.error.HTTPError, path: str) -> dict:
+    """本机 HTTP 错误 → 给 agent 的 dict(正文是 JSON 对象就用它,否则只给状态码)。"""
     try:
         body = json.loads(e.read().decode())
     except Exception:
         body = None
-    ours = isinstance(body, dict)
-    if not ours:
+    if not isinstance(body, dict):
         body = {"error": f"HTTP {e.code} {path}"}
     if e.code == 403 and e.headers.get("X-Modal-Bridge-Auth") == "capability-required":
         # 0.8.36 起 localhost 也要 capability。agent 看到裸 403 不知道该配什么,这里把
@@ -112,7 +111,7 @@ def _http_error_body(e: urllib.error.HTTPError, path: str) -> tuple[dict, bool]:
                         "MODAL_BRIDGE_LOCAL_CONFIG=<ComfyUI 的插件 config.json 路径>"
                         "(推荐,值不出文件),或 MODAL_BRIDGE_LOCAL_CAPABILITY=<值>。"
                         f"当前:{'已从文件读到值' if _LOCAL_CAPABILITY else '两者都未设置'}。")
-    return body, ours
+    return body
 
 
 def _call(path: str, body: dict | None = None, timeout: int = 120) -> dict:
@@ -124,25 +123,40 @@ def _call(path: str, body: dict | None = None, timeout: int = 120) -> dict:
         # 调用方一律按 dict 读(.get);别让一个 JSON 数组变成 AttributeError
         return out if isinstance(out, dict) else {"error": f"{path} 返回的不是 JSON 对象"}
     except urllib.error.HTTPError as e:
-        return _http_error_body(e, path)[0]
+        return _http_error_body(e, path)
     except Exception as e:
         return {"error": f"{type(e).__name__}: {e} (ComfyUI 在跑吗? BASE={BASE})"}
 
 
 # 本机 /submit 的超时(契约 D2,2026-10-05 深度 review 第二轮)。/submit 里 modal_client.submit_job 最坏
-# 4 次 × 60s + 退避 1.5+3+6s = 250.5s,前面还有模型扫描、每个节点目录跑 git、读输入图转 base64。以前用
-# _call 的默认 120s:本机还在重试,MCP 先超时,手里没有 job_id,agent 只能重交 —— 云端多一个孤儿任务。
-_SUBMIT_TIMEOUT_S = 330
+# 4 次 × 60s + 退避 1.5+3+6s = 250.5s,前面还有模型扫描、每个节点目录跑 git、读输入图转 base64,以及
+# 0.8.60 起可能的 Registry 原包下载(本机 Registry 节点的 .py 比 .tracking 新、又没缓存时;每个版本只下一次,
+# 总时限 node_sync._CNR_FETCH_DEADLINE_S)。以前用 _call 的默认 120s:本机还在重试,MCP 先超时,手里没有
+# job_id,agent 只能重交 —— 云端多一个孤儿任务。
+_SUBMIT_TIMEOUT_S = 420
+
+# 插件 /submit 的每个答复都带这个头(routes.py 的 _SUBMIT_ORIGIN_HEADER / _SUBMIT_ORIGIN,有测试对齐)。
+# 只凭它认「插件自己的答复」,不凭正文长得像不像(2026-10-05 codex review 0.8.59 P1):MCP 与 ComfyUI 之间
+# 隔着反向代理时,代理回的 504 {"error": …} 也是 JSON 对象,以前被当成插件的确定答复原样返回,job_id 丢了。
+_SUBMIT_ORIGIN_HEADER = "X-Modal-Bridge-Origin"
+_SUBMIT_ORIGIN = "plugin-submit"
+
+
+def _from_plugin(headers) -> bool:
+    """X-Modal-Bridge-Auth 也只有插件会发:没重启的旧插件(< 0.8.60)不带来源头,但它的 403 配对照样带这个头。"""
+    return ((headers.get(_SUBMIT_ORIGIN_HEADER) or "").strip() == _SUBMIT_ORIGIN
+            or bool(headers.get("X-Modal-Bridge-Auth")))
 
 
 def _submit_local(prompt: dict) -> dict:
     """local 模式的提交。job_id 由这里先定、随请求带给本机 /submit(契约 D2),这一跳出任何岔子都能交还它。
 
-    结局分三种:
-      · 本机 /submit 给了答复(成功,或它自己的 {error[, job_id, outcome]}):原样返回;
-      · 请求确定没发出去(连接被拒 = ComfyUI 没开、DNS、TLS,判据同 bridge_client.never_sent):
-        普通错误,**没有提交**,ComfyUI 起来后重交即可;
-      · 其余(超时、读响应时断连、网关 5xx、回了看不懂的东西):本机可能已经把任务交上云端 ——
+    结局分四种:
+      · 插件自己的答复(带 _SUBMIT_ORIGIN 头;成功,或它判出的 {error[, job_id, outcome]}):原样返回;
+      · 确定没提交:连接被拒 = ComfyUI 没开、DNS、TLS(判据同 bridge_client.never_sent),或不带头的 4xx
+        (408 / 429 除外;代理 / 网关的拒绝,或没重启的旧插件、没加载插件的 ComfyUI)—— 普通错误,处理后重交即可;
+      · 成功码但不带头:job_id 对得上就是插件的答复(头被代理剥掉了),对不上按结果未知;
+      · 其余(超时、读响应时断连、不带头的 5xx / 408 / 429、回了看不懂的东西):本机可能已经把任务交上云端 ——
         {ok:false, outcome:"unknown", job_id, error},agent 拿 job_id 去 job_status 核实,别重交。"""
     job_id = str(uuid.uuid4())
     path = "/modal_bridge/submit"
@@ -150,12 +164,21 @@ def _submit_local(prompt: dict) -> dict:
     try:
         with _open_http(_request(path, {"prompt": prompt, "job_id": job_id}), timeout=_SUBMIT_TIMEOUT_S) as r:
             raw = r.read()
+            ours = _from_plugin(r.headers)
     except urllib.error.HTTPError as e:
-        body, ours = _http_error_body(e, path)
-        if ours or (e.code < 500 and e.code not in (408, 429)):
-            return body           # 插件自己的答复(含它判出的 outcome:unknown),或代理 / 网关的确定拒绝
-        return {**unknown, "error": f"本机 /submit 回了 HTTP {e.code}(不是插件的答复),提交结果未知 —— "
-                                    f"按 job_id 用 job_status 核实,别重新提交"}
+        body = _http_error_body(e, path)
+        if _from_plugin(e.headers):
+            return body           # 插件自己的答复(含它判出的 outcome:unknown)
+        # 不带头 = 不是这版插件的答复:中间的代理 / 网关,或 ComfyUI 还没重启(跑的是旧版插件)、插件没加载
+        where = "不是插件的答复:可能是中间的代理 / 网关,也可能是 ComfyUI 还没重启、跑的是旧版插件"
+        if 400 <= e.code < 500 and e.code not in (408, 429):     # 3xx 跳转说明不了什么,按未知
+            # 确定的拒绝(代理鉴权、请求体太大、旧插件的 400……):没被受理。正文不一定是插件的,统一成 {ok, error}
+            detail = str(body.get("error") or body.get("message") or "")[:300]
+            return {"ok": False, "error": f"本机 /submit 回了 HTTP {e.code}({where}),请求没被受理,"
+                                          f"任务没有提交{':' + detail if detail else ''}"}
+        return {**unknown, "error": f"本机 /submit 回了 HTTP {e.code}({where}),提交结果未知 —— 插件可能还在重试"
+                                    f"提交(最长约 {_SUBMIT_TIMEOUT_S // 60} 分钟):按 job_id 用 job_status 核实,"
+                                    f"not_found 持续 9 分钟以上才说明没落地,别重新提交"}
     except Exception as e:
         if never_sent(e):
             return {"ok": False, "error": f"连不上本机 ComfyUI({type(e).__name__}: {e};BASE={BASE}),"
@@ -166,7 +189,7 @@ def _submit_local(prompt: dict) -> dict:
         out = json.loads(raw.decode())
     except ValueError:
         out = None
-    if not isinstance(out, dict):
+    if not isinstance(out, dict) or not (ours or out.get("job_id") == job_id):
         return {**unknown, "error": "本机 /submit 回了看不懂的内容,提交结果未知 —— 按 job_id 用 job_status 核实"}
     return out
 
@@ -281,9 +304,10 @@ def submit_workflow(workflow_json: str, gpu_class: str = "") -> dict:
     输入图按 MODAL_BRIDGE_INPUT_DIRS 搜索打包。
     返回含 job_id;随后 job_status 轮询,完成后 fetch_result 取产物。
     ⚠ 返回 outcome:"unknown"(带 job_id)= 提交结果不确定,任务**可能已在云端跑、在计费**:
-    按这个 job_id 照常 job_status 轮询核实(not_found 连续出现才作数),**不要重新提交**(会双跑双计费)。
-    local 模式等本机答复最多约 330s;本机 ComfyUI 没开(连接被拒)时是普通错误,没有提交,可直接重交。
-    ⚠ MCP 客户端自己的工具调用超时要 ≥ 330s:客户端先掐断的话,上面那个带 job_id 的 unknown 结果到不了你手里。
+    按这个 job_id 照常 job_status 轮询核实,**不要重新提交**(会双跑双计费)。not_found 要持续 2 分钟以上才说明
+    多半没落地;error 里写着「不是插件的答复」时(代理掐断),插件可能还在重试提交,要等 9 分钟以上。
+    local 模式等本机答复最多约 420s;本机 ComfyUI 没开(连接被拒)时是普通错误,没有提交,可直接重交。
+    ⚠ MCP 客户端自己的工具调用超时要 ≥ 420s:客户端先掐断的话,上面那个带 job_id 的 unknown 结果到不了你手里。
     轮询 deadline:local 模式用返回的 worker_timeout_sec+180s;cloud 模式问部署者(默认按 3600s)。"""
     prompt = _parse_prompt(workflow_json)
     if prompt is None:

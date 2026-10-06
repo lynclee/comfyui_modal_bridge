@@ -23,6 +23,11 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
+import threading
+import time
+import urllib.request
+import zipfile
 from pathlib import Path
 from typing import NamedTuple
 
@@ -331,25 +336,173 @@ def _read_cnr_info(path: Path) -> tuple[str, str] | None:
     return None
 
 
-# 判 Registry 节点改没改时的时间容差(秒):有的文件系统 mtime 只精确到 1~2 秒(FAT / SMB / 部分虚拟化共享),
-# 解包与写 .tracking 落在同一刻时别把它们误判成「解包之后又改过」。
-_CNR_MTIME_SLACK_S = 600.0
+# 判 Registry 节点本机改没改代码(2026-10-05 codex review 0.8.59 P2)。
+#   第三轮改成「列出的 .py 的 mtime 中位数」当基准是错的:单文件节点、两个文件改一个、多数文件被改时,
+#   中位数本身就落在改过的时间上,改动全部漏判 —— 只用这批文件自己的时间证明不了它们没被改过。现在分两步:
+#   1) 先用 .tracking 的时间判「解包之后一个 .py 都没动过」:Manager 先解包(extractall 不保留 zip 里的时间,
+#      文件 mtime = 解包时刻)再写 .tracking,所以列出的 .py 都不晚于它 = 装完没人碰过,不用联网。
+#      容差只罩文件系统的 mtime 精度(FAT 2 秒),不再给 10 分钟 —— 那 10 分钟里改的代码会被漏掉。
+#   2) 有比 .tracking 晚的 .py:可能真改过,也可能只是不保留时间戳的拷贝 / 迁移(那时 .tracking 可能先落盘,
+#      第二轮复核的 P3)。时间分不清,改比内容:从 Registry 下载这个版本的原包,逐个比 sha256。
+#      哈希按 id@version 缓存在插件数据目录,同一版本只下载一次(版本发布后内容不可变)。
+#      拿不到原包(离线 / Registry 出错)就判改过 —— 宁可多传一份私有节点,也不悄悄丢掉本机的改动。
+#      一旦下载了原包,就把所有列出的 .py 都比一遍(本地算哈希很便宜):慢速拷贝时先拷的文件可能不晚于 .tracking,
+#      只比「晚于它的」会漏掉先拷的那个改过的文件(第四轮复核)。
+#   2026-10-05 实测:本机 15 个 Registry 节点列出的 .py 都不晚于 .tracking(日常不联网);能下载到的 12 个
+#   与原包的 .py 逐字节一致,.tracking 与原包 namelist 完全相同。
+#   残留的盲区:解包之后改了代码,又用不保留时间戳的工具迁移,且整个拷贝在容差(3 秒)内完成、或 .tracking 最后落盘
+#   —— 时间上与刚装完无法区分,第一步就判干净了。
+_CNR_MTIME_SLACK_S = 3.0
+_CNR_ZIP_MAX_BYTES = 512 * 1024 * 1024
+# 一次下载(版本 API + 原包)的总时限。/submit 没带 local_nodes 时(MCP / CLI)会在提交前判 dirty,
+# 下载落在提交的关键路径上,不能无限等(单次读另有 socket 超时)。超时按「拿不到原包」处理。
+# 节点是逐个判的:同一个工作流里有 N 个「时间分不清、又没缓存」的 Registry 节点时,最坏 N 倍。这种情况只在迁移目录 /
+# 改过代码之后出现,且每个版本只下载一次,所以不另设整体预算。
+_CNR_FETCH_DEADLINE_S = 60.0
+# 下载失败后这么久内不再重试:一次预检 / 部署会对同一个节点判好几次,别每次都等一遍超时。只记在内存里。
+_CNR_FETCH_RETRY_S = 300.0
+# 按 id@version 各一把锁:/check_nodes 与 /submit 可能并发判同一个节点,别下两遍;但一个节点在下载时,
+# 别的节点(含缓存命中的)不用陪着等。
+_CNR_LOCKS: dict = {}
+_CNR_LOCKS_GUARD = threading.Lock()
+_CNR_BASELINE_MEM: dict = {}                # "id@version" → 哈希;磁盘缓存写不进去时也不必每次重下
+_CNR_BASELINE_FAILED: dict = {}             # "id@version" → 上次下载失败的 time.monotonic()
 
 
-def cnr_dirty(path: Path) -> bool:
+def _cnr_cache_dir() -> Path:
+    """原包哈希的缓存目录:插件数据目录(config.json 旁边)下的 cnr_baseline/。"""
+    try:
+        from . import config as _cfg
+    except ImportError:
+        import config as _cfg
+    return _cfg._config_path().parent / "cnr_baseline"
+
+
+def _download_cnr_py_hashes(cnr_id: str, version: str) -> dict:
+    """联网:Registry 版本 API → downloadUrl → 原包里每个 .py 的 sha256({相对路径: hex})。出错直接抛。
+    走系统代理(urllib 默认读代理环境变量);原包落临时文件、流式哈希,不整包进内存。
+    总时限 _CNR_FETCH_DEADLINE_S(另加单次读的 socket 超时)。"""
+    deadline = time.monotonic() + _CNR_FETCH_DEADLINE_S
+
+    def left(cap: float) -> float:
+        rest = deadline - time.monotonic()
+        if rest <= 0:
+            raise TimeoutError(f"下载 Registry 原包超过 {_CNR_FETCH_DEADLINE_S:.0f}s")
+        return min(cap, rest)
+    with urllib.request.urlopen(cnr_url(cnr_id, version), timeout=left(20)) as r:
+        meta = json.loads(r.read(1 << 20).decode("utf-8"))
+    url = str(meta.get("downloadUrl") or "") if isinstance(meta, dict) else ""
+    if not url.lower().startswith("https://"):
+        raise ValueError(f"Registry 没给 https 下载地址: {url[:120]!r}")
+    out = {}
+    with tempfile.TemporaryFile() as tmp:
+        with urllib.request.urlopen(url, timeout=left(30)) as r:
+            total = 0
+            # read1:有多少收多少(至多一次 recv)。read(1 MiB) 会一直攒到 1 MiB,慢速链路上能越过总时限很久
+            # (10 KB/s 时约 100s,第五轮复核实测);read1 让越过的时间不超过一次 socket 超时。
+            read = getattr(r, "read1", r.read)
+            while chunk := read(1 << 20):
+                left(30)
+                total += len(chunk)
+                if total > _CNR_ZIP_MAX_BYTES:
+                    raise ValueError(f"原包超过 {_CNR_ZIP_MAX_BYTES >> 20} MB 上限")
+                tmp.write(chunk)
+        tmp.seek(0)
+        with zipfile.ZipFile(tmp) as z:
+            for info in z.infolist():
+                rel = info.filename.replace("\\", "/")
+                rel = rel[2:] if rel.startswith("./") else rel
+                if info.is_dir() or not rel.endswith(".py"):
+                    continue
+                h = hashlib.sha256()
+                with z.open(info) as f:
+                    for block in iter(lambda: f.read(1 << 20), b""):
+                        h.update(block)
+                out[rel] = h.hexdigest()
+    return out
+
+
+def _cnr_lock(key: str) -> threading.Lock:
+    with _CNR_LOCKS_GUARD:
+        return _CNR_LOCKS.setdefault(key, threading.Lock())
+
+
+def _read_cnr_cache(cache: Path | None) -> dict | None:
+    if cache is None:
+        return None
+    try:
+        data = json.loads(cache.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return data["py"] if isinstance(data, dict) and isinstance(data.get("py"), dict) else None
+
+
+def cnr_baseline(cnr_id: str, version: str) -> dict | None:
+    """Registry 上 (id, version) 原包里每个 .py 的 sha256。先读缓存,没有就下载并写缓存;拿不到返回 None。"""
+    if not (_CNR_ID_RE.match(cnr_id or "") and _CNR_VER_RE.match(version or "")):
+        return None
+    key = f"{cnr_id.lower()}@{version}"
+    try:
+        cache = _cnr_cache_dir() / f"{key}.json"
+    except Exception:
+        cache = None
+    hit = _CNR_BASELINE_MEM.get(key)
+    if hit is None:
+        hit = _read_cnr_cache(cache)          # 读缓存不进锁:别的节点在下载时不用排队
+    if hit is not None:
+        return hit
+    with _cnr_lock(key):
+        hit = _CNR_BASELINE_MEM.get(key)
+        if hit is None:
+            hit = _read_cnr_cache(cache)      # 等锁期间别的请求可能刚下载完
+        if hit is not None:
+            return hit
+        failed_at = _CNR_BASELINE_FAILED.get(key)
+        if failed_at is not None and time.monotonic() - failed_at < _CNR_FETCH_RETRY_S:
+            return None
+        try:
+            hashes = _download_cnr_py_hashes(cnr_id, version)
+        except Exception as e:
+            _CNR_BASELINE_FAILED[key] = time.monotonic()
+            print(f"[modal_bridge] 取不到 Registry 原包 {key},按本机改过处理: {type(e).__name__}: {e}")
+            return None
+        _CNR_BASELINE_FAILED.pop(key, None)
+        _CNR_BASELINE_MEM[key] = hashes
+        if cache is not None:
+            try:
+                cache.parent.mkdir(parents=True, exist_ok=True)
+                tmp = cache.with_name(cache.name + ".tmp")
+                tmp.write_text(json.dumps({"py": hashes}), encoding="utf-8")
+                os.replace(tmp, cache)
+            except OSError:
+                pass          # 写不进磁盘缓存:这个进程里有内存那份,重启后再下载一遍
+        return hashes
+
+
+def _file_sha256(f: Path) -> str | None:
+    h = hashlib.sha256()
+    try:
+        with open(f, "rb") as fh:
+            for block in iter(lambda: fh.read(1 << 20), b""):
+                h.update(block)
+    except OSError:
+        return None
+    return h.hexdigest()
+
+
+def cnr_dirty(path: Path, cnr: tuple[str, str] | None = None) -> bool:
     """Registry(CNR)装的节点,本机有没有改过代码。ComfyUI-Manager 解包后把包里的文件逐行写进 .tracking
-    (zip 的 namelist),之后不再碰它。判为改过(dirty)的三种情况:
-      · .tracking 列的某个 .py 的 mtime 比列出的 .py 的 mtime **中位数**晚 10 分钟以上 → 解包之后被改过;
+    (zip 的 namelist),之后不再碰它。判为改过(dirty):
       · 列了的 .py 被删了(云端从 Registry 装的那份还有它);
-      · 出现 .tracking 里没有的 .py → 本机加了代码。
-    ⚠ 基准用列出文件自己的 mtime 中位数,不用 .tracking 本身的时间:不保留时间戳的拷贝 / 同步工具迁移安装目录时,
-      .tracking 可能先落盘,所有文件都比它新 → 全部 Registry 节点被误判成改过、改走私有通道(包超 200MB 就打包失败)。
-      10 分钟容差罩住慢盘上拷贝本身的时间差;用户真改代码几乎都在装完很久之后(2026-10-05 第二轮复核)。
+      · 出现 .tracking 里没有的 .py → 本机加了代码;
+      · 有比 .tracking 晚的 .py,且列出的 .py 有任何一个与 Registry 原包不同(或拿不到原包)—— 见上方说明。
+    cnr 是 (id, version),不给就从 pyproject 读。
     只看 .py:节点运行时常往自己目录写配置 / 缓存 / 下载的模型,改的是数据不是代码(同 worktree_dirty 的取舍)。
     跳过隐藏目录与已知垃圾目录(__pycache__、.venv 之类)。读不了 .tracking 时按干净处理。"""
     tracking = path / ".tracking"
     try:
         lines = tracking.read_text(encoding="utf-8", errors="replace").splitlines()
+        tracking_mtime = tracking.stat().st_mtime
     except OSError:
         return False
     listed = set()
@@ -358,17 +511,14 @@ def cnr_dirty(path: Path) -> bool:
         rel = rel[2:] if rel.startswith("./") else rel
         if rel and not rel.endswith("/"):
             listed.add(rel)
-    mtimes = []
-    for rel in sorted(r for r in listed if r.endswith(".py")):
+    listed_py = sorted(r for r in listed if r.endswith(".py"))
+    newer = False
+    for rel in listed_py:
         try:
-            mtimes.append((rel, (path / rel).stat().st_mtime))
+            mtime = (path / rel).stat().st_mtime
         except OSError:
             return True     # 列了的代码文件被删了
-    if mtimes:
-        ts = sorted(t for _, t in mtimes)
-        median = ts[len(ts) // 2]
-        if any(t > median + _CNR_MTIME_SLACK_S for _, t in mtimes):
-            return True
+        newer = newer or mtime > tracking_mtime + _CNR_MTIME_SLACK_S
     for root, dirs, files in os.walk(path):
         dirs[:] = [d for d in dirs if not d.startswith(".") and d not in _JUNK_DIRS
                    and d not in ("venv", "env", "site-packages")]
@@ -377,7 +527,13 @@ def cnr_dirty(path: Path) -> bool:
                 rel = Path(root, fn).relative_to(path).as_posix()
                 if rel not in listed:
                     return True
-    return False
+    if not newer:
+        return False        # 解包之后一个 .py 都没动过
+    ref = cnr or _read_cnr_info(path)
+    base = cnr_baseline(*ref) if ref else None
+    if base is None:
+        return True         # 分不清是改过还是拷贝:宁可判改过
+    return any(base.get(rel) is None or _file_sha256(path / rel) != base[rel] for rel in listed_py)
 
 
 def _baked_entry(name: str, src: dict) -> dict:
@@ -1063,11 +1219,11 @@ def folder_git_info(folder: str) -> dict:
             return info
     cnr = _read_cnr_info(path)
     if cnr:
-        # dirty 按 .tracking 判(见 cnr_dirty)。以前写死 False:本机改了 Registry 节点,云端照样从 Registry
+        # dirty 按 .tracking 的时间 + Registry 原包内容判(见 cnr_dirty)。以前写死 False:本机改了 Registry 节点,云端照样从 Registry
         # 下载原版,改动被静默丢掉 —— 而以前这类节点走 Volume 时是带着本机文件的(2026-10-05 深度 review 第二轮)。
         # dirty 的节点在 plan_node_sync 里走私有节点通道(local_pack),把本机这份传上去。
         return {"folder": folder, "has_git": True, "url": cnr_url(*cnr), "commit": "",
-                "cnr_id": cnr[0], "version": cnr[1], "pushed": True, "dirty": cnr_dirty(path)}
+                "cnr_id": cnr[0], "version": cnr[1], "pushed": True, "dirty": cnr_dirty(path, cnr)}
     repo = _pyproject_repo_url(path)
     if repo:
         return {"folder": folder, "has_git": True,

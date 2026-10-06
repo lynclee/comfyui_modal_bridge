@@ -4574,7 +4574,8 @@ def test_privileged_local_routes_are_all_admin_guarded():
         ("get", "/modal_bridge/platform_status"),
         ("get", "/modal_bridge/version"),
     }
-    found = re.findall(r'@routes\.(get|post)\("([^"]+)"\)(\n\s+@_admin_only)?', src)
+    # /submit 在 guard 外面多套一层 @_tag_submit_origin(给 403 / 400 也打来源头,见 routes 的说明)
+    found = re.findall(r'@routes\.(get|post)\("([^"]+)"\)(?:\n\s+@_tag_submit_origin)?(\n\s+@_admin_only)?', src)
     assert found
     for method, path, guard in found:
         if (method, path) in public:
