@@ -5,6 +5,7 @@
 const fs = require("node:fs");
 const path = require("node:path");
 const vm = require("node:vm");
+require("./_runaway_guard.cjs");   // 虚拟时钟失控保险:被测循环没有终止条件时失败而不是空转(见该文件)
 const assert = require("node:assert/strict");
 const { test } = require("node:test");
 
